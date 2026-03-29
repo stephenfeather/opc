@@ -85,6 +85,7 @@ async def store_learning_v2(
     context: str | None = None,
     tags: list[str] | None = None,
     confidence: str | None = None,
+    host_id: str | None = None,
 ) -> dict:
     """Store learning with v2 metadata schema and deduplication.
 
@@ -152,6 +153,8 @@ async def store_learning_v2(
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
+        if host_id:
+            metadata["host_id"] = host_id
         if learning_type:
             metadata["learning_type"] = learning_type
         if context:
@@ -301,6 +304,9 @@ async def main():
         help="Confidence level (v2)",
     )
 
+    # Host identification
+    parser.add_argument("--host-id", help="Machine identifier for multi-system support")
+
     # Output options
     parser.add_argument("--json", action="store_true", help="Output as JSON")
 
@@ -320,6 +326,7 @@ async def main():
             context=args.context,
             tags=tags,
             confidence=args.confidence,
+            host_id=args.host_id,
         )
     else:
         # Legacy mode

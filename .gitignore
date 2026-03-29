@@ -1,0 +1,26 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Environment
+.env
+.env.backup.*
+
+# Database backups (contain sensitive data)
+backups/*.dump
+backups/*.sql.gz
+
+# Caches
+.ruff_cache/
+.tldr/
+.claude/cache/
+.claude/tsc-cache/
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/

@@ -1,0 +1,41 @@
+---
+session: Continuous-Claude-v3
+date: 2026-02-12
+status: crashed
+outcome: PARTIAL_MINUS
+---
+
+goal: Session auto-compacted
+now: Continue from auto-compact
+test: # No test command captured
+
+done_this_session:
+  - task: "Session started"
+    files: []
+
+blockers:
+  []
+
+questions:
+  []
+
+decisions:
+  - crash_recovery: "Previous session ended unexpectedly (CLI crash/hang)"
+
+findings:
+  - tool_calls: "2 recent tool calls"
+  - files_modified: "0 files changed"
+
+worked:
+  - "Bash, Bash completed successfully"
+
+failed:
+  []
+
+next:
+  - "Review session state and continue"
+
+files:
+  created: []
+  modified:
+    []

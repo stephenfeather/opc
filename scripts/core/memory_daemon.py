@@ -65,7 +65,7 @@ PID_FILE = Path.home() / ".claude" / "memory-daemon.pid"
 LOG_FILE = Path.home() / ".claude" / "memory-daemon.log"
 
 # Worker queue state (module-level for daemon process)
-active_extractions: dict[int, tuple[str, Path | None, str]] = {}  # pid -> (session_id, jsonl_path, project)
+active_extractions: dict = {}  # pid -> (session_id, proc, jsonl_path, project)
 pending_queue: list[tuple[str, str, str | None]] = []  # [(session_id, project, transcript_path), ...]
 
 
@@ -440,7 +440,7 @@ Store each learning using store_learning.py with appropriate type and tags."""
             stderr=subprocess.DEVNULL,
             env=env,
         )
-        active_extractions[proc.pid] = (session_id, jsonl_path, project_dir)
+        active_extractions[proc.pid] = (session_id, proc, jsonl_path, project_dir)
         log(f"Started extraction for {session_id} "
             f"(pid={proc.pid}, file={jsonl_path.name}, "
             f"active={len(active_extractions)})")
@@ -514,27 +514,17 @@ def archive_session_jsonl(session_id: str, jsonl_path: Path | None = None):
 def reap_completed_extractions():
     """Check for completed extraction processes and remove from active set."""
     completed = []
-    for pid, (session_id, jsonl_path, project) in list(active_extractions.items()):
-        try:
-            # Use waitpid with WNOHANG to properly reap zombies
-            # os.kill(pid, 0) fails for zombies - they still exist in process table
-            result_pid, status = os.waitpid(pid, os.WNOHANG)
-            if result_pid != 0:
-                # Process has exited (zombie is now reaped)
-                completed.append(pid)
-                exit_code = os.waitstatus_to_exitcode(status)
-                log(f"Extraction completed for {session_id} "
-                    f"(pid={pid}, exit={exit_code})")
-                if exit_code == 0:
-                    mark_extracted(session_id)
-                    archive_session_jsonl(session_id, jsonl_path)
-                else:
-                    mark_extraction_failed(session_id)
-        except ChildProcessError:
-            # Not our child or already reaped - remove from tracking
+    for pid, (session_id, proc, jsonl_path, project) in list(active_extractions.items()):
+        exit_code = proc.poll()
+        if exit_code is not None:
             completed.append(pid)
-            log(f"Extraction orphaned for {session_id} (pid={pid})")
-            mark_extraction_failed(session_id)
+            log(f"Extraction completed for {session_id} "
+                f"(pid={pid}, project={project}, exit={exit_code})")
+            if exit_code == 0:
+                mark_extracted(session_id)
+                archive_session_jsonl(session_id, jsonl_path)
+            else:
+                mark_extraction_failed(session_id)
 
     for pid in completed:
         del active_extractions[pid]

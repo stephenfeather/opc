@@ -511,6 +511,56 @@ def archive_session_jsonl(session_id: str, jsonl_path: Path | None = None):
         log(f"Archive error for {session_id}: {e}")
 
 
+def _extract_and_store_workflows(
+    session_id: str,
+    jsonl_path: Path,
+    project: str | None,
+):
+    """Extract workflow patterns and store as learnings. Non-fatal."""
+    try:
+        from scripts.core.extract_workflow_patterns import (
+            extract_tool_uses,
+            detect_workflow_sequences,
+            format_pattern_as_learning,
+        )
+    except ImportError as e:
+        log(f"Workflow extraction unavailable: {e}")
+        return
+
+    try:
+        tool_uses = extract_tool_uses(jsonl_path)
+        patterns = detect_workflow_sequences(tool_uses)
+        successful = [p for p in patterns if p.get("success") is True]
+
+        if not successful:
+            log(f"No successful workflow patterns for {session_id}")
+            return
+
+        from scripts.core.store_learning import store_learning_v2
+
+        stored = 0
+        for pattern in successful:
+            content = format_pattern_as_learning(pattern)
+            try:
+                import asyncio
+                result = asyncio.run(store_learning_v2(
+                    session_id=session_id,
+                    content=content,
+                    learning_type="WORKING_SOLUTION",
+                    context=project or "unknown",
+                    tags=["workflow", pattern["pattern_type"]],
+                    confidence="high",
+                ))
+                if result.get("success") and not result.get("skipped"):
+                    stored += 1
+            except Exception as e:
+                log(f"Failed to store workflow learning: {e}")
+
+        log(f"Stored {stored} workflow patterns for {session_id}")
+    except Exception as e:
+        log(f"Workflow extraction failed for {session_id}: {e}")
+
+
 def reap_completed_extractions():
     """Check for completed extraction processes and remove from active set."""
     completed = []
@@ -522,6 +572,7 @@ def reap_completed_extractions():
                 f"(pid={pid}, project={project}, exit={exit_code})")
             if exit_code == 0:
                 mark_extracted(session_id)
+                _extract_and_store_workflows(session_id, jsonl_path, project)
                 archive_session_jsonl(session_id, jsonl_path)
             else:
                 mark_extraction_failed(session_id)

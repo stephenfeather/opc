@@ -141,13 +141,13 @@ def pg_get_stale_sessions() -> list:
     """Get sessions with stale heartbeat that need extraction."""
     conn = pg_connect()
     cur = conn.cursor()
-    threshold = datetime.now() - timedelta(seconds=STALE_THRESHOLD)
+    # Use DB clock for comparison to avoid local-vs-UTC timezone mismatch
     cur.execute("""
         SELECT id, project, transcript_path FROM sessions
-        WHERE last_heartbeat < %s
+        WHERE last_heartbeat < NOW() - INTERVAL '%s seconds'
         AND extraction_status = 'pending'
         AND extraction_attempts < %s
-    """, (threshold, MAX_RETRIES))
+    """, (STALE_THRESHOLD, MAX_RETRIES))
     rows = cur.fetchall()
     conn.close()
     return rows

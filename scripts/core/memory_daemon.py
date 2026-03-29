@@ -60,7 +60,7 @@ if global_env.exists():
 POLL_INTERVAL = 60  # seconds
 STALE_THRESHOLD = 900  # 15 minutes in seconds
 MAX_CONCURRENT_EXTRACTIONS = 4
-MAX_RETRIES = 3
+MAX_RETRIES = 5
 PID_FILE = Path.home() / ".claude" / "memory-daemon.pid"
 LOG_FILE = Path.home() / ".claude" / "memory-daemon.log"
 

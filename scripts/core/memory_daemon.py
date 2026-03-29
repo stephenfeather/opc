@@ -561,6 +561,37 @@ def _extract_and_store_workflows(
         log(f"Workflow extraction failed for {session_id}: {e}")
 
 
+def _generate_mini_handoff(
+    session_id: str,
+    jsonl_path: Path,
+    project: str | None,
+):
+    """Generate a mini-handoff YAML from session JSONL. Non-fatal."""
+    try:
+        from scripts.core.generate_mini_handoff import (
+            generate_handoff,
+            write_handoff,
+        )
+    except ImportError as e:
+        log(f"Mini-handoff generation unavailable: {e}")
+        return
+
+    if not project:
+        log(f"Mini-handoff skipped for {session_id}: no project dir")
+        return
+
+    try:
+        handoff = generate_handoff(
+            session_id=session_id,
+            project_dir=project,
+            jsonl_path=jsonl_path,
+        )
+        output_path = write_handoff(handoff, Path(project), session_id)
+        log(f"Mini-handoff written for {session_id}: {output_path}")
+    except Exception as e:
+        log(f"Mini-handoff generation failed for {session_id}: {e}")
+
+
 def reap_completed_extractions():
     """Check for completed extraction processes and remove from active set."""
     completed = []
@@ -573,6 +604,7 @@ def reap_completed_extractions():
             if exit_code == 0:
                 mark_extracted(session_id)
                 _extract_and_store_workflows(session_id, jsonl_path, project)
+                _generate_mini_handoff(session_id, jsonl_path, project)
                 archive_session_jsonl(session_id, jsonl_path)
             else:
                 mark_extraction_failed(session_id)

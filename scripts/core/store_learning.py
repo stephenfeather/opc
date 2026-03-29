@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import sys
@@ -124,9 +125,20 @@ async def store_learning_v2(
             session_id=session_id,
         )
 
+        # Compute content hash for deduplication
+        content_hash = hashlib.sha256(
+            content.strip().encode()
+        ).hexdigest()
+
         # Generate embedding
-        embedder = EmbeddingService(provider=os.getenv("EMBEDDING_PROVIDER", "local"))
+        embed_provider = os.getenv("EMBEDDING_PROVIDER", "local")
+        embedder = EmbeddingService(provider=embed_provider)
         embedding = await embedder.embed(content)
+
+        # Determine embedding model name for metadata
+        embedding_model = None
+        if hasattr(embedder, '_provider') and hasattr(embedder._provider, 'model'):
+            embedding_model = embedder._provider.model
 
         # Deduplication check: search for similar existing memories
         try:
@@ -155,6 +167,8 @@ async def store_learning_v2(
 
         if host_id:
             metadata["host_id"] = host_id
+        if embedding_model:
+            metadata["embedding_model"] = embedding_model
         if learning_type:
             metadata["learning_type"] = learning_type
         if context:
@@ -164,14 +178,24 @@ async def store_learning_v2(
         if confidence:
             metadata["confidence"] = confidence
 
-        # Store with embedding
+        # Store with embedding and content_hash dedup
         memory_id = await memory.store(
             content,
             metadata=metadata,
             embedding=embedding,
+            content_hash=content_hash,
+            host_id=host_id,
         )
 
         await memory.close()
+
+        # content_hash dedup returns empty string
+        if not memory_id:
+            return {
+                "success": True,
+                "skipped": True,
+                "reason": "duplicate (content_hash match)",
+            }
 
         return {
             "success": True,

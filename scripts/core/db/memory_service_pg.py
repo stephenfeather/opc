@@ -313,6 +313,8 @@ class MemoryServicePG:
         metadata: dict[str, Any] | None = None,
         embedding: list[float] | None = None,
         tags: list[str] | None = None,
+        content_hash: str | None = None,
+        host_id: str | None = None,
     ) -> str:
         """Store a fact in archival memory.
 
@@ -321,9 +323,11 @@ class MemoryServicePG:
             metadata: Optional metadata dict
             embedding: Optional pre-computed embedding (normalized to 1024 dims)
             tags: Optional list of tags for categorization
+            content_hash: SHA-256 hash for deduplication
+            host_id: Machine identifier for multi-system support
 
         Returns:
-            Memory ID
+            Memory ID (or empty string if deduplicated)
         """
         memory_id = generate_memory_id()
 
@@ -338,11 +342,15 @@ class MemoryServicePG:
                 # Register vector type for this connection
                 await init_pgvector(conn)
 
-                await conn.execute(
+                result = await conn.execute(
                     """
                     INSERT INTO archival_memory
-                        (id, session_id, agent_id, content, metadata, embedding)
-                    VALUES ($1, $2, $3, $4, $5, $6)
+                        (id, session_id, agent_id, content,
+                         metadata, embedding, content_hash, host_id)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    ON CONFLICT (content_hash)
+                        WHERE content_hash IS NOT NULL
+                        DO NOTHING
                 """,
                     memory_id,
                     self.session_id,
@@ -350,20 +358,32 @@ class MemoryServicePG:
                     content,
                     json.dumps(metadata or {}),
                     padded_embedding,
+                    content_hash,
+                    host_id,
                 )
             else:
-                await conn.execute(
+                result = await conn.execute(
                     """
                     INSERT INTO archival_memory
-                        (id, session_id, agent_id, content, metadata)
-                    VALUES ($1, $2, $3, $4, $5)
+                        (id, session_id, agent_id, content,
+                         metadata, content_hash, host_id)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT (content_hash)
+                        WHERE content_hash IS NOT NULL
+                        DO NOTHING
                 """,
                     memory_id,
                     self.session_id,
                     self.agent_id,
                     content,
                     json.dumps(metadata or {}),
+                    content_hash,
+                    host_id,
                 )
+
+            # Check if insert actually happened (dedup may have skipped)
+            if result == "INSERT 0 0":
+                return ""
 
             # Store tags if provided (deduplicated via set)
             if tags:

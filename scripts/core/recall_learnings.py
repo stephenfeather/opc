@@ -271,7 +271,7 @@ async def search_learnings_hybrid_rrf(
     # Generate query embedding
     embedder = EmbeddingService(provider=provider)
     try:
-        query_embedding = await embedder.embed(query)
+        query_embedding = await embedder.embed(query, input_type="query")
     finally:
         await embedder.aclose()
 
@@ -401,7 +401,7 @@ async def search_learnings_postgres(
         # Vector similarity search
         embedder = EmbeddingService(provider=provider)
         try:
-            query_embedding = await embedder.embed(query)
+            query_embedding = await embedder.embed(query, input_type="query")
         finally:
             await embedder.aclose()
 

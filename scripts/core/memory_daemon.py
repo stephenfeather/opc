@@ -18,9 +18,11 @@ USAGE:
 ARCHITECTURE:
     - Single global instance (PID file at ~/.claude/memory-daemon.pid)
     - Works with PostgreSQL or SQLite
-    - Polls every 60 seconds for stale sessions (heartbeat > 5 min)
+    - Polls every 60 seconds for stale sessions (heartbeat > 15 min)
     - Runs headless `claude -p` for memory extraction
-    - Marks sessions as extracted to prevent re-processing
+    - 4-state extraction lifecycle: pending -> extracting -> extracted | failed
+    - S3 archival after successful extraction (zstd + upload)
+    - DB retry logic for transient PostgreSQL failures
 
 The session_start hook ensures this daemon is running.
 """
@@ -41,27 +43,30 @@ import faulthandler
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
 # Load .env files for DATABASE_URL (cross-platform)
-# 1. Global ~/.claude/.env (API keys, may have DB config)
-global_env = Path.home() / ".claude" / ".env"
-if global_env.exists():
-    load_dotenv(global_env)
-
-# 2. Local opc/.env (relative to script location)
+# 1. Local opc/.env first (relative to script location)
 # Script is at opc/scripts/core/memory_daemon.py, .env is at opc/.env
 opc_env = Path(__file__).parent.parent.parent / ".env"
 if opc_env.exists():
-    load_dotenv(opc_env, override=True)  # Override with project-specific values
+    load_dotenv(opc_env, override=True)
+
+# 2. Global ~/.claude/.env (API keys, S3 bucket, etc.)
+# Loaded with override=True so global secrets always take effect,
+# even if the hook environment had empty/missing values.
+global_env = Path.home() / ".claude" / ".env"
+if global_env.exists():
+    load_dotenv(global_env, override=True)
 
 # Global config
 POLL_INTERVAL = 60  # seconds
-STALE_THRESHOLD = 300  # 5 minutes in seconds
-MAX_CONCURRENT_EXTRACTIONS = 2  # Limit concurrent headless claude processes
+STALE_THRESHOLD = 900  # 15 minutes in seconds
+MAX_CONCURRENT_EXTRACTIONS = 4
+MAX_RETRIES = 3
 PID_FILE = Path.home() / ".claude" / "memory-daemon.pid"
 LOG_FILE = Path.home() / ".claude" / "memory-daemon.log"
 
 # Worker queue state (module-level for daemon process)
-active_extractions: dict[int, str] = {}  # pid -> session_id
-pending_queue: list[tuple[str, str]] = []  # [(session_id, project), ...]
+active_extractions: dict[int, tuple[str, Path | None, str]] = {}  # pid -> (session_id, jsonl_path, project)
+pending_queue: list[tuple[str, str, str | None]] = []  # [(session_id, project, transcript_path), ...]
 
 
 def log(msg: str):
@@ -94,43 +99,130 @@ def use_postgres() -> bool:
 
 
 # Database operations - PostgreSQL
-def pg_ensure_column():
-    """Ensure memory_extracted_at column exists in PostgreSQL."""
+
+def pg_connect(max_retries: int = 3, base_delay: float = 2.0):
+    """Connect to PostgreSQL with retry logic for transient failures."""
     import psycopg2
-    conn = psycopg2.connect(get_postgres_url())
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            return psycopg2.connect(get_postgres_url())
+        except psycopg2.OperationalError as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)  # 2s, 4s, 8s
+                log(f"DB connection failed (attempt {attempt + 1}/{max_retries}), "
+                    f"retrying in {delay}s: {e}")
+                time.sleep(delay)
+    raise last_error
+
+
+def pg_ensure_column():
+    """Ensure extraction columns exist in PostgreSQL."""
+    conn = pg_connect()
     cur = conn.cursor()
-    cur.execute("""
-        ALTER TABLE sessions
-        ADD COLUMN IF NOT EXISTS memory_extracted_at TIMESTAMP
-    """)
+    for col, typedef in [
+        ("memory_extracted_at", "TIMESTAMP"),
+        ("extraction_status", "TEXT DEFAULT 'pending'"),
+        ("extraction_attempts", "INTEGER DEFAULT 0"),
+        ("transcript_path", "TEXT"),
+        ("archived_at", "TIMESTAMP"),
+        ("archive_path", "TEXT"),
+    ]:
+        cur.execute(f"""
+            ALTER TABLE sessions
+            ADD COLUMN IF NOT EXISTS {col} {typedef}
+        """)
     conn.commit()
     conn.close()
 
 
 def pg_get_stale_sessions() -> list:
-    """Get sessions with stale heartbeat that haven't been extracted."""
-    import psycopg2
-    conn = psycopg2.connect(get_postgres_url())
+    """Get sessions with stale heartbeat that need extraction."""
+    conn = pg_connect()
     cur = conn.cursor()
     threshold = datetime.now() - timedelta(seconds=STALE_THRESHOLD)
     cur.execute("""
-        SELECT id, project FROM sessions
+        SELECT id, project, transcript_path FROM sessions
         WHERE last_heartbeat < %s
-        AND memory_extracted_at IS NULL
-    """, (threshold,))
+        AND extraction_status = 'pending'
+        AND extraction_attempts < %s
+    """, (threshold, MAX_RETRIES))
     rows = cur.fetchall()
     conn.close()
     return rows
 
 
-def pg_mark_extracted(session_id: str):
-    """Mark session as extracted in PostgreSQL."""
-    import psycopg2
-    conn = psycopg2.connect(get_postgres_url())
+def pg_mark_extracting(session_id: str):
+    """Mark session as actively being extracted in PostgreSQL."""
+    conn = pg_connect()
     cur = conn.cursor()
     cur.execute("""
-        UPDATE sessions SET memory_extracted_at = NOW() WHERE id = %s
+        UPDATE sessions
+        SET extraction_status = 'extracting',
+            extraction_attempts = COALESCE(extraction_attempts, 0) + 1
+        WHERE id = %s
     """, (session_id,))
+    conn.commit()
+    conn.close()
+
+
+def pg_mark_extracted(session_id: str):
+    """Mark session as successfully extracted in PostgreSQL."""
+    conn = pg_connect()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE sessions
+        SET memory_extracted_at = NOW(),
+            extraction_status = 'extracted'
+        WHERE id = %s
+    """, (session_id,))
+    conn.commit()
+    conn.close()
+
+
+def pg_mark_extraction_failed(session_id: str):
+    """Mark extraction as failed; retry if under MAX_RETRIES, else give up."""
+    conn = pg_connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT extraction_attempts FROM sessions WHERE id = %s
+    """, (session_id,))
+    row = cur.fetchone()
+    attempts = row[0] if row else 0
+
+    if attempts < MAX_RETRIES:
+        cur.execute("""
+            UPDATE sessions SET extraction_status = 'pending' WHERE id = %s
+        """, (session_id,))
+        log(f"Extraction failed for {session_id} (attempt {attempts}/{MAX_RETRIES}), will retry")
+    else:
+        cur.execute("""
+            UPDATE sessions SET extraction_status = 'failed' WHERE id = %s
+        """, (session_id,))
+        log(f"Extraction permanently failed for {session_id} after {attempts} attempts")
+
+    conn.commit()
+    conn.close()
+
+
+def pg_mark_archived(session_id: str, archive_path: str):
+    """Mark session as archived in PostgreSQL and stamp learnings with archive_path."""
+    conn = pg_connect()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE sessions
+        SET archived_at = NOW(), archive_path = %s
+        WHERE id = %s
+    """, (archive_path, session_id))
+    # Stamp archival_memory with source traceability
+    cur.execute("""
+        UPDATE archival_memory
+        SET metadata = COALESCE(metadata, '{}'::jsonb) ||
+            jsonb_build_object('source_session_id', %s, 'archive_path', %s)
+        WHERE session_id = %s
+        AND (metadata->>'archive_path') IS NULL
+    """, (session_id, archive_path, session_id))
     conn.commit()
     conn.close()
 
@@ -138,7 +230,6 @@ def pg_mark_extracted(session_id: str):
 # Database operations - SQLite
 def get_sqlite_path() -> Path:
     """Get SQLite database path."""
-    # Use global path for cross-repo sessions
     return Path.home() / ".claude" / "sessions.db"
 
 
@@ -154,33 +245,61 @@ def sqlite_ensure_table():
             working_on TEXT,
             started_at TIMESTAMP,
             last_heartbeat TIMESTAMP,
-            memory_extracted_at TIMESTAMP
+            memory_extracted_at TIMESTAMP,
+            extraction_status TEXT DEFAULT 'pending',
+            extraction_attempts INTEGER DEFAULT 0,
+            transcript_path TEXT,
+            archived_at TIMESTAMP,
+            archive_path TEXT
         )
     """)
-    # Add column if table already exists without it
-    try:
-        conn.execute("ALTER TABLE sessions ADD COLUMN memory_extracted_at TIMESTAMP")
-    except sqlite3.OperationalError:
-        pass  # Column already exists
+    # Add columns if table already exists without them
+    for col, typedef in [
+        ("memory_extracted_at", "TIMESTAMP"),
+        ("extraction_status", "TEXT DEFAULT 'pending'"),
+        ("extraction_attempts", "INTEGER DEFAULT 0"),
+        ("transcript_path", "TEXT"),
+        ("archived_at", "TIMESTAMP"),
+        ("archive_path", "TEXT"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {typedef}")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
     conn.commit()
     conn.close()
 
 
 def sqlite_get_stale_sessions() -> list:
-    """Get sessions with stale heartbeat that haven't been extracted."""
+    """Get sessions with stale heartbeat that need extraction."""
     db_path = get_sqlite_path()
     if not db_path.exists():
         return []
     conn = sqlite3.connect(db_path)
     threshold = (datetime.now() - timedelta(seconds=STALE_THRESHOLD)).isoformat()
     cursor = conn.execute("""
-        SELECT id, project FROM sessions
+        SELECT id, project, transcript_path FROM sessions
         WHERE last_heartbeat < ?
-        AND memory_extracted_at IS NULL
-    """, (threshold,))
+        AND extraction_status = 'pending'
+        AND COALESCE(extraction_attempts, 0) < ?
+    """, (threshold, MAX_RETRIES))
     rows = cursor.fetchall()
     conn.close()
     return rows
+
+
+def sqlite_mark_extracting(session_id: str):
+    """Mark session as actively being extracted in SQLite."""
+    db_path = get_sqlite_path()
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        UPDATE sessions
+        SET extraction_status = 'extracting',
+            extraction_attempts = COALESCE(extraction_attempts, 0) + 1
+        WHERE id = ?
+    """, (session_id,))
+    conn.commit()
+    conn.close()
 
 
 def sqlite_mark_extracted(session_id: str):
@@ -188,8 +307,35 @@ def sqlite_mark_extracted(session_id: str):
     db_path = get_sqlite_path()
     conn = sqlite3.connect(db_path)
     conn.execute("""
-        UPDATE sessions SET memory_extracted_at = ? WHERE id = ?
+        UPDATE sessions
+        SET memory_extracted_at = ?,
+            extraction_status = 'extracted'
+        WHERE id = ?
     """, (datetime.now().isoformat(), session_id))
+    conn.commit()
+    conn.close()
+
+
+def sqlite_mark_extraction_failed(session_id: str):
+    """Mark extraction as failed in SQLite; retry if under MAX_RETRIES."""
+    db_path = get_sqlite_path()
+    conn = sqlite3.connect(db_path)
+    cursor = conn.execute(
+        "SELECT extraction_attempts FROM sessions WHERE id = ?", (session_id,)
+    )
+    row = cursor.fetchone()
+    attempts = row[0] if row else 0
+
+    if attempts < MAX_RETRIES:
+        conn.execute(
+            "UPDATE sessions SET extraction_status = 'pending' WHERE id = ?",
+            (session_id,),
+        )
+    else:
+        conn.execute(
+            "UPDATE sessions SET extraction_status = 'failed' WHERE id = ?",
+            (session_id,),
+        )
     conn.commit()
     conn.close()
 
@@ -210,6 +356,14 @@ def get_stale_sessions() -> list:
     return sqlite_get_stale_sessions()
 
 
+def mark_extracting(session_id: str):
+    """Mark session as actively being extracted."""
+    if use_postgres():
+        pg_mark_extracting(session_id)
+    else:
+        sqlite_mark_extracting(session_id)
+
+
 def mark_extracted(session_id: str):
     """Mark session as extracted."""
     if use_postgres():
@@ -218,39 +372,36 @@ def mark_extracted(session_id: str):
         sqlite_mark_extracted(session_id)
 
 
-def extract_memories(session_id: str, project_dir: str):
-    """Run memory extraction for a session."""
-    log(f"Extracting memories for session {session_id} in {project_dir}")
+def mark_extraction_failed(session_id: str):
+    """Mark extraction as failed (will retry if under MAX_RETRIES)."""
+    if use_postgres():
+        pg_mark_extraction_failed(session_id)
+    else:
+        sqlite_mark_extraction_failed(session_id)
 
-    # Find the most recent JSONL for this session
-    config_dir = Path(os.environ.get('CLAUDE_CONFIG_DIR', str(Path.home() / '.claude')))
-    jsonl_dir = config_dir / "projects"
 
-    # Look for session JSONL
-    # Session IDs may be truncated (s-mkb24ccg) while JSONL uses full UUIDs
-    # Strategy: Match by ID if possible, otherwise use most recent modified JSONL
+def extract_memories(
+    session_id: str,
+    project_dir: str,
+    transcript_path: str | None = None,
+) -> bool:
+    """Run memory extraction for a session. Returns True if subprocess started."""
+    log(f"Extracting memories for session {session_id} "
+        f"(project={project_dir or 'unknown'})")
+
+    # Use transcript_path from DB — no glob fallback (wrong-file guessing caused orphaned extractions)
     jsonl_path = None
-    all_jsonls = sorted(jsonl_dir.glob("*/*.jsonl"), key=lambda x: x.stat().st_mtime, reverse=True)
-
-    # First try exact/partial match on session ID
-    for f in all_jsonls:
-        if session_id in f.name or f.stem == session_id:
-            jsonl_path = f
-            break
-
-    # Fallback: Use most recent JSONL if no ID match (common with truncated IDs)
-    if not jsonl_path and all_jsonls:
-        # Use most recent JSONL modified in last 10 minutes (likely the stale session)
-        recent_threshold = datetime.now() - timedelta(minutes=10)
-        for f in all_jsonls:
-            if datetime.fromtimestamp(f.stat().st_mtime) > recent_threshold:
-                jsonl_path = f
-                log(f"Using recent JSONL {f.name} for session {session_id} (no ID match)")
-                break
+    if transcript_path:
+        candidate = Path(transcript_path)
+        if candidate.exists():
+            jsonl_path = candidate
 
     if not jsonl_path:
-        log(f"No JSONL found for session {session_id}, skipping")
-        return
+        reason = "no transcript_path in DB" if not transcript_path else "file missing from disk"
+        log(f"No JSONL for session {session_id} "
+            f"(project={project_dir or 'unknown'}, {reason}), marking as extracted (skip)")
+        mark_extracted(session_id)
+        return False
 
     # Run headless memory extraction
     try:
@@ -273,10 +424,13 @@ def extract_memories(session_id: str, project_dir: str):
 Look for decisions, what worked, what failed, and patterns discovered.
 Store each learning using store_learning.py with appropriate type and tags."""
 
+        env = os.environ.copy()
+        env["CLAUDE_MEMORY_EXTRACTION"] = "1"  # Prevent session-register from registering extraction sessions
+
         proc = subprocess.Popen(
             [
                 "claude", "-p",
-                "--model", "sonnet",  # Better extraction quality
+                "--model", "sonnet",
                 "--dangerously-skip-permissions",
                 "--max-turns", "15",
                 "--append-system-prompt", agent_prompt,
@@ -284,28 +438,103 @@ Store each learning using store_learning.py with appropriate type and tags."""
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            start_new_session=True  # Detach from parent
+            env=env,
         )
-        active_extractions[proc.pid] = session_id
-        log(f"Started extraction for {session_id} (pid={proc.pid}, active={len(active_extractions)})")
+        active_extractions[proc.pid] = (session_id, jsonl_path, project_dir)
+        log(f"Started extraction for {session_id} "
+            f"(pid={proc.pid}, file={jsonl_path.name}, "
+            f"active={len(active_extractions)})")
+        return True
     except Exception as e:
         log(f"Failed to start extraction: {e}")
+        return False
+
+
+def archive_session_jsonl(session_id: str, jsonl_path: Path | None = None):
+    """Compress and upload session JSONL to S3, then delete local copy."""
+    bucket = os.environ.get("CLAUDE_SESSION_ARCHIVE_BUCKET")
+    if not bucket:
+        return
+
+    if not jsonl_path or not jsonl_path.exists():
+        log(f"Archive skipped for {session_id}: JSONL not found")
+        return
+
+    project_name = jsonl_path.parent.name
+    s3_key = f"s3://{bucket}/sessions/{project_name}/{jsonl_path.stem}.jsonl.zst"
+    zst_path = jsonl_path.with_suffix(".jsonl.zst")
+
+    try:
+        # Compress with zstd
+        result = subprocess.run(
+            ["zstd", "-q", "--rm", str(jsonl_path)],
+            capture_output=True, timeout=300,
+        )
+        if result.returncode != 0:
+            log(f"zstd failed for {session_id}: {result.stderr.decode()}")
+            return
+
+        # Upload to S3
+        result = subprocess.run(
+            ["aws", "s3", "cp", str(zst_path), s3_key, "--quiet"],
+            capture_output=True, timeout=120,
+        )
+        if result.returncode != 0:
+            log(f"S3 upload failed for {session_id}: {result.stderr.decode()}")
+            # Restore original file on upload failure
+            subprocess.run(
+                ["zstd", "-d", "-q", "--rm", str(zst_path)],
+                capture_output=True, timeout=300,
+            )
+            return
+
+        # Clean up local compressed file
+        zst_path.unlink(missing_ok=True)
+
+        # Mark archived in DB
+        try:
+            pg_mark_archived(session_id, s3_key)
+        except Exception as e:
+            log(f"Archive DB update failed for {session_id} (file already in S3): {e}")
+
+        log(f"Archived {session_id} -> {s3_key}")
+
+    except subprocess.TimeoutExpired:
+        log(f"Archive timeout for {session_id}")
+        # Restore if compressed but not uploaded
+        if zst_path.exists() and not jsonl_path.exists():
+            subprocess.run(
+                ["zstd", "-d", "-q", "--rm", str(zst_path)],
+                capture_output=True, timeout=300,
+            )
+    except Exception as e:
+        log(f"Archive error for {session_id}: {e}")
 
 
 def reap_completed_extractions():
     """Check for completed extraction processes and remove from active set."""
     completed = []
-    for pid, session_id in active_extractions.items():
+    for pid, (session_id, jsonl_path, project) in list(active_extractions.items()):
         try:
-            # Check if process is still running (signal 0 = check existence)
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            # Process finished
+            # Use waitpid with WNOHANG to properly reap zombies
+            # os.kill(pid, 0) fails for zombies - they still exist in process table
+            result_pid, status = os.waitpid(pid, os.WNOHANG)
+            if result_pid != 0:
+                # Process has exited (zombie is now reaped)
+                completed.append(pid)
+                exit_code = os.waitstatus_to_exitcode(status)
+                log(f"Extraction completed for {session_id} "
+                    f"(pid={pid}, exit={exit_code})")
+                if exit_code == 0:
+                    mark_extracted(session_id)
+                    archive_session_jsonl(session_id, jsonl_path)
+                else:
+                    mark_extraction_failed(session_id)
+        except ChildProcessError:
+            # Not our child or already reaped - remove from tracking
             completed.append(pid)
-            log(f"Extraction completed for {session_id} (pid={pid})")
-        except PermissionError:
-            # Process exists but we can't signal it - assume still running
-            pass
+            log(f"Extraction orphaned for {session_id} (pid={pid})")
+            mark_extraction_failed(session_id)
 
     for pid in completed:
         del active_extractions[pid]
@@ -317,20 +546,26 @@ def process_pending_queue():
     """Spawn extractions from queue if under concurrency limit."""
     spawned = 0
     while pending_queue and len(active_extractions) < MAX_CONCURRENT_EXTRACTIONS:
-        session_id, project = pending_queue.pop(0)
-        log(f"Dequeuing {session_id} (queue remaining: {len(pending_queue)})")
-        extract_memories(session_id, project)
+        session_id, project, transcript_path = pending_queue.pop(0)
+        log(f"Dequeuing {session_id} (project={project or 'unknown'}, "
+            f"queue remaining: {len(pending_queue)})")
+        extract_memories(session_id, project, transcript_path)
         spawned += 1
     return spawned
 
 
-def queue_or_extract(session_id: str, project: str):
+def queue_or_extract(
+    session_id: str,
+    project: str,
+    transcript_path: str | None = None,
+):
     """Queue extraction if at limit, otherwise extract immediately."""
     if len(active_extractions) >= MAX_CONCURRENT_EXTRACTIONS:
-        pending_queue.append((session_id, project))
-        log(f"Queued {session_id} (active={len(active_extractions)}, queue={len(pending_queue)})")
+        pending_queue.append((session_id, project, transcript_path))
+        log(f"Queued {session_id} (active={len(active_extractions)}, "
+            f"queue={len(pending_queue)})")
     else:
-        extract_memories(session_id, project)
+        extract_memories(session_id, project, transcript_path)
 
 
 def daemon_loop():
@@ -348,10 +583,16 @@ def daemon_loop():
             # Find new stale sessions
             stale = get_stale_sessions()
             if stale:
-                log(f"Found {len(stale)} stale sessions")
-                for session_id, project in stale:
-                    queue_or_extract(session_id, project or "")
-                    mark_extracted(session_id)
+                summary = ", ".join(
+                    f"{sid}({proj or '?'})"
+                    for sid, proj, *_ in stale
+                )
+                log(f"Found {len(stale)} stale sessions: {summary}")
+                for row in stale:
+                    session_id, project = row[0], row[1]
+                    tp = row[2] if len(row) > 2 else None
+                    mark_extracting(session_id)
+                    queue_or_extract(session_id, project or "", tp)
         except Exception as e:
             log(f"Error in daemon loop: {e}")
 
@@ -405,8 +646,6 @@ def start_daemon():
 
     if sys.platform == "win32":
         # Windows: spawn as detached subprocess
-        # Uses DETACHED_PROCESS flag to run independently of parent
-        # Reference: MongoDB pymongo/daemon.py pattern
         DETACHED_PROCESS = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
         try:
             with open(os.devnull, "r+b") as devnull:
@@ -462,7 +701,7 @@ def status_daemon():
     running, pid = is_running()
     db_type = "PostgreSQL" if use_postgres() else "SQLite"
 
-    print(f"Memory Daemon Status")
+    print("Memory Daemon Status")
     print(f"  Running: {'Yes' if running else 'No'}")
     if running:
         print(f"  PID: {pid}")
@@ -470,9 +709,27 @@ def status_daemon():
     print(f"  PID file: {PID_FILE}")
     print(f"  Log file: {LOG_FILE}")
 
+    # Show extraction status counts
+    if use_postgres():
+        try:
+            conn = pg_connect()
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT extraction_status, COUNT(*)
+                FROM sessions
+                GROUP BY extraction_status
+            """)
+            counts = dict(cur.fetchall())
+            conn.close()
+            print("\nExtraction Status:")
+            for status in ['pending', 'extracting', 'extracted', 'failed']:
+                print(f"  {status}: {counts.get(status, 0)}")
+        except Exception as e:
+            print(f"\n  (DB query failed: {e})")
+
     # Show recent log
     if LOG_FILE.exists():
-        print(f"\nRecent log:")
+        print("\nRecent log:")
         lines = LOG_FILE.read_text().strip().split("\n")[-5:]
         for line in lines:
             print(f"  {line}")

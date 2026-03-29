@@ -266,12 +266,14 @@ class VoyageEmbeddingProvider(EmbeddingProvider):
         """Exit async context manager and close client."""
         await self.aclose()
 
-    async def embed(self, text: str) -> list[float]:
+    async def embed(self, text: str, input_type: str = "document") -> list[float]:
         """Generate embedding for a single text."""
-        embeddings = await self._call_api([text])
+        embeddings = await self._call_api([text], input_type=input_type)
         return embeddings[0]
 
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+    async def embed_batch(
+        self, texts: list[str], input_type: str = "document",
+    ) -> list[list[float]]:
         """Generate embeddings for multiple texts."""
         if not texts:
             return []
@@ -280,12 +282,12 @@ class VoyageEmbeddingProvider(EmbeddingProvider):
 
         for i in range(0, len(texts), self.max_batch_size):
             chunk = texts[i : i + self.max_batch_size]
-            chunk_embeddings = await self._call_api(chunk)
+            chunk_embeddings = await self._call_api(chunk, input_type=input_type)
             all_embeddings.extend(chunk_embeddings)
 
         return all_embeddings
 
-    async def _call_api(self, texts: list[str]) -> list[list[float]]:
+    async def _call_api(self, texts: list[str], input_type: str = "document") -> list[list[float]]:
         """Call Voyage embeddings API with retry logic."""
         last_error: Exception | None = None
         last_response_text: str | None = None
@@ -301,7 +303,7 @@ class VoyageEmbeddingProvider(EmbeddingProvider):
                     json={
                         "model": self.model,
                         "input": texts,
-                        "input_type": "document",
+                        "input_type": input_type,
                     },
                 )
 
@@ -606,7 +608,10 @@ class EmbeddingService:
             dim = dimension if dimension is not None else MockEmbeddingProvider.DEFAULT_DIMENSION
             self._provider = MockEmbeddingProvider(dimension=dim)
         elif provider == "voyage":
-            voyage_model = model if model is not None else "voyage-3"
+            voyage_model = (
+                model if model is not None
+                else os.getenv("VOYAGE_EMBEDDING_MODEL", "voyage-3")
+            )
             self._provider = VoyageEmbeddingProvider(
                 model=voyage_model,
                 max_batch_size=max_batch_size,

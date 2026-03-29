@@ -24,6 +24,7 @@ faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log")
 
 # Perception change signal patterns (Alan Kay "point of view" moments)
 PERCEPTION_SIGNALS = [
+    # Corrections and realizations
     r"\bactually\b",
     r"\brealized?\b",
     r"\bthe issue\b",
@@ -47,6 +48,24 @@ PERCEPTION_SIGNALS = [
     r"\bdifferent from\b",
     r"\bnot what I\b",
     r"\bwasn'?t\b.*\bexpect",
+    # Validation and success signals
+    r"\bthis works\b",
+    r"\bthat works\b",
+    r"\bworked well\b",
+    r"\bgood approach\b",
+    r"\bright approach\b",
+    r"\bas expected\b",
+    r"\bconfirm(?:s|ed)?\b.*\bapproach\b",
+    r"\bthis pattern\b.*\b(?:works|effective|reliable)\b",
+    r"\bkeep doing\b",
+    r"\bcorrect approach\b",
+    r"\bsolid approach\b",
+    r"\bclean(?:er)? (?:solution|approach|pattern)\b",
+    r"\beffective(?:ly)?\b.*\b(?:handles?|solves?|addresses)\b",
+    r"\brobust\b.*\b(?:solution|approach|pattern)\b",
+    r"\belegant\b.*\b(?:solution|approach|pattern)\b",
+    r"\bthis is the right\b",
+    r"\bvalidated\b",
 ]
 
 PERCEPTION_PATTERN = re.compile("|".join(PERCEPTION_SIGNALS), re.IGNORECASE)

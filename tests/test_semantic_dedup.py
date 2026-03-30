@@ -1,0 +1,191 @@
+"""Tests for semantic deduplication in store_learning_v2.
+
+Validates that:
+1. search_vector_global searches across ALL sessions (no session_id filter)
+2. store_learning_v2 uses global search for dedup
+3. Near-duplicates (>= 0.92 similarity) are rejected
+4. Sufficiently different learnings (< 0.92) are stored
+5. Fallback to session-scoped search when global search is unavailable
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from scripts.core.store_learning import DEDUP_THRESHOLD, store_learning_v2
+
+# Patch targets: these are lazy imports inside store_learning_v2,
+# so we patch at the SOURCE module, not the target module.
+MEMORY_FACTORY = "scripts.core.db.memory_factory"
+EMBEDDING_SVC = "scripts.core.db.embedding_service"
+
+
+@pytest.fixture
+def mock_embedding():
+    """A fake 1024-dim embedding vector."""
+    return [0.1] * 1024
+
+
+@pytest.fixture
+def mock_memory_service():
+    """Mock MemoryServicePG with search_vector_global."""
+    memory = AsyncMock()
+    memory.search_vector_global = AsyncMock(return_value=[])
+    memory.search_vector = AsyncMock(return_value=[])
+    memory.store = AsyncMock(return_value="new-uuid-123")
+    memory.close = AsyncMock()
+    return memory
+
+
+@pytest.fixture
+def mock_embedder(mock_embedding):
+    """Mock EmbeddingService."""
+    embedder = MagicMock()
+    embedder.embed = AsyncMock(return_value=mock_embedding)
+    embedder._provider = MagicMock()
+    embedder._provider.model = "test-model"
+    return embedder
+
+
+def _patches(mock_memory_service, mock_embedder):
+    """Return context managers that patch the lazy imports."""
+    mock_create = AsyncMock(return_value=mock_memory_service)
+    mock_get_backend = MagicMock(return_value="postgres")
+    mock_embed_cls = MagicMock(return_value=mock_embedder)
+
+    return (
+        patch(f"{MEMORY_FACTORY}.create_memory_service", mock_create),
+        patch(f"{MEMORY_FACTORY}.get_default_backend", mock_get_backend),
+        patch(f"{EMBEDDING_SVC}.EmbeddingService", mock_embed_cls),
+    )
+
+
+def test_dedup_threshold_is_092():
+    """Threshold should be 0.92 per the enhancement spec."""
+    assert DEDUP_THRESHOLD == 0.92
+
+
+@pytest.mark.asyncio
+async def test_global_dedup_rejects_cross_session_duplicate(
+    mock_memory_service, mock_embedder
+):
+    """A learning that matches an existing one from a DIFFERENT session should be rejected."""
+    mock_memory_service.search_vector_global.return_value = [
+        {
+            "id": "existing-uuid",
+            "session_id": "other-session-999",
+            "content": "Nearly identical learning",
+            "similarity": 0.95,
+        }
+    ]
+
+    p1, p2, p3 = _patches(mock_memory_service, mock_embedder)
+    with p1, p2, p3:
+        result = await store_learning_v2(
+            session_id="my-session",
+            content="Nearly identical learning content",
+        )
+
+    assert result["success"] is True
+    assert result["skipped"] is True
+    assert "duplicate" in result["reason"]
+    assert "other-session-999" in result["reason"]
+    assert result["existing_id"] == "existing-uuid"
+    mock_memory_service.store.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_global_dedup_allows_sufficiently_different(
+    mock_memory_service, mock_embedder
+):
+    """A learning below the threshold should be stored."""
+    mock_memory_service.search_vector_global.return_value = [
+        {
+            "id": "existing-uuid",
+            "session_id": "other-session",
+            "content": "Somewhat related but different",
+            "similarity": 0.80,
+        }
+    ]
+
+    p1, p2, p3 = _patches(mock_memory_service, mock_embedder)
+    with p1, p2, p3:
+        result = await store_learning_v2(
+            session_id="my-session",
+            content="A genuinely new learning",
+        )
+
+    assert result["success"] is True
+    assert "skipped" not in result
+    assert result["memory_id"] == "new-uuid-123"
+    mock_memory_service.store.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_global_dedup_allows_when_no_matches(
+    mock_memory_service, mock_embedder
+):
+    """When no existing memories match at all, the learning should be stored."""
+    mock_memory_service.search_vector_global.return_value = []
+
+    p1, p2, p3 = _patches(mock_memory_service, mock_embedder)
+    with p1, p2, p3:
+        result = await store_learning_v2(
+            session_id="my-session",
+            content="Brand new learning",
+        )
+
+    assert result["success"] is True
+    assert result["memory_id"] == "new-uuid-123"
+
+
+@pytest.mark.asyncio
+async def test_fallback_to_session_scoped_search(mock_embedder):
+    """When search_vector_global is missing, fall back to search_vector."""
+    memory = AsyncMock()
+    del memory.search_vector_global
+    memory.search_vector = AsyncMock(return_value=[])
+    memory.store = AsyncMock(return_value="fallback-uuid")
+    memory.close = AsyncMock()
+
+    mock_create = AsyncMock(return_value=memory)
+    mock_get_backend = MagicMock(return_value="sqlite")
+    mock_embed_cls = MagicMock(return_value=mock_embedder)
+
+    with (
+        patch(f"{MEMORY_FACTORY}.create_memory_service", mock_create),
+        patch(f"{MEMORY_FACTORY}.get_default_backend", mock_get_backend),
+        patch(f"{EMBEDDING_SVC}.EmbeddingService", mock_embed_cls),
+    ):
+        result = await store_learning_v2(
+            session_id="my-session",
+            content="Learning on SQLite backend",
+        )
+
+    assert result["success"] is True
+    assert result["memory_id"] == "fallback-uuid"
+    memory.search_vector.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_dedup_error_does_not_block_storage(
+    mock_memory_service, mock_embedder
+):
+    """If global dedup search errors out, the learning should still be stored."""
+    mock_memory_service.search_vector_global.side_effect = RuntimeError("DB error")
+
+    p1, p2, p3 = _patches(mock_memory_service, mock_embedder)
+    with p1, p2, p3:
+        result = await store_learning_v2(
+            session_id="my-session",
+            content="Learning despite DB errors",
+        )
+
+    assert result["success"] is True
+    assert result["memory_id"] == "new-uuid-123"

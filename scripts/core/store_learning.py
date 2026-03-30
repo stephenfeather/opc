@@ -75,8 +75,9 @@ LEARNING_TYPES = [
 # Valid confidence levels
 CONFIDENCE_LEVELS = ["high", "medium", "low"]
 
-# Deduplication threshold (0.85 = 85% similar)
-DEDUP_THRESHOLD = 0.85
+# Semantic deduplication threshold (0.92 = 92% cosine similarity).
+# Global cross-session check — catches near-duplicates from ANY session.
+DEDUP_THRESHOLD = 0.92
 
 
 async def store_learning_v2(
@@ -140,18 +141,28 @@ async def store_learning_v2(
         if hasattr(embedder, '_provider') and hasattr(embedder._provider, 'model'):
             embedding_model = embedder._provider.model
 
-        # Deduplication check: search for similar existing memories
+        # Semantic dedup: search ALL sessions for near-duplicates.
+        # The old code used search_vector() which was session-scoped —
+        # duplicates from other sessions slipped through.
         try:
-            existing = await memory.search_vector(embedding, limit=1)
+            if hasattr(memory, "search_vector_global"):
+                existing = await memory.search_vector_global(
+                    embedding, threshold=DEDUP_THRESHOLD, limit=1
+                )
+            else:
+                # Fallback for non-PG backends that lack global search
+                existing = await memory.search_vector(embedding, limit=1)
+
             if existing and len(existing) > 0:
                 top_match = existing[0]
                 similarity = top_match.get("similarity", 0)
                 if similarity >= DEDUP_THRESHOLD:
+                    existing_session = top_match.get("session_id", "unknown")
                     await memory.close()
                     return {
                         "success": True,
                         "skipped": True,
-                        "reason": f"duplicate (similarity: {similarity:.2f})",
+                        "reason": f"duplicate (similarity: {similarity:.2f}, session: {existing_session})",
                         "existing_id": top_match.get("id"),
                     }
         except Exception:

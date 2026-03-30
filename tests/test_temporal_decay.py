@@ -166,6 +166,14 @@ class TestRRFRecallBoost:
         assert results[0]["similarity"] == 0.025
         assert results[0]["raw_rrf_score"] == 0.023
 
+    async def test_boost_is_zero_for_never_recalled(self):
+        """Learnings with recall_count=0 should get zero boost."""
+        import math
+        recall_count = 0
+        # Mirrors the SQL CASE: 0 when recall_count = 0
+        boost = 0 if recall_count == 0 else math.log2(1 + recall_count) * 0.002
+        assert boost == 0.0
+
     async def test_boost_is_small_relative_to_rrf(self):
         """The recall boost should be small enough to not overwhelm RRF scores.
 
@@ -175,7 +183,7 @@ class TestRRFRecallBoost:
         """
         import math
         recall_count = 10
-        boost = math.log2(max(2, 1 + recall_count)) * 0.002
+        boost = math.log2(1 + recall_count) * 0.002
         assert boost < 0.01, f"Boost {boost} too large for RRF range"
         assert boost > 0.001, f"Boost {boost} too small to matter"
 

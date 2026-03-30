@@ -353,8 +353,9 @@ async def search_learnings_hybrid_rrf(
                 a.recall_count,
                 a.last_recalled,
                 c.rrf_score +
-                    log(2.0, GREATEST(2, 1 + COALESCE(a.recall_count, 0))) * 0.002
-                    as boosted_score,
+                    CASE WHEN COALESCE(a.recall_count, 0) = 0 THEN 0
+                    ELSE log(2.0, 1 + COALESCE(a.recall_count, 0)) * 0.002
+                    END as boosted_score,
                 c.rrf_score as raw_rrf_score,
                 c.fts_rank,
                 c.vec_rank
@@ -658,6 +659,7 @@ async def main() -> int:
         print(f"Provider: {args.provider}")
         print()
 
+    recall_already_recorded = False
     try:
         backend = get_backend()
 
@@ -670,7 +672,7 @@ async def main() -> int:
             # Fast text-only search (no embeddings)
             results = await search_learnings_text_only_postgres(args.query, args.k)
         elif args.vector_only:
-            # Vector-only search with recency boost
+            # search_learnings() already calls record_recall internally
             results = await search_learnings(
                 query=args.query,
                 k=args.k,
@@ -678,6 +680,7 @@ async def main() -> int:
                 similarity_threshold=args.threshold,
                 recency_weight=args.recency,
             )
+            recall_already_recorded = True
         else:
             # Default: Hybrid RRF search (text + vector combined)
             results = await search_learnings_hybrid_rrf(
@@ -693,8 +696,9 @@ async def main() -> int:
             print(f"Error: {e}", file=sys.stderr)
         return 1
 
-    # Record recall for temporal decay tracking
-    await record_recall([r["id"] for r in results])
+    # Record recall for temporal decay tracking (skip if already done)
+    if not recall_already_recorded:
+        await record_recall([r["id"] for r in results])
 
     # JSON output mode
     if args.json:

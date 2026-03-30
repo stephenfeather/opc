@@ -495,6 +495,183 @@ def parse_handoff(file_path: Path) -> dict:
     }
 
 
+def _parse_simple_yaml(text: str) -> dict:
+    """Parse simple YAML without pyyaml dependency.
+
+    Handles the flat key-value and list structures used in handoff YAML files.
+    Does NOT handle arbitrary nested YAML - only the handoff format.
+    """
+    result = {}
+    current_key = None
+    current_list = None
+
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        # List item under a key
+        if stripped.startswith("- ") and current_key is not None:
+            item = stripped[2:].strip()
+            # Handle dict-style list items like "- task: ..."
+            if ": " in item and not item.startswith('"'):
+                # Could be "key: value" inside a list item
+                if current_list is None:
+                    current_list = []
+                if isinstance(current_list, list) and len(current_list) > 0 and isinstance(current_list[-1], dict):
+                    # Check if this is a continuation of a dict item
+                    pass
+                k, v = item.split(": ", 1)
+                k = k.strip()
+                v = v.strip().strip('"')
+                if current_list and isinstance(current_list[-1], dict) and k not in current_list[-1]:
+                    current_list[-1][k] = v
+                else:
+                    current_list.append({k: v})
+            else:
+                if current_list is None:
+                    current_list = []
+                # Strip quotes
+                item = item.strip('"').strip("'")
+                current_list.append(item)
+            result[current_key] = current_list
+            continue
+
+        # Indented key-value under a list item (e.g., "    files: [...]")
+        if line.startswith("    ") and current_key and current_list and isinstance(current_list[-1], dict):
+            if ": " in stripped:
+                k, v = stripped.split(": ", 1)
+                k = k.strip()
+                v = v.strip()
+                # Parse inline lists like [a, b, c]
+                if v.startswith("[") and v.endswith("]"):
+                    v = [x.strip().strip('"').strip("'") for x in v[1:-1].split(",") if x.strip()]
+                else:
+                    v = v.strip('"').strip("'")
+                current_list[-1][k] = v
+            continue
+
+        # Top-level key
+        if ":" in line and not line.startswith(" "):
+            # Save previous list
+            if current_key and current_list is not None:
+                result[current_key] = current_list
+
+            key, value = line.split(":", 1)
+            current_key = key.strip()
+            value = value.strip()
+            current_list = None
+
+            if value == "" or value == "[]":
+                current_list = []
+                result[current_key] = current_list
+            elif value.startswith("[") and value.endswith("]"):
+                result[current_key] = [x.strip().strip('"').strip("'") for x in value[1:-1].split(",") if x.strip()]
+                current_list = None
+                current_key = None
+            else:
+                result[current_key] = value.strip('"').strip("'")
+                current_list = None
+
+    return result
+
+
+def parse_handoff_yaml(file_path: Path) -> dict:
+    """Parse a handoff YAML file into structured data.
+
+    Handles the YAML format used by auto-generated mini-handoffs.
+    """
+    raw_content = file_path.read_text()
+
+    # Separate frontmatter from body
+    frontmatter, body = parse_frontmatter(raw_content)
+
+    # Parse the YAML body
+    data = _parse_simple_yaml(body)
+
+    # Generate ID from file path
+    file_id = hashlib.md5(str(file_path).encode()).hexdigest()[:12]
+
+    # Extract session info from frontmatter or path
+    session_name = frontmatter.get("session", "")
+    if not session_name:
+        session_name, _ = extract_session_info(file_path)
+
+    # Build task summary from done_this_session
+    done_items = data.get("done_this_session", [])
+    if isinstance(done_items, list):
+        task_lines = []
+        for item in done_items:
+            if isinstance(item, dict):
+                task_lines.append(item.get("task", ""))
+            elif isinstance(item, str):
+                task_lines.append(item)
+        task_summary = "; ".join(t for t in task_lines if t)[:500]
+    else:
+        task_summary = str(done_items)[:500]
+
+    # Extract what_worked
+    worked = data.get("worked", [])
+    if isinstance(worked, list):
+        what_worked = "\n".join(f"- {w}" if isinstance(w, str) else f"- {w}" for w in worked)
+    else:
+        what_worked = str(worked)
+
+    # Extract what_failed
+    failed = data.get("failed", [])
+    if isinstance(failed, list):
+        what_failed = "\n".join(f"- {f}" if isinstance(f, str) else f"- {f}" for f in failed)
+    else:
+        what_failed = str(failed)
+
+    # Extract decisions
+    decisions = data.get("decisions", [])
+    if isinstance(decisions, list):
+        decision_lines = []
+        for d in decisions:
+            if isinstance(d, dict):
+                for k, v in d.items():
+                    decision_lines.append(f"- {k}: {v}")
+            elif isinstance(d, str):
+                decision_lines.append(f"- {d}")
+        key_decisions = "\n".join(decision_lines)
+    else:
+        key_decisions = str(decisions)
+
+    # Extract files modified
+    files_section = data.get("files", {})
+    all_files = []
+    if isinstance(files_section, dict):
+        for file_list in files_section.values():
+            if isinstance(file_list, list):
+                all_files.extend(file_list)
+    elif isinstance(files_section, list):
+        all_files = files_section
+
+    # Normalize outcome
+    status = frontmatter.get("status", data.get("outcome", "UNKNOWN"))
+    outcome = normalize_outcome(status)
+
+    return {
+        "id": file_id,
+        "session_name": session_name,
+        "session_uuid": None,
+        "task_number": None,
+        "file_path": str(file_path),
+        "task_summary": task_summary,
+        "what_worked": what_worked,
+        "what_failed": what_failed,
+        "key_decisions": key_decisions,
+        "files_modified": json.dumps(all_files),
+        "outcome": outcome,
+        "root_span_id": frontmatter.get("root_span_id", ""),
+        "turn_span_id": frontmatter.get("turn_span_id", ""),
+        "session_id": frontmatter.get("session_id", ""),
+        "braintrust_session_id": frontmatter.get("braintrust_session_id", ""),
+        "created_at": frontmatter.get("date", datetime.now().isoformat()),
+    }
+
+
 def extract_files(content: str) -> list:
     """Extract file paths from markdown content."""
     files = []
@@ -510,15 +687,23 @@ def extract_files(content: str) -> list:
 
 
 def index_handoffs(conn, base_path: Path = Path("thoughts/shared/handoffs")):
-    """Index all handoffs into the database."""
+    """Index all handoffs (.md and .yaml) into the database."""
     if not base_path.exists():
         print(f"Handoffs directory not found: {base_path}")
         return 0
 
     count = 0
-    for handoff_file in base_path.rglob("*.md"):
+    # Collect both markdown and YAML handoff files
+    handoff_files = list(base_path.rglob("*.md"))
+    handoff_files.extend(base_path.rglob("*.yaml"))
+    handoff_files.extend(base_path.rglob("*.yml"))
+
+    for handoff_file in handoff_files:
         try:
-            data = parse_handoff(handoff_file)
+            if handoff_file.suffix in (".yaml", ".yml"):
+                data = parse_handoff_yaml(handoff_file)
+            else:
+                data = parse_handoff(handoff_file)
             db_execute(
                 conn,
                 """
@@ -738,9 +923,12 @@ def index_single_file(conn, file_path: Path) -> bool:
     # Determine file type based on path
     path_str = str(file_path)
 
-    if "handoffs" in path_str and file_path.suffix == ".md":
+    if "handoffs" in path_str and file_path.suffix in (".md", ".yaml", ".yml"):
         try:
-            data = parse_handoff(file_path)
+            if file_path.suffix in (".yaml", ".yml"):
+                data = parse_handoff_yaml(file_path)
+            else:
+                data = parse_handoff(file_path)
             db_execute(
                 conn,
                 """

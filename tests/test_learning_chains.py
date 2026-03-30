@@ -218,7 +218,7 @@ class TestStoreSupersedes:
 
     async def test_supersedes_none_skips_update(self, mock_pool):
         """store_learning_v2 without supersedes doesn't update anything."""
-        pool, conn = mock_pool
+        _pool, conn = mock_pool
         new_id = str(uuid.uuid4())
 
         mock_memory = AsyncMock()

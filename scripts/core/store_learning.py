@@ -249,7 +249,10 @@ async def store_learning_v2(
             except Exception:
                 # Graceful: don't fail the store if chain update fails
                 # (e.g., superseded_by column doesn't exist yet)
-                pass
+                logger.debug(
+                    "Chain update failed for supersedes=%s", supersedes,
+                    exc_info=True,
+                )
 
         result_dict = {
             "success": True,

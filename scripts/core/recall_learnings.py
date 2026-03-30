@@ -28,11 +28,14 @@ import argparse
 import asyncio
 import faulthandler
 import json
+import logging
 import os
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from dotenv import load_dotenv
 
@@ -159,6 +162,7 @@ async def search_learnings_text_only_postgres(query: str, k: int = 5) -> list[di
             )
         except Exception:
             # Fallback: superseded_by column doesn't exist yet (pre-migration)
+            logger.debug("Chain filter fallback in text_only_postgres FTS", exc_info=True)
             rows = await conn.fetch(
                 """
                 SELECT
@@ -203,6 +207,7 @@ async def search_learnings_text_only_postgres(query: str, k: int = 5) -> list[di
                     k,
                 )
             except Exception:
+                logger.debug("Chain filter fallback in text_only_postgres ILIKE", exc_info=True)
                 rows = await conn.fetch(
                     """
                     SELECT
@@ -439,12 +444,16 @@ async def search_learnings_hybrid_rrf(
         try:
             rows = await conn.fetch(_BOOSTED_SELECT, *query_args)
         except Exception:
-            # Fallback: decay or chain columns don't exist yet (pre-migration)
+            # Fallback: decay or chain columns don't exist yet
+            logger.debug("RRF boosted+chain fallback", exc_info=True)
             has_decay_columns = False
             try:
                 rows = await conn.fetch(_PLAIN_SELECT, *query_args)
             except Exception:
-                rows = await conn.fetch(_PLAIN_SELECT_NO_CHAIN, *query_args)
+                logger.debug("RRF plain+chain fallback", exc_info=True)
+                rows = await conn.fetch(
+                    _PLAIN_SELECT_NO_CHAIN, *query_args
+                )
 
     results = []
     for row in rows:
@@ -564,6 +573,7 @@ async def search_learnings_postgres(
                         str(query_embedding), k, recency_weight,
                     )
                 except Exception:
+                    logger.debug("Chain filter fallback in postgres recency", exc_info=True)
                     rows = await conn.fetch(
                         _recency_sql.format(chain_filter=""),
                         str(query_embedding), k, recency_weight,
@@ -590,6 +600,7 @@ async def search_learnings_postgres(
                         str(query_embedding), k,
                     )
                 except Exception:
+                    logger.debug("Chain filter fallback in postgres vector", exc_info=True)
                     rows = await conn.fetch(
                         _vector_sql.format(chain_filter=""),
                         str(query_embedding), k,
@@ -618,6 +629,7 @@ async def search_learnings_postgres(
                     query, k,
                 )
             except Exception:
+                logger.debug("Chain filter fallback in postgres text", exc_info=True)
                 rows = await conn.fetch(
                     _text_sql.format(chain_filter=""),
                     query, k,

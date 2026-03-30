@@ -83,6 +83,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_archival_content_hash ON archival_memory(c
 CREATE INDEX IF NOT EXISTS idx_archival_host ON archival_memory(host_id);
 CREATE INDEX IF NOT EXISTS idx_archival_last_recalled ON archival_memory(last_recalled DESC NULLS LAST);
 CREATE INDEX IF NOT EXISTS idx_archival_superseded ON archival_memory(superseded_by) WHERE superseded_by IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_archival_active ON archival_memory(superseded_by) WHERE superseded_by IS NULL;
 
 -- =============================================================================
 -- HANDOFFS LAYER

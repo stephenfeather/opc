@@ -8,5 +8,8 @@
 ALTER TABLE archival_memory ADD COLUMN IF NOT EXISTS superseded_by UUID REFERENCES archival_memory(id);
 ALTER TABLE archival_memory ADD COLUMN IF NOT EXISTS superseded_at TIMESTAMPTZ;
 
--- Index for filtering active (non-superseded) learnings
+-- Index for looking up superseded learnings (e.g., chain traversal)
 CREATE INDEX IF NOT EXISTS idx_archival_superseded ON archival_memory(superseded_by) WHERE superseded_by IS NOT NULL;
+
+-- Index for filtering active (non-superseded) learnings in recall queries
+CREATE INDEX IF NOT EXISTS idx_archival_active ON archival_memory(superseded_by) WHERE superseded_by IS NULL;

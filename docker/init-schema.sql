@@ -85,6 +85,19 @@ CREATE INDEX IF NOT EXISTS idx_archival_last_recalled ON archival_memory(last_re
 CREATE INDEX IF NOT EXISTS idx_archival_superseded ON archival_memory(superseded_by) WHERE superseded_by IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_archival_active ON archival_memory(superseded_by) WHERE superseded_by IS NULL;
 
+-- Memory Tags: Structured tag storage for archival_memory entries
+CREATE TABLE IF NOT EXISTS memory_tags (
+    memory_id UUID NOT NULL REFERENCES archival_memory(id) ON DELETE CASCADE,
+    tag       TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (memory_id, tag)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_tags_tag ON memory_tags(tag);
+CREATE INDEX IF NOT EXISTS idx_memory_tags_session ON memory_tags(session_id);
+CREATE INDEX IF NOT EXISTS idx_memory_tags_memory_id ON memory_tags(memory_id);
+
 -- =============================================================================
 -- HANDOFFS LAYER
 -- =============================================================================

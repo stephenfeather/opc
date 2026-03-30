@@ -166,6 +166,55 @@ class TestRRFRecallBoost:
         assert results[0]["similarity"] == 0.025
         assert results[0]["raw_rrf_score"] == 0.023
 
+    async def test_rrf_fallback_without_decay_columns(self):
+        """Hybrid RRF falls back to plain query if decay columns missing."""
+        now = datetime.now(UTC)
+        plain_row = {
+            "id": uuid.uuid4(),
+            "session_id": "test-session",
+            "content": "test learning",
+            "metadata": '{"type": "session_learning"}',
+            "created_at": now,
+            "rrf_score": 0.023,
+            "fts_rank": 1,
+            "vec_rank": 2,
+        }
+
+        call_count = 0
+
+        async def fake_fetch(sql, *args):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # First call (boosted query) fails
+                raise Exception("column \"recall_count\" does not exist")
+            # Second call (plain query) succeeds
+            return [plain_row]
+
+        conn = AsyncMock()
+        conn.fetch = fake_fetch
+
+        pool = MagicMock()
+        pool.acquire.return_value = FakeAcquire(conn)
+
+        mock_embedder = MagicMock()
+        mock_embedder.embed = AsyncMock(return_value=[0.1] * 1024)
+        mock_embedder.aclose = AsyncMock()
+
+        pgvector_patch = "scripts.core.db.postgres_pool.init_pgvector"
+        embed_patch = "scripts.core.db.embedding_service.EmbeddingService"
+        with patch("scripts.core.db.postgres_pool.get_pool", return_value=pool), \
+             patch(pgvector_patch, new_callable=AsyncMock), \
+             patch(embed_patch, return_value=mock_embedder):
+            from scripts.core.recall_learnings import search_learnings_hybrid_rrf
+            results = await search_learnings_hybrid_rrf("test query", k=5)
+
+        assert len(results) == 1
+        assert results[0]["similarity"] == 0.023
+        assert "recall_count" not in results[0]
+        assert "last_recalled" not in results[0]
+        assert call_count == 2
+
     async def test_boost_is_zero_for_never_recalled(self):
         """Learnings with recall_count=0 should get zero boost."""
         import math

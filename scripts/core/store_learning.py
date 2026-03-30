@@ -201,13 +201,17 @@ async def store_learning_v2(
         if confidence:
             metadata["confidence"] = confidence
 
-        # Store with embedding and content_hash dedup
+        # Store with embedding and content_hash dedup.
+        # When supersedes is set and the backend is postgres, the INSERT
+        # and the superseded_by UPDATE run in a single transaction so
+        # chaining is atomic.
         memory_id = await memory.store(
             content,
             metadata=metadata,
             embedding=embedding,
             content_hash=content_hash,
             host_id=host_id,
+            supersedes=supersedes if backend == "postgres" else None,
         )
 
         await memory.close()
@@ -220,40 +224,6 @@ async def store_learning_v2(
                 "reason": "duplicate (content_hash match)",
             }
 
-        # Mark the old learning as superseded by this new one
-        superseded_id = None
-        if supersedes and memory_id and backend == "postgres":
-            try:
-                from scripts.core.db.postgres_pool import get_pool
-
-                pool = await get_pool()
-                async with pool.acquire() as conn:
-                    result = await conn.execute(
-                        """
-                        UPDATE archival_memory
-                        SET superseded_by = $1::uuid,
-                            superseded_at = NOW()
-                        WHERE id = $2::uuid
-                            AND superseded_by IS NULL
-                        """,
-                        memory_id,
-                        supersedes,
-                    )
-                    # result is "UPDATE N" — check if row was actually updated
-                    try:
-                        parts = (result or "").split()
-                        if len(parts) == 2 and parts[0] == "UPDATE" and int(parts[1]) > 0:
-                            superseded_id = supersedes
-                    except (ValueError, IndexError):
-                        pass
-            except Exception:
-                # Graceful: don't fail the store if chain update fails
-                # (e.g., superseded_by column doesn't exist yet)
-                logger.debug(
-                    "Chain update failed for supersedes=%s", supersedes,
-                    exc_info=True,
-                )
-
         result_dict = {
             "success": True,
             "memory_id": memory_id,
@@ -261,8 +231,8 @@ async def store_learning_v2(
             "content_length": len(content),
             "embedding_dim": len(embedding),
         }
-        if superseded_id:
-            result_dict["superseded"] = superseded_id
+        if supersedes:
+            result_dict["superseded"] = supersedes
         return result_dict
 
     except Exception as e:

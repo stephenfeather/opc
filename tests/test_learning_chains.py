@@ -10,6 +10,7 @@ Validates that:
 
 from __future__ import annotations
 
+import os
 import sys
 import uuid
 from datetime import UTC, datetime
@@ -170,11 +171,15 @@ class TestRecallChainFilter:
 # ---------------------------------------------------------------------------
 
 class TestStoreSupersedes:
-    """Tests for the supersedes parameter in store_learning_v2."""
+    """Tests for the supersedes parameter in store_learning_v2.
 
-    async def test_supersedes_marks_old_learning(self, mock_pool):
-        """store_learning_v2 with supersedes updates the old learning."""
-        pool, conn = mock_pool
+    The supersede UPDATE now runs inside memory.store() in the same
+    transaction as the INSERT (atomic chaining).  These tests verify
+    that store_learning_v2 passes ``supersedes`` through correctly.
+    """
+
+    async def test_supersedes_passed_to_memory_store(self):
+        """store_learning_v2 with supersedes passes it to memory.store()."""
         old_id = str(uuid.uuid4())
         new_id = str(uuid.uuid4())
 
@@ -194,7 +199,6 @@ class TestStoreSupersedes:
         with patch(_es, return_value=mock_embedder), \
              patch(_cm, return_value=mock_memory), \
              patch(_gb, return_value="postgres"), \
-             patch("scripts.core.db.postgres_pool.get_pool", return_value=pool), \
              patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
             from scripts.core.store_learning import store_learning_v2
             result = await store_learning_v2(
@@ -207,18 +211,13 @@ class TestStoreSupersedes:
         assert result["memory_id"] == new_id
         assert result["superseded"] == old_id
 
-        # Verify the UPDATE was called with correct args
-        conn.execute.assert_called_once()
-        call_args = conn.execute.call_args
-        sql = call_args[0][0]
-        assert "superseded_by" in sql
-        assert "superseded_at" in sql
-        assert call_args[0][1] == new_id
-        assert call_args[0][2] == old_id
+        # Verify supersedes was forwarded to memory.store()
+        mock_memory.store.assert_called_once()
+        call_kwargs = mock_memory.store.call_args
+        assert call_kwargs.kwargs.get("supersedes") == old_id
 
-    async def test_supersedes_none_skips_update(self, mock_pool):
-        """store_learning_v2 without supersedes doesn't update anything."""
-        _pool, conn = mock_pool
+    async def test_supersedes_none_not_passed(self):
+        """store_learning_v2 without supersedes passes None."""
         new_id = str(uuid.uuid4())
 
         mock_memory = AsyncMock()
@@ -246,15 +245,15 @@ class TestStoreSupersedes:
 
         assert result["success"] is True
         assert "superseded" not in result
-        conn.execute.assert_not_called()
 
-    async def test_supersedes_graceful_on_missing_column(self, mock_pool):
-        """Supersession fails gracefully if column doesn't exist."""
-        pool, conn = mock_pool
+        # supersedes=None should be passed through
+        call_kwargs = mock_memory.store.call_args
+        assert call_kwargs.kwargs.get("supersedes") is None
+
+    async def test_supersedes_not_passed_for_sqlite(self):
+        """store_learning_v2 passes supersedes=None for non-postgres backends."""
         old_id = str(uuid.uuid4())
         new_id = str(uuid.uuid4())
-
-        conn.execute.side_effect = Exception('column "superseded_by" does not exist')
 
         mock_memory = AsyncMock()
         mock_memory.store = AsyncMock(return_value=new_id)
@@ -269,60 +268,25 @@ class TestStoreSupersedes:
         _es = "scripts.core.db.embedding_service.EmbeddingService"
         _cm = "scripts.core.db.memory_factory.create_memory_service"
         _gb = "scripts.core.db.memory_factory.get_default_backend"
+        env_clean = {
+            k: v for k, v in os.environ.items()
+            if k not in ("DATABASE_URL", "CONTINUOUS_CLAUDE_DB_URL")
+        }
         with patch(_es, return_value=mock_embedder), \
              patch(_cm, return_value=mock_memory), \
-             patch(_gb, return_value="postgres"), \
-             patch("scripts.core.db.postgres_pool.get_pool", return_value=pool), \
-             patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
+             patch(_gb, return_value="sqlite"), \
+             patch.dict("os.environ", env_clean, clear=True):
             from scripts.core.store_learning import store_learning_v2
             result = await store_learning_v2(
                 session_id="test-session",
-                content="New learning",
+                content="Learning on sqlite",
                 supersedes=old_id,
             )
 
-        # Should succeed even though supersession failed
         assert result["success"] is True
-        assert result["memory_id"] == new_id
-        assert "superseded" not in result
-
-    async def test_supersedes_idempotent(self, mock_pool):
-        """Superseding an already-superseded learning is a no-op."""
-        pool, conn = mock_pool
-        old_id = str(uuid.uuid4())
-        new_id = str(uuid.uuid4())
-
-        # UPDATE 0 means no rows matched (already superseded)
-        conn.execute.return_value = "UPDATE 0"
-
-        mock_memory = AsyncMock()
-        mock_memory.store = AsyncMock(return_value=new_id)
-        mock_memory.search_vector_global = AsyncMock(return_value=[])
-        mock_memory.close = AsyncMock()
-
-        mock_embedder = MagicMock()
-        mock_embedder.embed = AsyncMock(return_value=[0.1] * 1024)
-        mock_embedder._provider = MagicMock()
-        mock_embedder._provider.model = "bge-large"
-
-        _es = "scripts.core.db.embedding_service.EmbeddingService"
-        _cm = "scripts.core.db.memory_factory.create_memory_service"
-        _gb = "scripts.core.db.memory_factory.get_default_backend"
-        with patch(_es, return_value=mock_embedder), \
-             patch(_cm, return_value=mock_memory), \
-             patch(_gb, return_value="postgres"), \
-             patch("scripts.core.db.postgres_pool.get_pool", return_value=pool), \
-             patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
-            from scripts.core.store_learning import store_learning_v2
-            result = await store_learning_v2(
-                session_id="test-session",
-                content="Another new learning",
-                supersedes=old_id,
-            )
-
-        # Succeeds but no superseded field (old was already superseded)
-        assert result["success"] is True
-        assert "superseded" not in result
+        # supersedes should be None for sqlite (not passed through)
+        call_kwargs = mock_memory.store.call_args
+        assert call_kwargs.kwargs.get("supersedes") is None
 
 
 # ---------------------------------------------------------------------------

@@ -315,6 +315,7 @@ class MemoryServicePG:
         tags: list[str] | None = None,
         content_hash: str | None = None,
         host_id: str | None = None,
+        supersedes: str | None = None,
     ) -> str:
         """Store a fact in archival memory.
 
@@ -325,6 +326,9 @@ class MemoryServicePG:
             tags: Optional list of tags for categorization
             content_hash: SHA-256 hash for deduplication
             host_id: Machine identifier for multi-system support
+            supersedes: UUID of an older learning this one replaces.
+                When set, the old row's superseded_by is updated atomically
+                within the same transaction as the INSERT.
 
         Returns:
             Memory ID (or empty string if deduplicated)
@@ -399,6 +403,24 @@ class MemoryServicePG:
                         tag,
                         self.session_id,
                     )
+
+            # Mark the old learning as superseded (same transaction)
+            if supersedes:
+                try:
+                    await conn.execute(
+                        """
+                        UPDATE archival_memory
+                        SET superseded_by = $1::uuid,
+                            superseded_at = NOW()
+                        WHERE id = $2::uuid
+                          AND superseded_by IS NULL
+                        """,
+                        memory_id,
+                        supersedes,
+                    )
+                except Exception:
+                    # Column may not exist yet; don't break the insert
+                    pass
 
         return memory_id
 

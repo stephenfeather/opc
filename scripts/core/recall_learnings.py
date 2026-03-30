@@ -28,11 +28,14 @@ import argparse
 import asyncio
 import faulthandler
 import json
+import logging
 import os
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from dotenv import load_dotenv
 
@@ -137,29 +140,7 @@ async def search_learnings_text_only_postgres(query: str, k: int = 5) -> list[di
             words = clean_query.split()[:1] or [query.split()[0]]
         or_query = ' | '.join(words)
 
-        rows = await conn.fetch(
-            """
-            SELECT
-                id,
-                session_id,
-                content,
-                metadata,
-                created_at,
-                ts_rank(to_tsvector('english', content), to_tsquery('english', $1)) as similarity
-            FROM archival_memory
-            WHERE metadata->>'type' = 'session_learning'
-                AND to_tsvector('english', content) @@ to_tsquery('english', $1)
-            ORDER BY similarity DESC, created_at DESC
-            LIMIT $2
-            """,
-            or_query,
-            k,
-        )
-
-        # Fallback to ILIKE if no FTS results (query was all stopwords)
-        if not rows:
-            # Extract first word for simple substring match
-            first_word = query.split()[0] if query.split() else query
+        try:
             rows = await conn.fetch(
                 """
                 SELECT
@@ -168,16 +149,83 @@ async def search_learnings_text_only_postgres(query: str, k: int = 5) -> list[di
                     content,
                     metadata,
                     created_at,
-                    0.1 as similarity
+                    ts_rank(to_tsvector('english', content), to_tsquery('english', $1)) as similarity
                 FROM archival_memory
                 WHERE metadata->>'type' = 'session_learning'
-                    AND content ILIKE '%' || $1 || '%'
-                ORDER BY created_at DESC
+                    AND superseded_by IS NULL
+                    AND to_tsvector('english', content) @@ to_tsquery('english', $1)
+                ORDER BY similarity DESC, created_at DESC
                 LIMIT $2
                 """,
-                first_word,
+                or_query,
                 k,
             )
+        except Exception:
+            # Fallback: superseded_by column doesn't exist yet (pre-migration)
+            logger.debug("Chain filter fallback in text_only_postgres FTS", exc_info=True)
+            rows = await conn.fetch(
+                """
+                SELECT
+                    id,
+                    session_id,
+                    content,
+                    metadata,
+                    created_at,
+                    ts_rank(to_tsvector('english', content), to_tsquery('english', $1)) as similarity
+                FROM archival_memory
+                WHERE metadata->>'type' = 'session_learning'
+                    AND to_tsvector('english', content) @@ to_tsquery('english', $1)
+                ORDER BY similarity DESC, created_at DESC
+                LIMIT $2
+                """,
+                or_query,
+                k,
+            )
+
+        # Fallback to ILIKE if no FTS results (query was all stopwords)
+        if not rows:
+            # Extract first word for simple substring match
+            first_word = query.split()[0] if query.split() else query
+            try:
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        id,
+                        session_id,
+                        content,
+                        metadata,
+                        created_at,
+                        0.1 as similarity
+                    FROM archival_memory
+                    WHERE metadata->>'type' = 'session_learning'
+                        AND superseded_by IS NULL
+                        AND content ILIKE '%' || $1 || '%'
+                    ORDER BY created_at DESC
+                    LIMIT $2
+                    """,
+                    first_word,
+                    k,
+                )
+            except Exception:
+                logger.debug("Chain filter fallback in text_only_postgres ILIKE", exc_info=True)
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        id,
+                        session_id,
+                        content,
+                        metadata,
+                        created_at,
+                        0.1 as similarity
+                    FROM archival_memory
+                    WHERE metadata->>'type' = 'session_learning'
+                        AND content ILIKE '%' || $1 || '%'
+                    ORDER BY created_at DESC
+                    LIMIT $2
+                    """,
+                    first_word,
+                    k,
+                )
 
     results = []
     for row in rows:
@@ -307,7 +355,9 @@ async def search_learnings_hybrid_rrf(
     finally:
         await embedder.aclose()
 
-    _RRF_CTE = """
+    def _build_rrf_cte(*, chain_filter: bool) -> str:
+        chain_clause = "\n                AND superseded_by IS NULL" if chain_filter else ""
+        return f"""
             WITH fts_ranked AS (
                 SELECT
                     id,
@@ -318,7 +368,7 @@ async def search_learnings_hybrid_rrf(
                         ) DESC
                     ) as fts_rank
                 FROM archival_memory
-                WHERE metadata->>'type' = 'session_learning'
+                WHERE metadata->>'type' = 'session_learning'{chain_clause}
                 AND to_tsvector('english', content) @@ plainto_tsquery('english', $1)
             ),
             vector_ranked AS (
@@ -326,7 +376,7 @@ async def search_learnings_hybrid_rrf(
                     id,
                     ROW_NUMBER() OVER (ORDER BY embedding <=> $2::vector) as vec_rank
                 FROM archival_memory
-                WHERE metadata->>'type' = 'session_learning'
+                WHERE metadata->>'type' = 'session_learning'{chain_clause}
                 AND embedding IS NOT NULL
             ),
             combined AS (
@@ -340,7 +390,10 @@ async def search_learnings_hybrid_rrf(
                 FULL OUTER JOIN vector_ranked v ON f.id = v.id
             )"""
 
-    _BOOSTED_SELECT = _RRF_CTE + """
+    _RRF_CTE = _build_rrf_cte(chain_filter=True)
+    _RRF_CTE_PLAIN = _build_rrf_cte(chain_filter=False)
+
+    _BOOSTED_TAIL = """
             SELECT
                 a.id,
                 a.session_id,
@@ -362,7 +415,7 @@ async def search_learnings_hybrid_rrf(
             LIMIT $4
             """
 
-    _PLAIN_SELECT = _RRF_CTE + """
+    _PLAIN_TAIL = """
             SELECT
                 a.id,
                 a.session_id,
@@ -378,6 +431,11 @@ async def search_learnings_hybrid_rrf(
             LIMIT $4
             """
 
+    # Build queries: chain-filtered first, plain fallback
+    _BOOSTED_SELECT = _RRF_CTE + _BOOSTED_TAIL
+    _PLAIN_SELECT = _RRF_CTE + _PLAIN_TAIL
+    _PLAIN_SELECT_NO_CHAIN = _RRF_CTE_PLAIN + _PLAIN_TAIL
+
     has_decay_columns = True
     async with pool.acquire() as conn:
         await init_pgvector(conn)
@@ -386,9 +444,16 @@ async def search_learnings_hybrid_rrf(
         try:
             rows = await conn.fetch(_BOOSTED_SELECT, *query_args)
         except Exception:
-            # Fallback: columns don't exist yet (pre-migration)
+            # Fallback: decay or chain columns don't exist yet
+            logger.debug("RRF boosted+chain fallback", exc_info=True)
             has_decay_columns = False
-            rows = await conn.fetch(_PLAIN_SELECT, *query_args)
+            try:
+                rows = await conn.fetch(_PLAIN_SELECT, *query_args)
+            except Exception:
+                logger.debug("RRF plain+chain fallback", exc_info=True)
+                rows = await conn.fetch(
+                    _PLAIN_SELECT_NO_CHAIN, *query_args
+                )
 
     results = []
     for row in rows:
@@ -480,8 +545,7 @@ async def search_learnings_postgres(
             if recency_weight > 0:
                 # Combined score: (1-recency_weight)*similarity + recency_weight*recency
                 # Recency is normalized: 1.0 for newest, 0.0 for 30 days old or older
-                rows = await conn.fetch(
-                    """
+                _recency_sql = """
                     WITH scored AS (
                         SELECT
                             id,
@@ -494,6 +558,7 @@ async def search_learnings_postgres(
                         FROM archival_memory
                         WHERE metadata->>'type' = 'session_learning'
                             AND embedding IS NOT NULL
+                            {chain_filter}
                     )
                     SELECT
                         id, session_id, content, metadata, created_at, similarity, recency,
@@ -501,14 +566,20 @@ async def search_learnings_postgres(
                     FROM scored
                     ORDER BY combined_score DESC
                     LIMIT $2
-                    """,
-                    str(query_embedding),
-                    k,
-                    recency_weight,
-                )
-            else:
-                rows = await conn.fetch(
                     """
+                try:
+                    rows = await conn.fetch(
+                        _recency_sql.format(chain_filter="AND superseded_by IS NULL"),
+                        str(query_embedding), k, recency_weight,
+                    )
+                except Exception:
+                    logger.debug("Chain filter fallback in postgres recency", exc_info=True)
+                    rows = await conn.fetch(
+                        _recency_sql.format(chain_filter=""),
+                        str(query_embedding), k, recency_weight,
+                    )
+            else:
+                _vector_sql = """
                     SELECT
                         id,
                         session_id,
@@ -519,17 +590,24 @@ async def search_learnings_postgres(
                     FROM archival_memory
                     WHERE metadata->>'type' = 'session_learning'
                         AND embedding IS NOT NULL
+                        {chain_filter}
                     ORDER BY embedding <=> $1::vector
                     LIMIT $2
-                    """,
-                    str(query_embedding),
-                    k,
-                )
+                    """
+                try:
+                    rows = await conn.fetch(
+                        _vector_sql.format(chain_filter="AND superseded_by IS NULL"),
+                        str(query_embedding), k,
+                    )
+                except Exception:
+                    logger.debug("Chain filter fallback in postgres vector", exc_info=True)
+                    rows = await conn.fetch(
+                        _vector_sql.format(chain_filter=""),
+                        str(query_embedding), k,
+                    )
     elif text_fallback:
         # Fallback to text search (ILIKE) when no embeddings
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
+        _text_sql = """
                 SELECT
                     id,
                     session_id,
@@ -540,12 +618,22 @@ async def search_learnings_postgres(
                 FROM archival_memory
                 WHERE metadata->>'type' = 'session_learning'
                     AND content ILIKE '%' || $1 || '%'
+                    {chain_filter}
                 ORDER BY created_at DESC
                 LIMIT $2
-                """,
-                query,
-                k,
-            )
+                """
+        async with pool.acquire() as conn:
+            try:
+                rows = await conn.fetch(
+                    _text_sql.format(chain_filter="AND superseded_by IS NULL"),
+                    query, k,
+                )
+            except Exception:
+                logger.debug("Chain filter fallback in postgres text", exc_info=True)
+                rows = await conn.fetch(
+                    _text_sql.format(chain_filter=""),
+                    query, k,
+                )
     else:
         return []
 

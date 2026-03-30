@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import faulthandler
 import json
+import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime
@@ -41,6 +42,8 @@ import numpy as np
 from .postgres_pool import get_connection, get_pool, get_transaction, init_pgvector
 
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+
+logger = logging.getLogger(__name__)
 
 
 class EmbeddingProvider(Protocol):
@@ -315,6 +318,7 @@ class MemoryServicePG:
         tags: list[str] | None = None,
         content_hash: str | None = None,
         host_id: str | None = None,
+        supersedes: str | None = None,
     ) -> str:
         """Store a fact in archival memory.
 
@@ -325,6 +329,9 @@ class MemoryServicePG:
             tags: Optional list of tags for categorization
             content_hash: SHA-256 hash for deduplication
             host_id: Machine identifier for multi-system support
+            supersedes: UUID of an older learning this one replaces.
+                When set, the old row's superseded_by is updated atomically
+                within the same transaction as the INSERT.
 
         Returns:
             Memory ID (or empty string if deduplicated)
@@ -398,6 +405,27 @@ class MemoryServicePG:
                         memory_id,
                         tag,
                         self.session_id,
+                    )
+
+            # Mark the old learning as superseded (same transaction)
+            if supersedes:
+                try:
+                    await conn.execute(
+                        """
+                        UPDATE archival_memory
+                        SET superseded_by = $1::uuid,
+                            superseded_at = NOW()
+                        WHERE id = $2::uuid
+                          AND superseded_by IS NULL
+                        """,
+                        memory_id,
+                        supersedes,
+                    )
+                except Exception:
+                    # Column may not exist yet; don't break the insert
+                    logger.debug(
+                        "Supersede UPDATE failed for %s -> %s",
+                        supersedes, memory_id, exc_info=True,
                     )
 
         return memory_id

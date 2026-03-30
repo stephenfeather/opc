@@ -91,6 +91,7 @@ async def store_learning_v2(
     tags: list[str] | None = None,
     confidence: str | None = None,
     host_id: str | None = None,
+    supersedes: str | None = None,
 ) -> dict:
     """Store learning with v2 metadata schema and deduplication.
 
@@ -101,6 +102,9 @@ async def store_learning_v2(
         context: What this learning relates to (e.g., "hook development")
         tags: List of tags for categorization
         confidence: Confidence level (high/medium/low)
+        supersedes: UUID of an older learning this one replaces. The old
+            learning is marked with superseded_by pointing to the new one,
+            so recall queries filter it out via WHERE superseded_by IS NULL.
 
     Returns:
         dict with success status, memory_id, or skipped info for duplicates
@@ -171,7 +175,7 @@ async def store_learning_v2(
                             f"duplicate (similarity: {similarity:.2f},"
                             f" session: {existing_session})"
                         ),
-                        "existing_id": top_match.get("id"),
+                        "existing_id": str(top_match.get("id", "")),
                     }
         except Exception:
             # If search fails, proceed with storing (don't block on dedup errors)
@@ -216,13 +220,43 @@ async def store_learning_v2(
                 "reason": "duplicate (content_hash match)",
             }
 
-        return {
+        # Mark the old learning as superseded by this new one
+        superseded_id = None
+        if supersedes and memory_id and backend == "postgres":
+            try:
+                from scripts.core.db.postgres_pool import get_pool
+
+                pool = await get_pool()
+                async with pool.acquire() as conn:
+                    result = await conn.execute(
+                        """
+                        UPDATE archival_memory
+                        SET superseded_by = $1::uuid,
+                            superseded_at = NOW()
+                        WHERE id = $2::uuid
+                            AND superseded_by IS NULL
+                        """,
+                        memory_id,
+                        supersedes,
+                    )
+                    # result is "UPDATE N" — check if row was actually updated
+                    if result and result.endswith("1"):
+                        superseded_id = supersedes
+            except Exception:
+                # Graceful: don't fail the store if chain update fails
+                # (e.g., superseded_by column doesn't exist yet)
+                pass
+
+        result_dict = {
             "success": True,
             "memory_id": memory_id,
             "backend": backend,
             "content_length": len(content),
             "embedding_dim": len(embedding),
         }
+        if superseded_id:
+            result_dict["superseded"] = superseded_id
+        return result_dict
 
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -350,6 +384,9 @@ async def main():
     # Host identification
     parser.add_argument("--host-id", help="Machine identifier for multi-system support")
 
+    # Learning chains
+    parser.add_argument("--supersedes", help="UUID of older learning this one replaces (v2)")
+
     # Output options
     parser.add_argument("--json", action="store_true", help="Output as JSON")
 
@@ -370,6 +407,7 @@ async def main():
             tags=tags,
             confidence=args.confidence,
             host_id=args.host_id,
+            supersedes=args.supersedes,
         )
     else:
         # Legacy mode

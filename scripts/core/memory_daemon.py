@@ -566,7 +566,11 @@ def _generate_mini_handoff(
     jsonl_path: Path,
     project: str | None,
 ):
-    """Generate a mini-handoff YAML from session JSONL. Non-fatal."""
+    """Generate a mini-handoff YAML from session data. Non-fatal.
+
+    Prefers state file (real-time hook data) over JSONL (post-session transcript).
+    Cleans up state file after successful generation.
+    """
     try:
         from scripts.core.generate_mini_handoff import (
             generate_handoff,
@@ -580,14 +584,28 @@ def _generate_mini_handoff(
         log(f"Mini-handoff skipped for {session_id}: no project dir")
         return
 
+    # Check for state file from session-state-collector hook
+    state_file = Path(project) / ".claude" / "cache" / "session-state" / f"{session_id}.jsonl"
+    use_state_file = state_file.exists() and state_file.stat().st_size > 0
+
     try:
         handoff = generate_handoff(
             session_id=session_id,
             project_dir=project,
             jsonl_path=jsonl_path,
+            state_file=state_file if use_state_file else None,
         )
         output_path = write_handoff(handoff, Path(project), session_id)
-        log(f"Mini-handoff written for {session_id}: {output_path}")
+        source = "state_file" if use_state_file else "jsonl"
+        log(f"Mini-handoff written for {session_id} (source={source}): {output_path}")
+
+        # Clean up state file after successful generation
+        if use_state_file:
+            try:
+                state_file.unlink()
+                log(f"State file cleaned up for {session_id}")
+            except OSError as cleanup_err:
+                log(f"State file cleanup failed for {session_id}: {cleanup_err}")
     except Exception as e:
         log(f"Mini-handoff generation failed for {session_id}: {e}")
 

@@ -49,6 +49,38 @@ project_dir = os.environ.get("CLAUDE_PROJECT_DIR", str(Path(__file__).parent.par
 sys.path.insert(0, project_dir)
 
 
+async def record_recall(result_ids: list[str]) -> None:
+    """Update last_recalled and recall_count for recalled learnings.
+
+    Batch-updates all returned results in a single query.
+    Fails silently to avoid breaking recall if columns don't exist yet.
+    """
+    if not result_ids:
+        return
+
+    backend = get_backend()
+    if backend != "postgres":
+        return
+
+    try:
+        from scripts.core.db.postgres_pool import get_pool
+
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE archival_memory
+                SET last_recalled = NOW(),
+                    recall_count = recall_count + 1
+                WHERE id = ANY($1::uuid[])
+                """,
+                result_ids,
+            )
+    except Exception:
+        # Graceful degradation: don't break recall if columns missing or DB error
+        pass
+
+
 def format_result_preview(content: str, max_length: int = 200) -> str:
     """Format content for display, truncating if needed.
 
@@ -318,12 +350,17 @@ async def search_learnings_hybrid_rrf(
                 a.content,
                 a.metadata,
                 a.created_at,
-                c.rrf_score,
+                a.recall_count,
+                a.last_recalled,
+                c.rrf_score +
+                    log(2.0, GREATEST(2, 1 + COALESCE(a.recall_count, 0))) * 0.002
+                    as boosted_score,
+                c.rrf_score as raw_rrf_score,
                 c.fts_rank,
                 c.vec_rank
             FROM combined c
             JOIN archival_memory a ON a.id = c.id
-            ORDER BY c.rrf_score DESC
+            ORDER BY boosted_score DESC
             LIMIT $4
             """,
             query,
@@ -334,9 +371,9 @@ async def search_learnings_hybrid_rrf(
 
     results = []
     for row in rows:
-        rrf_score = float(row["rrf_score"])
+        boosted = float(row["boosted_score"])
 
-        if similarity_threshold > 0 and rrf_score < similarity_threshold:
+        if similarity_threshold > 0 and boosted < similarity_threshold:
             continue
 
         metadata = row["metadata"]
@@ -349,7 +386,10 @@ async def search_learnings_hybrid_rrf(
             "content": row["content"],
             "metadata": metadata,
             "created_at": row["created_at"],
-            "similarity": rrf_score,  # Use RRF score as similarity for consistency
+            "similarity": boosted,
+            "raw_rrf_score": float(row["raw_rrf_score"]),
+            "recall_count": row["recall_count"] or 0,
+            "last_recalled": row["last_recalled"],
             "fts_rank": row["fts_rank"],
             "vec_rank": row["vec_rank"],
         })
@@ -547,9 +587,12 @@ async def search_learnings(
     backend = get_backend()
 
     if backend == "sqlite":
-        return await search_learnings_sqlite(query, k)
+        results = await search_learnings_sqlite(query, k)
     else:
-        return await search_learnings_postgres(query, k, provider, text_fallback, similarity_threshold, recency_weight)
+        results = await search_learnings_postgres(query, k, provider, text_fallback, similarity_threshold, recency_weight)
+
+    await record_recall([r["id"] for r in results])
+    return results
 
 
 async def main() -> int:
@@ -649,6 +692,9 @@ async def main() -> int:
         else:
             print(f"Error: {e}", file=sys.stderr)
         return 1
+
+    # Record recall for temporal decay tracking
+    await record_recall([r["id"] for r in results])
 
     # JSON output mode
     if args.json:

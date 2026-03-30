@@ -240,8 +240,12 @@ async def store_learning_v2(
                         supersedes,
                     )
                     # result is "UPDATE N" — check if row was actually updated
-                    if result and result.endswith("1"):
-                        superseded_id = supersedes
+                    try:
+                        parts = (result or "").split()
+                        if len(parts) == 2 and parts[0] == "UPDATE" and int(parts[1]) > 0:
+                            superseded_id = supersedes
+                    except (ValueError, IndexError):
+                        pass
             except Exception:
                 # Graceful: don't fail the store if chain update fails
                 # (e.g., superseded_by column doesn't exist yet)

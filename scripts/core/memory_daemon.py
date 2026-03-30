@@ -63,6 +63,8 @@ global_env = Path.home() / ".claude" / ".env"
 if global_env.exists():
     load_dotenv(global_env, override=True)
 
+DAEMON_VERSION = "0.6.10"
+
 # Global config
 POLL_INTERVAL = 60  # seconds
 STALE_THRESHOLD = 900  # 15 minutes in seconds
@@ -758,7 +760,9 @@ def queue_or_extract(
 def daemon_loop():
     """Main daemon loop."""
     db_type = "PostgreSQL" if use_postgres() else "SQLite"
-    log(f"Memory daemon started (using {db_type}, max_concurrent={MAX_CONCURRENT_EXTRACTIONS})")
+    log(f"Memory daemon v{DAEMON_VERSION} started "
+        f"(using {db_type}, "
+        f"max_concurrent={MAX_CONCURRENT_EXTRACTIONS})")
     ensure_schema()
     recover_stalled_extractions()
 
@@ -905,7 +909,7 @@ def status_daemon():
     running, pid = is_running()
     db_type = "PostgreSQL" if use_postgres() else "SQLite"
 
-    print("Memory Daemon Status")
+    print(f"Memory Daemon Status (v{DAEMON_VERSION})")
     print(f"  Running: {'Yes' if running else 'No'}")
     if running:
         print(f"  PID: {pid}")

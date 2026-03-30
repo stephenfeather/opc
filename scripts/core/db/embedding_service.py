@@ -53,13 +53,23 @@ class EmbeddingProvider(ABC):
     """
 
     @abstractmethod
-    async def embed(self, text: str) -> list[float]:
-        """Generate embedding for text."""
+    async def embed(self, text: str, **kwargs) -> list[float]:
+        """Generate embedding for text.
+
+        Args:
+            text: Text to embed
+            **kwargs: Provider-specific options (e.g., input_type for Voyage)
+        """
         ...
 
     @abstractmethod
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        """Generate embeddings for multiple texts."""
+    async def embed_batch(self, texts: list[str], **kwargs) -> list[list[float]]:
+        """Generate embeddings for multiple texts.
+
+        Args:
+            texts: List of texts to embed
+            **kwargs: Provider-specific options (e.g., input_type for Voyage)
+        """
         ...
 
     @property
@@ -118,11 +128,12 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         """Exit async context manager and close client."""
         await self.aclose()
 
-    async def embed(self, text: str) -> list[float]:
+    async def embed(self, text: str, **kwargs) -> list[float]:
         """Generate embedding for a single text.
 
         Args:
             text: Text to embed
+            **kwargs: Ignored (OpenAI doesn't support input_type)
 
         Returns:
             Embedding vector (1536 dimensions)
@@ -133,13 +144,14 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         embeddings = await self._call_api([text])
         return embeddings[0]
 
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+    async def embed_batch(self, texts: list[str], **kwargs) -> list[list[float]]:
         """Generate embeddings for multiple texts.
 
         Automatically splits into chunks to respect API limits.
 
         Args:
             texts: List of texts to embed
+            **kwargs: Ignored (OpenAI doesn't support input_type)
 
         Returns:
             List of embedding vectors
@@ -266,13 +278,13 @@ class VoyageEmbeddingProvider(EmbeddingProvider):
         """Exit async context manager and close client."""
         await self.aclose()
 
-    async def embed(self, text: str, input_type: str = "document") -> list[float]:
+    async def embed(self, text: str, input_type: str = "document", **kwargs) -> list[float]:
         """Generate embedding for a single text."""
         embeddings = await self._call_api([text], input_type=input_type)
         return embeddings[0]
 
     async def embed_batch(
-        self, texts: list[str], input_type: str = "document",
+        self, texts: list[str], input_type: str = "document", **kwargs,
     ) -> list[list[float]]:
         """Generate embeddings for multiple texts."""
         if not texts:
@@ -387,7 +399,7 @@ class LocalEmbeddingProvider(EmbeddingProvider):
         self._model = SentenceTransformer(model, device=device)
         self._dimension = self._model.get_sentence_embedding_dimension()
 
-    async def embed(self, text: str) -> list[float]:
+    async def embed(self, text: str, **kwargs) -> list[float]:
         """Generate embedding for a single text."""
         import asyncio
 
@@ -397,7 +409,7 @@ class LocalEmbeddingProvider(EmbeddingProvider):
         )
         return embedding
 
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+    async def embed_batch(self, texts: list[str], **kwargs) -> list[list[float]]:
         """Generate embeddings for multiple texts."""
         if not texts:
             return []
@@ -462,14 +474,14 @@ class OllamaEmbeddingProvider(EmbeddingProvider):
         self._client = httpx.AsyncClient(timeout=30.0, verify=False)
         self._dimension = self.MODELS.get(self.model, 768)
 
-    async def embed(self, text: str) -> list[float]:
+    async def embed(self, text: str, **kwargs) -> list[float]:
         """Generate embedding for a single text."""
         url = f"{self.host.rstrip('/')}/api/embeddings"
         response = await self._client.post(url, json={"model": self.model, "prompt": text})
         response.raise_for_status()
         return response.json()["embedding"]
 
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+    async def embed_batch(self, texts: list[str], **kwargs) -> list[list[float]]:
         """Generate embeddings for multiple texts (sequential for Ollama)."""
         results = []
         for text in texts:
@@ -505,11 +517,12 @@ class MockEmbeddingProvider(EmbeddingProvider):
         """
         self._dimension = dimension
 
-    async def embed(self, text: str) -> list[float]:
+    async def embed(self, text: str, **kwargs) -> list[float]:
         """Generate deterministic embedding from text hash.
 
         Args:
             text: Text to embed
+            **kwargs: Ignored (mock provider)
 
         Returns:
             Deterministic embedding vector based on text hash
@@ -529,11 +542,12 @@ class MockEmbeddingProvider(EmbeddingProvider):
 
         return embedding
 
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+    async def embed_batch(self, texts: list[str], **kwargs) -> list[list[float]]:
         """Generate embeddings for multiple texts.
 
         Args:
             texts: List of texts to embed
+            **kwargs: Ignored (mock provider)
 
         Returns:
             List of embedding vectors
@@ -635,11 +649,12 @@ class EmbeddingService:
         else:
             raise ValueError(f"Unknown provider: {provider}")
 
-    async def embed(self, text: str) -> list[float]:
+    async def embed(self, text: str, **kwargs) -> list[float]:
         """Generate embedding for text with optional caching.
 
         Args:
             text: Text to embed
+            **kwargs: Provider-specific options (e.g., input_type for Voyage)
 
         Returns:
             Embedding vector
@@ -650,7 +665,7 @@ class EmbeddingService:
                 if cache_key in self._cache:
                     return self._cache[cache_key]
 
-        embedding = await self._provider.embed(text)
+        embedding = await self._provider.embed(text, **kwargs)
 
         if self.cache_enabled:
             async with self._cache_lock:
@@ -658,13 +673,14 @@ class EmbeddingService:
 
         return embedding
 
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+    async def embed_batch(self, texts: list[str], **kwargs) -> list[list[float]]:
         """Generate embeddings for multiple texts.
 
         Uses caching for already-seen texts and batches remaining.
 
         Args:
             texts: List of texts to embed
+            **kwargs: Provider-specific options (e.g., input_type for Voyage)
 
         Returns:
             List of embedding vectors (same order as input)
@@ -688,7 +704,7 @@ class EmbeddingService:
         # Embed remaining texts (outside lock - allows concurrent API calls)
         if texts_to_embed:
             indices, remaining_texts = zip(*texts_to_embed)
-            new_embeddings = await self._provider.embed_batch(list(remaining_texts))
+            new_embeddings = await self._provider.embed_batch(list(remaining_texts), **kwargs)
 
             async with self._cache_lock:
                 for idx, text, embedding in zip(indices, remaining_texts, new_embeddings):

@@ -68,11 +68,12 @@ POLL_INTERVAL = 60  # seconds
 STALE_THRESHOLD = 900  # 15 minutes in seconds
 MAX_CONCURRENT_EXTRACTIONS = 4
 MAX_RETRIES = 5
+EXTRACTION_TIMEOUT = 1800  # 30 minutes - kill stuck extraction subprocesses
 PID_FILE = Path.home() / ".claude" / "memory-daemon.pid"
 LOG_FILE = Path.home() / ".claude" / "memory-daemon.log"
 
 # Worker queue state (module-level for daemon process)
-active_extractions: dict = {}  # pid -> (session_id, proc, jsonl_path, project)
+active_extractions: dict = {}  # pid -> (session_id, proc, jsonl_path, project, start_time)
 pending_queue: list[tuple[str, str, str | None]] = []  # [(session_id, project, transcript_path), ...]
 
 
@@ -502,7 +503,9 @@ Store each learning using store_learning.py with appropriate type and tags."""
             stderr=subprocess.DEVNULL,
             env=env,
         )
-        active_extractions[proc.pid] = (session_id, proc, jsonl_path, project_dir)
+        active_extractions[proc.pid] = (
+            session_id, proc, jsonl_path, project_dir, time.time()
+        )
         log(f"Started extraction for {session_id} "
             f"(pid={proc.pid}, file={jsonl_path.name}, "
             f"active={len(active_extractions)})")
@@ -675,12 +678,14 @@ def _generate_mini_handoff(
 def reap_completed_extractions():
     """Check for completed extraction processes and remove from active set."""
     completed = []
-    for pid, (session_id, proc, jsonl_path, project) in list(active_extractions.items()):
+    for pid, (session_id, proc, jsonl_path, project, _start) in list(active_extractions.items()):
         exit_code = proc.poll()
         if exit_code is not None:
             completed.append(pid)
+            elapsed = int(time.time() - _start)
             log(f"Extraction completed for {session_id} "
-                f"(pid={pid}, project={project}, exit={exit_code})")
+                f"(pid={pid}, project={project}, "
+                f"exit={exit_code}, elapsed={elapsed}s)")
             if exit_code == 0:
                 mark_extracted(session_id)
                 _extract_and_store_workflows(session_id, jsonl_path, project)
@@ -693,6 +698,35 @@ def reap_completed_extractions():
         del active_extractions[pid]
 
     return len(completed)
+
+
+def watchdog_stuck_extractions():
+    """Kill extraction subprocesses that exceed EXTRACTION_TIMEOUT."""
+    now = time.time()
+    killed = []
+    for pid, (session_id, proc, jsonl_path, project, start_time) in list(
+        active_extractions.items()
+    ):
+        elapsed = now - start_time
+        if elapsed > EXTRACTION_TIMEOUT:
+            elapsed_min = int(elapsed / 60)
+            log(f"Watchdog: killing stuck extraction "
+                f"{session_id} (pid={pid}, "
+                f"running {elapsed_min}m)")
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception as e:
+                log(f"Watchdog: failed to kill pid {pid}: {e}")
+            killed.append(pid)
+            mark_extraction_failed(session_id)
+
+    for pid in killed:
+        del active_extractions[pid]
+
+    if killed:
+        log(f"Watchdog: killed {len(killed)} stuck extractions")
+    return len(killed)
 
 
 def process_pending_queue():
@@ -730,8 +764,9 @@ def daemon_loop():
 
     while True:
         try:
-            # Reap completed processes and process pending queue
+            # Reap completed, kill stuck, then process pending queue
             reap_completed_extractions()
+            watchdog_stuck_extractions()
             process_pending_queue()
 
             # Find new stale sessions

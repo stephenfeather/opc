@@ -359,6 +359,50 @@ def _is_process_alive(pid: int | None) -> bool:
         return False
 
 
+def pg_recover_stalled_extractions():
+    """Reset sessions stuck in 'extracting' back to 'pending' on daemon startup."""
+    conn = pg_connect()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE sessions
+        SET extraction_status = 'pending'
+        WHERE extraction_status = 'extracting'
+        RETURNING id
+    """)
+    recovered = [row[0] for row in cur.fetchall()]
+    conn.commit()
+    conn.close()
+    if recovered:
+        log(f"Startup recovery: reset {len(recovered)} stalled sessions: {', '.join(recovered)}")
+
+
+def sqlite_recover_stalled_extractions():
+    """Reset sessions stuck in 'extracting' back to 'pending' on daemon startup."""
+    db_path = get_sqlite_path()
+    if not db_path.exists():
+        return
+    conn = sqlite3.connect(db_path)
+    cursor = conn.execute("""
+        UPDATE sessions
+        SET extraction_status = 'pending'
+        WHERE extraction_status = 'extracting'
+        RETURNING id
+    """)
+    recovered = [row[0] for row in cursor.fetchall()]
+    conn.commit()
+    conn.close()
+    if recovered:
+        log(f"Startup recovery: reset {len(recovered)} stalled sessions: {', '.join(recovered)}")
+
+
+def recover_stalled_extractions():
+    """Reset stalled extractions on daemon startup (handles sleep/crash recovery)."""
+    if use_postgres():
+        pg_recover_stalled_extractions()
+    else:
+        sqlite_recover_stalled_extractions()
+
+
 def ensure_schema():
     """Ensure database schema is ready."""
     if use_postgres():
@@ -682,6 +726,7 @@ def daemon_loop():
     db_type = "PostgreSQL" if use_postgres() else "SQLite"
     log(f"Memory daemon started (using {db_type}, max_concurrent={MAX_CONCURRENT_EXTRACTIONS})")
     ensure_schema()
+    recover_stalled_extractions()
 
     while True:
         try:

@@ -676,6 +676,62 @@ class MemoryServicePG:
                 for row in rows
             ]
 
+    async def search_vector_global(
+        self,
+        query_embedding: list[float],
+        threshold: float = 0.92,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Search archival memory globally (all sessions) with similarity threshold.
+
+        Used for deduplication at store time — finds near-duplicates across
+        all sessions, not just the current one.
+
+        Args:
+            query_embedding: Query embedding vector
+            threshold: Minimum cosine similarity (0.0 to 1.0)
+            limit: Max results to return
+
+        Returns:
+            List of matching facts with cosine similarity score >= threshold
+        """
+        padded_query = self._pad_embedding(query_embedding)
+
+        async with get_connection() as conn:
+            await init_pgvector(conn)
+
+            rows = await conn.fetch(
+                """
+                SELECT
+                    id,
+                    session_id,
+                    content,
+                    metadata,
+                    created_at,
+                    1 - (embedding <=> $1::vector) as similarity
+                FROM archival_memory
+                WHERE embedding IS NOT NULL
+                AND (1 - (embedding <=> $1::vector)) >= $2
+                ORDER BY embedding <=> $1::vector
+                LIMIT $3
+            """,
+                padded_query,
+                threshold,
+                limit,
+            )
+
+            return [
+                {
+                    "id": row["id"],
+                    "session_id": row["session_id"],
+                    "content": row["content"],
+                    "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
+                    "created_at": row["created_at"],
+                    "similarity": row["similarity"],
+                }
+                for row in rows
+            ]
+
     async def search_hybrid(
         self,
         text_query: str,

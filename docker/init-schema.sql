@@ -63,7 +63,11 @@ CREATE TABLE IF NOT EXISTS archival_memory (
     -- OPC: Embedding provenance and deduplication
     embedding_model TEXT DEFAULT 'bge',
     host_id TEXT,
-    content_hash TEXT
+    content_hash TEXT,
+
+    -- OPC: Temporal decay tracking
+    last_recalled TIMESTAMPTZ,
+    recall_count INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_archival_session ON archival_memory(session_id);
@@ -73,6 +77,7 @@ CREATE INDEX IF NOT EXISTS idx_archival_content_fts ON archival_memory
     USING gin(to_tsvector('english', content));
 CREATE UNIQUE INDEX IF NOT EXISTS idx_archival_content_hash ON archival_memory(content_hash);
 CREATE INDEX IF NOT EXISTS idx_archival_host ON archival_memory(host_id);
+CREATE INDEX IF NOT EXISTS idx_archival_last_recalled ON archival_memory(last_recalled DESC NULLS LAST);
 
 -- =============================================================================
 -- HANDOFFS LAYER

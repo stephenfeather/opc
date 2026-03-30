@@ -49,6 +49,38 @@ project_dir = os.environ.get("CLAUDE_PROJECT_DIR", str(Path(__file__).parent.par
 sys.path.insert(0, project_dir)
 
 
+async def record_recall(result_ids: list[str]) -> None:
+    """Update last_recalled and recall_count for recalled learnings.
+
+    Batch-updates all returned results in a single query.
+    Fails silently to avoid breaking recall if columns don't exist yet.
+    """
+    if not result_ids:
+        return
+
+    backend = get_backend()
+    if backend != "postgres":
+        return
+
+    try:
+        from scripts.core.db.postgres_pool import get_pool
+
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE archival_memory
+                SET last_recalled = NOW(),
+                    recall_count = recall_count + 1
+                WHERE id = ANY($1::uuid[])
+                """,
+                result_ids,
+            )
+    except Exception:
+        # Graceful degradation: don't break recall if columns missing or DB error
+        pass
+
+
 def format_result_preview(content: str, max_length: int = 200) -> str:
     """Format content for display, truncating if needed.
 
@@ -275,12 +307,7 @@ async def search_learnings_hybrid_rrf(
     finally:
         await embedder.aclose()
 
-    async with pool.acquire() as conn:
-        await init_pgvector(conn)
-
-        # RRF query across all sessions for learnings
-        rows = await conn.fetch(
-            """
+    _RRF_CTE = """
             WITH fts_ranked AS (
                 SELECT
                     id,
@@ -311,7 +338,31 @@ async def search_learnings_hybrid_rrf(
                     v.vec_rank
                 FROM fts_ranked f
                 FULL OUTER JOIN vector_ranked v ON f.id = v.id
-            )
+            )"""
+
+    _BOOSTED_SELECT = _RRF_CTE + """
+            SELECT
+                a.id,
+                a.session_id,
+                a.content,
+                a.metadata,
+                a.created_at,
+                a.recall_count,
+                a.last_recalled,
+                c.rrf_score +
+                    CASE WHEN COALESCE(a.recall_count, 0) = 0 THEN 0
+                    ELSE log(2.0, 1 + COALESCE(a.recall_count, 0)) * 0.002
+                    END as boosted_score,
+                c.rrf_score as raw_rrf_score,
+                c.fts_rank,
+                c.vec_rank
+            FROM combined c
+            JOIN archival_memory a ON a.id = c.id
+            ORDER BY boosted_score DESC
+            LIMIT $4
+            """
+
+    _PLAIN_SELECT = _RRF_CTE + """
             SELECT
                 a.id,
                 a.session_id,
@@ -325,34 +376,51 @@ async def search_learnings_hybrid_rrf(
             JOIN archival_memory a ON a.id = c.id
             ORDER BY c.rrf_score DESC
             LIMIT $4
-            """,
-            query,
-            str(query_embedding),
-            rrf_k,
-            k * 2,  # Fetch more to allow filtering
-        )
+            """
+
+    has_decay_columns = True
+    async with pool.acquire() as conn:
+        await init_pgvector(conn)
+        query_args = (query, str(query_embedding), rrf_k, k * 2)
+
+        try:
+            rows = await conn.fetch(_BOOSTED_SELECT, *query_args)
+        except Exception:
+            # Fallback: columns don't exist yet (pre-migration)
+            has_decay_columns = False
+            rows = await conn.fetch(_PLAIN_SELECT, *query_args)
 
     results = []
     for row in rows:
-        rrf_score = float(row["rrf_score"])
+        if has_decay_columns:
+            score = float(row["boosted_score"])
+        else:
+            score = float(row["rrf_score"])
 
-        if similarity_threshold > 0 and rrf_score < similarity_threshold:
+        if similarity_threshold > 0 and score < similarity_threshold:
             continue
 
         metadata = row["metadata"]
         if isinstance(metadata, str):
             metadata = json.loads(metadata)
 
-        results.append({
+        result = {
             "id": str(row["id"]),
             "session_id": row["session_id"],
             "content": row["content"],
             "metadata": metadata,
             "created_at": row["created_at"],
-            "similarity": rrf_score,  # Use RRF score as similarity for consistency
+            "similarity": score,
             "fts_rank": row["fts_rank"],
             "vec_rank": row["vec_rank"],
-        })
+        }
+
+        if has_decay_columns:
+            result["raw_rrf_score"] = float(row["raw_rrf_score"])
+            result["recall_count"] = row["recall_count"] or 0
+            result["last_recalled"] = row["last_recalled"]
+
+        results.append(result)
 
         if len(results) >= k:
             break
@@ -547,9 +615,12 @@ async def search_learnings(
     backend = get_backend()
 
     if backend == "sqlite":
-        return await search_learnings_sqlite(query, k)
+        results = await search_learnings_sqlite(query, k)
     else:
-        return await search_learnings_postgres(query, k, provider, text_fallback, similarity_threshold, recency_weight)
+        results = await search_learnings_postgres(query, k, provider, text_fallback, similarity_threshold, recency_weight)
+
+    await record_recall([r["id"] for r in results])
+    return results
 
 
 async def main() -> int:
@@ -615,6 +686,7 @@ async def main() -> int:
         print(f"Provider: {args.provider}")
         print()
 
+    recall_already_recorded = False
     try:
         backend = get_backend()
 
@@ -627,7 +699,7 @@ async def main() -> int:
             # Fast text-only search (no embeddings)
             results = await search_learnings_text_only_postgres(args.query, args.k)
         elif args.vector_only:
-            # Vector-only search with recency boost
+            # search_learnings() already calls record_recall internally
             results = await search_learnings(
                 query=args.query,
                 k=args.k,
@@ -635,6 +707,7 @@ async def main() -> int:
                 similarity_threshold=args.threshold,
                 recency_weight=args.recency,
             )
+            recall_already_recorded = True
         else:
             # Default: Hybrid RRF search (text + vector combined)
             results = await search_learnings_hybrid_rrf(
@@ -649,6 +722,10 @@ async def main() -> int:
         else:
             print(f"Error: {e}", file=sys.stderr)
         return 1
+
+    # Record recall for temporal decay tracking (skip if already done)
+    if not recall_already_recorded:
+        await record_recall([r["id"] for r in results])
 
     # JSON output mode
     if args.json:

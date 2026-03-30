@@ -151,13 +151,19 @@ def detect_workflow_sequences(tool_uses: list[dict]) -> list[dict]:
                 j += 1
 
             if step_idx == len(pat_steps) and len(matched) >= min_len:
-                # Determine success: check the last Bash result
+                # Determine success: check last Bash, then Edit/Write
                 success = None
                 for m in reversed(matched):
                     if m["tool_name"] == "Bash":
                         if m["result_error"] is not None:
                             success = not m["result_error"]
                         break
+                if success is None:
+                    for m in reversed(matched):
+                        if m["tool_name"] in ("Edit", "Write"):
+                            if m["result_error"] is not None:
+                                success = not m["result_error"]
+                            break
 
                 files = list({
                     m["input"].get("file_path", "")

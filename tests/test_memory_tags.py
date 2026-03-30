@@ -103,8 +103,8 @@ class TestMemoryTagsSchema:
         assert "REFERENCES archival_memory" in content
         assert "ON DELETE CASCADE" in content
 
-        # UNIQUE constraint for ON CONFLICT (memory_id, tag) DO NOTHING
-        assert "UNIQUE" in content or "unique" in content
+        # PRIMARY KEY on (memory_id, tag) for ON CONFLICT (memory_id, tag) DO NOTHING
+        assert "PRIMARY KEY" in content
 
         # Indexes for performance
         assert "idx_memory_tags_tag" in content or "INDEX" in content
@@ -363,9 +363,11 @@ class TestRecallTagsArg:
 
     def test_recall_main_accepts_tags_arg(self):
         """recall_learnings main() argparser should accept --tags."""
-        import inspect  # noqa: E402
+        import subprocess
+        import sys
 
-        from scripts.core.recall_learnings import main  # noqa: E402
-
-        source = inspect.getsource(main)
-        assert "--tags" in source, "main() should accept --tags argument"
+        result = subprocess.run(
+            [sys.executable, "-m", "scripts.core.recall_learnings", "--help"],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert "--tags" in result.stdout, "CLI help should list --tags argument"

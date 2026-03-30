@@ -91,7 +91,7 @@ CREATE TABLE IF NOT EXISTS memory_tags (
     tag       TEXT NOT NULL,
     session_id TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (memory_id, tag)
+    PRIMARY KEY (memory_id, tag)
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_tags_tag ON memory_tags(tag);

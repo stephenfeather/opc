@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS memory_tags (
     tag       TEXT NOT NULL,
     session_id TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (memory_id, tag)
+    PRIMARY KEY (memory_id, tag)
 );
 
 -- Index on tag for fast tag-based lookups (e.g., WHERE tag = ANY($1))

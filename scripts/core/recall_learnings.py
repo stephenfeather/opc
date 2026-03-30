@@ -768,7 +768,7 @@ async def main() -> int:
     parser.add_argument(
         "--tags",
         nargs="+",
-        help="Filter results by tags (space-separated, OR match)",
+        help="[NOT YET IMPLEMENTED] Filter results by tags (space-separated, OR match)",
     )
 
     args = parser.parse_args()

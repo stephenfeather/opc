@@ -36,8 +36,7 @@ except ImportError:
 
 # Default paths
 PROJECT_ROOT = Path(__file__).parent.parent.parent
-# Docker setup is in the docker/ directory at repo root (parent of opc/)
-DOCKER_DIR = PROJECT_ROOT.parent / "docker"
+DOCKER_DIR = PROJECT_ROOT / "docker"
 DOCKER_COMPOSE_FILE = DOCKER_DIR / "docker-compose.yml"
 MIGRATIONS_DIR = PROJECT_ROOT / "scripts" / "migrations"
 

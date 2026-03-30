@@ -1,0 +1,22 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: opc-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-claude}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-claude_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-continuous_claude}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - opc_data:/var/lib/postgresql/data
+      - ./init-schema.sql:/docker-entrypoint-initdb.d/init-schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U claude -d continuous_claude"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  opc_data:

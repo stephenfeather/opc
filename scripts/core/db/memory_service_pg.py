@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import faulthandler
 import json
+import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime
@@ -41,6 +42,8 @@ import numpy as np
 from .postgres_pool import get_connection, get_pool, get_transaction, init_pgvector
 
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+
+logger = logging.getLogger(__name__)
 
 
 class EmbeddingProvider(Protocol):
@@ -420,7 +423,10 @@ class MemoryServicePG:
                     )
                 except Exception:
                     # Column may not exist yet; don't break the insert
-                    pass
+                    logger.debug(
+                        "Supersede UPDATE failed for %s -> %s",
+                        supersedes, memory_id, exc_info=True,
+                    )
 
         return memory_id
 

@@ -90,6 +90,10 @@ class MemoryBackend(Protocol):
         content: str,
         metadata: dict[str, Any] | None = None,
         embedding: list[float] | None = None,
+        tags: list[str] | None = None,
+        content_hash: str | None = None,
+        host_id: str | None = None,
+        supersedes: str | None = None,
     ) -> str:
         """Store content in archival memory.
 
@@ -97,6 +101,10 @@ class MemoryBackend(Protocol):
             content: Content to store
             metadata: Optional metadata dictionary
             embedding: Optional embedding vector
+            tags: Optional list of tags for categorization
+            content_hash: SHA-256 hash for deduplication
+            host_id: Machine identifier for multi-system support
+            supersedes: UUID of an older learning this one replaces
 
         Returns:
             Memory ID (UUID)

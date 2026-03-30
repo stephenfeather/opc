@@ -143,7 +143,7 @@ def pg_get_stale_sessions() -> list:
     cur = conn.cursor()
     # Use DB clock for comparison to avoid local-vs-UTC timezone mismatch
     cur.execute("""
-        SELECT id, project, transcript_path FROM sessions
+        SELECT id, project, transcript_path, pid FROM sessions
         WHERE last_heartbeat < NOW() - INTERVAL '%s seconds'
         AND extraction_status = 'pending'
         AND extraction_attempts < %s
@@ -278,7 +278,7 @@ def sqlite_get_stale_sessions() -> list:
     conn = sqlite3.connect(db_path)
     threshold = (datetime.now() - timedelta(seconds=STALE_THRESHOLD)).isoformat()
     cursor = conn.execute("""
-        SELECT id, project, transcript_path FROM sessions
+        SELECT id, project, transcript_path, pid FROM sessions
         WHERE last_heartbeat < ?
         AND extraction_status = 'pending'
         AND COALESCE(extraction_attempts, 0) < ?
@@ -341,6 +341,17 @@ def sqlite_mark_extraction_failed(session_id: str):
 
 
 # Unified interface
+def _is_process_alive(pid: int | None) -> bool:
+    """Check if a process is still running via kill(0) signal."""
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
 def ensure_schema():
     """Ensure database schema is ready."""
     if use_postgres():
@@ -674,16 +685,31 @@ def daemon_loop():
             # Find new stale sessions
             stale = get_stale_sessions()
             if stale:
-                summary = ", ".join(
-                    f"{sid}({proj or '?'})"
-                    for sid, proj, *_ in stale
-                )
-                log(f"Found {len(stale)} stale sessions: {summary}")
+                # Filter out sessions whose Claude process is still alive
+                truly_stale = []
                 for row in stale:
-                    session_id, project = row[0], row[1]
-                    tp = row[2] if len(row) > 2 else None
-                    mark_extracting(session_id)
-                    queue_or_extract(session_id, project or "", tp)
+                    session_id = row[0]
+                    pid = row[3] if len(row) > 3 else None
+                    if _is_process_alive(pid):
+                        log(f"Skipping {session_id}: process {pid} "
+                            f"still alive")
+                        continue
+                    truly_stale.append(row)
+
+                if truly_stale:
+                    summary = ", ".join(
+                        f"{sid}({proj or '?'})"
+                        for sid, proj, *_ in truly_stale
+                    )
+                    log(f"Found {len(truly_stale)} stale sessions: "
+                        f"{summary}")
+                    for row in truly_stale:
+                        session_id, project = row[0], row[1]
+                        tp = row[2] if len(row) > 2 else None
+                        mark_extracting(session_id)
+                        queue_or_extract(
+                            session_id, project or "", tp
+                        )
         except Exception as e:
             log(f"Error in daemon loop: {e}")
 

@@ -128,6 +128,60 @@ async def test_global_dedup_allows_sufficiently_different(
 
 
 @pytest.mark.asyncio
+async def test_global_dedup_rejects_at_exact_threshold(
+    mock_memory_service, mock_embedder
+):
+    """Similarity exactly at 0.92 should be rejected (>= condition)."""
+    mock_memory_service.search_vector_global.return_value = [
+        {
+            "id": "boundary-uuid",
+            "session_id": "other-session",
+            "content": "Boundary match",
+            "similarity": 0.92,
+        }
+    ]
+
+    p1, p2, p3 = _patches(mock_memory_service, mock_embedder)
+    with p1, p2, p3:
+        result = await store_learning_v2(
+            session_id="my-session",
+            content="Boundary test learning",
+        )
+
+    assert result["success"] is True
+    assert result["skipped"] is True
+    assert "duplicate" in result["reason"]
+    mock_memory_service.store.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_global_dedup_allows_just_below_threshold(
+    mock_memory_service, mock_embedder
+):
+    """Similarity just below 0.92 should be stored."""
+    mock_memory_service.search_vector_global.return_value = [
+        {
+            "id": "near-miss-uuid",
+            "session_id": "other-session",
+            "content": "Almost a match",
+            "similarity": 0.9199,
+        }
+    ]
+
+    p1, p2, p3 = _patches(mock_memory_service, mock_embedder)
+    with p1, p2, p3:
+        result = await store_learning_v2(
+            session_id="my-session",
+            content="Just below threshold learning",
+        )
+
+    assert result["success"] is True
+    assert "skipped" not in result
+    assert result["memory_id"] == "new-uuid-123"
+    mock_memory_service.store.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_global_dedup_allows_when_no_matches(
     mock_memory_service, mock_embedder
 ):

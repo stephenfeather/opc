@@ -13,13 +13,13 @@ Usage:
 """
 
 import argparse
+import faulthandler
 import json
+import os
 import re
 import sys
 from pathlib import Path
 
-import os
-import faulthandler
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
 # Perception change signal patterns (Alan Kay "point of view" moments)
@@ -84,7 +84,7 @@ def extract_thinking_blocks(jsonl_path: Path, filter_perception: bool = False) -
     """
     blocks = []
 
-    with open(jsonl_path, 'r') as f:
+    with open(jsonl_path) as f:
         for line_num, line in enumerate(f, 1):
             try:
                 data = json.loads(line.strip())

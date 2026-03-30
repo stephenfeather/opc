@@ -118,7 +118,14 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]
-ignore = ["N815"]  # Allow mixedCase variable names for config compatibility
+ignore = [
+    "N815",  # Allow mixedCase variable names for config compatibility
+    "E402",  # Module-level imports not at top — faulthandler pattern requires this
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Math compute modules use uppercase variable names by convention (M, A, X, etc.)
+"scripts/cc_math/*.py" = ["N806", "N803", "N802", "E741"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

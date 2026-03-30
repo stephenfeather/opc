@@ -46,6 +46,7 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 import faulthandler
+
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
 # Load .env files for DATABASE_URL (cross-platform)
@@ -536,8 +537,8 @@ def _extract_and_store_workflows(
     """Extract workflow patterns and store as learnings. Non-fatal."""
     try:
         from scripts.core.extract_workflow_patterns import (
-            extract_tool_uses,
             detect_workflow_sequences,
+            extract_tool_uses,
             format_pattern_as_learning,
         )
     except ImportError as e:

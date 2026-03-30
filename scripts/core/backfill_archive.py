@@ -10,6 +10,7 @@ Usage:
     uv run python scripts/core/backfill_archive.py              # execute
 """
 
+import faulthandler
 import os
 import subprocess
 import sys
@@ -17,8 +18,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
 
 # Load env (same as daemon)
 global_env = Path.home() / ".claude" / ".env"

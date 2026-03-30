@@ -8,6 +8,7 @@ Uses dispatch tables for result unwrapping to reduce cyclomatic complexity.
 """
 
 import asyncio
+import faulthandler  # noqa: E402
 import json
 import logging
 import os
@@ -28,13 +29,14 @@ from mcp.types import Tool
 from .config import McpConfig, ServerConfig
 from .exceptions import (
     ConfigurationError,
-
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
-
     ServerConnectionError,
     ToolExecutionError,
     ToolNotFoundError,
+)
+
+faulthandler.enable(  # noqa: E501, E402
+    file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"),
+    all_threads=True,
 )
 
 logger = logging.getLogger("mcp_execution.client")

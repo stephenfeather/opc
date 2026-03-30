@@ -14,8 +14,10 @@ Typical workflow:
 """
 
 import asyncio
+import faulthandler  # noqa: E402
 import json
 import logging
+import os  # noqa: E402
 from pathlib import Path
 from typing import Any
 
@@ -25,11 +27,11 @@ from .exceptions import ToolExecutionError
 from .mcp_client import McpClientManager
 from .schema_inference import (
     infer_pydantic_model_from_response,
+)
 
-import os
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
-
+faulthandler.enable(  # noqa: E501, E402
+    file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"),
+    all_threads=True,
 )
 
 logger = logging.getLogger("mcp_execution.discover_schemas")

@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import json
 import os
 import subprocess
@@ -27,8 +28,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
 
 if TYPE_CHECKING:
     from typing import Any

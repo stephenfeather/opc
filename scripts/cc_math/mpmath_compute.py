@@ -181,15 +181,17 @@ USAGE:
     uv run python -m scripts.mpmath_compute mp_isqrt 1000
 """
 
+import faulthandler  # noqa: E402
+import os  # noqa: E402
 import sys
 
-from scripts.math_base import (
+faulthandler.enable(  # noqa: E501, E402
+    file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"),
+    all_threads=True,
+)
+
+from scripts.math_base import (  # noqa: E402
     create_main_parser,
-
-import os
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
-
     get_registry,
     main_cli,
     math_command,

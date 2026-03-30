@@ -19,16 +19,16 @@ USAGE:
 """
 
 import argparse
+import faulthandler
 import json
+import os
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import wraps
-from typing import Any, Dict, List, Optional, TypeVar, Union
+from typing import Any, TypeVar
 
-import os
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
 
 # Type variables for generic decorators
 T = TypeVar("T")
@@ -49,7 +49,7 @@ class MathCommand:
     category: str
     description: str
     latex_template: str | None = None
-    args: list[Dict[str, Any]] = field(default_factory=list)
+    args: list[dict[str, Any]] = field(default_factory=list)
 
 
 # Global registry per script - use module-level dict
@@ -61,7 +61,7 @@ def math_command(
     category: str,
     description: str = "",
     latex_template: str | None = None,
-    args: List[Dict[str, Any]] | None = None,
+    args: list[dict[str, Any]] | None = None,
 ) -> Callable[[F], F]:
     """Decorator to register a math command.
 
@@ -134,7 +134,7 @@ def clear_registry() -> None:
 # =============================================================================
 
 
-def format_output(result: dict[str, Any], latex_template: str | None = None) -> Dict[str, Any]:
+def format_output(result: dict[str, Any], latex_template: str | None = None) -> dict[str, Any]:
     """Format computation result as standardized JSON.
 
     Output structure:
@@ -723,7 +723,7 @@ def register_commands(
 
 def run_command(
     args: argparse.Namespace, registry: dict[str, MathCommand] | None = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Run command based on parsed arguments.
 
     Args:

@@ -12,15 +12,17 @@ USAGE:
     uv run python scripts/numpy_compute.py lstsq "[[1,1],[1,2],[1,3]]" "[1,2,2]"
 """
 
+import faulthandler
+import os
 import sys
+
+faulthandler.enable(
+    file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"),
+    all_threads=True,
+)
 
 from scripts.math_base import (
     create_main_parser,
-
-import os
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
-
     format_latex_matrix,
     get_array_info,
     get_registry,

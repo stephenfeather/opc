@@ -29,13 +29,13 @@ USAGE:
 """
 
 import argparse
+import faulthandler
 import os
 import subprocess
 import sys
 from pathlib import Path
 
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
 
 SESSION_NAME = "rp-async"
 

@@ -10,16 +10,16 @@ Usage:
     cd opc && uv run python scripts/benchmark_daemon.py
 """
 
+import faulthandler
+import hashlib
 import json
 import os
 import socket
 import subprocess
 import time
-import hashlib
 from pathlib import Path
 from statistics import mean, stdev
 
-import faulthandler
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
 # Config

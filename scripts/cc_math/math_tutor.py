@@ -27,7 +27,9 @@ Requires: sympy (pip install sympy)
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import json
+import os
 import random
 import re
 import sys
@@ -36,9 +38,7 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Any
 
-import os
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
 
 # Import sympy lazily
 _sympy = None

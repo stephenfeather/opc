@@ -16,17 +16,17 @@ Usage:
 """
 from __future__ import annotations
 
+import faulthandler
 import json
 import os
 import signal
 import subprocess
 import sys
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from threading import Lock
 
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
 
 # Configuration
 PORT = 8340

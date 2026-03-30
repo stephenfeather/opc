@@ -24,13 +24,16 @@ from typing import Any
 
 # Import from sympy_compute
 sys.path.insert(0, ".")
-from scripts.sympy_compute import (
+import faulthandler  # noqa: E402
+import os  # noqa: E402
+
+faulthandler.enable(  # noqa: E501, E402
+    file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"),
+    all_threads=True,
+)
+
+from scripts.sympy_compute import (  # noqa: E402
     binomial_coeff,
-
-import os
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
-
     catalan_number,
     det_matrix,
     differentiate_expr,

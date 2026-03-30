@@ -42,15 +42,15 @@ Graceful Degradation:
 
 import argparse
 import asyncio
+import faulthandler
 import json
+import os
 import sys
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
-import os
-import faulthandler
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
 

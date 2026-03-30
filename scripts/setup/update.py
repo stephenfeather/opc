@@ -10,15 +10,15 @@ USAGE:
     python scripts/setup/update.py
 """
 
+import faulthandler
 import hashlib
+import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-import os
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
 
 # Ensure project root is in sys.path
 _this_file = Path(__file__).resolve()

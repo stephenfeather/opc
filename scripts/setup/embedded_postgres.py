@@ -12,12 +12,12 @@ USAGE:
     )
 """
 
+import faulthandler
+import os
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus
 
-import os
-import faulthandler
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
 

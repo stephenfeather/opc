@@ -15,13 +15,13 @@ Usage:
 """
 
 import argparse
+import faulthandler
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
-import faulthandler
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
 # Add tldr-code to path
@@ -30,9 +30,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "packages" / "tldr-code"))
 # Try to import TLDR API, but gracefully handle missing deps
 try:
     from tldr.api import (
-        scan_project_files,
-        extract_file,
         build_function_index,
+        extract_file,
+        scan_project_files,
     )
     TLDR_AVAILABLE = True
 except ImportError as e:

@@ -13,6 +13,7 @@ Or run as a standalone script:
 """
 
 import asyncio
+import faulthandler
 import json
 import os
 import platform
@@ -23,7 +24,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import faulthandler
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
 # Ensure project root is in sys.path for imports when run as a script
@@ -41,7 +41,8 @@ try:
 
     console = Console()
 except ImportError:
-    rich_escape = lambda x: x  # No escaping needed without Rich
+    def rich_escape(x):  # No escaping needed without Rich
+        return x
     # Fallback for minimal environments
     class Console:
         def print(self, *args, **kwargs):
@@ -203,7 +204,8 @@ async def check_prerequisites_with_install_offers() -> dict[str, Any]:
     if not runtime_info["installed"]:
         await offer_docker_install()
     elif not runtime_info.get("daemon_running", False):
-        console.print(f"  [yellow]{runtime_name.title()} is installed but the daemon is not running.[/yellow]")
+        msg = f"  [yellow]{runtime_name.title()} is installed but the daemon is not running.[/yellow]"
+        console.print(msg)
         if runtime_name == "docker":
             console.print("  Please start Docker Desktop or the Docker service.")
         else:
@@ -212,24 +214,31 @@ async def check_prerequisites_with_install_offers() -> dict[str, Any]:
         # Retry loop for daemon startup
         max_retries = 3
         for attempt in range(max_retries):
-            if Confirm.ask(f"\n  Retry checking {runtime_name} daemon? (attempt {attempt + 1}/{max_retries})", default=True):
+            retry_msg = f"\n  Retry checking {runtime_name} daemon? (attempt {attempt + 1}/{max_retries})"
+            if Confirm.ask(retry_msg, default=True):
                 console.print(f"  Checking {runtime_name} daemon...")
                 await asyncio.sleep(2)  # Give daemon time to start
                 runtime_info = await check_runtime_installed(runtime_name)
                 if runtime_info.get("daemon_running", False):
                     result["docker"] = True
                     result["docker_daemon_running"] = True
-                    console.print(f"  [green]OK[/green] {runtime_name.title()} daemon is now running!")
+                    console.print(
+                        f"  [green]OK[/green] {runtime_name.title()} daemon is now running!"
+                    )
                     break
                 else:
-                    console.print(f"  [yellow]{runtime_name.title()} daemon still not running.[/yellow]")
+                    console.print(
+                        f"  [yellow]{runtime_name.title()} daemon still not running.[/yellow]"
+                    )
             else:
                 break
 
     # Check elan/Lean4 (optional, for theorem proving with /prove skill)
     if not result["elan"]:
         console.print("\n  [dim]Optional: Lean4/elan not found (needed for /prove skill)[/dim]")
-        console.print("  [dim]Install with: curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh[/dim]")
+        console.print(
+            "  [dim]Install with: curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh[/dim]"
+        )
 
     # elan is optional, so exclude from all_present check
     result["all_present"] = all([result["docker"], result["python"], result["uv"]])
@@ -393,7 +402,9 @@ async def prompt_embedding_config() -> dict[str, str]:
     console.print("    3. openai - OpenAI API (requires API key)")
     console.print("    4. voyage - Voyage AI API (requires API key)")
 
-    provider = Prompt.ask("Embedding provider", choices=["local", "ollama", "openai", "voyage"], default="local")
+    provider = Prompt.ask(
+        "Embedding provider", choices=["local", "ollama", "openai", "voyage"], default="local"
+    )
 
     config = {"provider": provider}
 
@@ -573,15 +584,23 @@ async def run_setup_wizard() -> None:
     console.print("    [bold]docker[/bold]    - PostgreSQL in Docker (recommended)")
     console.print("    [bold]embedded[/bold]  - Embedded PostgreSQL (no Docker needed)")
     console.print("    [bold]sqlite[/bold]    - SQLite fallback (simplest, no cross-terminal)")
-    db_mode = Prompt.ask("\n  Database mode", choices=["docker", "embedded", "sqlite"], default="docker")
+    db_mode = Prompt.ask(
+        "\n  Database mode", choices=["docker", "embedded", "sqlite"], default="docker"
+    )
 
     if db_mode == "embedded":
         from scripts.setup.embedded_postgres import setup_embedded_environment
         console.print("  Setting up embedded postgres (creates Python 3.12 environment)...")
         embed_result = await setup_embedded_environment()
         if embed_result["success"]:
-            console.print(f"  [green]OK[/green] Embedded environment ready at {embed_result['venv']}")
-            db_config = {"mode": "embedded", "pgdata": str(embed_result["pgdata"]), "venv": str(embed_result["venv"])}
+            console.print(
+                f"  [green]OK[/green] Embedded environment ready at {embed_result['venv']}"
+            )
+            db_config = {
+                "mode": "embedded",
+                "pgdata": str(embed_result["pgdata"]),
+                "venv": str(embed_result["venv"]),
+            }
         else:
             console.print(f"  [red]ERROR[/red] {embed_result.get('error', 'Unknown')}")
             console.print("  Falling back to Docker mode")
@@ -630,18 +649,23 @@ async def run_setup_wizard() -> None:
 
     # Step 5: Container stack (Sandbox Infrastructure)
     runtime = prereqs.get("container_runtime", "docker")
-    console.print(f"\n[bold]Step 6/13: Container Stack (Sandbox Infrastructure)[/bold]")
+    console.print("\n[bold]Step 6/13: Container Stack (Sandbox Infrastructure)[/bold]")
     console.print("  The sandbox requires PostgreSQL and Redis for:")
     console.print("  - Agent coordination and scheduling")
     console.print("  - Build cache and LSP index storage")
     console.print("  - Real-time agent status")
     if Confirm.ask(f"Start {runtime} stack (PostgreSQL, Redis)?", default=True):
-        from scripts.setup.docker_setup import run_migrations, set_container_runtime, start_docker_stack, wait_for_services
+        from scripts.setup.docker_setup import (
+            run_migrations,
+            set_container_runtime,
+            start_docker_stack,
+            wait_for_services,
+        )
 
         # Set the detected runtime before starting
         set_container_runtime(runtime)
 
-        console.print(f"  [dim]Starting containers (first run downloads ~500MB, may take a few minutes)...[/dim]")
+        console.print("  [dim]Starting containers (first run downloads ~500MB, may take a few minutes)...[/dim]")
         result = await start_docker_stack(env_file=env_path)
         if result["success"]:
             console.print(f"  [green]OK[/green] {runtime.title()} stack started")
@@ -1028,7 +1052,9 @@ async def run_setup_wizard() -> None:
 
                         settings_path.parent.mkdir(parents=True, exist_ok=True)
                         settings_path.write_text(json.dumps(settings, indent=2))
-                        console.print(f"  [green]OK[/green] Semantic search enabled (threshold: {threshold})")
+                        console.print(
+                            f"  [green]OK[/green] Semantic search enabled (threshold: {threshold})"
+                        )
 
                         # Offer to pre-download embedding model
                         # Note: We only download the model here, not index any directory.
@@ -1038,7 +1064,11 @@ async def run_setup_wizard() -> None:
                             try:
                                 # Just load the model to trigger download (no indexing)
                                 download_result = subprocess.run(
-                                    [sys.executable, "-c", f"from tldr.semantic import get_model; get_model('{model}')"],
+                                    [
+                                        sys.executable,
+                                        "-c",
+                                        f"from tldr.semantic import get_model; get_model('{model}')",
+                                    ],
                                     capture_output=True,
                                     text=True,
                                     timeout=timeout,
@@ -1055,7 +1085,9 @@ async def run_setup_wizard() -> None:
                             except Exception as e:
                                 console.print(f"  [yellow]WARN[/yellow] {e}")
                         else:
-                            console.print("  [dim]Model downloads on first use of: tldr semantic index .[/dim]")
+                            console.print(
+                                "  [dim]Model downloads on first use of: tldr semantic index .[/dim]"
+                            )
                     else:
                         console.print("  Semantic search disabled")
                         console.print("  [dim]Enable later in .claude/settings.json[/dim]")
@@ -1128,7 +1160,9 @@ async def run_setup_wizard() -> None:
         # Check elan prerequisite
         if not shutil.which("elan"):
             console.print("  [yellow]WARN[/yellow] Lean 4 (elan) not installed")
-            console.print("  Install with: curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh")
+            console.print(
+                "  Install with: curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh"
+            )
             console.print("  Then re-run the wizard to install Loogle.")
         else:
             console.print("  [green]OK[/green] elan found")
@@ -1156,7 +1190,9 @@ async def run_setup_wizard() -> None:
                     if result.returncode == 0:
                         console.print("  [green]OK[/green] Updated")
                     else:
-                        console.print(f"  [yellow]WARN[/yellow] Update failed: {result.stderr[:100]}")
+                        console.print(
+                            f"  [yellow]WARN[/yellow] Update failed: {result.stderr[:100]}"
+                        )
             else:
                 console.print(f"  Cloning Loogle to {loogle_home}...")
                 loogle_home.parent.mkdir(parents=True, exist_ok=True)
@@ -1191,12 +1227,18 @@ async def run_setup_wizard() -> None:
                     if result.returncode == 0:
                         console.print("  [green]OK[/green] Loogle built")
                     else:
-                        console.print(f"  [red]ERROR[/red] Build failed")
+                        console.print("  [red]ERROR[/red] Build failed")
                         console.print(f"       {result.stderr[:200]}")
-                        console.print("  You can build manually: cd ~/.local/share/loogle && lake build")
+                        console.print(
+                            "  You can build manually: cd ~/.local/share/loogle && lake build"
+                        )
                 except subprocess.TimeoutExpired:
-                    console.print("  [yellow]WARN[/yellow] Build timed out (this is normal for first build)")
-                    console.print("  Continue building manually: cd ~/.local/share/loogle && lake build")
+                    console.print(
+                        "  [yellow]WARN[/yellow] Build timed out (this is normal for first build)"
+                    )
+                    console.print(
+                        "  Continue building manually: cd ~/.local/share/loogle && lake build"
+                    )
                 except Exception as e:
                     console.print(f"  [red]ERROR[/red] {e}")
 
@@ -1221,10 +1263,10 @@ async def run_setup_wizard() -> None:
                 else:
                     console.print(f"  [dim]LOOGLE_HOME already in {shell_config.name}[/dim]")
             elif sys.platform == "win32":
-                console.print(f"  [yellow]NOTE[/yellow] Add to your environment:")
+                console.print("  [yellow]NOTE[/yellow] Add to your environment:")
                 console.print(f"       set LOOGLE_HOME={loogle_home}")
             else:
-                console.print(f"  [yellow]NOTE[/yellow] Add to your shell config:")
+                console.print("  [yellow]NOTE[/yellow] Add to your shell config:")
                 console.print(f'       export LOOGLE_HOME="{loogle_home}"')
 
             # Install loogle-search script
@@ -1244,7 +1286,7 @@ async def run_setup_wizard() -> None:
                     dst_server = bin_dir / "loogle-server"
                     shutil.copy(src_server, dst_server)
                     dst_server.chmod(0o755)
-                    console.print(f"  [green]OK[/green] Installed loogle-server")
+                    console.print("  [green]OK[/green] Installed loogle-server")
             else:
                 console.print(f"  [yellow]WARN[/yellow] loogle_search.py not found at {src_script}")
 
@@ -1270,11 +1312,11 @@ async def run_setup_wizard() -> None:
 async def run_uninstall_wizard() -> None:
     """Run the uninstall wizard to remove OPC and restore backup."""
     from scripts.setup.claude_integration import (
+        PRESERVE_DIRS,
+        PRESERVE_FILES,
         find_latest_backup,
         get_global_claude_dir,
         uninstall_opc_integration,
-        PRESERVE_FILES,
-        PRESERVE_DIRS,
     )
 
     console.print(

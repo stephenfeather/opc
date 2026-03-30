@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import faulthandler
 import json
 import os
 import sys
@@ -35,7 +36,6 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-import faulthandler
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
 # Load .env files
@@ -177,8 +177,8 @@ async def search_learnings_sqlite(query: str, k: int = 5) -> list[dict[str, Any]
     Returns:
         List of matching learnings with BM25 scores
     """
-    import sqlite3
     import re
+    import sqlite3
 
     # Global SQLite path
     db_path = Path.home() / ".claude" / "cache" / "memory.db"

@@ -13,6 +13,7 @@ USAGE:
 Works on: Windows, macOS, Linux
 """
 
+import faulthandler
 import json
 import os
 import platform
@@ -22,7 +23,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import faulthandler
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
 
@@ -645,7 +645,7 @@ def install_opc_integration_symlink(
             try:
                 os.symlink(source_path, target_path)
                 result["symlinked_dirs"].append(dir_name)
-            except OSError as e:
+            except OSError:
                 if platform.system() == "Windows":
                     result["error"] = (
                         f"Symlink creation failed for '{dir_name}'. On Windows, enable Developer Mode "

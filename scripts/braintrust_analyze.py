@@ -46,6 +46,7 @@ Requires: BRAINTRUST_API_KEY in environment
 """
 
 import argparse
+import faulthandler
 import json
 import os
 import re
@@ -55,8 +56,10 @@ from pathlib import Path
 
 import requests
 
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+faulthandler.enable(
+    file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"),
+    all_threads=True,
+)
 
 # Note: We use direct LLM-as-judge API calls via Braintrust proxy
 # instead of autoevals library for more control over prompts
@@ -436,7 +439,7 @@ def detect_loops(project_id: str, api_key: str):
     )
 
     # Client-side filter: only keep tools called >5 times
-    loops = [l for l in (all_counts or []) if l.get("call_count", 0) > 5][:15]
+    loops = [el for el in (all_counts or []) if el.get("call_count", 0) > 5][:15]
 
     if not loops:
         print("No potential loops detected (>5 same tool calls)")
@@ -444,9 +447,9 @@ def detect_loops(project_id: str, api_key: str):
 
     print("## Potential Loops (>5 repeated tool calls)")
     print()
-    for l in loops:
-        print(f"**Session:** `{l['session_id'][:8]}...`")
-        print(f"  Tool: {l['tool']} ({l['call_count']}x)")
+    for el in loops:
+        print(f"**Session:** `{el['session_id'][:8]}...`")
+        print(f"  Tool: {el['tool']} ({el['call_count']}x)")
         print()
 
 
@@ -743,7 +746,8 @@ DEFAULT_MODEL = "gpt-5.2-2025-12-11"  # Via Braintrust proxy custom provider "Ev
 # Critique-focused LLM-as-Judge prompts (binary pass/fail + gaps list)
 # Based on research: "Scores are theater, critiques are the product"
 
-PLAN_JUDGE_PROMPT = """You are a critical reviewer of implementation plans. Find what's MISSING or WRONG.
+PLAN_JUDGE_PROMPT = """\
+You are a critical reviewer of implementation plans. Find what's MISSING or WRONG.
 
 **Plan Document:**
 {content}
@@ -885,7 +889,10 @@ async def llm_judge(prompt: str, **format_args) -> dict:
                 if not response_text and finish_reason == "length":
                     return {
                         "verdict": None,
-                        "error": f"Empty response (finish_reason: length). Usage: {usage}. Model may need higher max_tokens.",
+                        "error": (
+                            f"Empty response (finish_reason: length). Usage: {usage}."
+                            " Model may need higher max_tokens."
+                        ),
                     }
 
                 # Parse JSON from response (handle nested objects)
@@ -973,7 +980,8 @@ Respond in JSON:
 {{
   "verdict": "PASS" or "FAIL",
   "gaps": [
-    {{"requirement": "What's missing", "severity": "P0/P1", "evidence": "Based on similar failure in..."}}
+    {{"requirement": "What's missing", "severity": "P0/P1",
+      "evidence": "Based on similar failure in..."}}
   ],
   "insights": ["Patterns from past successes that apply here"],
   "summary": "One sentence assessment"
@@ -1250,11 +1258,11 @@ async def learn_from_session(project_id: str, api_key: str, session_id: str | No
     # Dynamic budget calculation (accounting for hierarchical context)
     # Braintrust API disconnects above ~300K chars empirically (see learn.log)
     # 308K succeeded, 340K+ failed with "Server disconnected"
-    TOTAL_CHARS = 250_000  # Conservative limit below API threshold
-    RESERVE_CHARS = 50_000  # prompt template + response headroom
-    AVAILABLE_CHARS = TOTAL_CHARS - RESERVE_CHARS - hierarchical_chars
-    MIN_PER_FIELD = 1500
-    MAX_PER_FIELD = 8000
+    total_chars = 250_000  # Conservative limit below API threshold
+    reserve_chars = 50_000  # prompt template + response headroom
+    available_chars = total_chars - reserve_chars - hierarchical_chars
+    min_per_field = 1500
+    max_per_field = 8000
 
     # --- IMPORTANCE-BASED SPAN SELECTION ---
     # Score spans by signal value, keep highest-importance within budget
@@ -1296,19 +1304,19 @@ async def learn_from_session(project_id: str, api_key: str, session_id: str | No
         return 40  # Default
 
     # Always keep first N and last M spans (setup + resolution)
-    KEEP_FIRST = 10
-    KEEP_LAST = 20
+    keep_first = 10
+    keep_last = 20
     span_count = len(spans)
 
-    if span_count <= KEEP_FIRST + KEEP_LAST:
+    if span_count <= keep_first + keep_last:
         # Small session, keep all
         selected_spans = list(enumerate(spans, 1))
     else:
         # Score middle spans and select by importance
-        first_spans = [(i, spans[i - 1]) for i in range(1, KEEP_FIRST + 1)]
-        last_spans = [(i, spans[i - 1]) for i in range(span_count - KEEP_LAST + 1, span_count + 1)]
+        first_spans = [(i, spans[i - 1]) for i in range(1, keep_first + 1)]
+        last_spans = [(i, spans[i - 1]) for i in range(span_count - keep_last + 1, span_count + 1)]
         middle_spans = [
-            (i, spans[i - 1]) for i in range(KEEP_FIRST + 1, span_count - KEEP_LAST + 1)
+            (i, spans[i - 1]) for i in range(keep_first + 1, span_count - keep_last + 1)
         ]
 
         # Score and sort middle spans
@@ -1317,9 +1325,9 @@ async def learn_from_session(project_id: str, api_key: str, session_id: str | No
 
         # Calculate how many middle spans we can afford
         # Budget: ~2500 chars per span average
-        CHARS_PER_SPAN = 2500
-        total_span_budget = AVAILABLE_CHARS // CHARS_PER_SPAN
-        middle_budget = max(0, total_span_budget - KEEP_FIRST - KEEP_LAST)
+        chars_per_span = 2500
+        total_span_budget = available_chars // chars_per_span
+        middle_budget = max(0, total_span_budget - keep_first - keep_last)
 
         # Take top-scoring middle spans
         selected_middle = [(i, s) for i, s, _ in scored_middle[:middle_budget]]
@@ -1331,14 +1339,15 @@ async def learn_from_session(project_id: str, api_key: str, session_id: str | No
         skipped = len(middle_spans) - len(selected_middle)
         if skipped > 0:
             print(
-                f"  Importance sampling: kept {len(selected_spans)}/{span_count} spans (skipped {skipped} low-value)"
+                f"  Importance sampling: kept {len(selected_spans)}/{span_count}"
+                f" spans (skipped {skipped} low-value)"
             )
 
     # Calculate per-field budget based on selected spans
     selected_count = len(selected_spans)
     estimated_fields = int(selected_count * 2.5)
-    per_field_budget = AVAILABLE_CHARS // max(1, estimated_fields)
-    per_field_budget = max(MIN_PER_FIELD, min(MAX_PER_FIELD, per_field_budget))
+    per_field_budget = available_chars // max(1, estimated_fields)
+    per_field_budget = max(min_per_field, min(max_per_field, per_field_budget))
 
     def clean(text: str, max_len: int = per_field_budget) -> str:
         """Clean and truncate text for trace (dynamic budget based on span count)."""
@@ -1401,21 +1410,22 @@ async def learn_from_session(project_id: str, api_key: str, session_id: str | No
 
     # CRITICAL: Final length check - truncate if over budget
     # This catches the case where per-field budget * actual fields exceeds total budget
-    MAX_CONTEXT_CHARS = TOTAL_CHARS - RESERVE_CHARS
-    if len(full_session_context) > MAX_CONTEXT_CHARS:
+    max_context_chars = total_chars - reserve_chars
+    if len(full_session_context) > max_context_chars:
         # Preserve hierarchical context (high value), truncate traces
         if hierarchical_context:
-            max_trace_chars = MAX_CONTEXT_CHARS - hierarchical_chars - 100  # buffer
+            max_trace_chars = max_context_chars - hierarchical_chars - 100  # buffer
             formatted_trace = (
                 formatted_trace[:max_trace_chars] + "\n\n[... trace truncated for length ...]"
             )
             full_session_context = hierarchical_context + "\n" + formatted_trace
         else:
             full_session_context = (
-                full_session_context[:MAX_CONTEXT_CHARS] + "\n\n[... truncated for length ...]"
+                full_session_context[:max_context_chars] + "\n\n[... truncated for length ...]"
             )
         print(
-            f"  WARNING: Context truncated from {len(formatted_trace):,} to {MAX_CONTEXT_CHARS:,} chars"
+            f"  WARNING: Context truncated from {len(formatted_trace):,}"
+            f" to {max_context_chars:,} chars"
         )
 
     # Pass to LLM judge for learning extraction
@@ -1431,7 +1441,8 @@ async def learn_from_session(project_id: str, api_key: str, session_id: str | No
 
     full_prompt = LEARN_JUDGE_PROMPT.format(formatted_trace=full_session_context)
     print(
-        f"  Context: {len(full_session_context):,} chars (hierarchical: {hierarchical_chars:,}, traces: {len(formatted_trace):,})"
+        f"  Context: {len(full_session_context):,} chars"
+        f" (hierarchical: {hierarchical_chars:,}, traces: {len(formatted_trace):,})"
     )
     print(f"  Prompt: {len(full_prompt):,} chars")
 
@@ -1631,7 +1642,8 @@ def main():
         output_lines.append(f"**Plan:** {args.rag_judge}")
         output_lines.append(f"**Verdict:** {verdict}")
         output_lines.append(
-            f"**Precedent used:** {precedent.get('succeeded', 0)} succeeded, {precedent.get('failed', 0)} failed"
+            f"**Precedent used:** {precedent.get('succeeded', 0)} succeeded,"
+            f" {precedent.get('failed', 0)} failed"
         )
 
         if result.get("summary"):

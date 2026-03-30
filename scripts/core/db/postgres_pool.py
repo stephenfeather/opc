@@ -29,6 +29,7 @@ Usage:
 """
 
 import asyncio
+import faulthandler
 import logging
 import os
 import random
@@ -38,8 +39,7 @@ from contextlib import asynccontextmanager
 import asyncpg
 from asyncpg import Connection, Pool
 
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
 
 # Global pool instance
 _pool: Pool | None = None

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
-import os
 import faulthandler
+import os
+
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
 r"""Morph Fast Apply - Apply code edits using AI-assisted diff application.

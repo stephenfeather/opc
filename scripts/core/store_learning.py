@@ -39,17 +39,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import faulthandler
 import hashlib
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
 
 # Load global ~/.claude/.env first, then local .env
 global_env = Path.home() / ".claude" / ".env"
@@ -102,11 +102,11 @@ async def store_learning_v2(
         dict with success status, memory_id, or skipped info for duplicates
     """
     try:
+        from scripts.core.db.embedding_service import EmbeddingService
         from scripts.core.db.memory_factory import (
             create_memory_service,
             get_default_backend,
         )
-        from scripts.core.db.embedding_service import EmbeddingService
     except ImportError as e:
         return {"success": False, "error": f"Memory service not available: {e}"}
 
@@ -162,7 +162,7 @@ async def store_learning_v2(
         metadata = {
             "type": "session_learning",
             "session_id": session_id,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
         }
 
         if host_id:
@@ -229,11 +229,11 @@ async def store_learning(
         dict with success status and memory_id
     """
     try:
+        from scripts.core.db.embedding_service import EmbeddingService
         from scripts.core.db.memory_factory import (
             create_memory_service,
             get_default_backend,
         )
-        from scripts.core.db.embedding_service import EmbeddingService
     except ImportError as e:
         return {"success": False, "error": f"Memory service not available: {e}"}
 
@@ -257,7 +257,7 @@ async def store_learning(
     metadata = {
         "type": "session_learning",
         "session_id": session_id,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "categories": {
             "worked": bool(worked and worked.lower() != "none"),
             "failed": bool(failed and failed.lower() != "none"),

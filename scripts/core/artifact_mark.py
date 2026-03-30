@@ -24,13 +24,13 @@ Examples:
 """
 
 import argparse
+import faulthandler
 import os
 import sqlite3
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-import faulthandler
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
 # Load .env files for DATABASE_URL (cross-platform)

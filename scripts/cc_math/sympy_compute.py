@@ -51,14 +51,14 @@ Requires: sympy (pip install sympy)
 
 import argparse
 import asyncio
+import faulthandler
 import json
+import os
 import sys
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from typing import Any
 
-import os
-import faulthandler
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
 

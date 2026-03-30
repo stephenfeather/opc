@@ -19,6 +19,7 @@ Examples:
 """
 
 import argparse
+import faulthandler
 import hashlib
 import json
 import os
@@ -27,7 +28,6 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-import faulthandler
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
 # Load .env files for DATABASE_URL (cross-platform)
@@ -210,7 +210,7 @@ class DatabaseConnection:
         if not match:
             return sql
 
-        table = match.group(1)
+        _table = match.group(1)
         columns = [c.strip() for c in match.group(2).split(",")]
 
         # Build ON CONFLICT clause
@@ -308,7 +308,8 @@ def _adapt_for_postgres(sql: str, params: tuple, table_hint: str) -> tuple:
 def _convert_pg_upsert(sql: str) -> str:
     """Convert SQLite INSERT OR REPLACE to PostgreSQL ON CONFLICT."""
     # Use DOTALL to match across newlines
-    match = re.search(r"INSERT\s+OR\s+REPLACE\s+INTO\s+(\w+)\s*\(([^)]+)\)", sql, re.IGNORECASE | re.DOTALL)
+    pattern = r"INSERT\s+OR\s+REPLACE\s+INTO\s+(\w+)\s*\(([^)]+)\)"
+    match = re.search(pattern, sql, re.IGNORECASE | re.DOTALL)
     if not match:
         return sql
 
@@ -518,13 +519,21 @@ def _parse_simple_yaml(text: str) -> dict:
                 # Could be "key: value" inside a list item
                 if current_list is None:
                     current_list = []
-                if isinstance(current_list, list) and len(current_list) > 0 and isinstance(current_list[-1], dict):
+                if (
+                    isinstance(current_list, list)
+                    and len(current_list) > 0
+                    and isinstance(current_list[-1], dict)
+                ):
                     # Check if this is a continuation of a dict item
                     pass
                 k, v = item.split(": ", 1)
                 k = k.strip()
                 v = v.strip().strip('"')
-                if current_list and isinstance(current_list[-1], dict) and k not in current_list[-1]:
+                if (
+                    current_list
+                    and isinstance(current_list[-1], dict)
+                    and k not in current_list[-1]
+                ):
                     current_list[-1][k] = v
                 else:
                     current_list.append({k: v})
@@ -538,7 +547,12 @@ def _parse_simple_yaml(text: str) -> dict:
             continue
 
         # Indented key-value under a list item (e.g., "    files: [...]")
-        if line.startswith("    ") and current_key and current_list and isinstance(current_list[-1], dict):
+        if (
+            line.startswith("    ")
+            and current_key
+            and current_list
+            and isinstance(current_list[-1], dict)
+        ):
             if ": " in stripped:
                 k, v = stripped.split(": ", 1)
                 k = k.strip()
@@ -566,7 +580,11 @@ def _parse_simple_yaml(text: str) -> dict:
                 current_list = []
                 result[current_key] = current_list
             elif value.startswith("[") and value.endswith("]"):
-                result[current_key] = [x.strip().strip('"').strip("'") for x in value[1:-1].split(",") if x.strip()]
+                result[current_key] = [
+                    x.strip().strip('"').strip("'")
+                    for x in value[1:-1].split(",")
+                    if x.strip()
+                ]
                 current_list = None
                 current_key = None
             else:

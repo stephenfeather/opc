@@ -9,7 +9,9 @@ This harness:
 """
 
 import asyncio
+import faulthandler
 import logging
+import os
 import runpy
 import signal
 import sys
@@ -20,9 +22,7 @@ from .env_utils import load_project_env
 from .exceptions import McpExecutionError
 from .mcp_client import get_mcp_client_manager
 
-import os
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
 
 # Configure logging to stderr
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s", stream=sys.stderr)

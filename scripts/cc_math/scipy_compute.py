@@ -32,15 +32,17 @@ EXAMPLES:
     uv run python scripts/scipy_compute.py curve_fit "a*exp(-b*x)" "0,1,2,3" "1,0.6,0.4,0.2" "1,0.5"
 """
 
+import faulthandler
+import os
 import sys
+
+faulthandler.enable(
+    file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"),
+    all_threads=True,
+)
 
 from scripts.math_base import (
     create_main_parser,
-
-import os
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
-
     get_registry,
     main_cli,
     math_command,

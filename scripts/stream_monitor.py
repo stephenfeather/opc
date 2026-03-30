@@ -10,19 +10,19 @@ See docs/cli-native-agent-architecture.md Section 8 for full spec.
 """
 
 import asyncio
+import faulthandler
 import json
 import logging
+import os
 import subprocess
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from collections.abc import Callable
 
-import os
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
 
 logger = logging.getLogger(__name__)
 

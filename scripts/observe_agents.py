@@ -33,6 +33,7 @@ This script provides unified observation of agent activity across:
 
 import argparse
 import asyncio
+import faulthandler
 import json
 import os
 import sqlite3
@@ -40,7 +41,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import faulthandler
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
 # PostgreSQL connection

@@ -16,15 +16,14 @@ Examples:
 """
 
 import argparse
+import faulthandler
 import hashlib
 import json
+import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
-import os
-import faulthandler
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
 

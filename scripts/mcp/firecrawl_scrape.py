@@ -21,13 +21,13 @@ Requires: FIRECRAWL_API_KEY in environment or ~/.claude/.env
 
 import argparse
 import asyncio
+import faulthandler
 import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
 
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
 
 # API configuration
 FIRECRAWL_SCRAPE_URL = "https://api.firecrawl.dev/v1/scrape"

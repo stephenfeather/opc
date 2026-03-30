@@ -10,17 +10,17 @@ Auto-starts the Loogle server if not running (singleton, no orphans).
 """
 from __future__ import annotations
 
+import faulthandler
 import json
 import os
 import signal
 import subprocess
 import sys
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 from pathlib import Path
 
-import faulthandler
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
 # Configuration

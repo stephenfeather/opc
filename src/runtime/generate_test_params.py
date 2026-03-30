@@ -8,16 +8,16 @@ and descriptions.
 """
 
 import argparse
+import faulthandler
 import json
 import logging
+import os
 import re
 import subprocess
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
-import os
-import faulthandler
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
 try:

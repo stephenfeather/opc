@@ -5,11 +5,11 @@ This module infers Pydantic models from actual response data when output
 schemas are not available or incomplete.
 """
 
+import faulthandler
+import os
 from typing import Any
 
-import os
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
 
 
 def infer_python_type(value: Any) -> str:

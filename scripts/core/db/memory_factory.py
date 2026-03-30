@@ -6,13 +6,13 @@ Provides factory functions for backend instantiation with:
 - Dependency validation
 """
 
+import faulthandler
 import os
 from typing import Any, Literal
 
 from .memory_protocol import MemoryBackend
 
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
 
 BackendType = Literal["sqlite", "postgres"]
 

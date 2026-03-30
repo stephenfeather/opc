@@ -19,7 +19,7 @@ import faulthandler
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 faulthandler.enable(
@@ -205,9 +205,9 @@ def _handoff_from_jsonl(jsonl_path: Path, session_id: str, project_dir: str) -> 
             dt = datetime.fromisoformat(timestamps["first_timestamp"].replace("Z", "+00:00"))
             date_str = dt.strftime("%Y-%m-%d")
         except (ValueError, TypeError):
-            date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            date_str = datetime.now(UTC).strftime("%Y-%m-%d")
     else:
-        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        date_str = datetime.now(UTC).strftime("%Y-%m-%d")
 
     # Limit commands to last 50
     recent_commands = [c["command"] for c in commands[-50:]]
@@ -279,9 +279,9 @@ def _handoff_from_state_file(state_file: Path, session_id: str, project_dir: str
             dt = datetime.fromisoformat(first_ts.replace("Z", "+00:00"))
             date_str = dt.strftime("%Y-%m-%d")
         except (ValueError, TypeError):
-            date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            date_str = datetime.now(UTC).strftime("%Y-%m-%d")
     else:
-        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        date_str = datetime.now(UTC).strftime("%Y-%m-%d")
 
     recent_commands = [c["command"] for c in commands[-50:]]
 

@@ -11,14 +11,13 @@ Usage:
     python /path/to/benchmark_tokens.py
 """
 
-import json
+import faulthandler
 import os
 import subprocess
 import sys
 from pathlib import Path
 
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
 
 # Try to import tiktoken
 try:
@@ -104,7 +103,7 @@ def main():
     print("TOKEN SAVINGS BENCHMARK: Raw Files vs TLDR")
     print("=" * 70)
     print(f"Project: {project}")
-    print(f"Encoder: cl100k_base (Claude)")
+    print("Encoder: cl100k_base (Claude)")
     print()
 
     results = []

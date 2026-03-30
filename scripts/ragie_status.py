@@ -14,6 +14,7 @@ Examples:
 """
 
 import argparse
+import faulthandler
 import json
 import os
 import sys
@@ -21,8 +22,7 @@ import sys
 import httpx
 from dotenv import load_dotenv
 
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
 
 load_dotenv()
 

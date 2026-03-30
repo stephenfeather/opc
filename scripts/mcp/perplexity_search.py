@@ -34,11 +34,11 @@ Requires: PERPLEXITY_API_KEY in environment or ~/.claude/.env
 
 import argparse
 import asyncio
+import faulthandler
 import os
 import sys
 from pathlib import Path
 
-import faulthandler
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
 # API configuration

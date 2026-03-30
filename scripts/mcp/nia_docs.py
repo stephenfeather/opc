@@ -62,13 +62,12 @@ Requires: NIA_API_KEY environment variable
 
 import argparse
 import asyncio
+import faulthandler
 import json
 import os
 import sys
 from pathlib import Path
-from typing import List
 
-import faulthandler
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
 # API base URL
@@ -322,7 +321,7 @@ async def oracle_stream_job_events(job_id: str) -> None:
 async def search_query(
     messages: list[dict],
     repositories: list[str] = None,
-    data_sources: List[str] = None,
+    data_sources: list[str] = None,
     search_mode: str = "repositories",
     include_sources: bool = True,
 ) -> dict:

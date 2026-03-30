@@ -41,10 +41,11 @@ load_dotenv()
 project_dir = os.environ.get("CLAUDE_PROJECT_DIR", str(Path(__file__).parent.parent.parent))
 sys.path.insert(0, project_dir)
 
+import faulthandler
+
 from scripts.core.db.embedding_service import EmbeddingError, VoyageEmbeddingProvider  # noqa: E402
 from scripts.core.db.postgres_pool import close_pool, get_connection  # noqa: E402
 
-import faulthandler
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
 BATCH_SIZE = 64

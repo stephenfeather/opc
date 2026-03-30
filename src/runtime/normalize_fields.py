@@ -6,13 +6,13 @@ but expect PascalCase prefixes in certain contexts. This module provides
 configurable normalization strategies.
 """
 
+import faulthandler
+import os
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
-import os
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
 
 # Type alias for normalization strategies
 NormalizationStrategy = Literal["none", "ado-pascal-case"]

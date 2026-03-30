@@ -27,13 +27,13 @@ Requires: pint (pip install pint)
 
 import argparse
 import asyncio
+import faulthandler
 import json
+import os
 import re
 import sys
 from typing import Any
 
-import os
-import faulthandler
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
 # =============================================================================

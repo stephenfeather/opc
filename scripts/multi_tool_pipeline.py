@@ -23,11 +23,11 @@ REQUIREMENTS:
 
 import argparse
 import asyncio
+import faulthandler
+import os
 import sys
 
-import os
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
 
 
 def parse_args():

@@ -5,11 +5,12 @@ Converts MCP tool schemas (JSON Schema format) to Pydantic model definitions.
 Uses dispatch tables to reduce cyclomatic complexity.
 """
 
-from typing import Any, Callable
-
-import os
 import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+import os
+from collections.abc import Callable
+from typing import Any
+
+faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
 
 
 # ===========================================================================

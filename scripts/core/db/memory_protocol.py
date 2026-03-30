@@ -6,11 +6,11 @@ Uses Protocol for structural typing (duck typing with type checking).
 Both SQLite and PostgreSQL implementations satisfy this protocol.
 """
 
+import faulthandler
+import os
 from typing import Any, Protocol
 
-import os
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
 
 
 class MemoryBackend(Protocol):

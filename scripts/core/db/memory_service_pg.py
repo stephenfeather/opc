@@ -27,7 +27,9 @@ Usage:
 
 from __future__ import annotations
 
+import faulthandler
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol
@@ -38,8 +40,6 @@ import numpy as np
 
 from .postgres_pool import get_connection, get_pool, get_transaction, init_pgvector
 
-import os
-import faulthandler
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
 

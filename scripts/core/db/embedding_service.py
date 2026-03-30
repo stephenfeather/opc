@@ -28,14 +28,14 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import faulthandler
 import hashlib
 import os
 from abc import ABC, abstractmethod
 
 import httpx
 
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
 
 
 class EmbeddingError(Exception):
@@ -467,6 +467,7 @@ class OllamaEmbeddingProvider(EmbeddingProvider):
             host: Ollama server URL (default from OLLAMA_HOST env or localhost:11434)
         """
         import os
+
         import httpx
 
         self.model = model or os.getenv("OLLAMA_EMBED_MODEL", self.DEFAULT_MODEL)

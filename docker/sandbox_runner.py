@@ -24,15 +24,15 @@ Output format (failure):
 
 from __future__ import annotations
 
+import faulthandler
 import json
+import os
 import resource
 import signal
 import sys
 from typing import Any
 
-import os
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
 
 # Set resource limits
 CPU_LIMIT = 30  # seconds

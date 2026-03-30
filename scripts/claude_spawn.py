@@ -7,6 +7,7 @@ Spawns Claude agents via `claude -p` command with:
 - CoordinationDB registration
 """
 
+import faulthandler
 import json
 import logging
 import os
@@ -19,7 +20,6 @@ from pathlib import Path
 
 import psutil
 
-import faulthandler
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
 # Configure logging

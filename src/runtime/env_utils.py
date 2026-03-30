@@ -5,6 +5,7 @@ This module provides:
 - ${VAR} and ${VAR:-default} expansion in config values
 """
 
+import faulthandler
 import os
 import re
 from pathlib import Path
@@ -12,8 +13,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
 
 # Pattern for ${VAR} or ${VAR:-default}
 ENV_VAR_PATTERN = re.compile(r"\$\{([^}:]+)(?::-([^}]*))?\}")

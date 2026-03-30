@@ -52,13 +52,13 @@ Requires: shapely (pip install shapely)
 
 import argparse
 import asyncio
-import json
-import sys
-from typing import Any, Tuple
-
-import os
 import faulthandler
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+import json
+import os
+import sys
+from typing import Any
+
+faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
 
 
 def get_shapely():

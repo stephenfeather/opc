@@ -235,6 +235,7 @@ def _handoff_from_state_file(state_file: Path, session_id: str, project_dir: str
 
     State file is JSONL with events: {timestamp, tool, file?, command?, exit_code?}
     """
+    read_files: list[str] = []
     edited_files: list[str] = []
     created_files: list[str] = []
     commands: list[dict] = []
@@ -259,7 +260,9 @@ def _handoff_from_state_file(state_file: Path, session_id: str, project_dir: str
             tool_counts[tool] = tool_counts.get(tool, 0) + 1
 
             file_path = event.get("file", "")
-            if tool in ("Edit", "MultiEdit") and file_path and file_path not in edited_files:
+            if tool == "Read" and file_path and file_path not in read_files:
+                read_files.append(file_path)
+            elif tool in ("Edit", "MultiEdit") and file_path and file_path not in edited_files:
                 edited_files.append(file_path)
             elif tool == "Write" and file_path and file_path not in created_files:
                 created_files.append(file_path)
@@ -289,7 +292,7 @@ def _handoff_from_state_file(state_file: Path, session_id: str, project_dir: str
         "outcome": "auto-extracted",
         "goal": "Auto-extracted session summary",
         "files": {
-            "read": [],
+            "read": read_files,
             "modified": edited_files,
             "created": created_files,
         },

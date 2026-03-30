@@ -39,6 +39,12 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+# Ensure project root is on sys.path so `scripts.*` imports work
+# when launched via `uv run` (which doesn't add cwd to sys.path)
+_project_root = str(Path(__file__).parent.parent.parent)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
 import faulthandler
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 

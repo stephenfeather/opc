@@ -25,12 +25,16 @@ project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 # Load BRAINTRUST_API_KEY from .env files
+# Precedence: project_root > ~/opc > ~/.claude (first found wins)
+# override=True on first hit to replace any stale shell env vars
 from dotenv import load_dotenv  # noqa: E402
 
+_env_loaded = False
 for env_dir in [project_root, Path.home() / "opc", Path.home() / ".claude"]:
     env_file = env_dir / ".env"
     if env_file.exists():
-        load_dotenv(env_file, override=True)
+        load_dotenv(env_file, override=not _env_loaded)
+        _env_loaded = True
 
 from scripts.braintrust_analyze import classify_learning  # noqa: E402
 
@@ -214,6 +218,12 @@ async def main():
         default=1.0,
         help="Seconds between API calls (default: 1.0)",
     )
+    parser.add_argument(
+        "--accuracy-threshold",
+        type=float,
+        default=0.8,
+        help="Minimum accuracy to pass (default: 0.8)",
+    )
     args = parser.parse_args()
 
     print(f"Loading golden set from {args.golden_set}")
@@ -229,7 +239,7 @@ async def main():
     # Build output
     output = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "golden_set": str(args.golden_set),
+        "golden_set": str(args.golden_set.relative_to(project_root)),
         "metrics": metrics,
         "duration_seconds": eval_result["duration_seconds"],
         "predictions": eval_result["predictions"],
@@ -240,7 +250,7 @@ async def main():
             json.dump(output, f, indent=2)
         print(f"\nResults written to {args.output}")
 
-    return 0 if metrics["accuracy"] >= 0.8 else 1
+    return 0 if metrics["accuracy"] >= args.accuracy_threshold else 1
 
 
 if __name__ == "__main__":

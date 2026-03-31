@@ -1,18 +1,18 @@
 {
-  "timestamp": "2026-03-31T14:25:16",
-  "golden_set": "/Users/stephenfeather/opc/.worktrees/learning-classifier/tests/eval/golden_set.jsonl",
+  "timestamp": "2026-03-31T15:16:38",
+  "golden_set": "tests/eval/golden_set.jsonl",
   "metrics": {
-    "accuracy": 0.8431,
-    "correct": 43,
-    "total": 51,
+    "accuracy": 0.7857,
+    "correct": 44,
+    "total": 56,
     "per_class": {
       "ARCHITECTURAL_DECISION": {
-        "precision": 0.0,
-        "recall": 0.0,
-        "support": 0
+        "precision": 1.0,
+        "recall": 0.2,
+        "support": 5
       },
       "CODEBASE_PATTERN": {
-        "precision": 0.812,
+        "precision": 0.722,
         "recall": 0.812,
         "support": 16
       },
@@ -37,13 +37,17 @@
         "support": 9
       },
       "WORKING_SOLUTION": {
-        "precision": 0.8,
+        "precision": 0.571,
         "recall": 0.8,
         "support": 5
       }
     },
     "confusion_matrix": {
-      "ARCHITECTURAL_DECISION": {},
+      "ARCHITECTURAL_DECISION": {
+        "ARCHITECTURAL_DECISION": 1,
+        "CODEBASE_PATTERN": 2,
+        "WORKING_SOLUTION": 2
+      },
       "CODEBASE_PATTERN": {
         "CODEBASE_PATTERN": 13,
         "USER_PREFERENCE": 3
@@ -70,7 +74,7 @@
       }
     }
   },
-  "duration_seconds": 63.22,
+  "duration_seconds": 69.92,
   "predictions": [
     {
       "id": "207eac33-eb53-49d2-b612-d88edf0dbe30",
@@ -78,7 +82,7 @@
       "predicted": "CODEBASE_PATTERN",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It describes how session IDs are structured and mapped in the system without any failure context, fix, preference, or explicit decision.",
+      "reasoning": "It describes how the system represents and maps two different session IDs via a database column, without a failure, fix, preference, or explicit decision.",
       "error": null
     },
     {
@@ -87,7 +91,7 @@
       "predicted": "CODEBASE_PATTERN",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It describes Vue\u2019s reactivity behavior with Set mutations requiring replacement, without a specific failure symptom/error context or explicit decision.",
+      "reasoning": "It describes Vue reactivity behavior with Set mutations (requires full replacement) without an explicit failure symptom or personal preference.",
       "error": null
     },
     {
@@ -96,7 +100,7 @@
       "predicted": "USER_PREFERENCE",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It prescribes an enforced workflow and commit conventions using imperative language like 'must' and an ordered commit structure, matching rule 4.",
+      "reasoning": "It prescribes a required workflow and commit organization using imperative language like \"must\" and specific conventions, matching the USER_PREFERENCE rule.",
       "error": null
     },
     {
@@ -105,7 +109,7 @@
       "predicted": "WORKING_SOLUTION",
       "correct": true,
       "confidence": "medium",
-      "reasoning": "It describes a concrete successful technique\u2014merging overly granular subcategories into broader ones and using filter attributes (caliber) to address an overly granular taxonomy problem.",
+      "reasoning": "It describes a successful action taken to address overly granular taxonomy design by merging subcategories and using attributes as filters.",
       "error": null
     },
     {
@@ -114,7 +118,7 @@
       "predicted": "FAILED_APPROACH",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It describes a negative merge outcome where PR #8 overwrote and deleted the modular Admin page classes from PR #7 due to an architectural mismatch, indicating the approach did not work as intended.",
+      "reasoning": "The merge of PR #8 had a negative outcome (it deleted the modular Admin page classes), indicating the attempted approach/merge did not work as intended.",
       "error": null
     },
     {
@@ -123,7 +127,7 @@
       "predicted": "CODEBASE_PATTERN",
       "correct": true,
       "confidence": "medium",
-      "reasoning": "It states a general boundary for where TDD applies (business logic like parsers/handlers) versus where it doesn\u2019t (migrations/schema), without describing a failed attempt, fix, or explicit personal rule.",
+      "reasoning": "It delineates where TDD applies versus not as a general practice/observation, without describing a failed attempt, specific error fix, open TODO, or explicit personal mandate.",
       "error": null
     },
     {
@@ -131,8 +135,8 @@
       "expected": "CODEBASE_PATTERN",
       "predicted": "USER_PREFERENCE",
       "correct": false,
-      "confidence": "high",
-      "reasoning": "It\u2019s a prescriptive imperative (\u201cimplement client-side usage tracking\u201d) about how to handle rate-limited APIs, without a specific error symptom or explicit trade-off.",
+      "confidence": "medium",
+      "reasoning": "It\u2019s a prescriptive imperative (\u201cimplement client-side usage tracking\u201d) without a specific error symptom, framing a required practice.",
       "error": null
     },
     {
@@ -140,8 +144,8 @@
       "expected": "WORKING_SOLUTION",
       "predicted": "CODEBASE_PATTERN",
       "correct": false,
-      "confidence": "medium",
-      "reasoning": "It states how numDays should be derived from endHours in the computed property without describing a specific failure symptom, fix context, or explicit decision trade-offs.",
+      "confidence": "high",
+      "reasoning": "It states how the computed property should derive numDays from endHours without mentioning a failed attempt, specific error symptom, or explicit trade-off decision, so it\u2019s an observation about intended code behavior.",
       "error": null
     },
     {
@@ -149,8 +153,8 @@
       "expected": "CODEBASE_PATTERN",
       "predicted": "CODEBASE_PATTERN",
       "correct": true,
-      "confidence": "high",
-      "reasoning": "It describes a general pattern for implementing multi-item auto-calculation (map + reduce with Math.max) without any failure, error symptom, preference, or explicit decision trade-off.",
+      "confidence": "medium",
+      "reasoning": "It describes a general pattern for extending single-item calculation to arrays (map + reduce with Math.max) without a specific error, failure, preference, or decision context.",
       "error": null
     },
     {
@@ -159,7 +163,7 @@
       "predicted": "USER_PREFERENCE",
       "correct": false,
       "confidence": "high",
-      "reasoning": "It\u2019s a prescriptive, imperative workflow guideline (use task-master-ai, break into phases, implement MVP first, follow TDD, ensure quality) rather than a failure, fix, or observed system behavior.",
+      "reasoning": "It prescribes a specific workflow with imperative steps (use task-master-ai, break into phases, implement MVP first, follow TDD, ensure quality), matching the user-enforced rule pattern.",
       "error": null
     },
     {
@@ -168,7 +172,7 @@
       "predicted": "CODEBASE_PATTERN",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It describes how the hook-auto-execute rule applies (when deny+command) and when it does not, without a failure context, fix, preference, or decision.",
+      "reasoning": "It describes how the hook-auto-execute rule applies (when deny+command) and when it doesn't (skill/Task recommendation) without a failure, fix, preference, or decision.",
       "error": null
     },
     {
@@ -177,7 +181,7 @@
       "predicted": "CODEBASE_PATTERN",
       "correct": true,
       "confidence": "medium",
-      "reasoning": "It describes a bug/behavior where sessions are marked extracted when queued rather than completed, without stating a specific fix or resolution.",
+      "reasoning": "It describes a bug/behavior where sessions were marked extracted when queued rather than on completion, but does not include an explicit fix or resolution.",
       "error": null
     },
     {
@@ -186,7 +190,7 @@
       "predicted": "USER_PREFERENCE",
       "correct": false,
       "confidence": "medium",
-      "reasoning": "It gives a prescriptive workflow rule (verify dependencies via git history rather than status fields), matching the imperative 'must/verify' style of USER_PREFERENCE.",
+      "reasoning": "It\u2019s a prescriptive instruction to verify task dependencies via git history rather than relying on status fields, matching the imperative workflow rule in USER_PREFERENCE.",
       "error": null
     },
     {
@@ -195,7 +199,7 @@
       "predicted": "ERROR_FIX",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It cites a specific error message (\"No such module XCTest\") and explains the cause/fix: SourceKit errors until the files are added to the Xcode project.",
+      "reasoning": "It cites a specific error message (\"No such module XCTest\") and explains the cause and resolution (files not yet added to Xcode project; adding them fixes it).",
       "error": null
     },
     {
@@ -204,7 +208,7 @@
       "predicted": "CODEBASE_PATTERN",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It\u2019s an observational statement about how multi-dose PK concentration peaks behave under BID dosing with accumulation, with no failure, fix, preference, or decision involved.",
+      "reasoning": "It describes expected PK behavior under BID dosing with accumulation (peaks increasing until steady state) without any failure, fix, preference, or decision.",
       "error": null
     },
     {
@@ -213,7 +217,7 @@
       "predicted": "USER_PREFERENCE",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It prescribes an imperative workflow rule (\u201calways run... BEFORE committing\u201d and commit regenerated artifacts with source), matching the USER_PREFERENCE rule.",
+      "reasoning": "It\u2019s a prescriptive workflow rule (\u201calways run... BEFORE committing\u201d, \u201cshould be committed along with...\u201d) that matches the USER_PREFERENCE criterion.",
       "error": null
     },
     {
@@ -222,7 +226,7 @@
       "predicted": "ERROR_FIX",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It describes the symptom (npm audit shows stale vulnerability reports) and the fix/cause (node_modules not updated; run npm install after updating package.json).",
+      "reasoning": "It describes the symptom (npm audit showing stale vulnerability reports) and the fix/cause (node_modules not updated; run npm install after updating package.json).",
       "error": null
     },
     {
@@ -240,7 +244,7 @@
       "predicted": "CODEBASE_PATTERN",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It describes WordPress REST API behavior (updates replace full content and raw may be null) without a specific failure symptom or explicit problem-solving narrative.",
+      "reasoning": "It describes WordPress REST API behavior (updates replace entire content and GET raw may be null) without a specific error symptom/fix, preference, or decision.",
       "error": null
     },
     {
@@ -249,7 +253,7 @@
       "predicted": "USER_PREFERENCE",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It is a prescriptive rule ('Always use do/try/catch with logging, not try?') about how saves should be handled, matching the imperative convention in rule 4.",
+      "reasoning": "It\u2019s a prescriptive rule (\u201cAlways use do/try/catch \u2026 not try?\u201d) about how to handle SwiftData saves, matching the imperative preference rule.",
       "error": null
     },
     {
@@ -257,8 +261,8 @@
       "expected": "ERROR_FIX",
       "predicted": "ERROR_FIX",
       "correct": true,
-      "confidence": "medium",
-      "reasoning": "It describes a validation error symptom (MCP adapter expects an object but gets []) and identifies the root cause as PHP serialization behavior.",
+      "confidence": "high",
+      "reasoning": "It describes a validation error symptom (MCP adapter expects an object but gets []), and identifies the root cause as PHP serialization behavior.",
       "error": null
     },
     {
@@ -267,7 +271,7 @@
       "predicted": "ERROR_FIX",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It states a concrete symptom (npm audit vulnerabilities/stale results after npm audit fix) and the fix/cause (node_modules is stale; run npm install in the correct directory).",
+      "reasoning": "It names a concrete symptom (npm audit shows vulnerabilities/stale results after audit fix) and gives the fix/cause (node_modules is stale; run npm install in the correct directory).",
       "error": null
     },
     {
@@ -276,7 +280,7 @@
       "predicted": "ERROR_FIX",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It describes a failure symptom (tests still using old values after file update) and identifies the cause and fix (PHPUnit cache; clear cache or rerun tests).",
+      "reasoning": "It describes a failure symptom (tests still fail with old values after updating the file) and identifies the cause/fix (PHPUnit cache; clear cache or rerun tests).",
       "error": null
     },
     {
@@ -285,7 +289,7 @@
       "predicted": "USER_PREFERENCE",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It states a prescriptive rule ('Never manually add Co-Authored-By: Claude') about how commits should be made, matching the user-enforced convention category.",
+      "reasoning": "It prescribes a rule in imperative terms (\u201cNever manually add Co-Authored-By: Claude\u201d) about how commits should be authored, reflecting an enforced workflow preference.",
       "error": null
     },
     {
@@ -294,7 +298,7 @@
       "predicted": "FAILED_APPROACH",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It describes that a global replace_all approach was tried and leads to incorrect updates (negative outcome), so it matches the failed approach rule.",
+      "reasoning": "It warns that using a global replace_all was tried/considered and leads to an incorrect outcome (updates all intents), so it matches a failed/anti-pattern approach.",
       "error": null
     },
     {
@@ -303,7 +307,7 @@
       "predicted": "FAILED_APPROACH",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It labels using wp eval as an anti-pattern to be avoided (a negative/failed approach) and suggests not using it for testing.",
+      "reasoning": "It explicitly labels using `wp eval` as an antipattern to be avoided (a negative/failed approach) when testing fa-wpmcp abilities, matching rule 1.",
       "error": null
     },
     {
@@ -312,7 +316,7 @@
       "predicted": "WORKING_SOLUTION",
       "correct": false,
       "confidence": "medium",
-      "reasoning": "It recommends a proactive technique (estimate context usage and create a handoff between tasks) to address the concrete problem of context exhaustion during multi-image sessions.",
+      "reasoning": "It recommends a proactive technique (estimate context usage and create a handoff between tasks) to handle the concrete problem of context consumption during multi-image sessions.",
       "error": null
     },
     {
@@ -321,7 +325,7 @@
       "predicted": "CODEBASE_PATTERN",
       "correct": false,
       "confidence": "medium",
-      "reasoning": "It describes system behavior (in-memory queue state is lost on restart and zombie processes can block processing) without a completed fix or a tried-and-failed approach.",
+      "reasoning": "It describes observed behavior of the daemon (in-memory queue lost on restart and blocked by zombies) without a specific implemented fix or completed action, so it matches the default behavior pattern.",
       "error": null
     },
     {
@@ -330,7 +334,7 @@
       "predicted": "FAILED_APPROACH",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It reports that both HTML entities and zero-width spaces were tried for copy-pasteable code examples in WordPress and both approaches fail/break.",
+      "reasoning": "It states that HTML entities and zero-width spaces were tried for copy-pasteable code examples in WordPress and both approaches fail (negative outcome).",
       "error": null
     },
     {
@@ -339,7 +343,7 @@
       "predicted": "FAILED_APPROACH",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It states Cmd+Q was used to test crash recovery and 'doesn't work' because it performs a graceful SIGTERM shutdown rather than a true crash.",
+      "reasoning": "It explicitly says using Cmd+Q to test crash recovery 'doesn't work' because it triggers a graceful shutdown, indicating a tried approach that failed (Rule 1).",
       "error": null
     },
     {
@@ -357,7 +361,7 @@
       "predicted": "FAILED_APPROACH",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It explicitly states HTML entities are NOT decoded and thus are not a viable workaround, indicating a tried approach that did not work (rule 1).",
+      "reasoning": "Rule 1 matches because it states HTML entities are NOT decoded in WordPress output, making this attempted WAF-bypass workaround not viable (a negative outcome).",
       "error": null
     },
     {
@@ -366,7 +370,7 @@
       "predicted": "OPEN_THREAD",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It states the Pi database is behind 5 migrations and lists missing tables with an explicit action needed before deployment, matching the incomplete-work signal in rule 3.",
+      "reasoning": "It states the Pi database is behind 5 migrations and specifies missing tables with a required action to run migrations before deploying, indicating incomplete work to resume.",
       "error": null
     },
     {
@@ -375,7 +379,7 @@
       "predicted": "CODEBASE_PATTERN",
       "correct": false,
       "confidence": "high",
-      "reasoning": "It\u2019s an observation about configuration defaults and their effect on embedding search quality, with no explicit failed attempt, fix, or prescribed action.",
+      "reasoning": "It describes existing environment/config behavior and its consequence on search quality without an explicit attempted fix, error symptom+resolution, preference, or decision.",
       "error": null
     },
     {
@@ -384,7 +388,7 @@
       "predicted": "ERROR_FIX",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It identifies a specific failure symptom (empty parameters {} become null due to PHP empty()) and provides the concrete fix (replace empty() check with !isset() or is_null()).",
+      "reasoning": "It describes a specific failure symptom (empty {} treated as null due to PHP empty()) and provides the concrete fix (use !isset()/is_null() instead of empty()).",
       "error": null
     },
     {
@@ -393,7 +397,7 @@
       "predicted": "FAILED_APPROACH",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It reports that attempted fixes did not work and the MCP execution still fails with a generic error despite direct PHP working.",
+      "reasoning": "It reports that attempts to fix MCP execution still fail (negative outcome) while direct PHP works, matching a tried-but-did-not-work result.",
       "error": null
     },
     {
@@ -402,7 +406,7 @@
       "predicted": "OPEN_THREAD",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It states the endpoint is an incomplete implementation (never calls detect and returns empty), indicating work still needs to be done.",
+      "reasoning": "It explicitly notes an incomplete implementation (endpoint never calls detect and returns an empty list), indicating work that still needs to be completed.",
       "error": null
     },
     {
@@ -411,7 +415,7 @@
       "predicted": "CODEBASE_PATTERN",
       "correct": true,
       "confidence": "high",
-      "reasoning": "This is a factual observation about the user's hardware environment and capability (no failure, fix, preference, decision, or action solving a problem).",
+      "reasoning": "It\u2019s a factual observation about the user\u2019s hardware and capabilities with no failure, fix, preference, decision, or problem-solving action described.",
       "error": null
     },
     {
@@ -420,7 +424,7 @@
       "predicted": "FAILED_APPROACH",
       "correct": false,
       "confidence": "medium",
-      "reasoning": "It labels conditional expects as an anti-pattern (a negative approach that should not be used), matching the failure/anti-pattern signal in rule 1.",
+      "reasoning": "It labels conditional expects as an anti-pattern (a negative/does-not-work approach) and recommends refactoring, matching the failed approach rule first.",
       "error": null
     },
     {
@@ -429,7 +433,7 @@
       "predicted": "USER_PREFERENCE",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It\u2019s a prescriptive rule (\u201calways use ParaTest instead of PHPUnit\u201d) for this project\u2019s testing workflow, matching the USER_PREFERENCE rule.",
+      "reasoning": "It is a prescriptive rule (\u201calways use ParaTest instead of PHPUnit\u201d) indicating an enforced workflow preference for the project.",
       "error": null
     },
     {
@@ -438,7 +442,7 @@
       "predicted": "CODEBASE_PATTERN",
       "correct": true,
       "confidence": "medium",
-      "reasoning": "It states a general workflow pattern (search-read-edit) without describing a failure, fix, explicit preference, or decision rationale, so it defaults to an observational pattern.",
+      "reasoning": "It states a general workflow pattern (search-read-edit) without a failure, fix, incomplete work, or explicit user-enforced rule, so it defaults to CODEBASE_PATTERN.",
       "error": null
     },
     {
@@ -447,7 +451,7 @@
       "predicted": "CODEBASE_PATTERN",
       "correct": true,
       "confidence": "medium",
-      "reasoning": "It describes expected behavior/interpretation of a git instruction and cautions that deleting the old branch is destructive and should require confirmation, without a specific error, failed attempt, or explicit user-enforced preference.",
+      "reasoning": "It describes expected git intent/behavior and a safety constraint (deleting master requires confirmation) without a specific error, completed fix, or user-enforced preference.",
       "error": null
     },
     {
@@ -456,7 +460,7 @@
       "predicted": "USER_PREFERENCE",
       "correct": true,
       "confidence": "high",
-      "reasoning": "This is a prescriptive workflow rule the user requires (always GPG sign commits, never use --no-gpg-sign, and leave changes staged if signing fails).",
+      "reasoning": "It states prescriptive workflow rules the user requires (always GPG sign commits, never use --no-gpg-sign, and leave changes staged if signing fails).",
       "error": null
     },
     {
@@ -465,7 +469,7 @@
       "predicted": "USER_PREFERENCE",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It prescribes a required documentation convention (\u201cshould be documented in README.md under Future Enhancements\u201d), matching the imperative workflow rule.",
+      "reasoning": "It\u2019s a prescriptive documentation convention ('should be documented in README.md under Future Enhancements'), matching the imperative rule in USER_PREFERENCE.",
       "error": null
     },
     {
@@ -474,7 +478,7 @@
       "predicted": "USER_PREFERENCE",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It prescribes a required way to select Gemini models (never use GEMINI_MODEL; use the --model flag), matching the imperative workflow rule in USER_PREFERENCE.",
+      "reasoning": "It prescribes a required way to configure the Gemini agent (do not use GEMINI_MODEL; use --model flag), matching the imperative convention rule.",
       "error": null
     },
     {
@@ -492,7 +496,7 @@
       "predicted": "CODEBASE_PATTERN",
       "correct": true,
       "confidence": "high",
-      "reasoning": "This states how Vue Test Utils exposes refs on the component instance (already unwrapped) without describing a failure, explicit error symptom, or user-enforced convention.",
+      "reasoning": "It describes how Vue Test Utils behaves by exposing refs as already-unwrapped properties, without a failure symptom, explicit fix context, or personal preference.",
       "error": null
     },
     {
@@ -501,7 +505,7 @@
       "predicted": "ERROR_FIX",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It describes the symptom (Alexa skill simulation showed an unexpected error) and the diagnosed cause (issue was on the Alexa side, not Lambda) along with the verification step to confirm Lambda behavior.",
+      "reasoning": "It describes a concrete failure symptom (unexpected error in Alexa simulation) and identifies the root cause (Alexa-side, not Lambda) along with the diagnostic fix (verify by direct Lambda invoke first).",
       "error": null
     },
     {
@@ -510,7 +514,7 @@
       "predicted": "CODEBASE_PATTERN",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It describes how Gutenberg block delimiters and the REST API's block_version behavior work, without a failure context, fix, or prescriptive preference.",
+      "reasoning": "It describes the Gutenberg block delimiter format and REST API behavior (block_version: 1 rendering) without a failure, fix, preference, or explicit decision.",
       "error": null
     },
     {
@@ -519,7 +523,7 @@
       "predicted": "WORKING_SOLUTION",
       "correct": true,
       "confidence": "high",
-      "reasoning": "It describes a successful refactoring technique to handle the concrete problem of large-scale (70+ files) refactoring by establishing a pattern manually then parallelizing with agents.",
+      "reasoning": "It provides a successful technique for handling the concrete problem of large-scale refactoring by combining manual pattern-setting with parallel agents.",
       "error": null
     },
     {
@@ -528,7 +532,52 @@
       "predicted": "WORKING_SOLUTION",
       "correct": true,
       "confidence": "medium",
-      "reasoning": "It describes concrete steps to successfully backfill unregistered Claude Code sessions into PostgreSQL for the memory daemon.",
+      "reasoning": "It describes a concrete technique (using JSONL UUIDs as session IDs and DFS path decoding) to solve the problem of backfilling unregistered sessions into PostgreSQL.",
+      "error": null
+    },
+    {
+      "id": "4de5a260-01b1-4837-adc5-29cc0ad24b48",
+      "expected": "ARCHITECTURAL_DECISION",
+      "predicted": "ARCHITECTURAL_DECISION",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It explicitly chooses a database-based crash detection design over file marker-based tracking, describing the alternative and how the new schema/queries replace it.",
+      "error": null
+    },
+    {
+      "id": "7598903e-052e-4730-86ee-e56c883be1c3",
+      "expected": "ARCHITECTURAL_DECISION",
+      "predicted": "WORKING_SOLUTION",
+      "correct": false,
+      "confidence": "medium",
+      "reasoning": "It describes a concrete problem (false crash detection with multiple terminals due to a single marker file) and the successful action taken to fix it (migrating to a PostgreSQL sessions table).",
+      "error": null
+    },
+    {
+      "id": "8ac1029b-733d-44a7-ae99-e87a066d68e5",
+      "expected": "ARCHITECTURAL_DECISION",
+      "predicted": "CODEBASE_PATTERN",
+      "correct": false,
+      "confidence": "high",
+      "reasoning": "It observes that constructor side effects and tight coupling limit unit-test coverage in WordPress plugins without describing a failed attempt, specific error fix, or explicit decision between alternatives.",
+      "error": null
+    },
+    {
+      "id": "c91d738d-a268-499a-bedc-d879cbd039f7",
+      "expected": "ARCHITECTURAL_DECISION",
+      "predicted": "WORKING_SOLUTION",
+      "correct": false,
+      "confidence": "high",
+      "reasoning": "It describes a concrete problem (loss of original markdown content during parsing) and the successful action to resolve it (re-read the original markdown file when generating artifacts).",
+      "error": null
+    },
+    {
+      "id": "f3649996-7197-42ef-9680-1f20729578bb",
+      "expected": "ARCHITECTURAL_DECISION",
+      "predicted": "CODEBASE_PATTERN",
+      "correct": false,
+      "confidence": "high",
+      "reasoning": "It describes the established code behavior/pattern for choosing between comparePrescriptions and currentPrescription without mentioning a failure, fix, or personal preference.",
       "error": null
     }
   ]

@@ -40,6 +40,7 @@ sys.path.insert(0, project_dir)
 from scripts.core.pattern_detector import (  # noqa: E402
     DetectedPattern,
     Learning,
+    _learning_to_dict,
     detect_patterns,
 )
 
@@ -359,8 +360,6 @@ async def run_pattern_detection(
     # Build classifier
     classifier = None
     if use_llm:
-        from scripts.core.pattern_detector import _learning_to_dict
-
         async def _llm_classifier(members):
             from scripts.braintrust_analyze import classify_pattern_llm
             dicts = [_learning_to_dict(m) for m in members]

@@ -1236,6 +1236,10 @@ async def reclassify_learnings(
 
     stats = {"processed": 0, "changed": 0, "unchanged": 0, "errors": 0, "changes": []}
 
+    write_conn = None
+    if not dry_run:
+        write_conn = psycopg2.connect(db_url)
+
     for row_id, content, metadata in rows:
         stats["processed"] += 1
         existing_type = (metadata or {}).get("learning_type")
@@ -1266,32 +1270,31 @@ async def reclassify_learnings(
             )
 
             if not dry_run:
-                write_conn = psycopg2.connect(db_url)
-                try:
-                    with write_conn.cursor() as cur:
-                        cur.execute("""
-                            UPDATE archival_memory
-                            SET metadata = metadata || %s::jsonb
-                            WHERE id = %s
-                        """, (
-                            json.dumps({
-                                "learning_type": result["learning_type"],
-                                "classification_reasoning": (
-                                    result["reasoning"]
-                                ),
-                                "classified_at": (
-                                    datetime.now().isoformat()
-                                ),
-                                "classified_by": "llm_judge",
-                            }),
-                            row_id,
-                        ))
-                    write_conn.commit()
-                finally:
-                    write_conn.close()
+                with write_conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE archival_memory
+                        SET metadata = metadata || %s::jsonb
+                        WHERE id = %s
+                    """, (
+                        json.dumps({
+                            "learning_type": result["learning_type"],
+                            "classification_reasoning": (
+                                result["reasoning"]
+                            ),
+                            "classified_at": (
+                                datetime.now().isoformat()
+                            ),
+                            "classified_by": "llm_judge",
+                        }),
+                        row_id,
+                    ))
 
         # Rate limit: 1 request/second
         await asyncio.sleep(1)
+
+    if not dry_run and write_conn is not None:
+        write_conn.commit()
+        write_conn.close()
 
     return stats
 

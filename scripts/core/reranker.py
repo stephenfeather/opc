@@ -216,10 +216,15 @@ def compute_type_centroids(rows: list[dict]) -> dict[str, list[float]]:
         ltype = row.get("ltype")
         if ltype is None:
             continue
-        groups.setdefault(ltype, []).append(row["embedding"])
+        embedding = row.get("embedding")
+        if embedding is None or (hasattr(embedding, "__len__") and len(embedding) == 0):
+            continue
+        groups.setdefault(ltype, []).append(embedding)
 
     centroids: dict[str, list[float]] = {}
     for ltype, vectors in groups.items():
+        if not vectors:
+            continue
         n = len(vectors)
         centroid = [sum(dims) / n for dims in zip(*vectors)]
         centroids[ltype] = centroid

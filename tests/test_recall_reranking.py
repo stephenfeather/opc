@@ -79,12 +79,16 @@ class TestNoRerankFlag:
                 return_value=fake_results,
             ),
             patch("scripts.core.recall_learnings.record_recall", new_callable=AsyncMock) as mock_record,
+            patch("scripts.core.reranker.rerank") as mock_rerank,
             patch("sys.argv", ["recall", "--query", "test", "--k", "3", "--no-rerank", "--json"]),
         ):
             from scripts.core.recall_learnings import main
 
             exit_code = await main()
             assert exit_code == 0
+
+            # rerank() should not have been called
+            mock_rerank.assert_not_called()
 
             # record_recall should be called with the original 3 IDs
             mock_record.assert_called_once()
@@ -107,7 +111,14 @@ class TestProjectFlag:
     @pytest.mark.asyncio
     async def test_project_flag_sets_context(self):
         """--project my-project should create RecallContext with project='my-project'."""
+        from scripts.core.reranker import rerank as real_rerank
+
         fake_results = _make_results(3)
+        captured_ctx = []
+
+        def spy_rerank(results, ctx, k=5):
+            captured_ctx.append(ctx)
+            return real_rerank(results, ctx, k=k)
 
         with (
             patch("scripts.core.recall_learnings.get_backend", return_value="postgres"),
@@ -117,28 +128,17 @@ class TestProjectFlag:
                 return_value=fake_results,
             ),
             patch("scripts.core.recall_learnings.record_recall", new_callable=AsyncMock),
-            patch("scripts.core.reranker.rerank", wraps=None) as mock_rerank,
+            patch("scripts.core.reranker.rerank", side_effect=spy_rerank),
             patch("sys.argv", ["recall", "--query", "test", "--k", "3", "--project", "my-project", "--json"]),
         ):
-            # We need to patch rerank inside the lazy import path
-            # Since the import is lazy (inside the if block), we patch it at module level
-            from scripts.core.reranker import RecallContext, rerank as real_rerank
+            from scripts.core.recall_learnings import main
 
-            captured_ctx = []
+            exit_code = await main()
+            assert exit_code == 0
 
-            def fake_rerank(results, ctx, k=5):
-                captured_ctx.append(ctx)
-                return real_rerank(results, ctx, k=k)
-
-            with patch("scripts.core.reranker.rerank", side_effect=fake_rerank):
-                from scripts.core.recall_learnings import main
-
-                exit_code = await main()
-                assert exit_code == 0
-
-                # Verify RecallContext.project was set
-                assert len(captured_ctx) == 1
-                assert captured_ctx[0].project == "my-project"
+            # Verify RecallContext.project was set
+            assert len(captured_ctx) == 1
+            assert captured_ctx[0].project == "my-project"
 
 
 # ---------------------------------------------------------------------------

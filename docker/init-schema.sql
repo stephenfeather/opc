@@ -71,7 +71,10 @@ CREATE TABLE IF NOT EXISTS archival_memory (
 
     -- OPC: Learning chains (superseded learnings)
     superseded_by UUID REFERENCES archival_memory(id),
-    superseded_at TIMESTAMPTZ
+    superseded_at TIMESTAMPTZ,
+
+    -- OPC: Project relevance for contextual reranking
+    project TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_archival_session ON archival_memory(session_id);
@@ -84,6 +87,7 @@ CREATE INDEX IF NOT EXISTS idx_archival_host ON archival_memory(host_id);
 CREATE INDEX IF NOT EXISTS idx_archival_last_recalled ON archival_memory(last_recalled DESC NULLS LAST);
 CREATE INDEX IF NOT EXISTS idx_archival_superseded ON archival_memory(superseded_by) WHERE superseded_by IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_archival_active ON archival_memory(superseded_by) WHERE superseded_by IS NULL;
+CREATE INDEX IF NOT EXISTS idx_archival_project ON archival_memory(project) WHERE project IS NOT NULL;
 
 -- Memory Tags: Structured tag storage for archival_memory entries
 CREATE TABLE IF NOT EXISTS memory_tags (

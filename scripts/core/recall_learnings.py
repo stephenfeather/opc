@@ -807,12 +807,15 @@ async def main() -> int:
             # Fast text-only search (no embeddings)
             results = await search_learnings_text_only_postgres(args.query, fetch_k)
         elif args.vector_only:
+            # When reranking, suppress SQL-level recency blend to avoid
+            # double-counting (the reranker applies its own recency signal).
+            sql_recency = 0.0 if not args.no_rerank else args.recency
             results = await search_learnings(
                 query=args.query,
                 k=fetch_k,
                 provider=args.provider,
                 similarity_threshold=args.threshold,
-                recency_weight=args.recency,
+                recency_weight=sql_recency,
             )
         else:
             # Default: Hybrid RRF search (text + vector combined)
@@ -828,6 +831,14 @@ async def main() -> int:
         else:
             print(f"Error: {e}", file=sys.stderr)
         return 1
+
+    # Hard-filter by tags BEFORE reranking (so reranker sees filtered pool)
+    if args.tags_strict and args.tags:
+        tag_set = set(args.tags)
+        results = [
+            r for r in results
+            if set(r.get("metadata", {}).get("tags", [])) & tag_set
+        ]
 
     # Apply contextual re-ranking
     if not args.no_rerank:
@@ -849,13 +860,6 @@ async def main() -> int:
             retrieval_mode=retrieval_mode,
         )
         results = rerank(results, ctx, k=args.k)
-
-    # Hard-filter by tags if --tags-strict
-    if args.tags_strict and args.tags:
-        results = [
-            r for r in results
-            if set(r.get("metadata", {}).get("tags", [])) & set(args.tags)
-        ]
 
     # Record recall ONLY for final results (after rerank trims)
     await record_recall([r["id"] for r in results])

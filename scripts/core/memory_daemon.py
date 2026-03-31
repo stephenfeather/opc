@@ -78,6 +78,14 @@ LOG_FILE = Path.home() / ".claude" / "memory-daemon.log"
 active_extractions: dict = {}  # pid -> (session_id, proc, jsonl_path, project, start_time)
 pending_queue: list[tuple[str, str, str | None]] = []  # [(session_id, project, transcript_path), ...]
 
+# Pattern detection state (module-level for daemon process)
+# Interval configurable via PATTERN_DETECTION_INTERVAL_HOURS env var
+_PATTERN_DETECTION_INTERVAL = int(
+    os.environ.get("PATTERN_DETECTION_INTERVAL_HOURS", "6")
+) * 3600
+_pattern_proc: subprocess.Popen | None = None
+_last_pattern_run: float = 0
+
 
 def log(msg: str):
     """Write timestamped log message."""
@@ -757,6 +765,54 @@ def queue_or_extract(
         extract_memories(session_id, project, transcript_path)
 
 
+# ---------------------------------------------------------------------------
+# Pattern detection (non-blocking subprocess)
+# ---------------------------------------------------------------------------
+
+def _run_pattern_detection_batch():
+    """Launch pattern detection as a non-blocking subprocess.
+
+    Uses Popen to avoid blocking the daemon loop (detection can take
+    minutes on large datasets). Only one detection run at a time.
+    """
+    global _pattern_proc, _last_pattern_run
+    # Don't start if already running
+    if _pattern_proc is not None and _pattern_proc.poll() is None:
+        log("Pattern detection already running, skipping")
+        return
+    try:
+        project_root = Path(__file__).parent.parent.parent
+        log("Starting pattern detection batch...")
+        _pattern_proc = subprocess.Popen(
+            [sys.executable, "-m", "scripts.core.pattern_batch"],
+            cwd=str(project_root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        _last_pattern_run = time.time()
+    except Exception as e:
+        log(f"Pattern detection launch error: {e}")
+
+
+def _check_pattern_detection():
+    """Check if background pattern detection finished.
+
+    Called from daemon loop each iteration.
+    """
+    global _pattern_proc
+    if _pattern_proc is None:
+        return
+    rc = _pattern_proc.poll()
+    if rc is not None:
+        if rc == 0:
+            stdout = _pattern_proc.stdout.read().decode()[:200]
+            log(f"Pattern detection completed: {stdout}")
+        else:
+            stderr = _pattern_proc.stderr.read().decode()[:200]
+            log(f"Pattern detection failed (rc={rc}): {stderr}")
+        _pattern_proc = None
+
+
 def daemon_loop():
     """Main daemon loop."""
     db_type = "PostgreSQL" if use_postgres() else "SQLite"
@@ -801,6 +857,12 @@ def daemon_loop():
                         queue_or_extract(
                             session_id, project or "", tp
                         )
+            # Pattern detection: check completion, trigger if due
+            _check_pattern_detection()
+            elapsed = time.time() - _last_pattern_run
+            if elapsed > _PATTERN_DETECTION_INTERVAL:
+                _run_pattern_detection_batch()
+
         except Exception as e:
             log(f"Error in daemon loop: {e}")
 
@@ -934,6 +996,34 @@ def status_daemon():
                 print(f"  {status}: {counts.get(status, 0)}")
         except Exception as e:
             print(f"\n  (DB query failed: {e})")
+
+    # Show pattern detection status
+    if use_postgres():
+        try:
+            conn = pg_connect()
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT run_id, MIN(created_at), COUNT(*)
+                FROM detected_patterns
+                WHERE superseded_at IS NULL
+                GROUP BY run_id
+                ORDER BY MIN(created_at) DESC
+                LIMIT 1
+            """)
+            row = cur.fetchone()
+            conn.close()
+            if row:
+                _, last_run, count = row
+                print(f"\nPattern Detection:")
+                print(f"  Last run: {last_run}")
+                print(f"  Active patterns: {count}")
+                interval_h = _PATTERN_DETECTION_INTERVAL // 3600
+                print(f"  Interval: every {interval_h}h")
+            else:
+                print("\nPattern Detection: no runs yet")
+        except Exception:
+            # Table may not exist yet — that's fine
+            pass
 
     # Show recent log
     if LOG_FILE.exists():

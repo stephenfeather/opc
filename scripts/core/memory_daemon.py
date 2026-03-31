@@ -74,8 +74,9 @@ def _normalize_project(path_str: str) -> str | None:
     parts = p.parts
     if ".worktrees" in parts:
         idx = parts.index(".worktrees")
-        return parts[idx - 1] if idx > 0 else p.name
-    return p.name
+        name = parts[idx - 1] if idx > 0 else p.name
+        return name or None
+    return p.name or None
 
 # Global config
 POLL_INTERVAL = 60  # seconds
@@ -511,7 +512,8 @@ Store each learning using store_learning.py with appropriate type and tags."""
 
         env = os.environ.copy()
         env["CLAUDE_MEMORY_EXTRACTION"] = "1"  # Prevent session-register from registering extraction sessions
-        env["CLAUDE_PROJECT_DIR"] = project_dir or ""
+        if project_dir:
+            env["CLAUDE_PROJECT_DIR"] = project_dir
 
         proc = subprocess.Popen(
             [

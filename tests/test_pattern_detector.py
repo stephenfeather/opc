@@ -217,12 +217,12 @@ class TestClusterByTags:
         learnings = []
         for i in range(10):
             learnings.append(_make_learning(
-                tags=["perception", f"unique_{i}"],
+                tags=["high-frequency-noise", f"unique_{i}"],
             ))
         clusters = cluster_by_tags(
-            learnings, exclude_tags={"perception"}, min_component_size=5,
+            learnings, exclude_tags={"high-frequency-noise"}, min_component_size=5,
         )
-        # Without "perception", each learning has unique tags only -> no clusters
+        # Without noise tag, each learning has unique tags only -> no clusters
         assert len(clusters) == 0
 
     def test_empty_input(self):

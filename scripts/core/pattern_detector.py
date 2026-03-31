@@ -538,7 +538,7 @@ async def detect_patterns(
     # Step 2: Tag IDF + tag clustering
     all_tags = {l.id: l.tags for l in learnings}
     tag_idf = compute_tag_idf(all_tags, len(learnings))
-    noise_tags = detect_noise_tags(tag_idf, tag_noise_percentile)
+    noise_tags = detect_noise_tags(tag_idf, tag_noise_percentile) | {"perception"}
     tag_clusters = cluster_by_tags(
         learnings,
         min_cooccurrence=1.0,

@@ -13,23 +13,42 @@ This project began as a fork of [Continuous-Claude-v3](https://github.com/parcad
 - **Artifact indexing** - Track and query files, plans, and other artifacts across the project
 - **Memory daemon** - Background process that extracts thinking blocks, workflow patterns, and generates mini-handoffs automatically
 - **Multi-provider embeddings** - Pluggable embedding service supporting Voyage AI, OpenAI, local sentence-transformers, and Ollama
+- **Contextual reranking** - Adaptive reranker that reorders recall results using recency, tag relevance, type inference, and per-mode calibration
+- **Cross-session pattern detection** - Identifies recurring patterns across sessions (repeated errors, tool preferences, architectural decisions) and boosts them in recall
+- **Learning chains** - Learnings can supersede previous entries, keeping the knowledge base current without duplication
+- **Temporal decay tracking** - Tracks when learnings are recalled and decays stale entries that haven't been useful recently
+- **Semantic deduplication** - Prevents storing near-duplicate learnings using embedding similarity checks across sessions
+- **Tag-based filtering** - Store and recall learnings with tags for precise filtering (`--tags`, `--tags-strict`)
 
 ## Project Structure
 
 ```
-scripts/core/          Core memory system
-  recall_learnings.py    Semantic search over stored learnings
-  store_learning.py      Persist learnings to PostgreSQL
-  memory_daemon.py       Background extraction and handoff generation
-  artifact_index.py      Artifact indexing and querying
-  db/                    Database layer
-    embedding_service.py   Multi-provider embedding abstraction
-    memory_service_pg.py   PostgreSQL memory storage
-    postgres_pool.py       Connection pooling
+scripts/core/              Core memory system
+  recall_learnings.py        Semantic search over stored learnings
+  store_learning.py          Persist learnings to PostgreSQL
+  memory_daemon.py           Background extraction and handoff generation
+  reranker.py                Contextual reranking with adaptive overfetch
+  pattern_detector.py        Cross-session pattern detection
+  pattern_batch.py           Batch pattern analysis
+  pattern_report.py          Pattern reporting
+  artifact_index.py          Artifact indexing and querying
+  artifact_query.py          Artifact querying interface
+  artifact_mark.py           Artifact marking
+  extract_thinking_blocks.py Thinking block extraction from transcripts
+  extract_workflow_patterns.py Workflow pattern extraction
+  generate_mini_handoff.py   Automatic mini-handoff generation
+  db/                        Database layer
+    embedding_service.py       Multi-provider embedding abstraction
+    memory_service_pg.py       PostgreSQL memory storage
+    memory_protocol.py         Backend protocol definition
+    memory_factory.py          Backend factory
+    postgres_pool.py           Connection pooling
 
-src/runtime/           MCP execution runtime
+src/runtime/               MCP execution runtime
 
-docker/                PostgreSQL setup, container sandboxing
+docker/                    PostgreSQL setup, container sandboxing
+
+hooks/                     Claude Code hook scripts
 ```
 
 ## Requirements
@@ -70,13 +89,15 @@ The embedding service supports multiple backends, configured via the `provider` 
 The complete database schema is in [`docker/init-schema.sql`](docker/init-schema.sql). It extends the upstream [Continuous-Claude-v3](https://github.com/parcadei/Continuous-Claude-v3) schema with:
 
 - **`sessions`** — 10 extra columns for the memory daemon extraction pipeline, process liveness, transcript archival, and multi-host coordination
-- **`archival_memory`** — 3 extra columns for embedding provenance (`embedding_model`), deduplication (`content_hash`), and multi-host support (`host_id`)
-- **`continuity`** — New table for session state snapshots (continuity ledger system)
-- **`plans`** — New table for indexed implementation plans
+- **`archival_memory`** — Extra columns for embedding provenance (`embedding_model`), deduplication (`content_hash`), multi-host support (`host_id`), learning chains (`superseded_by`), temporal decay (`recall_count`, `last_recalled_at`), and project scoping (`project`)
+- **`memory_tags`** — Tag table for categorizing learnings with fast lookup
+- **`cross_session_patterns`** — Detected patterns across sessions (recurring errors, tool preferences, decisions)
+- **`continuity`** — Session state snapshots (continuity ledger system)
+- **`plans`** — Indexed implementation plans
 
-## Note on Hook Scripts
+## Hook Scripts
 
-The scripts in this repo reference Claude Code hook scripts that are not yet included. Some are new, others are modified versions of hooks from the original Continuous-Claude-v3 project. They will be added to the repo in the future.
+The `hooks/` directory contains Claude Code hook scripts used by OPC, including originals from the Continuous-Claude-v3 project and new additions for memory awareness, modern CLI enforcement, and other integrations.
 
 ## License
 

@@ -27,6 +27,7 @@ from scripts.core.reranker import (  # noqa: E402
     confidence_score,
     infer_query_type,
     load_centroids,
+    pattern_score,
     project_match,
     recall_score,
     recency_score,
@@ -455,3 +456,81 @@ class TestCentroidCache:
         path = tmp_path / "bad.json"
         path.write_text("not json {{{")
         assert load_centroids(path) is None
+
+
+# ---------------------------------------------------------------------------
+# Pattern score tests
+# ---------------------------------------------------------------------------
+
+class TestPatternScore:
+
+    def test_no_pattern_strength_returns_zero(self):
+        result = _make_result()  # no pattern_strength key
+        ctx = RecallContext(tags_hint=["vue"])
+        assert pattern_score(result, ctx) == 0.0
+
+    def test_zero_strength_returns_zero(self):
+        result = _make_result()
+        result["pattern_strength"] = 0.0
+        result["pattern_tags"] = ["vue"]
+        ctx = RecallContext(tags_hint=["vue"])
+        assert pattern_score(result, ctx) == 0.0
+
+    def test_no_query_tags_returns_zero(self):
+        result = _make_result()
+        result["pattern_strength"] = 0.8
+        result["pattern_tags"] = ["vue", "testing"]
+        ctx = RecallContext(tags_hint=None)
+        assert pattern_score(result, ctx) == 0.0
+
+    def test_no_pattern_tags_returns_zero(self):
+        result = _make_result()
+        result["pattern_strength"] = 0.8
+        result["pattern_tags"] = []
+        ctx = RecallContext(tags_hint=["vue"])
+        assert pattern_score(result, ctx) == 0.0
+
+    def test_full_overlap_returns_strength(self):
+        result = _make_result()
+        result["pattern_strength"] = 0.8
+        result["pattern_tags"] = ["vue", "testing"]
+        ctx = RecallContext(tags_hint=["vue", "testing"])
+        score = pattern_score(result, ctx)
+        assert score == 0.8  # 2/2 overlap * 0.8
+
+    def test_partial_overlap_scales(self):
+        result = _make_result()
+        result["pattern_strength"] = 0.8
+        result["pattern_tags"] = ["vue"]
+        ctx = RecallContext(tags_hint=["vue", "testing"])
+        score = pattern_score(result, ctx)
+        assert score == 0.4  # 1/2 overlap * 0.8
+
+    def test_no_overlap_returns_zero(self):
+        result = _make_result()
+        result["pattern_strength"] = 0.8
+        result["pattern_tags"] = ["hooks", "daemon"]
+        ctx = RecallContext(tags_hint=["vue", "testing"])
+        assert pattern_score(result, ctx) == 0.0
+
+
+class TestRerankWithPattern:
+
+    def test_pattern_signal_in_rerank_details(self):
+        results = [
+            _make_result(similarity=0.5),
+            _make_result(similarity=0.4),
+        ]
+        results[1]["pattern_strength"] = 0.9
+        results[1]["pattern_tags"] = ["test"]
+        ctx = RecallContext(
+            tags_hint=["test"],
+            retrieval_mode="hybrid_rrf",
+        )
+        ranked = rerank(results, ctx, k=2)
+        assert "pattern" in ranked[0]["rerank_details"]
+
+    def test_pattern_weight_in_config(self):
+        config = RerankerConfig()
+        assert config.pattern_weight == 0.05
+        assert config.total_signal_weight > 0.35

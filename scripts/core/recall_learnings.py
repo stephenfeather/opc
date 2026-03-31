@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import sys
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -82,6 +83,67 @@ async def record_recall(result_ids: list[str]) -> None:
     except Exception:
         # Graceful degradation: don't break recall if columns missing or DB error
         pass
+
+
+async def enrich_with_pattern_strength(
+    results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Add pattern_strength and pattern_tags to recall results.
+
+    Queries detected_patterns + pattern_members via LEFT JOIN.
+    Gracefully returns results unchanged if tables don't exist.
+    """
+    if not results or get_backend() != "postgres":
+        return results
+
+    result_ids = [r["id"] for r in results if r.get("id")]
+    if not result_ids:
+        return results
+
+    try:
+        from scripts.core.db.postgres_pool import get_pool
+
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT pm.memory_id,
+                       MAX(dp.confidence * (1.0 - pm.distance))
+                           AS pattern_strength,
+                       ARRAY_AGG(DISTINCT unnested_tag)
+                           AS pattern_tags
+                FROM pattern_members pm
+                JOIN detected_patterns dp ON dp.id = pm.pattern_id
+                LEFT JOIN LATERAL unnest(dp.tags) AS unnested_tag
+                    ON true
+                WHERE dp.superseded_at IS NULL
+                  AND pm.memory_id = ANY($1::uuid[])
+                GROUP BY pm.memory_id
+                """,
+                [uuid.UUID(rid) for rid in result_ids],
+            )
+
+        # Build lookup
+        lookup: dict[str, dict] = {}
+        for row in rows:
+            mid = str(row["memory_id"])
+            lookup[mid] = {
+                "pattern_strength": float(row["pattern_strength"] or 0.0),
+                "pattern_tags": row["pattern_tags"] or [],
+            }
+
+        # Enrich results in place
+        for result in results:
+            rid = result.get("id")
+            if rid and rid in lookup:
+                result["pattern_strength"] = lookup[rid]["pattern_strength"]
+                result["pattern_tags"] = lookup[rid]["pattern_tags"]
+
+    except Exception:
+        # Graceful degradation: tables may not exist yet
+        logger.debug("Pattern enrichment unavailable", exc_info=True)
+
+    return results
 
 
 def format_result_preview(content: str, max_length: int = 200) -> str:
@@ -831,6 +893,10 @@ async def main() -> int:
         else:
             print(f"Error: {e}", file=sys.stderr)
         return 1
+
+    # Enrich with pattern strength for reranker (graceful if tables missing)
+    if not args.no_rerank and backend == "postgres":
+        results = await enrich_with_pattern_strength(results)
 
     # Hard-filter by tags BEFORE reranking (so reranker sees filtered pool)
     if args.tags_strict and args.tags:

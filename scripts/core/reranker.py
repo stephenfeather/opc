@@ -42,6 +42,7 @@ class RerankerConfig:
     recall_weight: float = 0.05
     type_affinity_weight: float = 0.05
     tag_overlap_weight: float = 0.05
+    pattern_weight: float = 0.05
 
     @property
     def total_signal_weight(self) -> float:
@@ -52,6 +53,7 @@ class RerankerConfig:
             + self.recall_weight
             + self.type_affinity_weight
             + self.tag_overlap_weight
+            + self.pattern_weight
         )
 
 
@@ -183,6 +185,29 @@ def tag_overlap(result: dict, ctx: RecallContext) -> float:
         return 0.0
 
     return len(intersection) / len(union)
+
+
+def pattern_score(result: dict, ctx: RecallContext) -> float:
+    """Score based on pattern membership, gated by query relevance.
+
+    Only boosts if the query's tags overlap with the pattern's tags,
+    preventing generic clustered learnings from drowning novel ones.
+
+    Returns pattern_strength * tag_overlap_ratio, or 0.0 if no overlap.
+    """
+    strength = result.get("pattern_strength", 0.0)
+    if not strength:
+        return 0.0
+
+    pattern_tags = result.get("pattern_tags") or []
+    query_tags = ctx.tags_hint or []
+
+    if not query_tags or not pattern_tags:
+        return 0.0
+
+    overlap = len(set(query_tags) & set(pattern_tags))
+    ratio = overlap / len(query_tags)
+    return strength * min(1.0, ratio)
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +355,7 @@ def rerank(
         sig_recall = recall_score(result)
         sig_type = type_match(result, ctx)
         sig_tags = tag_overlap(result, ctx)
+        sig_pattern = pattern_score(result, ctx)
 
         # Weighted combination
         final = (
@@ -340,6 +366,7 @@ def rerank(
             + config.recall_weight * sig_recall
             + config.type_affinity_weight * sig_type
             + config.tag_overlap_weight * sig_tags
+            + config.pattern_weight * sig_pattern
         )
 
         # Augment result (shallow copy to avoid mutating input)
@@ -353,6 +380,7 @@ def rerank(
             "recall": sig_recall,
             "type_match": sig_type,
             "tag_overlap": sig_tags,
+            "pattern": sig_pattern,
         }
         scored.append(augmented)
 

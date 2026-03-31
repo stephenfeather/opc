@@ -516,19 +516,21 @@ class TestPatternScore:
 
 class TestRerankWithPattern:
 
-    def test_pattern_signal_in_rerank_details(self):
-        results = [
-            _make_result(similarity=0.5),
-            _make_result(similarity=0.4),
-        ]
-        results[1]["pattern_strength"] = 0.9
-        results[1]["pattern_tags"] = ["test"]
+    def test_pattern_signal_boosts_ranking(self):
+        r1 = _make_result(similarity=0.5)
+        r1["id"] = "id1"
+        r2 = _make_result(similarity=0.4)
+        r2["id"] = "id2"
+        r2["pattern_strength"] = 0.9
+        r2["pattern_tags"] = ["test"]
         ctx = RecallContext(
             tags_hint=["test"],
             retrieval_mode="hybrid_rrf",
         )
-        ranked = rerank(results, ctx, k=2)
-        assert "pattern" in ranked[0]["rerank_details"]
+        ranked = rerank([r1, r2], ctx, k=2)
+        # Pattern-boosted result should rank higher
+        assert ranked[0]["id"] == "id2"
+        assert ranked[0]["rerank_details"]["pattern"] > 0
 
     def test_pattern_weight_in_config(self):
         config = RerankerConfig()

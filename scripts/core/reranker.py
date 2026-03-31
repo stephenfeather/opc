@@ -205,8 +205,11 @@ def pattern_score(result: dict, ctx: RecallContext) -> float:
     if not query_tags or not pattern_tags:
         return 0.0
 
-    overlap = len(set(query_tags) & set(pattern_tags))
-    ratio = overlap / len(query_tags)
+    unique_query = set(query_tags)
+    if not unique_query:
+        return 0.0
+    overlap = len(unique_query & set(pattern_tags))
+    ratio = overlap / len(unique_query)
     return strength * min(1.0, ratio)
 
 

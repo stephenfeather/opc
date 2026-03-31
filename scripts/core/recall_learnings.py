@@ -108,7 +108,7 @@ async def enrich_with_pattern_strength(
             rows = await conn.fetch(
                 """
                 SELECT pm.memory_id,
-                       MAX(dp.confidence * (1.0 - pm.distance))
+                       MAX(dp.confidence * GREATEST(1.0 - COALESCE(pm.distance, 0), 0))
                            AS pattern_strength,
                        ARRAY_AGG(DISTINCT unnested_tag)
                            AS pattern_tags
@@ -139,9 +139,12 @@ async def enrich_with_pattern_strength(
                 result["pattern_strength"] = lookup[rid]["pattern_strength"]
                 result["pattern_tags"] = lookup[rid]["pattern_tags"]
 
-    except Exception:
-        # Graceful degradation: tables may not exist yet
-        logger.debug("Pattern enrichment unavailable", exc_info=True)
+    except (ImportError, OSError, ConnectionError) as e:
+        # Expected: tables don't exist, DB unreachable, pool import fails
+        logger.debug("Pattern enrichment unavailable: %s", e)
+    except Exception as e:
+        # Unexpected: surface for debugging but don't break recall
+        logger.warning("Pattern enrichment error: %s", e, exc_info=True)
 
     return results
 

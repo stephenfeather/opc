@@ -1,0 +1,535 @@
+{
+  "timestamp": "2026-03-31T14:25:16",
+  "golden_set": "/Users/stephenfeather/opc/.worktrees/learning-classifier/tests/eval/golden_set.jsonl",
+  "metrics": {
+    "accuracy": 0.8431,
+    "correct": 43,
+    "total": 51,
+    "per_class": {
+      "ARCHITECTURAL_DECISION": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "support": 0
+      },
+      "CODEBASE_PATTERN": {
+        "precision": 0.812,
+        "recall": 0.812,
+        "support": 16
+      },
+      "ERROR_FIX": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "support": 8
+      },
+      "FAILED_APPROACH": {
+        "precision": 0.889,
+        "recall": 0.8,
+        "support": 10
+      },
+      "OPEN_THREAD": {
+        "precision": 1.0,
+        "recall": 0.667,
+        "support": 3
+      },
+      "USER_PREFERENCE": {
+        "precision": 0.727,
+        "recall": 0.889,
+        "support": 9
+      },
+      "WORKING_SOLUTION": {
+        "precision": 0.8,
+        "recall": 0.8,
+        "support": 5
+      }
+    },
+    "confusion_matrix": {
+      "ARCHITECTURAL_DECISION": {},
+      "CODEBASE_PATTERN": {
+        "CODEBASE_PATTERN": 13,
+        "USER_PREFERENCE": 3
+      },
+      "ERROR_FIX": {
+        "ERROR_FIX": 8
+      },
+      "FAILED_APPROACH": {
+        "CODEBASE_PATTERN": 1,
+        "FAILED_APPROACH": 8,
+        "WORKING_SOLUTION": 1
+      },
+      "OPEN_THREAD": {
+        "CODEBASE_PATTERN": 1,
+        "OPEN_THREAD": 2
+      },
+      "USER_PREFERENCE": {
+        "FAILED_APPROACH": 1,
+        "USER_PREFERENCE": 8
+      },
+      "WORKING_SOLUTION": {
+        "CODEBASE_PATTERN": 1,
+        "WORKING_SOLUTION": 4
+      }
+    }
+  },
+  "duration_seconds": 63.22,
+  "predictions": [
+    {
+      "id": "207eac33-eb53-49d2-b612-d88edf0dbe30",
+      "expected": "CODEBASE_PATTERN",
+      "predicted": "CODEBASE_PATTERN",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It describes how session IDs are structured and mapped in the system without any failure context, fix, preference, or explicit decision.",
+      "error": null
+    },
+    {
+      "id": "73253a97-071e-4310-a9c9-9eaa824e9754",
+      "expected": "CODEBASE_PATTERN",
+      "predicted": "CODEBASE_PATTERN",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It describes Vue\u2019s reactivity behavior with Set mutations requiring replacement, without a specific failure symptom/error context or explicit decision.",
+      "error": null
+    },
+    {
+      "id": "7494f24b-a9b5-44b5-88ea-47789cde3376",
+      "expected": "USER_PREFERENCE",
+      "predicted": "USER_PREFERENCE",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It prescribes an enforced workflow and commit conventions using imperative language like 'must' and an ordered commit structure, matching rule 4.",
+      "error": null
+    },
+    {
+      "id": "e7399048-83b1-4e39-96e6-9cfa0e6d131e",
+      "expected": "WORKING_SOLUTION",
+      "predicted": "WORKING_SOLUTION",
+      "correct": true,
+      "confidence": "medium",
+      "reasoning": "It describes a concrete successful technique\u2014merging overly granular subcategories into broader ones and using filter attributes (caliber) to address an overly granular taxonomy problem.",
+      "error": null
+    },
+    {
+      "id": "4129a9f3-0980-4aed-bce2-8771d9877557",
+      "expected": "FAILED_APPROACH",
+      "predicted": "FAILED_APPROACH",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It describes a negative merge outcome where PR #8 overwrote and deleted the modular Admin page classes from PR #7 due to an architectural mismatch, indicating the approach did not work as intended.",
+      "error": null
+    },
+    {
+      "id": "c716a8d9-f830-4886-a453-06b5f0c3c6d9",
+      "expected": "CODEBASE_PATTERN",
+      "predicted": "CODEBASE_PATTERN",
+      "correct": true,
+      "confidence": "medium",
+      "reasoning": "It states a general boundary for where TDD applies (business logic like parsers/handlers) versus where it doesn\u2019t (migrations/schema), without describing a failed attempt, fix, or explicit personal rule.",
+      "error": null
+    },
+    {
+      "id": "edcf123d-2b69-4376-b81d-aaf05e20fb4e",
+      "expected": "CODEBASE_PATTERN",
+      "predicted": "USER_PREFERENCE",
+      "correct": false,
+      "confidence": "high",
+      "reasoning": "It\u2019s a prescriptive imperative (\u201cimplement client-side usage tracking\u201d) about how to handle rate-limited APIs, without a specific error symptom or explicit trade-off.",
+      "error": null
+    },
+    {
+      "id": "6829ec80-6dcc-463a-b9e4-93c465112c1a",
+      "expected": "WORKING_SOLUTION",
+      "predicted": "CODEBASE_PATTERN",
+      "correct": false,
+      "confidence": "medium",
+      "reasoning": "It states how numDays should be derived from endHours in the computed property without describing a specific failure symptom, fix context, or explicit decision trade-offs.",
+      "error": null
+    },
+    {
+      "id": "d1265012-320c-4b0a-9706-ca7505017c0e",
+      "expected": "CODEBASE_PATTERN",
+      "predicted": "CODEBASE_PATTERN",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It describes a general pattern for implementing multi-item auto-calculation (map + reduce with Math.max) without any failure, error symptom, preference, or explicit decision trade-off.",
+      "error": null
+    },
+    {
+      "id": "8573f118-2abf-4835-a862-3d9f3f6616b6",
+      "expected": "CODEBASE_PATTERN",
+      "predicted": "USER_PREFERENCE",
+      "correct": false,
+      "confidence": "high",
+      "reasoning": "It\u2019s a prescriptive, imperative workflow guideline (use task-master-ai, break into phases, implement MVP first, follow TDD, ensure quality) rather than a failure, fix, or observed system behavior.",
+      "error": null
+    },
+    {
+      "id": "47f822b6-14d2-44b0-8f7d-7552bced3a66",
+      "expected": "CODEBASE_PATTERN",
+      "predicted": "CODEBASE_PATTERN",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It describes how the hook-auto-execute rule applies (when deny+command) and when it does not, without a failure context, fix, preference, or decision.",
+      "error": null
+    },
+    {
+      "id": "559785f6-17ec-4bb8-8996-954dd7f86f65",
+      "expected": "CODEBASE_PATTERN",
+      "predicted": "CODEBASE_PATTERN",
+      "correct": true,
+      "confidence": "medium",
+      "reasoning": "It describes a bug/behavior where sessions are marked extracted when queued rather than completed, without stating a specific fix or resolution.",
+      "error": null
+    },
+    {
+      "id": "d4f19f47-89c1-45f2-83df-a4ca5e0cd661",
+      "expected": "CODEBASE_PATTERN",
+      "predicted": "USER_PREFERENCE",
+      "correct": false,
+      "confidence": "medium",
+      "reasoning": "It gives a prescriptive workflow rule (verify dependencies via git history rather than status fields), matching the imperative 'must/verify' style of USER_PREFERENCE.",
+      "error": null
+    },
+    {
+      "id": "4116aba3-de13-4f1f-a07f-1d2b341e1f2a",
+      "expected": "ERROR_FIX",
+      "predicted": "ERROR_FIX",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It cites a specific error message (\"No such module XCTest\") and explains the cause/fix: SourceKit errors until the files are added to the Xcode project.",
+      "error": null
+    },
+    {
+      "id": "2bfa4980-3588-4afa-a35f-f86ecb874bb2",
+      "expected": "CODEBASE_PATTERN",
+      "predicted": "CODEBASE_PATTERN",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It\u2019s an observational statement about how multi-dose PK concentration peaks behave under BID dosing with accumulation, with no failure, fix, preference, or decision involved.",
+      "error": null
+    },
+    {
+      "id": "054cd12c-50fb-4c58-b3dc-a427dabe258b",
+      "expected": "USER_PREFERENCE",
+      "predicted": "USER_PREFERENCE",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It prescribes an imperative workflow rule (\u201calways run... BEFORE committing\u201d and commit regenerated artifacts with source), matching the USER_PREFERENCE rule.",
+      "error": null
+    },
+    {
+      "id": "4436662a-4fc9-4133-91e0-4afba3c1e006",
+      "expected": "ERROR_FIX",
+      "predicted": "ERROR_FIX",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It describes the symptom (npm audit shows stale vulnerability reports) and the fix/cause (node_modules not updated; run npm install after updating package.json).",
+      "error": null
+    },
+    {
+      "id": "55fd353d-5863-486a-81d1-944454d03765",
+      "expected": "ERROR_FIX",
+      "predicted": "ERROR_FIX",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It cites a specific failure symptom (Cannot read property of undefined in computed properties) and identifies the fix/root cause (tests must provide complete valid objects matching the interface).",
+      "error": null
+    },
+    {
+      "id": "088f0844-9a7b-4b81-8775-30aea212d4bd",
+      "expected": "CODEBASE_PATTERN",
+      "predicted": "CODEBASE_PATTERN",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It describes WordPress REST API behavior (updates replace full content and raw may be null) without a specific failure symptom or explicit problem-solving narrative.",
+      "error": null
+    },
+    {
+      "id": "a941d016-c049-4e04-b693-5b98dbe06c8d",
+      "expected": "USER_PREFERENCE",
+      "predicted": "USER_PREFERENCE",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It is a prescriptive rule ('Always use do/try/catch with logging, not try?') about how saves should be handled, matching the imperative convention in rule 4.",
+      "error": null
+    },
+    {
+      "id": "d4cd26df-fe02-4ce7-a6f0-055dc7c2087d",
+      "expected": "ERROR_FIX",
+      "predicted": "ERROR_FIX",
+      "correct": true,
+      "confidence": "medium",
+      "reasoning": "It describes a validation error symptom (MCP adapter expects an object but gets []) and identifies the root cause as PHP serialization behavior.",
+      "error": null
+    },
+    {
+      "id": "31830ccd-c8a2-47e3-ade5-a597ee687fb3",
+      "expected": "ERROR_FIX",
+      "predicted": "ERROR_FIX",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It states a concrete symptom (npm audit vulnerabilities/stale results after npm audit fix) and the fix/cause (node_modules is stale; run npm install in the correct directory).",
+      "error": null
+    },
+    {
+      "id": "60a729d0-7521-4abc-ba23-917297458cc8",
+      "expected": "ERROR_FIX",
+      "predicted": "ERROR_FIX",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It describes a failure symptom (tests still using old values after file update) and identifies the cause and fix (PHPUnit cache; clear cache or rerun tests).",
+      "error": null
+    },
+    {
+      "id": "cfd72622-7221-4594-8de0-31cc8e7f3944",
+      "expected": "USER_PREFERENCE",
+      "predicted": "USER_PREFERENCE",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It states a prescriptive rule ('Never manually add Co-Authored-By: Claude') about how commits should be made, matching the user-enforced convention category.",
+      "error": null
+    },
+    {
+      "id": "54e95d7a-8119-4892-b59b-2cd4730fbab5",
+      "expected": "FAILED_APPROACH",
+      "predicted": "FAILED_APPROACH",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It describes that a global replace_all approach was tried and leads to incorrect updates (negative outcome), so it matches the failed approach rule.",
+      "error": null
+    },
+    {
+      "id": "62c6ab4c-bd4e-45e3-9a73-8fb4ab2d25b4",
+      "expected": "FAILED_APPROACH",
+      "predicted": "FAILED_APPROACH",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It labels using wp eval as an anti-pattern to be avoided (a negative/failed approach) and suggests not using it for testing.",
+      "error": null
+    },
+    {
+      "id": "49911b53-e566-415e-9839-3674933fe5f8",
+      "expected": "FAILED_APPROACH",
+      "predicted": "WORKING_SOLUTION",
+      "correct": false,
+      "confidence": "medium",
+      "reasoning": "It recommends a proactive technique (estimate context usage and create a handoff between tasks) to address the concrete problem of context exhaustion during multi-image sessions.",
+      "error": null
+    },
+    {
+      "id": "c6f4d0b3-676b-4748-8bad-f4ccad371a52",
+      "expected": "FAILED_APPROACH",
+      "predicted": "CODEBASE_PATTERN",
+      "correct": false,
+      "confidence": "medium",
+      "reasoning": "It describes system behavior (in-memory queue state is lost on restart and zombie processes can block processing) without a completed fix or a tried-and-failed approach.",
+      "error": null
+    },
+    {
+      "id": "b1040f00-73f7-457d-aa91-4e8527a32028",
+      "expected": "FAILED_APPROACH",
+      "predicted": "FAILED_APPROACH",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It reports that both HTML entities and zero-width spaces were tried for copy-pasteable code examples in WordPress and both approaches fail/break.",
+      "error": null
+    },
+    {
+      "id": "c22489b6-44d2-4be6-811d-e9359d65fd55",
+      "expected": "FAILED_APPROACH",
+      "predicted": "FAILED_APPROACH",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It states Cmd+Q was used to test crash recovery and 'doesn't work' because it performs a graceful SIGTERM shutdown rather than a true crash.",
+      "error": null
+    },
+    {
+      "id": "369f47a3-f503-4a35-af74-6dcb94f2f12b",
+      "expected": "FAILED_APPROACH",
+      "predicted": "FAILED_APPROACH",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It describes a refactoring attempt (removing 'as any' casts) that caused previously passing tests to break, indicating a negative outcome.",
+      "error": null
+    },
+    {
+      "id": "3d8a4dfa-d9f6-4d21-96e3-787a4caa3809",
+      "expected": "FAILED_APPROACH",
+      "predicted": "FAILED_APPROACH",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It explicitly states HTML entities are NOT decoded and thus are not a viable workaround, indicating a tried approach that did not work (rule 1).",
+      "error": null
+    },
+    {
+      "id": "fe758168-2395-49b5-8761-51f8584718fa",
+      "expected": "OPEN_THREAD",
+      "predicted": "OPEN_THREAD",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It states the Pi database is behind 5 migrations and lists missing tables with an explicit action needed before deployment, matching the incomplete-work signal in rule 3.",
+      "error": null
+    },
+    {
+      "id": "c536279a-0105-4f9b-b30d-1a1eb24cf5ff",
+      "expected": "OPEN_THREAD",
+      "predicted": "CODEBASE_PATTERN",
+      "correct": false,
+      "confidence": "high",
+      "reasoning": "It\u2019s an observation about configuration defaults and their effect on embedding search quality, with no explicit failed attempt, fix, or prescribed action.",
+      "error": null
+    },
+    {
+      "id": "0e26f84f-8583-4016-93b2-6a3e4c42efa3",
+      "expected": "ERROR_FIX",
+      "predicted": "ERROR_FIX",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It identifies a specific failure symptom (empty parameters {} become null due to PHP empty()) and provides the concrete fix (replace empty() check with !isset() or is_null()).",
+      "error": null
+    },
+    {
+      "id": "0c0f941f-9cc9-4839-bd76-c3e091b3756b",
+      "expected": "FAILED_APPROACH",
+      "predicted": "FAILED_APPROACH",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It reports that attempted fixes did not work and the MCP execution still fails with a generic error despite direct PHP working.",
+      "error": null
+    },
+    {
+      "id": "67681253-e8d0-4fed-90da-394991eb109f",
+      "expected": "OPEN_THREAD",
+      "predicted": "OPEN_THREAD",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It states the endpoint is an incomplete implementation (never calls detect and returns empty), indicating work still needs to be done.",
+      "error": null
+    },
+    {
+      "id": "cd9235c3-06bb-41cb-8f7d-d484089b794c",
+      "expected": "CODEBASE_PATTERN",
+      "predicted": "CODEBASE_PATTERN",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "This is a factual observation about the user's hardware environment and capability (no failure, fix, preference, decision, or action solving a problem).",
+      "error": null
+    },
+    {
+      "id": "78285da1-3f83-4048-b144-4458a4106c59",
+      "expected": "USER_PREFERENCE",
+      "predicted": "FAILED_APPROACH",
+      "correct": false,
+      "confidence": "medium",
+      "reasoning": "It labels conditional expects as an anti-pattern (a negative approach that should not be used), matching the failure/anti-pattern signal in rule 1.",
+      "error": null
+    },
+    {
+      "id": "f5dbe5c9-f198-43b4-ba8e-cb95e76c4e08",
+      "expected": "USER_PREFERENCE",
+      "predicted": "USER_PREFERENCE",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It\u2019s a prescriptive rule (\u201calways use ParaTest instead of PHPUnit\u201d) for this project\u2019s testing workflow, matching the USER_PREFERENCE rule.",
+      "error": null
+    },
+    {
+      "id": "ba014e1f-7e1d-47bd-b42a-96a4374d117b",
+      "expected": "CODEBASE_PATTERN",
+      "predicted": "CODEBASE_PATTERN",
+      "correct": true,
+      "confidence": "medium",
+      "reasoning": "It states a general workflow pattern (search-read-edit) without describing a failure, fix, explicit preference, or decision rationale, so it defaults to an observational pattern.",
+      "error": null
+    },
+    {
+      "id": "02260a7d-860b-4467-8be4-c81b719b5534",
+      "expected": "CODEBASE_PATTERN",
+      "predicted": "CODEBASE_PATTERN",
+      "correct": true,
+      "confidence": "medium",
+      "reasoning": "It describes expected behavior/interpretation of a git instruction and cautions that deleting the old branch is destructive and should require confirmation, without a specific error, failed attempt, or explicit user-enforced preference.",
+      "error": null
+    },
+    {
+      "id": "fc79f6d9-7097-40cf-bec9-290e541ae3a5",
+      "expected": "USER_PREFERENCE",
+      "predicted": "USER_PREFERENCE",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "This is a prescriptive workflow rule the user requires (always GPG sign commits, never use --no-gpg-sign, and leave changes staged if signing fails).",
+      "error": null
+    },
+    {
+      "id": "71cef3f8-baf9-49b3-8b7f-a29618b66a8b",
+      "expected": "USER_PREFERENCE",
+      "predicted": "USER_PREFERENCE",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It prescribes a required documentation convention (\u201cshould be documented in README.md under Future Enhancements\u201d), matching the imperative workflow rule.",
+      "error": null
+    },
+    {
+      "id": "8140c598-10ea-408b-a426-aff61aad3594",
+      "expected": "USER_PREFERENCE",
+      "predicted": "USER_PREFERENCE",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It prescribes a required way to select Gemini models (never use GEMINI_MODEL; use the --model flag), matching the imperative workflow rule in USER_PREFERENCE.",
+      "error": null
+    },
+    {
+      "id": "673b7499-2a19-4208-969b-ccd6dfa73451",
+      "expected": "WORKING_SOLUTION",
+      "predicted": "WORKING_SOLUTION",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It describes a successful technique used to solve the concrete problem of recovering lost memory_daemon.py code by mining S3 session transcripts and parsing diffs.",
+      "error": null
+    },
+    {
+      "id": "165dd94d-aa9e-4486-90d2-d2f7451bb3c5",
+      "expected": "CODEBASE_PATTERN",
+      "predicted": "CODEBASE_PATTERN",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "This states how Vue Test Utils exposes refs on the component instance (already unwrapped) without describing a failure, explicit error symptom, or user-enforced convention.",
+      "error": null
+    },
+    {
+      "id": "a85735eb-1544-4d4f-8f93-9ecc96033c7a",
+      "expected": "ERROR_FIX",
+      "predicted": "ERROR_FIX",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It describes the symptom (Alexa skill simulation showed an unexpected error) and the diagnosed cause (issue was on the Alexa side, not Lambda) along with the verification step to confirm Lambda behavior.",
+      "error": null
+    },
+    {
+      "id": "95362da3-0c4e-43b2-ae2a-00ec6d765a64",
+      "expected": "CODEBASE_PATTERN",
+      "predicted": "CODEBASE_PATTERN",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It describes how Gutenberg block delimiters and the REST API's block_version behavior work, without a failure context, fix, or prescriptive preference.",
+      "error": null
+    },
+    {
+      "id": "80bff4fc-3870-4e1f-9a90-85078cdb5708",
+      "expected": "WORKING_SOLUTION",
+      "predicted": "WORKING_SOLUTION",
+      "correct": true,
+      "confidence": "high",
+      "reasoning": "It describes a successful refactoring technique to handle the concrete problem of large-scale (70+ files) refactoring by establishing a pattern manually then parallelizing with agents.",
+      "error": null
+    },
+    {
+      "id": "436264c6-af09-4834-9798-2053e65474a2",
+      "expected": "WORKING_SOLUTION",
+      "predicted": "WORKING_SOLUTION",
+      "correct": true,
+      "confidence": "medium",
+      "reasoning": "It describes concrete steps to successfully backfill unregistered Claude Code sessions into PostgreSQL for the memory daemon.",
+      "error": null
+    }
+  ]
+}

@@ -18,6 +18,9 @@ backups/*.sql.gz
 .claude/cache/
 .claude/tsc-cache/
 
+# Worktrees
+.worktrees/
+
 # OS
 .DS_Store
 

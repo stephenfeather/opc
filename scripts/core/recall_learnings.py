@@ -767,7 +767,12 @@ async def main() -> int:
     parser.add_argument(
         "--tags",
         nargs="+",
-        help="[NOT YET IMPLEMENTED] Filter results by tags (space-separated, OR match)",
+        help="Boost results matching these tags via reranker (space-separated)",
+    )
+    parser.add_argument(
+        "--tags-strict",
+        action="store_true",
+        help="Hard-filter to results sharing at least one tag with --tags",
     )
     parser.add_argument(
         "--no-rerank",
@@ -844,6 +849,13 @@ async def main() -> int:
             retrieval_mode=retrieval_mode,
         )
         results = rerank(results, ctx, k=args.k)
+
+    # Hard-filter by tags if --tags-strict
+    if args.tags_strict and args.tags:
+        results = [
+            r for r in results
+            if set(r.get("metadata", {}).get("tags", [])) & set(args.tags)
+        ]
 
     # Record recall ONLY for final results (after rerank trims)
     await record_recall([r["id"] for r in results])

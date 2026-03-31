@@ -364,6 +364,8 @@ async def run_pattern_detection(
             from scripts.braintrust_analyze import classify_pattern_llm
             dicts = [_learning_to_dict(m) for m in members]
             result = await classify_pattern_llm(dicts)
+            if result.get("error"):
+                raise RuntimeError(f"LLM classification failed: {result['error']}")
             return result["pattern_type"]
 
         classifier = _llm_classifier
@@ -387,7 +389,7 @@ async def run_pattern_detection(
 
     # Write results
     written = 0
-    if not dry_run and patterns:
+    if not dry_run:
         logger.info("Writing patterns to database...")
         written = await write_patterns(pool, patterns, run_id)
         logger.info("Wrote %d patterns", written)

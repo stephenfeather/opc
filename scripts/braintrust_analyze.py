@@ -1095,7 +1095,7 @@ async def classify_learning(
 
     if result.get("error"):
         return {
-            "learning_type": existing_type or "WORKING_SOLUTION",
+            "learning_type": existing_type or "CODEBASE_PATTERN",
             "confidence": "low",
             "reasoning": "classification failed — using fallback",
             "error": result["error"],
@@ -1107,7 +1107,7 @@ async def classify_learning(
     # Validate the type
     if classified_type not in valid_types:
         return {
-            "learning_type": existing_type or "WORKING_SOLUTION",
+            "learning_type": existing_type or "CODEBASE_PATTERN",
             "confidence": "low",
             "reasoning": f"LLM returned invalid type: {classified_type}",
             "error": f"invalid type: {classified_type}",
@@ -1273,7 +1273,7 @@ async def reclassify_learnings(
                 with write_conn.cursor() as cur:
                     cur.execute("""
                         UPDATE archival_memory
-                        SET metadata = metadata || %s::jsonb
+                        SET metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb
                         WHERE id = %s
                     """, (
                         json.dumps({

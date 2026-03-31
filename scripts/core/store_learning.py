@@ -222,6 +222,22 @@ async def store_learning_v2(
                     "Auto-classification error: %s", str(e)[:100]
                 )
 
+        # Auto-calibrate confidence if not explicitly provided
+        confidence_score_val = None
+        confidence_dimensions = None
+        if not confidence:
+            try:
+                from scripts.core.confidence_calibrator import (
+                    calibrate_confidence,
+                )
+
+                cal = calibrate_confidence(content)
+                confidence = cal["confidence"]
+                confidence_score_val = cal["score"]
+                confidence_dimensions = cal["dimensions"]
+            except Exception:
+                pass  # Non-fatal: fall through to no confidence
+
         # Build metadata
         metadata = {
             "type": "session_learning",
@@ -245,6 +261,10 @@ async def store_learning_v2(
             metadata["tags"] = tags
         if confidence:
             metadata["confidence"] = confidence
+        if confidence_score_val is not None:
+            metadata["confidence_score"] = confidence_score_val
+        if confidence_dimensions is not None:
+            metadata["confidence_dimensions"] = confidence_dimensions
         if project:
             metadata["project"] = project
 

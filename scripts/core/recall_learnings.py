@@ -707,7 +707,6 @@ async def search_learnings(
     else:
         results = await search_learnings_postgres(query, k, provider, text_fallback, similarity_threshold, recency_weight)
 
-    await record_recall([r["id"] for r in results])
     return results
 
 
@@ -768,10 +767,27 @@ async def main() -> int:
     parser.add_argument(
         "--tags",
         nargs="+",
-        help="[NOT YET IMPLEMENTED] Filter results by tags (space-separated, OR match)",
+        help="Boost results matching these tags via reranker (space-separated)",
+    )
+    parser.add_argument(
+        "--tags-strict",
+        action="store_true",
+        help="Hard-filter to results sharing at least one tag with --tags",
+    )
+    parser.add_argument(
+        "--no-rerank",
+        action="store_true",
+        help="Bypass contextual re-ranking (use raw retrieval scores)",
+    )
+    parser.add_argument(
+        "--project",
+        help="Project context for re-ranking (default: auto-detect from CLAUDE_PROJECT_DIR)",
     )
 
     args = parser.parse_args()
+
+    # Adaptive over-fetch: retrieve more candidates when reranking will trim
+    fetch_k = args.k if args.no_rerank else max(3 * args.k, 50)
 
     # JSON mode: suppress human-readable output
     if not args.json:
@@ -779,7 +795,6 @@ async def main() -> int:
         print(f"Provider: {args.provider}")
         print()
 
-    recall_already_recorded = False
     try:
         backend = get_backend()
 
@@ -787,25 +802,26 @@ async def main() -> int:
             # SQLite only supports text search (no pgvector)
             if not args.text_only and not args.json:
                 print("  (SQLite backend - using text search)")
-            results = await search_learnings_sqlite(args.query, args.k)
+            results = await search_learnings_sqlite(args.query, fetch_k)
         elif args.text_only:
             # Fast text-only search (no embeddings)
-            results = await search_learnings_text_only_postgres(args.query, args.k)
+            results = await search_learnings_text_only_postgres(args.query, fetch_k)
         elif args.vector_only:
-            # search_learnings() already calls record_recall internally
+            # When reranking, suppress SQL-level recency blend to avoid
+            # double-counting (the reranker applies its own recency signal).
+            sql_recency = 0.0 if not args.no_rerank else args.recency
             results = await search_learnings(
                 query=args.query,
-                k=args.k,
+                k=fetch_k,
                 provider=args.provider,
                 similarity_threshold=args.threshold,
-                recency_weight=args.recency,
+                recency_weight=sql_recency,
             )
-            recall_already_recorded = True
         else:
             # Default: Hybrid RRF search (text + vector combined)
             results = await search_learnings_hybrid_rrf(
                 query=args.query,
-                k=args.k,
+                k=fetch_k,
                 provider=args.provider,
                 similarity_threshold=args.threshold * 0.01,  # RRF scores are ~0.01-0.03 range
             )
@@ -816,9 +832,37 @@ async def main() -> int:
             print(f"Error: {e}", file=sys.stderr)
         return 1
 
-    # Record recall for temporal decay tracking (skip if already done)
-    if not recall_already_recorded:
-        await record_recall([r["id"] for r in results])
+    # Hard-filter by tags BEFORE reranking (so reranker sees filtered pool)
+    if args.tags_strict and args.tags:
+        tag_set = set(args.tags)
+        results = [
+            r for r in results
+            if set(r.get("metadata", {}).get("tags", [])) & tag_set
+        ]
+
+    # Apply contextual re-ranking
+    if not args.no_rerank:
+        from scripts.core.reranker import RecallContext, rerank
+
+        # Determine retrieval mode from backend and flags
+        if backend == "sqlite":
+            retrieval_mode = "sqlite"
+        elif args.text_only:
+            retrieval_mode = "text"
+        elif args.vector_only:
+            retrieval_mode = "vector"
+        else:
+            retrieval_mode = "hybrid_rrf"
+
+        ctx = RecallContext(
+            project=args.project or os.environ.get("CLAUDE_PROJECT_DIR", "").rsplit("/", 1)[-1] or None,
+            tags_hint=args.tags,
+            retrieval_mode=retrieval_mode,
+        )
+        results = rerank(results, ctx, k=args.k)
+
+    # Record recall ONLY for final results (after rerank trims)
+    await record_recall([r["id"] for r in results])
 
     # JSON output mode
     if args.json:
@@ -830,12 +874,16 @@ async def main() -> int:
             else:
                 created_str = str(created_at)
 
-            json_results.append({
-                "score": result["similarity"],
+            json_result = {
+                "score": result.get("final_score", result["similarity"]),
+                "raw_score": result["similarity"],
                 "session_id": result["session_id"],
                 "content": result["content"],
                 "created_at": created_str,
-            })
+            }
+            if "rerank_details" in result:
+                json_result["rerank_details"] = result["rerank_details"]
+            json_results.append(json_result)
         print(json.dumps({"results": json_results}))
         return 0
 
@@ -848,7 +896,7 @@ async def main() -> int:
     print()
 
     for i, result in enumerate(results, 1):
-        similarity = result["similarity"]
+        score = result.get("final_score", result["similarity"])
         content_preview = format_result_preview(result["content"], max_length=300)
         session_id = result["session_id"]
         created_at = result["created_at"]
@@ -859,7 +907,7 @@ async def main() -> int:
         else:
             created_str = str(created_at)[:16]
 
-        print(f"{i}. [{similarity:.3f}] Session: {session_id} ({created_str})")
+        print(f"{i}. [{score:.3f}] Session: {session_id} ({created_str})")
         print(f"   {content_preview}")
         print()
 

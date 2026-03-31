@@ -319,6 +319,7 @@ class MemoryServicePG:
         content_hash: str | None = None,
         host_id: str | None = None,
         supersedes: str | None = None,
+        project: str | None = None,
     ) -> str:
         """Store a fact in archival memory.
 
@@ -332,6 +333,7 @@ class MemoryServicePG:
             supersedes: UUID of an older learning this one replaces.
                 When set, the old row's superseded_by is updated atomically
                 within the same transaction as the INSERT.
+            project: Optional project name for recall relevance
 
         Returns:
             Memory ID (or empty string if deduplicated)
@@ -353,8 +355,8 @@ class MemoryServicePG:
                     """
                     INSERT INTO archival_memory
                         (id, session_id, agent_id, content,
-                         metadata, embedding, content_hash, host_id)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                         metadata, embedding, content_hash, host_id, project)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                     ON CONFLICT (content_hash)
                         WHERE content_hash IS NOT NULL
                         DO NOTHING
@@ -367,14 +369,15 @@ class MemoryServicePG:
                     padded_embedding,
                     content_hash,
                     host_id,
+                    project,
                 )
             else:
                 result = await conn.execute(
                     """
                     INSERT INTO archival_memory
                         (id, session_id, agent_id, content,
-                         metadata, content_hash, host_id)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                         metadata, content_hash, host_id, project)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                     ON CONFLICT (content_hash)
                         WHERE content_hash IS NOT NULL
                         DO NOTHING
@@ -386,6 +389,7 @@ class MemoryServicePG:
                     json.dumps(metadata or {}),
                     content_hash,
                     host_id,
+                    project,
                 )
 
             # Check if insert actually happened (dedup may have skipped)

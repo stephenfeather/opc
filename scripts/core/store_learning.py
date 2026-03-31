@@ -92,6 +92,7 @@ async def store_learning_v2(
     confidence: str | None = None,
     host_id: str | None = None,
     supersedes: str | None = None,
+    project: str | None = None,
 ) -> dict:
     """Store learning with v2 metadata schema and deduplication.
 
@@ -200,6 +201,8 @@ async def store_learning_v2(
             metadata["tags"] = tags
         if confidence:
             metadata["confidence"] = confidence
+        if project:
+            metadata["project"] = project
 
         # Store with embedding and content_hash dedup.
         # When supersedes is set and the backend is postgres, the INSERT
@@ -213,6 +216,7 @@ async def store_learning_v2(
             host_id=host_id,
             supersedes=supersedes if backend == "postgres" else None,
             tags=tags if backend == "postgres" else None,
+            project=project if backend == "postgres" else None,
         )
 
         await memory.close()
@@ -358,6 +362,10 @@ async def main():
         choices=CONFIDENCE_LEVELS,
         help="Confidence level (v2)",
     )
+    parser.add_argument(
+        "--project",
+        help="Project name for recall relevance (default: auto-detect from CLAUDE_PROJECT_DIR)",
+    )
 
     # Host identification
     parser.add_argument("--host-id", help="Machine identifier for multi-system support")
@@ -369,6 +377,9 @@ async def main():
     parser.add_argument("--json", action="store_true", help="Output as JSON")
 
     args = parser.parse_args()
+
+    # Auto-detect project from environment
+    project = args.project or os.environ.get("CLAUDE_PROJECT_DIR", "").rsplit("/", 1)[-1] or None
 
     # Determine which mode to use: v2 if --content is provided, else legacy
     if args.content:
@@ -386,6 +397,7 @@ async def main():
             confidence=args.confidence,
             host_id=args.host_id,
             supersedes=args.supersedes,
+            project=project,
         )
     else:
         # Legacy mode

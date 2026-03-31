@@ -244,8 +244,8 @@ class TestRRFRecallBoost:
 class TestSearchRecordIntegration:
     """Verify that search_learnings calls record_recall after returning."""
 
-    async def test_search_learnings_calls_record_recall(self):
-        """search_learnings should call record_recall with result IDs."""
+    async def test_search_learnings_does_not_call_record_recall(self):
+        """search_learnings should NOT call record_recall (main() handles it after reranking)."""
         fake_results = [
             {"id": "id-1", "content": "test", "session_id": "s1",
              "metadata": {}, "created_at": datetime.now(UTC),
@@ -263,11 +263,11 @@ class TestSearchRecordIntegration:
             from scripts.core.recall_learnings import search_learnings
             results = await search_learnings("test query", k=5)
 
-        mock_record.assert_called_once_with(["id-1", "id-2"])
+        mock_record.assert_not_called()
         assert len(results) == 2
 
     async def test_search_learnings_no_recall_on_empty(self):
-        """search_learnings should still call record_recall with empty list."""
+        """search_learnings should NOT call record_recall even with empty results."""
         with patch("scripts.core.recall_learnings.get_backend", return_value="postgres"), \
              patch("scripts.core.recall_learnings.search_learnings_postgres",
                    new_callable=AsyncMock, return_value=[]), \
@@ -276,5 +276,5 @@ class TestSearchRecordIntegration:
             from scripts.core.recall_learnings import search_learnings
             results = await search_learnings("test query", k=5)
 
-        mock_record.assert_called_once_with([])
+        mock_record.assert_not_called()
         assert len(results) == 0

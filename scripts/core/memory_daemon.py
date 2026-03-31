@@ -63,7 +63,7 @@ global_env = Path.home() / ".claude" / ".env"
 if global_env.exists():
     load_dotenv(global_env, override=True)
 
-DAEMON_VERSION = "0.6.10"
+DAEMON_VERSION = "0.6.11"
 
 # Global config
 POLL_INTERVAL = 60  # seconds

@@ -21,6 +21,7 @@ This project began as a fork of [Continuous-Claude-v3](https://github.com/parcad
 - **Tag-based filtering** - Store and recall learnings with tags for precise filtering (`--tags`, `--tags-strict`)
 - **LLM learning classification** - Auto-classifies learnings by type using a tuned prompt with eval harness (84.3% accuracy), wired into pattern detection
 - **Project-scoped extraction** - Daemon passes project context through both LLM and workflow extraction paths, enabling project-match reranking
+- **Per-project extraction opt-out** - Drop a `.claude/no-extract` sentinel file in any project to suppress memory extraction by both the daemon and the `--learn` skill
 
 ## Project Structure
 

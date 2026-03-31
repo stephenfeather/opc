@@ -1510,6 +1510,11 @@ Output in markdown format (not JSON)."""
 async def learn_from_session(project_id: str, api_key: str, session_id: str | None = None):
     """Extract learnings from a session and save to .claude/cache/learnings/."""
     project_dir = os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd())
+
+    if (Path(project_dir) / ".claude" / "no-extract").exists():
+        print(f"Extraction blocked by .claude/no-extract sentinel (project={project_dir})")
+        return
+
     learnings_dir = Path(project_dir) / ".claude" / "cache" / "learnings"
     learnings_dir.mkdir(parents=True, exist_ok=True)
 

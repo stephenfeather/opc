@@ -66,6 +66,14 @@ if global_env.exists():
 DAEMON_VERSION = "0.7.1"
 
 
+def _is_extraction_blocked(project_dir: str) -> bool:
+    """Return True if this project has opted out of memory extraction."""
+    if not project_dir:
+        return False
+    sentinel = Path(project_dir) / ".claude" / "no-extract"
+    return sentinel.exists()
+
+
 def _normalize_project(path_str: str) -> str | None:
     """Normalize project path to short name, handling worktrees."""
     if not path_str:
@@ -474,6 +482,12 @@ def extract_memories(
     """Run memory extraction for a session. Returns True if subprocess started."""
     log(f"Extracting memories for session {session_id} "
         f"(project={project_dir or 'unknown'})")
+
+    if _is_extraction_blocked(project_dir):
+        log(f"Extraction blocked by .claude/no-extract sentinel "
+            f"(project={project_dir}), marking as extracted (skip)")
+        mark_extracted(session_id)
+        return False
 
     # Use transcript_path from DB — no glob fallback (wrong-file guessing caused orphaned extractions)
     jsonl_path = None

@@ -9,9 +9,11 @@ No I/O, no database calls -- all functions are pure.
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +183,94 @@ def tag_overlap(result: dict, ctx: RecallContext) -> float:
         return 0.0
 
     return len(intersection) / len(union)
+
+
+# ---------------------------------------------------------------------------
+# Embedding Centroid Helpers
+# ---------------------------------------------------------------------------
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Cosine similarity between two vectors.  Returns 0.0 for zero-norm."""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def compute_type_centroids(rows: list[dict]) -> dict[str, list[float]]:
+    """Compute mean BGE embedding per learning_type.
+
+    Args:
+        rows: List of dicts with 'ltype' and 'embedding' keys.
+              Typically from: SELECT metadata->>'learning_type' as ltype,
+              embedding FROM archival_memory
+
+    Returns:
+        Dict mapping learning_type to centroid (mean embedding vector).
+    """
+    groups: dict[str, list[list[float]]] = {}
+    for row in rows:
+        ltype = row.get("ltype")
+        if ltype is None:
+            continue
+        groups.setdefault(ltype, []).append(row["embedding"])
+
+    centroids: dict[str, list[float]] = {}
+    for ltype, vectors in groups.items():
+        n = len(vectors)
+        centroid = [sum(dims) / n for dims in zip(*vectors)]
+        centroids[ltype] = centroid
+    return centroids
+
+
+def infer_query_type(
+    query_embedding: list[float],
+    centroids: dict[str, list[float]],
+) -> dict[str, float]:
+    """Infer query type as soft probability distribution over learning types.
+
+    Uses cosine similarity to each type centroid, then softmax.
+
+    Returns:
+        Dict mapping learning_type to probability (sums to ~1.0).
+    """
+    if not centroids:
+        return {}
+
+    sims = {lt: _cosine_similarity(query_embedding, c) for lt, c in centroids.items()}
+
+    # Softmax with max-subtraction for numerical stability
+    max_sim = max(sims.values())
+    exps = {lt: math.exp(s - max_sim) for lt, s in sims.items()}
+    total = sum(exps.values())
+
+    if total == 0.0:
+        # Uniform fallback (shouldn't happen with valid centroids)
+        n = len(centroids)
+        return {lt: 1.0 / n for lt in centroids}
+
+    return {lt: e / total for lt, e in exps.items()}
+
+
+def save_centroids(centroids: dict[str, list[float]], path: str | Path) -> None:
+    """Save centroids to a JSON file for caching."""
+    with open(path, "w") as f:
+        json.dump(centroids, f)
+
+
+def load_centroids(path: str | Path) -> dict[str, list[float]] | None:
+    """Load centroids from JSON file.  Returns None if missing or corrupt."""
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
 # ---------------------------------------------------------------------------

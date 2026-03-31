@@ -21,12 +21,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from scripts.core.reranker import (  # noqa: E402
     RecallContext,
     RerankerConfig,
+    _cosine_similarity,
     calibrate_score,
+    compute_type_centroids,
     confidence_score,
+    infer_query_type,
+    load_centroids,
     project_match,
     recall_score,
     recency_score,
     rerank,
+    save_centroids,
     tag_overlap,
     type_match,
 )
@@ -335,3 +340,118 @@ class TestRerank:
         ranked = rerank(results, ctx, config=None, k=5)
         assert len(ranked) == 1
         assert "final_score" in ranked[0]
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Cosine Similarity
+# ---------------------------------------------------------------------------
+
+class TestCosineSimilarity:
+    def test_identical_vectors(self):
+        assert abs(_cosine_similarity([1.0, 0.0], [1.0, 0.0]) - 1.0) < 1e-9
+
+    def test_orthogonal_vectors(self):
+        assert abs(_cosine_similarity([1.0, 0.0], [0.0, 1.0])) < 1e-9
+
+    def test_opposite_vectors(self):
+        assert abs(_cosine_similarity([1.0, 0.0], [-1.0, 0.0]) - (-1.0)) < 1e-9
+
+    def test_zero_vector(self):
+        assert _cosine_similarity([0.0, 0.0], [1.0, 0.0]) == 0.0
+
+    def test_both_zero_vectors(self):
+        assert _cosine_similarity([0.0, 0.0], [0.0, 0.0]) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Compute Type Centroids
+# ---------------------------------------------------------------------------
+
+class TestComputeCentroids:
+    def test_single_type(self):
+        rows = [
+            {"ltype": "WORKING_SOLUTION", "embedding": [1.0, 3.0]},
+            {"ltype": "WORKING_SOLUTION", "embedding": [3.0, 1.0]},
+        ]
+        centroids = compute_type_centroids(rows)
+        assert "WORKING_SOLUTION" in centroids
+        assert abs(centroids["WORKING_SOLUTION"][0] - 2.0) < 1e-9
+        assert abs(centroids["WORKING_SOLUTION"][1] - 2.0) < 1e-9
+
+    def test_multiple_types(self):
+        rows = [
+            {"ltype": "A", "embedding": [1.0, 0.0]},
+            {"ltype": "A", "embedding": [3.0, 0.0]},
+            {"ltype": "B", "embedding": [0.0, 5.0]},
+        ]
+        centroids = compute_type_centroids(rows)
+        assert len(centroids) == 2
+        assert abs(centroids["A"][0] - 2.0) < 1e-9
+        assert abs(centroids["B"][1] - 5.0) < 1e-9
+
+    def test_empty_rows(self):
+        assert compute_type_centroids([]) == {}
+
+    def test_skips_none_ltype(self):
+        rows = [
+            {"ltype": None, "embedding": [1.0, 0.0]},
+            {"ltype": "A", "embedding": [2.0, 3.0]},
+        ]
+        centroids = compute_type_centroids(rows)
+        assert len(centroids) == 1
+        assert "A" in centroids
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Infer Query Type
+# ---------------------------------------------------------------------------
+
+class TestInferQueryType:
+    def test_returns_distribution(self):
+        centroids = {
+            "A": [1.0, 0.0],
+            "B": [0.0, 1.0],
+        }
+        probs = infer_query_type([0.5, 0.5], centroids)
+        total = sum(probs.values())
+        assert abs(total - 1.0) < 1e-6
+
+    def test_closest_type_highest(self):
+        centroids = {
+            "A": [1.0, 0.0],
+            "B": [0.0, 1.0],
+        }
+        # Query is much closer to A
+        probs = infer_query_type([1.0, 0.0], centroids)
+        assert probs["A"] > probs["B"]
+
+    def test_single_centroid(self):
+        centroids = {"ONLY": [1.0, 0.0]}
+        probs = infer_query_type([0.5, 0.5], centroids)
+        assert abs(probs["ONLY"] - 1.0) < 1e-6
+
+    def test_empty_centroids(self):
+        probs = infer_query_type([1.0, 0.0], {})
+        assert probs == {}
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Centroid Cache (save/load)
+# ---------------------------------------------------------------------------
+
+class TestCentroidCache:
+    def test_save_and_load(self, tmp_path):
+        centroids = {"A": [1.0, 2.0, 3.0], "B": [4.0, 5.0, 6.0]}
+        path = tmp_path / "centroids.json"
+        save_centroids(centroids, path)
+        loaded = load_centroids(path)
+        assert loaded == centroids
+
+    def test_load_missing_file(self, tmp_path):
+        path = tmp_path / "nonexistent.json"
+        assert load_centroids(path) is None
+
+    def test_load_corrupt_file(self, tmp_path):
+        path = tmp_path / "bad.json"
+        path.write_text("not json {{{")
+        assert load_centroids(path) is None

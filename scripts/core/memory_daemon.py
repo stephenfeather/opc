@@ -63,7 +63,19 @@ global_env = Path.home() / ".claude" / ".env"
 if global_env.exists():
     load_dotenv(global_env, override=True)
 
-DAEMON_VERSION = "0.7.0"
+DAEMON_VERSION = "0.7.1"
+
+
+def _normalize_project(path_str: str) -> str | None:
+    """Normalize project path to short name, handling worktrees."""
+    if not path_str:
+        return None
+    p = Path(path_str)
+    parts = p.parts
+    if ".worktrees" in parts:
+        idx = parts.index(".worktrees")
+        return parts[idx - 1] if idx > 0 else p.name
+    return p.name
 
 # Global config
 POLL_INTERVAL = 60  # seconds
@@ -499,6 +511,7 @@ Store each learning using store_learning.py with appropriate type and tags."""
 
         env = os.environ.copy()
         env["CLAUDE_MEMORY_EXTRACTION"] = "1"  # Prevent session-register from registering extraction sessions
+        env["CLAUDE_PROJECT_DIR"] = project_dir or ""
 
         proc = subprocess.Popen(
             [
@@ -618,6 +631,7 @@ def _extract_and_store_workflows(
             content = format_pattern_as_learning(pattern)
             try:
                 import asyncio
+                project_name = _normalize_project(project) if project else None
                 result = asyncio.run(store_learning_v2(
                     session_id=session_id,
                     content=content,
@@ -625,6 +639,7 @@ def _extract_and_store_workflows(
                     context=project or "unknown",
                     tags=["workflow", pattern["pattern_type"]],
                     confidence="high",
+                    project=project_name,
                 ))
                 if result.get("success") and not result.get("skipped"):
                     stored += 1

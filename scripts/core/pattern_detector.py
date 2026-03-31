@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 from collections import Counter, defaultdict
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -343,8 +344,8 @@ def fuse_clusters(
 # Pattern classification
 # ---------------------------------------------------------------------------
 
-def classify_pattern(members: list[Learning]) -> str:
-    """Classify a cluster as one of the pattern types.
+def classify_pattern_heuristic(members: list[Learning]) -> str:
+    """Classify a cluster as one of the pattern types using heuristics.
 
     Rules (checked in priority order):
     - All FAILED_APPROACH -> 'anti_pattern'
@@ -384,6 +385,21 @@ def classify_pattern(members: list[Learning]) -> str:
         return "expertise"
 
     return "tool_cluster"
+
+
+def _learning_to_dict(m: Learning) -> dict:
+    """Convert a Learning to the dict format expected by classify_pattern_llm."""
+    return {
+        "content": m.content,
+        "learning_type": m.learning_type,
+        "session_id": m.session_id,
+        "context": m.context,
+        "tags": m.tags,
+    }
+
+
+# Type alias for an async cluster classifier callback.
+PatternClassifier = Callable[[list[Learning]], Awaitable[str]]
 
 
 # ---------------------------------------------------------------------------
@@ -492,12 +508,13 @@ def compute_distances(
 # Main detection pipeline
 # ---------------------------------------------------------------------------
 
-def detect_patterns(
+async def detect_patterns(
     learnings: list[Learning],
     min_cluster_size: int = 5,
     min_samples: int = 3,
     min_confidence: float = 0.3,
     tag_noise_percentile: float = 10,
+    classifier: PatternClassifier | None = None,
 ) -> list[DetectedPattern]:
     """Run the full pattern detection pipeline.
 
@@ -505,6 +522,10 @@ def detect_patterns(
     2. Compute tag IDF and cluster by tags
     3. Fuse clusters
     4. Classify, label, and score each cluster
+
+    Args:
+        classifier: Optional async callback for LLM-based classification.
+            Falls back to classify_pattern_heuristic() on None or error.
 
     Returns list of DetectedPattern sorted by confidence descending.
     """
@@ -543,7 +564,13 @@ def detect_patterns(
         distances = compute_distances(members, centroid)
         representative_id = min(distances, key=distances.get)
 
-        pattern_type = classify_pattern(members)
+        if classifier is not None:
+            try:
+                pattern_type = await classifier(members)
+            except Exception:
+                pattern_type = classify_pattern_heuristic(members)
+        else:
+            pattern_type = classify_pattern_heuristic(members)
         label = generate_label(members, pattern_type)
 
         # Aggregate tags

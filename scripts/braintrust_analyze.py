@@ -936,6 +936,369 @@ async def llm_judge(prompt: str, **format_args) -> dict:
         return {"verdict": None, "error": str(e)[:100]}
 
 
+# ---------------------------------------------------------------------------
+# Learning classification prompt
+# ---------------------------------------------------------------------------
+
+CLASSIFY_LEARNING_PROMPT = (  # noqa: E501
+    "Classify this learning into exactly one type.\n"
+    "\n"
+    "LEARNING:\n"
+    "{content}\n"
+    "\n"
+    "{context_line}\n"
+    "\n"
+    "Apply the FIRST matching rule (ordered by specificity):\n"
+    "\n"
+    "1. FAILED_APPROACH — Something was tried and did NOT work.\n"
+    "   Signal: negative outcome, \"doesn't work\", \"breaks\", \"anti-pattern\",\n"
+    "   \"NOT\", \"abandoned\", \"failed\". Past tense failure.\n"
+    "\n"
+    "2. ERROR_FIX — A specific error/failure was diagnosed and fixed.\n"
+    "   Signal: references a specific error message, status code, exception,\n"
+    "   or failure symptom AND provides the resolution or root cause.\n"
+    "   Key: must have BOTH a symptom and a fix/cause. An observation about\n"
+    "   how something behaves without an error context is CODEBASE_PATTERN.\n"
+    "\n"
+    "3. OPEN_THREAD — Work is explicitly incomplete, must be resumed.\n"
+    "   Signal: \"TODO\", \"not yet\", \"still needs\", \"incomplete\",\n"
+    "   \"behind N migrations\", \"deferred\". Forward-looking action items.\n"
+    "\n"
+    "4. USER_PREFERENCE — The user wants things done a specific way.\n"
+    "   Signal: prescriptive rules with imperative tone: \"always use X\",\n"
+    "   \"never do Y\", \"prefer X\", \"require X\", \"must\", \"convention\".\n"
+    "   Key: the PERSON enforces a rule. If the CODE enforces behavior,\n"
+    "   that's CODEBASE_PATTERN. \"User requires GPG signing\" = preference.\n"
+    "   \"Vue requires full Set replacement for reactivity\" = pattern.\n"
+    "\n"
+    "5. ARCHITECTURAL_DECISION — A deliberate choice between alternatives.\n"
+    "   Signal: explains WHY one approach was chosen OVER another.\n"
+    "   Must discuss alternatives or trade-offs explicitly.\n"
+    "\n"
+    "6. WORKING_SOLUTION — A specific technique that solved a concrete problem.\n"
+    "   Signal: describes an action someone took that succeeded.\n"
+    "   Key: there was a PROBLEM, and this describes the ACTION that fixed it.\n"
+    "   \"Recovered daemon code by mining S3 transcripts\" = solution.\n"
+    "   \"SAM copies CodeUri contents to Lambda root\" = pattern (no problem).\n"
+    "\n"
+    "7. CODEBASE_PATTERN — DEFAULT. An observation about how code/systems\n"
+    "   behave. No fix, no failure, no preference, no decision.\n"
+    "   \"When X happens, Y occurs.\" Describes behavior, not actions taken.\n"
+    "\n"
+    "FEW-SHOT EXAMPLES:\n"
+    "\n"
+    "\"Cmd+Q sends SIGTERM, allowing hooks to fire. Use kill -9 for true crash.\"\n"
+    "-> FAILED_APPROACH (Cmd+Q was tried for crash testing and didn't work)\n"
+    "\n"
+    "\"npm audit shows stale results if node_modules not updated. Run npm install first.\"\n"
+    "-> ERROR_FIX (stale audit is the symptom, npm install is the fix)\n"
+    "\n"
+    "\"BinBrain Pi database is behind 5 migrations. Run all before deploying.\"\n"
+    "-> OPEN_THREAD (incomplete work that must be done)\n"
+    "\n"
+    "\"Always use ParaTest instead of PHPUnit. 2.6x faster with 8 processes.\"\n"
+    "-> USER_PREFERENCE (prescriptive: \"always use\")\n"
+    "\n"
+    "\"Used psycopg2 over psycopg3 because project already depends on psycopg2-binary.\"\n"
+    "-> ARCHITECTURAL_DECISION (chose X over Y with rationale)\n"
+    "\n"
+    "\"For large refactoring, manually do 2-3 files first, then spawn parallel agents.\"\n"
+    "-> WORKING_SOLUTION (technique that solved a refactoring problem)\n"
+    "\n"
+    "\"Vue Set mutations require full replacement to preserve reactivity.\"\n"
+    "-> CODEBASE_PATTERN (how Vue behaves — observation, not a fix)\n"
+    "\n"
+    "\"Vitest rule: cannot use expect() inside conditional blocks.\"\n"
+    "-> CODEBASE_PATTERN (how the tool behaves — the tool enforces this)\n"
+    "\n"
+    "\"For sermon-browser, always use ParaTest instead of PHPUnit. 2.6x faster.\"\n"
+    "-> USER_PREFERENCE (the user prescribes a tool choice for a project)\n"
+    "\n"
+    "\"When committing spec changes, must run spec-convert script first.\"\n"
+    "-> USER_PREFERENCE (the user prescribes a required workflow step)\n"
+    "\n"
+    "{hint_line}\n"
+    "\n"
+    "Output ONLY valid JSON (no markdown fences):\n"
+    '{{"learning_type": "<TYPE>", '
+    '"confidence": "high|medium|low", '
+    '"reasoning": "<1 sentence explaining which rule matched>"}}'
+)
+
+
+CLASSIFY_PATTERN_PROMPT = (  # noqa: E501
+    "Classify this cluster of related learnings into exactly one "
+    "pattern type.\n"
+    "\n"
+    "CLUSTER SUMMARY:\n"
+    "- Members: {member_count} learnings\n"
+    "- Sessions: {session_count} distinct sessions\n"
+    "- Contexts: {contexts}\n"
+    "- Learning type distribution: {type_distribution}\n"
+    "- Tags: {tags}\n"
+    "\n"
+    "SAMPLE MEMBERS:\n"
+    "{samples}\n"
+    "\n"
+    "PATTERN TYPES:\n"
+    "- anti_pattern: Things that consistently fail or should be\n"
+    "  avoided. Dominated by FAILED_APPROACH learnings.\n"
+    "- cross_project: Knowledge that applies across multiple\n"
+    "  projects/domains. Broad applicability, diverse contexts.\n"
+    "- problem_solution: A recurring problem paired with its\n"
+    "  solution. Mix of ERROR_FIX and WORKING_SOLUTION learnings.\n"
+    "- expertise: Deep knowledge in a specific area, concentrated\n"
+    "  in recent activity. Shows skill development.\n"
+    "- tool_cluster: Knowledge about specific tools, libraries, or\n"
+    "  frameworks grouped together.\n"
+    "\n"
+    "Output ONLY valid JSON (no markdown fences):\n"
+    '{{"pattern_type": "<TYPE>", '
+    '"confidence": "high|medium|low", '
+    '"reasoning": "<1 sentence>"}}'
+)
+
+
+async def classify_learning(
+    content: str,
+    existing_type: str | None = None,
+    context: str | None = None,
+) -> dict:
+    """Classify a learning into one of 7 LEARNING_TYPES using LLM.
+
+    Args:
+        content: The learning text to classify
+        existing_type: Current type (used as hint, not trusted)
+        context: What the learning relates to
+
+    Returns:
+        dict with learning_type, confidence, reasoning (or error on failure)
+    """
+    valid_types = [
+        "ARCHITECTURAL_DECISION", "WORKING_SOLUTION", "CODEBASE_PATTERN",
+        "FAILED_APPROACH", "ERROR_FIX", "USER_PREFERENCE", "OPEN_THREAD",
+    ]
+
+    context_line = f"CONTEXT: {context}" if context else ""
+    hint_line = (
+        f"Current classification: {existing_type} (may be incorrect — override if wrong)"
+        if existing_type
+        else ""
+    )
+
+    result = await llm_judge(
+        CLASSIFY_LEARNING_PROMPT,
+        content=content,
+        context_line=context_line,
+        hint_line=hint_line,
+    )
+
+    if result.get("error"):
+        return {
+            "learning_type": existing_type or "CODEBASE_PATTERN",
+            "confidence": "low",
+            "reasoning": "classification failed — using fallback",
+            "error": result["error"],
+        }
+
+    raw = result.get("raw", {})
+    classified_type = raw.get("learning_type", "").upper()
+
+    # Validate the type
+    if classified_type not in valid_types:
+        return {
+            "learning_type": existing_type or "CODEBASE_PATTERN",
+            "confidence": "low",
+            "reasoning": f"LLM returned invalid type: {classified_type}",
+            "error": f"invalid type: {classified_type}",
+        }
+
+    return {
+        "learning_type": classified_type,
+        "confidence": raw.get("confidence", "medium"),
+        "reasoning": raw.get("reasoning", ""),
+    }
+
+
+async def classify_pattern_llm(
+    members: list[dict],
+) -> dict:
+    """Classify a cluster of learnings into one of 5 pattern types using LLM.
+
+    Args:
+        members: List of dicts with 'content', 'learning_type', 'session_id',
+                 'context', 'tags' keys
+
+    Returns:
+        dict with pattern_type, confidence, reasoning (or error on failure)
+    """
+    valid_types = ["anti_pattern", "cross_project", "problem_solution", "expertise", "tool_cluster"]
+
+    # Build summary stats
+    from collections import Counter
+
+    type_counts = Counter(m.get("learning_type", "unknown") for m in members)
+    sessions = set(m.get("session_id", "") for m in members)
+    contexts = set(m.get("context", "") for m in members if m.get("context"))
+    all_tags = set()
+    for m in members:
+        for t in (m.get("tags") or []):
+            all_tags.add(t)
+
+    # Take up to 10 samples, truncated
+    samples = []
+    for m in members[:10]:
+        text = (m.get("content") or "")[:500]
+        samples.append(f"- [{m.get('learning_type', '?')}] {text}")
+    samples_text = "\n".join(samples)
+
+    result = await llm_judge(
+        CLASSIFY_PATTERN_PROMPT,
+        member_count=len(members),
+        session_count=len(sessions),
+        contexts=", ".join(contexts) if contexts else "none",
+        type_distribution=", ".join(f"{k}: {v}" for k, v in type_counts.most_common()),
+        tags=", ".join(sorted(all_tags)[:20]) if all_tags else "none",
+        samples=samples_text,
+    )
+
+    if result.get("error"):
+        return {
+            "pattern_type": "tool_cluster",
+            "confidence": "low",
+            "reasoning": "classification failed — using fallback",
+            "error": result["error"],
+        }
+
+    raw = result.get("raw", {})
+    classified_type = raw.get("pattern_type", "").lower()
+
+    if classified_type not in valid_types:
+        return {
+            "pattern_type": "tool_cluster",
+            "confidence": "low",
+            "reasoning": f"LLM returned invalid type: {classified_type}",
+            "error": f"invalid type: {classified_type}",
+        }
+
+    return {
+        "pattern_type": classified_type,
+        "confidence": raw.get("confidence", "medium"),
+        "reasoning": raw.get("reasoning", ""),
+    }
+
+
+async def reclassify_learnings(
+    limit: int = 50,
+    dry_run: bool = True,
+) -> dict:
+    """Batch reclassify learnings that have default/missing types.
+
+    Args:
+        limit: Max learnings to process
+        dry_run: If True, show proposed changes without writing
+
+    Returns:
+        dict with stats: processed, changed, unchanged, errors, changes list
+    """
+    import asyncio
+
+    import psycopg2
+
+    db_url = (
+        os.environ.get("DATABASE_URL")
+        or os.environ.get("CONTINUOUS_CLAUDE_DB_URL")
+    )
+    if not db_url:
+        return {"error": "DATABASE_URL not set"}
+
+    # Find learnings with default or missing types
+    conn = psycopg2.connect(db_url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, content, metadata
+                FROM archival_memory
+                WHERE superseded_by IS NULL
+                  AND (
+                    metadata->>'learning_type' IS NULL
+                    OR metadata->>'learning_type' = 'WORKING_SOLUTION'
+                  )
+                ORDER BY created_at DESC
+                LIMIT %s
+            """, (limit,))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return {"processed": 0, "changed": 0, "unchanged": 0, "errors": 0, "changes": []}
+
+    stats = {"processed": 0, "changed": 0, "unchanged": 0, "errors": 0, "changes": []}
+
+    write_conn = None
+    if not dry_run:
+        write_conn = psycopg2.connect(db_url)
+
+    for row_id, content, metadata in rows:
+        stats["processed"] += 1
+        existing_type = (metadata or {}).get("learning_type")
+        context = (metadata or {}).get("context")
+
+        result = await classify_learning(content, existing_type=existing_type, context=context)
+
+        if result.get("error"):
+            stats["errors"] += 1
+            print(f"  ERROR [{row_id}]: {result['error']}")
+        elif result["learning_type"] == existing_type:
+            stats["unchanged"] += 1
+        else:
+            stats["changed"] += 1
+            change = {
+                "id": str(row_id),
+                "content_preview": content[:80],
+                "old_type": existing_type,
+                "new_type": result["learning_type"],
+                "confidence": result["confidence"],
+                "reasoning": result["reasoning"],
+            }
+            stats["changes"].append(change)
+            action = "WOULD UPDATE" if dry_run else "UPDATED"
+            print(
+                f"  {action} [{row_id}]: {existing_type} -> {result['learning_type']}"
+                f" ({result['confidence']}, {result['reasoning']})"
+            )
+
+            if not dry_run:
+                with write_conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE archival_memory
+                        SET metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb
+                        WHERE id = %s
+                    """, (
+                        json.dumps({
+                            "learning_type": result["learning_type"],
+                            "classification_reasoning": (
+                                result["reasoning"]
+                            ),
+                            "classified_at": (
+                                datetime.now().isoformat()
+                            ),
+                            "classified_by": "llm_judge",
+                        }),
+                        row_id,
+                    ))
+
+        # Rate limit: 1 request/second
+        await asyncio.sleep(1)
+
+    if not dry_run and write_conn is not None:
+        write_conn.commit()
+        write_conn.close()
+
+    return stats
+
+
 async def score_plan(plan_content: str) -> dict:
     """Score plan quality using critique-focused LLM-as-judge.
 
@@ -1526,15 +1889,42 @@ def parse_args():
         metavar="PLAN_PATH",
         help="RAG-enhanced plan judging using Context Graph precedent",
     )
+    group.add_argument(
+        "--classify",
+        metavar="LEARNING_ID",
+        help="Classify a single learning by ID",
+    )
+    group.add_argument(
+        "--reclassify",
+        action="store_true",
+        help="Batch reclassify learnings with default/missing types",
+    )
 
     parser.add_argument(
-        "--project", default="agentica", help="Braintrust project name (default: agentica)"
+        "--project",
+        default="agentica",
+        help="Braintrust project name (default: agentica)",
     )
     parser.add_argument(
-        "--session-id", metavar="ID", help="Specific session ID for --learn or --review"
+        "--session-id",
+        metavar="ID",
+        help="Specific session ID for --learn or --review",
     )
     parser.add_argument(
-        "--score", action="store_true", help="Enable qualitative scoring (uses LLM-as-judge)"
+        "--score",
+        action="store_true",
+        help="Enable qualitative scoring (uses LLM-as-judge)",
+    )
+    parser.add_argument(
+        "--reclassify-limit",
+        type=int,
+        default=50,
+        help="Max learnings to reclassify (default: 50)",
+    )
+    parser.add_argument(
+        "--reclassify-write",
+        action="store_true",
+        help="Actually write reclassification changes (default: dry-run)",
     )
 
     # Handle being called via runtime.harness
@@ -1612,6 +2002,84 @@ def main():
             sys.exit(1)
         else:
             print("\n**Ready for:** Handoff creation")
+
+    elif args.classify:
+        import asyncio
+
+        import psycopg2
+
+        db_url = os.environ.get("DATABASE_URL") or os.environ.get(
+            "CONTINUOUS_CLAUDE_DB_URL"
+        )
+        if not db_url:
+            print("Error: DATABASE_URL not set")
+            sys.exit(1)
+
+        async def _classify_one(learning_id: str):
+            conn = psycopg2.connect(db_url)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT content, metadata"
+                        " FROM archival_memory"
+                        " WHERE id::text LIKE %s LIMIT 1",
+                        (f"{learning_id}%",),
+                    )
+                    row = cur.fetchone()
+            finally:
+                conn.close()
+            if not row:
+                print(f"Learning not found: {learning_id}")
+                return
+            content, metadata = row
+            existing = (metadata or {}).get("learning_type")
+            ctx = (metadata or {}).get("context")
+            result = await classify_learning(
+                content, existing_type=existing, context=ctx
+            )
+            print(f"Content: {content[:120]}...")
+            print(f"Current type: {existing or 'None'}")
+            print(f"Classified:   {result['learning_type']}")
+            print(f"Confidence:   {result.get('confidence', '?')}")
+            print(f"Reasoning:    {result.get('reasoning', '?')}")
+            if result.get("error"):
+                print(f"Error:        {result['error']}")
+
+        asyncio.run(_classify_one(args.classify))
+
+    elif args.reclassify:
+        import asyncio
+
+        dry_run = not args.reclassify_write
+        mode = "DRY RUN" if dry_run else "WRITE MODE"
+        print(f"Reclassifying learnings ({mode}, limit={args.reclassify_limit})")
+
+        stats = asyncio.run(
+            reclassify_learnings(
+                limit=args.reclassify_limit, dry_run=dry_run
+            )
+        )
+
+        if stats.get("error"):
+            print(f"Error: {stats['error']}")
+            sys.exit(1)
+
+        print("\nReclassification Summary:")
+        print(f"  Processed: {stats['processed']}")
+        print(f"  Changed:   {stats['changed']}")
+        print(f"  Unchanged: {stats['unchanged']}")
+        print(f"  Errors:    {stats['errors']}")
+
+        if stats["changes"]:
+            from collections import Counter
+
+            transitions = Counter(
+                f"{c['old_type']} -> {c['new_type']}"
+                for c in stats["changes"]
+            )
+            print("\n  Transitions:")
+            for transition, count in transitions.most_common():
+                print(f"    {transition}: {count}")
 
     elif args.rag_judge:
         import asyncio

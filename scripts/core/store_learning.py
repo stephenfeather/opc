@@ -93,6 +93,7 @@ async def store_learning_v2(
     host_id: str | None = None,
     supersedes: str | None = None,
     project: str | None = None,
+    auto_classify: bool = False,
 ) -> dict:
     """Store learning with v2 metadata schema and deduplication.
 
@@ -182,12 +183,55 @@ async def store_learning_v2(
             # If search fails, proceed with storing (don't block on dedup errors)
             pass
 
+        # Auto-classify if requested and type is missing/default
+        classification_reasoning = None
+        if auto_classify and (
+            not learning_type or learning_type == "WORKING_SOLUTION"
+        ):
+            try:
+                from scripts.braintrust_analyze import classify_learning
+
+                result = await classify_learning(
+                    content,
+                    existing_type=learning_type,
+                    context=context,
+                )
+                if not result.get("error"):
+                    learning_type = result["learning_type"]
+                    classification_reasoning = result.get("reasoning")
+                    logger.info(
+                        "Auto-classified as %s (%s)",
+                        learning_type,
+                        classification_reasoning,
+                    )
+                else:
+                    logger.warning(
+                        "Auto-classification failed: %s. "
+                        "Using fallback type: %s",
+                        result["error"],
+                        learning_type or "WORKING_SOLUTION",
+                    )
+            except ImportError:
+                logger.warning(
+                    "braintrust_analyze not available for "
+                    "auto-classification. Install with: "
+                    "pip install aiohttp"
+                )
+            except Exception as e:
+                logger.warning(
+                    "Auto-classification error: %s", str(e)[:100]
+                )
+
         # Build metadata
         metadata = {
             "type": "session_learning",
             "session_id": session_id,
             "timestamp": datetime.now(UTC).isoformat(),
         }
+        if classification_reasoning:
+            metadata["classification_reasoning"] = classification_reasoning
+            metadata["classified_by"] = "llm_judge"
+            metadata["classified_at"] = datetime.now(UTC).isoformat()
 
         if host_id:
             metadata["host_id"] = host_id
@@ -373,6 +417,13 @@ async def main():
     # Learning chains
     parser.add_argument("--supersedes", help="UUID of older learning this one replaces (v2)")
 
+    # Auto-classification
+    parser.add_argument(
+        "--auto-classify",
+        action="store_true",
+        help="Auto-classify learning type via LLM (requires BRAINTRUST_API_KEY)",
+    )
+
     # Output options
     parser.add_argument("--json", action="store_true", help="Output as JSON")
 
@@ -398,6 +449,7 @@ async def main():
             host_id=args.host_id,
             supersedes=args.supersedes,
             project=project,
+            auto_classify=args.auto_classify,
         )
     else:
         # Legacy mode

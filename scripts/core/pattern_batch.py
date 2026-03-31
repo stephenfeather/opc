@@ -308,8 +308,13 @@ async def run_pattern_detection(
     min_samples: int = 3,
     min_confidence: float = 0.3,
     dry_run: bool = False,
+    use_llm: bool = False,
 ) -> dict:
     """Run full pattern detection pipeline.
+
+    Args:
+        use_llm: Use LLM-based classifier instead of heuristic.
+            Falls back to heuristic on LLM error.
 
     Returns summary dict with run stats.
     """
@@ -351,13 +356,28 @@ async def run_pattern_detection(
         if extra_tags:
             lrn.tags = list(set(lrn.tags + extra_tags))
 
+    # Build classifier
+    classifier = None
+    if use_llm:
+        from scripts.core.pattern_detector import _learning_to_dict
+
+        async def _llm_classifier(members):
+            from scripts.braintrust_analyze import classify_pattern_llm
+            dicts = [_learning_to_dict(m) for m in members]
+            result = await classify_pattern_llm(dicts)
+            return result["pattern_type"]
+
+        classifier = _llm_classifier
+        logger.info("Using LLM-based pattern classifier")
+
     # Run detection
     logger.info("Running pattern detection...")
-    patterns = detect_patterns(
+    patterns = await detect_patterns(
         learnings,
         min_cluster_size=min_cluster_size,
         min_samples=min_samples,
         min_confidence=min_confidence,
+        classifier=classifier,
     )
     logger.info("Detected %d patterns", len(patterns))
 
@@ -436,6 +456,11 @@ def main():
         help="Minimum pattern confidence (default: 0.3)",
     )
     parser.add_argument(
+        "--use-llm",
+        action="store_true",
+        help="Use LLM-based classifier instead of heuristic",
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Verbose logging",
@@ -461,6 +486,7 @@ def main():
         min_samples=args.min_samples,
         min_confidence=args.min_confidence,
         dry_run=args.dry_run,
+        use_llm=args.use_llm,
     ))
 
     print(json.dumps(result, indent=2))

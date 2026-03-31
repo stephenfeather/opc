@@ -24,10 +24,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import asyncio
+
 from scripts.core.pattern_detector import (  # noqa: E402
     DetectedPattern,
     Learning,
-    classify_pattern,
+    classify_pattern_heuristic,
     cluster_by_embeddings,
     cluster_by_tags,
     compute_centroid,
@@ -273,19 +275,19 @@ class TestClassifyPattern:
 
     def test_anti_pattern_all_failed(self):
         members = [_make_learning(learning_type="FAILED_APPROACH") for _ in range(5)]
-        assert classify_pattern(members) == "anti_pattern"
+        assert classify_pattern_heuristic(members) == "anti_pattern"
 
     def test_anti_pattern_majority_failed(self):
         members = [_make_learning(learning_type="FAILED_APPROACH") for _ in range(4)]
         members.append(_make_learning(learning_type="WORKING_SOLUTION"))
-        assert classify_pattern(members) == "anti_pattern"
+        assert classify_pattern_heuristic(members) == "anti_pattern"
 
     def test_cross_project(self):
         members = [
             _make_learning(session_id=f"s{i}", context=f"project{i}")
             for i in range(5)
         ]
-        assert classify_pattern(members) == "cross_project"
+        assert classify_pattern_heuristic(members) == "cross_project"
 
     def test_problem_solution(self):
         members = [
@@ -293,7 +295,7 @@ class TestClassifyPattern:
             _make_learning(learning_type="ERROR_FIX", session_id="s1", context="ctx"),
             _make_learning(learning_type="WORKING_SOLUTION", session_id="s1", context="ctx"),
         ]
-        assert classify_pattern(members) == "problem_solution"
+        assert classify_pattern_heuristic(members) == "problem_solution"
 
     def test_expertise_recent(self):
         now = datetime.now(UTC)
@@ -305,7 +307,7 @@ class TestClassifyPattern:
             )
             for i in range(5)
         ]
-        assert classify_pattern(members) == "expertise"
+        assert classify_pattern_heuristic(members) == "expertise"
 
     def test_default_tool_cluster(self):
         # Same session, same context -> falls through to default
@@ -313,10 +315,10 @@ class TestClassifyPattern:
             _make_learning(session_id="s1", context="ctx")
             for _ in range(5)
         ]
-        assert classify_pattern(members) == "tool_cluster"
+        assert classify_pattern_heuristic(members) == "tool_cluster"
 
     def test_empty_members(self):
-        assert classify_pattern([]) == "tool_cluster"
+        assert classify_pattern_heuristic([]) == "tool_cluster"
 
 
 # ---------------------------------------------------------------------------
@@ -438,9 +440,9 @@ class TestDetectPatterns:
                 created_at=datetime.now(UTC) - timedelta(days=i),
             ))
 
-        patterns = detect_patterns(
+        patterns = asyncio.run(detect_patterns(
             learnings, min_cluster_size=5, min_samples=3, min_confidence=0.1,
-        )
+        ))
         assert len(patterns) >= 1
         for p in patterns:
             assert p.confidence > 0
@@ -454,7 +456,7 @@ class TestDetectPatterns:
 
     def test_too_few_learnings_returns_empty(self):
         learnings = [_make_learning() for _ in range(3)]
-        assert detect_patterns(learnings) == []
+        assert asyncio.run(detect_patterns(learnings)) == []
 
     def test_patterns_sorted_by_confidence(self):
         """Output should be sorted by confidence descending."""
@@ -467,7 +469,7 @@ class TestDetectPatterns:
             )
             for i, e in enumerate(embeddings)
         ]
-        patterns = detect_patterns(learnings, min_cluster_size=5, min_confidence=0.0)
+        patterns = asyncio.run(detect_patterns(learnings, min_cluster_size=5, min_confidence=0.0))
         if len(patterns) >= 2:
             for i in range(len(patterns) - 1):
                 assert patterns[i].confidence >= patterns[i + 1].confidence

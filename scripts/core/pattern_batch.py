@@ -177,9 +177,6 @@ async def write_patterns(
 
     Returns count of patterns written.
     """
-    if not patterns:
-        return 0
-
     async with pool.acquire() as conn:
         async with conn.transaction():
             # Advisory lock to prevent concurrent pattern detection runs
@@ -332,6 +329,9 @@ async def run_pattern_detection(
     logger.info("Loaded %d learnings", len(learnings))
 
     if not learnings:
+        # Still supersede previous snapshot so stale patterns don't persist
+        if not dry_run:
+            await write_patterns(pool, [], run_id)
         return {
             "success": True,
             "run_id": run_id,

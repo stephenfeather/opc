@@ -216,11 +216,14 @@ class TestWritePatterns:
         assert conn.executemany.call_count == 1
 
     @pytest.mark.asyncio
-    async def test_empty_patterns_writes_nothing(self):
+    async def test_empty_patterns_still_supersedes(self):
         pool, conn = _make_pool()
         count = await write_patterns(pool, [], str(uuid.uuid4()))
         assert count == 0
-        conn.execute.assert_not_called()
+        # Should still acquire lock and supersede previous run
+        assert conn.execute.call_count == 2
+        supersede_call = conn.execute.call_args_list[1]
+        assert "superseded_at" in supersede_call.args[0]
 
     @pytest.mark.asyncio
     async def test_advisory_lock_acquired(self):

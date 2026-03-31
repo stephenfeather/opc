@@ -564,7 +564,7 @@ def detect_patterns(
             label=label,
             metadata={
                 "size": len(members),
-                "cohesion": float(np.mean(list(distances.values()))),
+                "cohesion": float(np.mean([1.0 - d for d in distances.values()])),
                 "temporal_span_days": (
                     (max(m.created_at for m in members) - min(m.created_at for m in members)).days
                     if len(members) >= 2 else 0

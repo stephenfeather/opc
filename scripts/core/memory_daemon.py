@@ -858,10 +858,12 @@ def daemon_loop():
                             session_id, project or "", tp
                         )
             # Pattern detection: check completion, trigger if due
+            # Only runs on PostgreSQL — pattern_batch.py requires asyncpg
             _check_pattern_detection()
-            elapsed = time.time() - _last_pattern_run
-            if elapsed > _PATTERN_DETECTION_INTERVAL:
-                _run_pattern_detection_batch()
+            if use_postgres():
+                elapsed = time.time() - _last_pattern_run
+                if elapsed > _PATTERN_DETECTION_INTERVAL:
+                    _run_pattern_detection_batch()
 
         except Exception as e:
             log(f"Error in daemon loop: {e}")

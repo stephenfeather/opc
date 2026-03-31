@@ -109,12 +109,17 @@ async def _fetch_total_learnings(conn) -> int:
 
 
 async def _fetch_total_sessions(conn) -> int:
-    """Count distinct sessions for context."""
+    """Count distinct sessions for context.
+
+    Uses the same filters as _fetch_total_learnings so both
+    functions count over the same analysed population.
+    """
     row = await conn.fetchrow(
         """
-        SELECT COUNT(DISTINCT metadata->>'session_id') AS cnt
+        SELECT COUNT(DISTINCT session_id) AS cnt
         FROM archival_memory
         WHERE superseded_by IS NULL
+          AND embedding IS NOT NULL
         """
     )
     return row["cnt"] if row else 0

@@ -677,6 +677,24 @@ def _generate_mini_handoff(
         log(f"Mini-handoff generation failed for {session_id}: {e}")
 
 
+def _count_session_learnings(session_id: str) -> int | None:
+    """Count learnings stored for a session. Returns None on error."""
+    try:
+        if use_postgres():
+            conn = pg_connect()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) FROM archival_memory WHERE session_id = %s",
+                (session_id,),
+            )
+            count = cur.fetchone()[0]
+            conn.close()
+            return count
+    except Exception:
+        return None
+    return None
+
+
 def reap_completed_extractions():
     """Check for completed extraction processes and remove from active set."""
     completed = []
@@ -685,9 +703,11 @@ def reap_completed_extractions():
         if exit_code is not None:
             completed.append(pid)
             elapsed = int(time.time() - _start)
+            learnings_count = _count_session_learnings(session_id) if exit_code == 0 else None
+            learnings_info = f", learnings={learnings_count}" if learnings_count is not None else ""
             log(f"Extraction completed for {session_id} "
                 f"(pid={pid}, project={project}, "
-                f"exit={exit_code}, elapsed={elapsed}s)")
+                f"exit={exit_code}, elapsed={elapsed}s{learnings_info})")
             if exit_code == 0:
                 mark_extracted(session_id)
                 _extract_and_store_workflows(session_id, jsonl_path, project)

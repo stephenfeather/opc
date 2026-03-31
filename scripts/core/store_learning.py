@@ -212,6 +212,7 @@ async def store_learning_v2(
             content_hash=content_hash,
             host_id=host_id,
             supersedes=supersedes if backend == "postgres" else None,
+            tags=tags if backend == "postgres" else None,
         )
 
         await memory.close()

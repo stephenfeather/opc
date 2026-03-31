@@ -765,6 +765,11 @@ async def main() -> int:
         default=0.1,
         help="Recency weight for vector-only mode (0.0-1.0, default: 0.1)",
     )
+    parser.add_argument(
+        "--tags",
+        nargs="+",
+        help="[NOT YET IMPLEMENTED] Filter results by tags (space-separated, OR match)",
+    )
 
     args = parser.parse_args()
 

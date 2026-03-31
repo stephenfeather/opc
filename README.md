@@ -19,6 +19,8 @@ This project began as a fork of [Continuous-Claude-v3](https://github.com/parcad
 - **Temporal decay tracking** - Tracks when learnings are recalled and decays stale entries that haven't been useful recently
 - **Semantic deduplication** - Prevents storing near-duplicate learnings using embedding similarity checks across sessions
 - **Tag-based filtering** - Store and recall learnings with tags for precise filtering (`--tags`, `--tags-strict`)
+- **LLM learning classification** - Auto-classifies learnings by type using a tuned prompt with eval harness (84.3% accuracy), wired into pattern detection
+- **Project-scoped extraction** - Daemon passes project context through both LLM and workflow extraction paths, enabling project-match reranking
 
 ## Project Structure
 

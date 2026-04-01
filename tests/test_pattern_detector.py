@@ -343,7 +343,7 @@ class TestClassifyPattern:
                            created_at=datetime(2026, 1, 1, tzinfo=UTC))
             for _ in range(3)
         ]
-        assert classify_pattern_heuristic(members) != "problem_solution"
+        assert classify_pattern_heuristic(members) == "tool_cluster"
 
     # -- Rule 3: expertise --
 

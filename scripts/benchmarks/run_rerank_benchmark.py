@@ -22,10 +22,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-# For sweep mode: import reranker directly to avoid subprocess overhead
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from core.reranker import RecallContext, RerankerConfig, rerank
-
+from scripts.core.reranker import RecallContext, RerankerConfig, rerank
 
 # -------------------------------------------------------------------
 # Data structures
@@ -283,19 +280,10 @@ async def run_query(
 
     if proc.returncode != 0:
         err = stderr.decode().strip()
-        print(
-            f"  WARNING: query {query_id} "
-            f"({'reranked' if rerank else 'raw'}) failed: {err}",
-            file=sys.stderr,
-        )
-        return QueryResult(
-            query_id=query_id,
-            query=query,
-            mode="reranked" if rerank else "raw",
-            result_ids=[],
-            result_scores=[],
-            result_contents=[],
-            elapsed_ms=elapsed_ms,
+        raise RuntimeError(
+            f"Query {query_id} "
+            f"({'reranked' if rerank else 'raw'}) failed "
+            f"with return code {proc.returncode}: {err}"
         )
 
     data = json.loads(stdout)
@@ -455,11 +443,18 @@ def generate_report(
     lat_reranked = avg([m.reranked_elapsed_ms for _, _, m in results])
     lat_raw = avg([m.raw_elapsed_ms for _, _, m in results])
 
+    ks = {q.get("k", 5) for q in queries}
+    if len(ks) != 1:
+        raise ValueError(
+            f"Mixed k values not supported: {sorted(ks)}"
+        )
+    default_k = ks.pop()
+
     report = {
         "timestamp": datetime.now(UTC).isoformat(),
         "config": {
             "num_queries": n,
-            "default_k": 5,
+            "default_k": default_k,
         },
         "summary": {
             "precision_at_k": {
@@ -502,6 +497,10 @@ def print_summary(report: dict) -> None:
     """Print human-readable summary to stdout."""
     s = report["summary"]
     n = report["config"]["num_queries"]
+
+    if n == 0:
+        print("\nNo benchmark queries were run.")
+        return
 
     print()
     print("=== Rerank A/B Benchmark Results ===")
@@ -772,6 +771,8 @@ def sweep_rerank(
             ))
 
         n = len(queries)
+        if n == 0:
+            continue
         sweep_results.append({
             "name": name,
             "weights": {

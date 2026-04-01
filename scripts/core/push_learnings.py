@@ -29,6 +29,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import asyncpg
+
 logger = logging.getLogger(__name__)
 
 
@@ -131,8 +133,6 @@ def merge_candidates(
         if rid not in seen_ids:
             seen_ids.add(rid)
             candidates.append(r)
-        if len(candidates) >= k:
-            break
     return candidates
 
 
@@ -198,7 +198,7 @@ async def get_push_candidates(
         stale = await get_stale_learnings(project, k, conn=conn)
         try:
             patterns = await get_pattern_representatives(k, conn=conn)
-        except Exception:
+        except asyncpg.exceptions.UndefinedTableError:
             logger.debug("detected_patterns table not available", exc_info=True)
             patterns = []
 
@@ -214,7 +214,7 @@ async def main() -> int:
     )
     parser.add_argument(
         "--project",
-        default=Path(os.environ["CLAUDE_PROJECT_DIR"]).name if os.environ.get("CLAUDE_PROJECT_DIR") else None,
+        default=Path(os.environ["CLAUDE_PROJECT_DIR"]).name if os.environ.get("CLAUDE_PROJECT_DIR") else None,  # noqa: E501
         help="Project name to filter by (default: auto-detect from CLAUDE_PROJECT_DIR)",
     )
     parser.add_argument(

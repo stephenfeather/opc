@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import asyncpg
 import pytest
 
 from scripts.core.push_learnings import (  # noqa: E402
@@ -251,7 +252,10 @@ class TestGetPushCandidates:
                 "scripts.core.push_learnings.get_pattern_representatives",
                 new_callable=AsyncMock, return_value=patterns,
             ),
-            patch("scripts.core.db.postgres_pool.get_pool", new_callable=AsyncMock, return_value=_make_pool_mock()),
+            patch(
+                "scripts.core.db.postgres_pool.get_pool",
+                new_callable=AsyncMock, return_value=_make_pool_mock(),
+            ),
         ):
             result = await get_push_candidates("opc", k=5)
 
@@ -273,9 +277,12 @@ class TestGetPushCandidates:
             patch(
                 "scripts.core.push_learnings.get_pattern_representatives",
                 new_callable=AsyncMock,
-                side_effect=Exception("relation does not exist"),
+                side_effect=asyncpg.exceptions.UndefinedTableError("relation does not exist"),
             ),
-            patch("scripts.core.db.postgres_pool.get_pool", new_callable=AsyncMock, return_value=_make_pool_mock()),
+            patch(
+                "scripts.core.db.postgres_pool.get_pool",
+                new_callable=AsyncMock, return_value=_make_pool_mock(),
+            ),
         ):
             result = await get_push_candidates("opc", k=5)
 
@@ -294,7 +301,10 @@ class TestGetPushCandidates:
                 "scripts.core.push_learnings.get_pattern_representatives",
                 new_callable=AsyncMock, return_value=[],
             ),
-            patch("scripts.core.db.postgres_pool.get_pool", new_callable=AsyncMock, return_value=_make_pool_mock()),
+            patch(
+                "scripts.core.db.postgres_pool.get_pool",
+                new_callable=AsyncMock, return_value=_make_pool_mock(),
+            ),
         ):
             result = await get_push_candidates("opc", k=5)
 

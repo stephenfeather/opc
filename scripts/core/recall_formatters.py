@@ -57,26 +57,27 @@ def format_json_output(results: list[dict[str, Any]], structured: bool = False) 
 
     Args:
         results: List of result dicts from search/rerank pipeline
-        structured: If True, group by learning_type
+        structured: If True, add groups key organized by learning_type
 
     Returns:
-        JSON string ready for print()
+        JSON string ready for print(). Envelope always has "results" and "total".
+        When structured=True, "groups" key is added alongside.
     """
+    json_results = [_build_json_result(r) for r in results]
+    output: dict[str, Any] = {
+        "results": json_results,
+        "total": len(json_results),
+    }
+
     if structured:
         grouped = group_by_type(results)
-        structured_output: dict[str, list[dict]] = {}
-        for type_name, type_results in grouped.items():
-            structured_output[type_name] = [
-                _build_json_result(r) for r in type_results
-            ]
-        return json.dumps({
-            "structured": True,
-            "groups": structured_output,
-            "total": len(results),
-        })
+        output["structured"] = True
+        output["groups"] = {
+            type_name: [_build_json_result(r) for r in type_results]
+            for type_name, type_results in grouped.items()
+        }
 
-    json_results = [_build_json_result(r) for r in results]
-    return json.dumps({"results": json_results})
+    return json.dumps(output)
 
 
 def format_json_full_output(results: list[dict[str, Any]]) -> str:

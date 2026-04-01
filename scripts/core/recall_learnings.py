@@ -944,8 +944,10 @@ async def main() -> int:
                 created_str = str(created_at)
 
             json_result = {
+                "id": result.get("id", ""),
                 "score": result.get("final_score", result["similarity"]),
                 "raw_score": result["similarity"],
+                "learning_type": result.get("metadata", {}).get("learning_type", "UNKNOWN"),
                 "session_id": result["session_id"],
                 "content": result["content"],
                 "created_at": created_str,

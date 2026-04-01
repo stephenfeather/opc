@@ -22,6 +22,10 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+# For sweep mode: import reranker directly to avoid subprocess overhead
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from core.reranker import RecallContext, RerankerConfig, rerank
+
 
 # -------------------------------------------------------------------
 # Data structures
@@ -553,6 +557,256 @@ def print_summary(report: dict) -> None:
 
 
 # -------------------------------------------------------------------
+# Weight sweep
+# -------------------------------------------------------------------
+
+WEIGHT_SWEEPS: list[dict] = [
+    {
+        "name": "baseline",
+        "project_weight": 0.15, "recency_weight": 0.05,
+        "confidence_weight": 0.05, "recall_weight": 0.05,
+        "type_affinity_weight": 0.05, "tag_overlap_weight": 0.05,
+        "pattern_weight": 0.05,
+    },
+    {
+        "name": "no-project",
+        "project_weight": 0.0, "recency_weight": 0.05,
+        "confidence_weight": 0.05, "recall_weight": 0.05,
+        "type_affinity_weight": 0.05, "tag_overlap_weight": 0.05,
+        "pattern_weight": 0.05,
+    },
+    {
+        "name": "heavy-project",
+        "project_weight": 0.30, "recency_weight": 0.05,
+        "confidence_weight": 0.05, "recall_weight": 0.05,
+        "type_affinity_weight": 0.05, "tag_overlap_weight": 0.05,
+        "pattern_weight": 0.05,
+    },
+    {
+        "name": "no-recency",
+        "project_weight": 0.15, "recency_weight": 0.0,
+        "confidence_weight": 0.05, "recall_weight": 0.05,
+        "type_affinity_weight": 0.05, "tag_overlap_weight": 0.05,
+        "pattern_weight": 0.05,
+    },
+    {
+        "name": "heavy-recency",
+        "project_weight": 0.15, "recency_weight": 0.15,
+        "confidence_weight": 0.05, "recall_weight": 0.05,
+        "type_affinity_weight": 0.05, "tag_overlap_weight": 0.05,
+        "pattern_weight": 0.05,
+    },
+    {
+        "name": "no-recall",
+        "project_weight": 0.15, "recency_weight": 0.05,
+        "confidence_weight": 0.05, "recall_weight": 0.0,
+        "type_affinity_weight": 0.05, "tag_overlap_weight": 0.05,
+        "pattern_weight": 0.05,
+    },
+    {
+        "name": "tags-heavy",
+        "project_weight": 0.10, "recency_weight": 0.05,
+        "confidence_weight": 0.05, "recall_weight": 0.05,
+        "type_affinity_weight": 0.05, "tag_overlap_weight": 0.15,
+        "pattern_weight": 0.05,
+    },
+    {
+        "name": "type-heavy",
+        "project_weight": 0.10, "recency_weight": 0.05,
+        "confidence_weight": 0.05, "recall_weight": 0.05,
+        "type_affinity_weight": 0.15, "tag_overlap_weight": 0.05,
+        "pattern_weight": 0.05,
+    },
+    {
+        "name": "minimal-signals",
+        "project_weight": 0.10, "recency_weight": 0.0,
+        "confidence_weight": 0.0, "recall_weight": 0.0,
+        "type_affinity_weight": 0.0, "tag_overlap_weight": 0.05,
+        "pattern_weight": 0.0,
+    },
+    {
+        "name": "retrieval-only",
+        "project_weight": 0.0, "recency_weight": 0.0,
+        "confidence_weight": 0.0, "recall_weight": 0.0,
+        "type_affinity_weight": 0.0, "tag_overlap_weight": 0.0,
+        "pattern_weight": 0.0,
+    },
+]
+
+
+async def fetch_full_results(
+    queries: list[dict],
+    fetch_k: int = 20,
+) -> dict[str, list[dict]]:
+    """Fetch full-metadata results for all queries (no reranking, large k).
+
+    Uses --json-full to get all metadata fields needed by the reranker.
+    Returns a mapping of query_id -> list of result dicts.
+    """
+    cache: dict[str, list[dict]] = {}
+
+    async def fetch_one(q: dict) -> tuple[str, list[dict]]:
+        qid = q["id"]
+        cmd = [
+            sys.executable,
+            "scripts/core/recall_learnings.py",
+            "--query", q["query"],
+            "--k", str(fetch_k),
+            "--json-full",
+            "--no-rerank",
+        ]
+        if q.get("project"):
+            cmd.extend(["--project", q["project"]])
+        if q.get("tags"):
+            cmd.extend(["--tags", *q["tags"]])
+
+        async with SEMAPHORE:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+
+        if proc.returncode != 0:
+            print(
+                f"  WARNING: sweep fetch {qid} failed: "
+                f"{stderr.decode().strip()}",
+                file=sys.stderr,
+            )
+            return qid, []
+
+        data = json.loads(stdout)
+        items = []
+        for r in data.get("results", []):
+            items.append({
+                "id": r.get("id", ""),
+                "similarity": r.get("raw_score", r.get("score", 0.0)),
+                "content": r.get("content", ""),
+                "session_id": r.get("session_id", ""),
+                "created_at": r.get("created_at", ""),
+                "metadata": r.get("metadata", {}),
+                "recall_count": r.get("recall_count", 0),
+                "pattern_strength": r.get("pattern_strength", 0.0),
+                "pattern_tags": r.get("pattern_tags", []),
+            })
+        return qid, items
+
+    results = await asyncio.gather(
+        *(fetch_one(q) for q in queries)
+    )
+    for qid, items in results:
+        cache[qid] = items
+    return cache
+
+
+def sweep_rerank(
+    cached_results: dict[str, list[dict]],
+    queries: list[dict],
+    weight_configs: list[dict],
+) -> list[dict]:
+    """Run reranker with each weight config on cached results."""
+    sweep_results = []
+
+    for wc in weight_configs:
+        name = wc["name"]
+        config = RerankerConfig(
+            project_weight=wc["project_weight"],
+            recency_weight=wc["recency_weight"],
+            confidence_weight=wc["confidence_weight"],
+            recall_weight=wc["recall_weight"],
+            type_affinity_weight=wc["type_affinity_weight"],
+            tag_overlap_weight=wc["tag_overlap_weight"],
+            pattern_weight=wc["pattern_weight"],
+        )
+
+        p_at_k_vals = []
+        ndcg_vals = []
+        mrr_vals = []
+
+        for q in queries:
+            qid = q["id"]
+            k = q.get("k", 5)
+            golden_ids = q.get("golden_ids", [])
+            golden_keywords = q.get("golden_keywords", [])
+            raw_items = cached_results.get(qid, [])
+
+            ctx = RecallContext(
+                project=q.get("project"),
+                tags_hint=q.get("tags") or None,
+                retrieval_mode="hybrid_rrf",
+            )
+
+            if config.total_signal_weight > 0:
+                reranked = rerank(raw_items, ctx, config=config, k=k)
+            else:
+                reranked = raw_items[:k]
+
+            rids = [r.get("id", "") for r in reranked]
+            rcontents = [r.get("content", "") for r in reranked]
+
+            p_at_k_vals.append(compute_precision_at_k(
+                rids, rcontents, golden_ids, golden_keywords,
+            ))
+            ndcg_vals.append(compute_ndcg(
+                rids, rcontents, golden_ids, golden_keywords, k,
+            ))
+            mrr_vals.append(compute_mrr(
+                rids, rcontents, golden_ids, golden_keywords,
+            ))
+
+        n = len(queries)
+        sweep_results.append({
+            "name": name,
+            "weights": {
+                k: v for k, v in wc.items() if k != "name"
+            },
+            "precision_at_k": round(sum(p_at_k_vals) / n, 4),
+            "ndcg_at_k": round(sum(ndcg_vals) / n, 4),
+            "mrr": round(sum(mrr_vals) / n, 4),
+        })
+
+    return sweep_results
+
+
+def print_sweep_summary(sweep_results: list[dict]) -> None:
+    """Print sweep comparison table."""
+    print()
+    print("=== Weight Sweep Results ===")
+    print()
+    print(
+        f"{'Config':20s} {'P@k':>8s} {'NDCG@k':>8s} "
+        f"{'MRR':>8s} {'Signal Wt':>10s}"
+    )
+    print("-" * 58)
+
+    best_p = max(r["precision_at_k"] for r in sweep_results)
+    best_ndcg = max(r["ndcg_at_k"] for r in sweep_results)
+    best_mrr = max(r["mrr"] for r in sweep_results)
+
+    for r in sweep_results:
+        total_w = sum(r["weights"].values())
+        markers = []
+        if r["precision_at_k"] == best_p:
+            markers.append("P")
+        if r["ndcg_at_k"] == best_ndcg:
+            markers.append("N")
+        if r["mrr"] == best_mrr:
+            markers.append("M")
+        badge = " *" + ",".join(markers) if markers else ""
+
+        print(
+            f"{r['name']:20s} {r['precision_at_k']:8.4f} "
+            f"{r['ndcg_at_k']:8.4f} {r['mrr']:8.4f} "
+            f"{total_w:10.2f}{badge}"
+        )
+
+    print()
+    print("* = best in column (P=Precision, N=NDCG, M=MRR)")
+    print()
+
+
+# -------------------------------------------------------------------
 # CLI
 # -------------------------------------------------------------------
 
@@ -576,6 +830,11 @@ def parse_args() -> argparse.Namespace:
         "--verbose", "-v",
         action="store_true",
         help="Show per-query detail in stdout",
+    )
+    parser.add_argument(
+        "--sweep",
+        action="store_true",
+        help="Run weight sensitivity sweep across configurations",
     )
     return parser.parse_args()
 
@@ -635,6 +894,30 @@ async def async_main() -> int:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(report, indent=2))
     print(f"Report saved to {output_path}")
+
+    # Weight sweep mode
+    if args.sweep:
+        print("\n--- Weight Sensitivity Sweep ---")
+        print("Fetching full-metadata results with k=20 for reranker input...")
+        cached = await fetch_full_results(queries, fetch_k=20)
+        print(
+            f"Cached {len(cached)} query result sets. "
+            f"Running {len(WEIGHT_SWEEPS)} configs..."
+        )
+        sweep_results = sweep_rerank(cached, queries, WEIGHT_SWEEPS)
+        print_sweep_summary(sweep_results)
+
+        # Save sweep results alongside the main report
+        sweep_path = output_path.with_name(
+            output_path.stem + "-sweep" + output_path.suffix
+        )
+        sweep_report = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "num_queries": len(queries),
+            "configs": sweep_results,
+        }
+        sweep_path.write_text(json.dumps(sweep_report, indent=2))
+        print(f"Sweep report saved to {sweep_path}")
 
     return 0
 

@@ -347,7 +347,8 @@ async def main() -> int:
             )
     except Exception as e:
         if args.json or args.json_full:
-            print(json.dumps({"error": str(e), "results": []}))
+            from scripts.core.recall_formatters import get_api_version
+            print(json.dumps({"version": get_api_version(), "error": str(e), "results": []}))
         else:
             print(f"Error: {e}", file=sys.stderr)
         return 1

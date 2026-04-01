@@ -14,6 +14,15 @@ from datetime import datetime
 from typing import Any
 
 
+def get_api_version() -> str:
+    """Return the OPC package version for API response envelopes."""
+    try:
+        from importlib.metadata import version
+        return version("mcp-execution")
+    except Exception:
+        return "0.7.2"
+
+
 def format_result_preview(content: str, max_length: int = 200) -> str:
     """Format content for display, truncating if needed.
 
@@ -65,6 +74,7 @@ def format_json_output(results: list[dict[str, Any]], structured: bool = False) 
     """
     json_results = [_build_json_result(r) for r in results]
     output: dict[str, Any] = {
+        "version": get_api_version(),
         "results": json_results,
         "total": len(json_results),
     }
@@ -95,7 +105,7 @@ def format_json_full_output(results: list[dict[str, Any]]) -> str:
         jr["pattern_strength"] = result.get("pattern_strength", 0.0)
         jr["pattern_tags"] = result.get("pattern_tags", [])
         json_results.append(jr)
-    return json.dumps({"results": json_results})
+    return json.dumps({"version": get_api_version(), "results": json_results})
 
 
 def format_human_output(results: list[dict[str, Any]], structured: bool = False) -> str:

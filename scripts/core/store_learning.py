@@ -482,6 +482,8 @@ async def main():
         )
 
     if args.json:
+        from scripts.core.recall_formatters import get_api_version
+        result["version"] = get_api_version()
         print(json.dumps(result))
     else:
         if result.get("skipped"):

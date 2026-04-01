@@ -1,4 +1,4 @@
-# Recall API Reference
+# OPC API Reference
 
 `scripts/core/recall_learnings.py` — Semantic recall of session learnings.
 
@@ -166,3 +166,156 @@ Embedding provider. Choices: `local` (BGE), `voyage` (Voyage AI).
   "results": []
 }
 ```
+
+---
+
+# Store API Reference
+
+`scripts/core/store_learning.py` — Store session learnings with embeddings and deduplication.
+
+## Default JSON Response (v2)
+
+```bash
+uv run python scripts/core/store_learning.py \
+  --session-id "session-1" \
+  --content "Pattern X works well for Y" \
+  --type WORKING_SOLUTION \
+  --json
+```
+
+```json
+{
+  "success": true,
+  "memory_id": "abc-123-def-456",
+  "backend": "postgres",
+  "content_length": 26,
+  "embedding_dim": 1024
+}
+```
+
+### `--supersedes`
+
+When provided, adds `superseded` to the response:
+
+```json
+{
+  "success": true,
+  "memory_id": "new-id-789",
+  "backend": "postgres",
+  "content_length": 26,
+  "embedding_dim": 1024,
+  "superseded": "old-id-456"
+}
+```
+
+### Duplicate detected (semantic)
+
+When content is >=92% similar to an existing learning:
+
+```json
+{
+  "success": true,
+  "skipped": true,
+  "reason": "duplicate (similarity: 0.95, session: session-2)",
+  "existing_id": "existing-id-123"
+}
+```
+
+### Duplicate detected (content hash)
+
+When exact content already exists:
+
+```json
+{
+  "success": true,
+  "skipped": true,
+  "reason": "duplicate (content_hash match)"
+}
+```
+
+### Error
+
+```json
+{
+  "success": false,
+  "error": "No content provided"
+}
+```
+
+## Flags
+
+### `--session-id` (required)
+
+Session identifier for the learning.
+
+### `--content`
+
+Direct learning content (v2 mode). When provided, uses v2 storage path with deduplication, auto-classification, and confidence calibration.
+
+### `--type`
+
+Learning type. Choices:
+
+| Type | Use For |
+|------|---------|
+| `FAILED_APPROACH` | Things that didn't work |
+| `WORKING_SOLUTION` | Successful approaches |
+| `USER_PREFERENCE` | User style/preferences |
+| `CODEBASE_PATTERN` | Discovered code patterns |
+| `ARCHITECTURAL_DECISION` | Design choices made |
+| `ERROR_FIX` | Error-to-solution pairs |
+| `OPEN_THREAD` | Unfinished work/TODOs |
+
+### `--context`
+
+What this learning relates to (e.g., "hook development", "database migration").
+
+### `--tags`
+
+Comma-separated tags for categorization (e.g., "hooks,typescript,build").
+
+### `--confidence`
+
+Confidence level. Choices: `high`, `medium`, `low`. When omitted, auto-calibrated using heuristic scorer.
+
+### `--project`
+
+Project name for recall relevance. Default: auto-detected from `CLAUDE_PROJECT_DIR`.
+
+### `--supersedes`
+
+UUID of an older learning this one replaces. The old learning is marked with `superseded_by` pointing to the new one. Recall queries filter superseded learnings via `WHERE superseded_by IS NULL`. Atomic — both the insert and update run in a single transaction.
+
+### `--auto-classify`
+
+Auto-classify learning type via LLM judge. Requires `BRAINTRUST_API_KEY`. Only runs when `--type` is omitted or is `WORKING_SOLUTION` (the default).
+
+### `--host-id`
+
+Machine identifier for multi-system support.
+
+### `--json`
+
+Output as JSON instead of human-readable text.
+
+## Legacy Mode (v1)
+
+When `--content` is not provided, falls back to legacy mode with category-based storage:
+
+```bash
+uv run python scripts/core/store_learning.py \
+  --session-id "session-1" \
+  --worked "Approach X worked well" \
+  --failed "Y didn't work" \
+  --decisions "Chose Z because..." \
+  --patterns "Reusable technique..."
+```
+
+Legacy flags: `--worked`, `--failed`, `--decisions`, `--patterns`. These are concatenated into a single learning with category metadata. No deduplication, auto-classification, or confidence calibration.
+
+## Deduplication
+
+Two layers, checked in order:
+
+1. **Semantic dedup** — Cosine similarity >= 0.92 against all existing learnings (cross-session). Returns `skipped` with `existing_id`.
+2. **Content hash dedup** — SHA-256 of exact content. Returns `skipped` without `existing_id`.

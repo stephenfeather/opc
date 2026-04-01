@@ -63,7 +63,11 @@ global_env = Path.home() / ".claude" / ".env"
 if global_env.exists():
     load_dotenv(global_env, override=True)
 
-DAEMON_VERSION = "0.7.1"
+try:
+    from importlib.metadata import version as _pkg_version
+    DAEMON_VERSION = _pkg_version("mcp-execution")
+except Exception:
+    DAEMON_VERSION = "0.7.2"  # fallback
 
 
 def _is_extraction_blocked(project_dir: str) -> bool:

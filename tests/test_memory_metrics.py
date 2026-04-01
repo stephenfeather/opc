@@ -79,6 +79,7 @@ class TestCLIParsing:
         parser = build_parser()
         args = parser.parse_args(["--human"])
         assert args.human is True
+        assert args.json is False
 
     def test_json_flag(self):
         parser = build_parser()
@@ -241,26 +242,14 @@ class TestJSONStructure:
 # ---------------------------------------------------------------------------
 
 def _db_available() -> bool:
-    """Check if PostgreSQL is reachable."""
-    import os
-    return bool(
-        os.environ.get("CONTINUOUS_CLAUDE_DB_URL")
-        or os.environ.get("DATABASE_URL")
-        or os.environ.get("OPC_POSTGRES_URL")
-        # Default dev DB — check if docker is running
-        or _check_default_db()
-    )
+    """Check if PostgreSQL is reachable by attempting a real connection."""
+    import socket
 
-
-def _check_default_db() -> bool:
-    import subprocess
     try:
-        result = subprocess.run(
-            ["docker", "exec", "continuous-claude-postgres", "pg_isready"],
-            capture_output=True, timeout=3,
-        )
-        return result.returncode == 0
-    except Exception:
+        sock = socket.create_connection(("localhost", 5432), timeout=2)
+        sock.close()
+        return True
+    except (OSError, TimeoutError):
         return False
 
 

@@ -90,6 +90,7 @@ def parse_period(period_str: str | None) -> tuple[datetime | None, datetime | No
 # ---------------------------------------------------------------------------
 
 async def get_totals(conn: Any, start: datetime | None, end: datetime | None) -> dict:
+    """Count active, superseded, and total learnings."""
     row = await conn.fetchrow(
         """
         SELECT
@@ -110,6 +111,7 @@ async def get_totals(conn: Any, start: datetime | None, end: datetime | None) ->
 
 
 async def get_per_session_stats(conn: Any, start: datetime | None, end: datetime | None) -> dict:
+    """Compute learnings-per-session averages (recent 10 and overall)."""
     recent = await conn.fetchrow(
         """
         WITH recent_sessions AS (
@@ -162,6 +164,7 @@ async def get_per_session_stats(conn: Any, start: datetime | None, end: datetime
 async def get_confidence_distribution(
     conn: Any, start: datetime | None, end: datetime | None
 ) -> dict:
+    """Count learnings by confidence level (high/medium/low) with percentages."""
     rows = await conn.fetch(
         """
         SELECT
@@ -197,6 +200,7 @@ async def get_confidence_distribution(
 async def get_classification_distribution(
     conn: Any, start: datetime | None, end: datetime | None
 ) -> dict:
+    """Count learnings by learning_type with percentages."""
     rows = await conn.fetch(
         """
         SELECT
@@ -222,6 +226,7 @@ async def get_classification_distribution(
 
 
 async def get_dedup_stats(conn: Any) -> dict:
+    """Report content-hash coverage as a dedup eligibility proxy (all-time)."""
     row = await conn.fetchrow(
         """
         SELECT
@@ -241,6 +246,7 @@ async def get_dedup_stats(conn: Any) -> dict:
 
 
 async def get_extraction_stats(conn: Any) -> dict:
+    """Count sessions by extraction status (all-time)."""
     row = await conn.fetchrow(
         """
         SELECT
@@ -267,6 +273,7 @@ async def get_extraction_stats(conn: Any) -> dict:
 async def get_stale_learnings(
     conn: Any, start: datetime | None, end: datetime | None
 ) -> dict:
+    """Count learnings that have never been recalled."""
     row = await conn.fetchrow(
         """
         SELECT
@@ -288,6 +295,7 @@ async def get_stale_learnings(
 
 
 async def get_top_tags(conn: Any, limit: int = 10) -> list[dict]:
+    """Return the most common tags by frequency (all-time)."""
     rows = await conn.fetch(
         """
         SELECT tag, COUNT(*) AS count
@@ -302,6 +310,7 @@ async def get_top_tags(conn: Any, limit: int = 10) -> list[dict]:
 
 
 async def get_superseded_stats(conn: Any) -> dict:
+    """Count superseded vs total learnings (all-time)."""
     row = await conn.fetchrow(
         """
         SELECT
@@ -321,6 +330,7 @@ async def get_superseded_stats(conn: Any) -> dict:
 
 
 async def get_temporal_stats(conn: Any) -> dict:
+    """Report oldest/newest learning and recent activity counts (all-time)."""
     row = await conn.fetchrow(
         """
         SELECT
@@ -423,13 +433,13 @@ def format_human(metrics: dict) -> str:
     lines.append("")
 
     d = metrics["dedup_stats_alltime"]
-    lines.append(f"Dedup:  {d['hash_coverage_pct']:.1f}% hash coverage "
+    lines.append(f"Dedup (all-time):  {d['hash_coverage_pct']:.1f}% hash coverage "
                  f"({d['learnings_with_content_hash']} with, "
                  f"{d['learnings_without_content_hash']} without)")
     lines.append("")
 
     e = metrics["extraction_stats_alltime"]
-    lines.append(f"Extraction:  {e['extracted']}/{e['total_sessions']} extracted "
+    lines.append(f"Extraction (all-time):  {e['extracted']}/{e['total_sessions']} extracted "
                  f"({e['extraction_rate_pct']:.1f}%), "
                  f"{e['pending']} pending, {e['failed']} failed, {e['retried']} retried")
     lines.append("")
@@ -445,12 +455,12 @@ def format_human(metrics: dict) -> str:
     lines.append("")
 
     sup = metrics["superseded_alltime"]
-    lines.append(f"Superseded:  {sup['superseded_count']}/{sup['total_learnings']} "
+    lines.append(f"Superseded (all-time):  {sup['superseded_count']}/{sup['total_learnings']} "
                  f"({sup['superseded_pct']:.1f}%)")
     lines.append("")
 
     tmp = metrics["temporal_alltime"]
-    lines.append(f"Temporal:  oldest {tmp['oldest_learning']}")
+    lines.append(f"Temporal (all-time):  oldest {tmp['oldest_learning']}")
     lines.append(f"           newest {tmp['newest_learning']}")
     lines.append(f"           last 7d: {tmp['last_7_days']},  last 30d: {tmp['last_30_days']}")
 
@@ -462,6 +472,7 @@ def format_human(metrics: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser."""
     parser = argparse.ArgumentParser(
         description="Memory system health and quality metrics"
     )
@@ -469,7 +480,6 @@ def build_parser() -> argparse.ArgumentParser:
     output.add_argument(
         "--json",
         action="store_true",
-        default=True,
         help="JSON output (default)",
     )
     output.add_argument(
@@ -487,6 +497,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 async def main() -> int:
+    """Entry point: parse args, collect metrics, output results."""
     parser = build_parser()
     args = parser.parse_args()
 

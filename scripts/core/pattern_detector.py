@@ -344,15 +344,14 @@ def fuse_clusters(
 # Pattern classification
 # ---------------------------------------------------------------------------
 
-def classify_pattern_heuristic(members: list[Learning]) -> str:
-    """Classify a cluster as one of the pattern types using heuristics.
+def classify_pattern_heuristic(members: list[Learning], reference_time: datetime | None = None) -> str:
+    """Classify a cluster using heuristics. Priority order: specific -> broad.
 
-    Rules (checked in priority order):
-    - All FAILED_APPROACH -> 'anti_pattern'
-    - Spans 3+ distinct sessions with different contexts -> 'cross_project'
-    - Contains both ERROR_FIX and WORKING_SOLUTION -> 'problem_solution'
-    - Temporally concentrated (last 2 weeks) and 3+ sessions -> 'expertise'
-    - Default: 'tool_cluster'
+    1. anti_pattern: >60% FAILED_APPROACH (keep as-is)
+    2. problem_solution: Both ERROR_FIX and WORKING_SOLUTION present AND combined >=40%
+    3. expertise: 60% in last 30d + >=60% one type + >=4 distinct contexts + >=3 sessions
+    4. tool_cluster: >=70% same learning_type + <=3 distinct contexts
+    5. cross_project: residual -- 4+ contexts OR (>=5 members AND session/member > 0.7)
     """
     if not members:
         return "tool_cluster"
@@ -360,29 +359,37 @@ def classify_pattern_heuristic(members: list[Learning]) -> str:
     types = Counter(m.learning_type for m in members)
     sessions = set(m.session_id for m in members)
     contexts = set(m.context for m in members if m.context)
+    total = sum(types.values())
 
-    # All failed approaches -> anti-pattern
+    # 1. Anti-pattern: all or majority FAILED_APPROACH
     if len(types) == 1 and "FAILED_APPROACH" in types:
         return "anti_pattern"
-
-    # Majority failed approaches -> anti-pattern
-    total = sum(types.values())
     if types.get("FAILED_APPROACH", 0) / total > 0.6:
         return "anti_pattern"
 
-    # Cross-project: 3+ sessions with 2+ distinct contexts
-    if len(sessions) >= 3 and len(contexts) >= 2:
-        return "cross_project"
-
-    # Problem-solution: mix of error fixes and working solutions
-    if "ERROR_FIX" in types and "WORKING_SOLUTION" in types:
+    # 2. Problem-solution: both ERROR_FIX and WORKING_SOLUTION present, combined >=40%
+    error_fix = types.get("ERROR_FIX", 0)
+    working_sol = types.get("WORKING_SOLUTION", 0)
+    if error_fix > 0 and working_sol > 0 and (error_fix + working_sol) / total >= 0.4:
         return "problem_solution"
 
-    # Expertise: temporally concentrated in last 2 weeks, 3+ sessions
-    now = datetime.now(UTC)
-    recent = [m for m in members if (now - m.created_at).days <= 14]
-    if len(recent) >= len(members) * 0.5 and len(sessions) >= 3:
+    # 3. Expertise: temporally concentrated + type-homogeneous + context-diverse + multi-session
+    now = reference_time or datetime.now(UTC)
+    recent = [m for m in members if (now - m.created_at).total_seconds() <= 30 * 24 * 3600]
+    max_type_count = max(types.values())
+    if (len(recent) >= len(members) * 0.6
+            and max_type_count / total >= 0.6
+            and len(contexts) >= 4
+            and len(sessions) >= 3):
         return "expertise"
+
+    # 4. Tool cluster: highly homogeneous type + narrow context
+    if max_type_count / total >= 0.7 and len(contexts) <= 3:
+        return "tool_cluster"
+
+    # 5. Cross-project: residual catch-all
+    if len(contexts) >= 4 or (len(members) >= 5 and len(sessions) / len(members) > 0.7):
+        return "cross_project"
 
     return "tool_cluster"
 

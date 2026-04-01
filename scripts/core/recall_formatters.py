@@ -20,7 +20,7 @@ def get_api_version() -> str:
         from importlib.metadata import version
         return version("mcp-execution")
     except Exception:
-        return "0.7.2"
+        return "0.7.3"
 
 
 def format_result_preview(content: str, max_length: int = 200) -> str:

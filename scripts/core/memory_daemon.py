@@ -67,7 +67,7 @@ try:
     from importlib.metadata import version as _pkg_version
     DAEMON_VERSION = _pkg_version("mcp-execution")
 except Exception:
-    DAEMON_VERSION = "0.7.2"  # fallback
+    DAEMON_VERSION = "0.7.3"  # fallback
 
 
 def _is_extraction_blocked(project_dir: str) -> bool:

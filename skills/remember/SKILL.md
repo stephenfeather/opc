@@ -103,3 +103,19 @@ If no `--type` specified, classify the learning by checking these rules **top-to
 - → Default: `CODEBASE_PATTERN`
 
 **IMPORTANT:** Do NOT default to WORKING_SOLUTION — that's rule 6, not the catch-all. CODEBASE_PATTERN is the catch-all. The rules are ordered by specificity: easy-to-detect types (FAILED_APPROACH, ERROR_FIX, OPEN_THREAD) are checked first since they have strong signal words.
+
+## Learning Decomposition
+
+Before storing, check: **Can this be split into "what failed" and "what works"?**
+
+A single observation like "worktree build artifacts cause cleanup friction" is vague. Instead, decompose into paired learnings:
+
+1. **FAILED_APPROACH** — What went wrong: "Avoid running `npm install` in git worktrees. Problem: creates untracked files that block `git worktree remove`..."
+2. **WORKING_SOLUTION** — What fixes it: "Before removing a worktree, run `git -C <path> clean -fd` to clear untracked artifacts..."
+
+**Format each as: Problem → Solution with concrete details.**
+- State the problem (what happened, what broke, what symptom)
+- State the solution (specific command, pattern, or approach)
+- Include enough detail that a future session can act without guessing
+
+Two focused learnings with accurate types beat one vague observation — they classify better, cluster better, and recall better.

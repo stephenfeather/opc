@@ -273,46 +273,248 @@ class TestFuseClusters:
 
 class TestClassifyPattern:
 
+    # -- Rule 1: anti_pattern --
+
     def test_anti_pattern_all_failed(self):
-        members = [_make_learning(learning_type="FAILED_APPROACH") for _ in range(5)]
+        # All FAILED_APPROACH -> anti_pattern (rule 1, pure case)
+        members = [
+            _make_learning(learning_type="FAILED_APPROACH", session_id="s1", context="ctx1",
+                           created_at=datetime(2026, 1, 1, tzinfo=UTC))
+            for _ in range(5)
+        ]
         assert classify_pattern_heuristic(members) == "anti_pattern"
 
     def test_anti_pattern_majority_failed(self):
-        members = [_make_learning(learning_type="FAILED_APPROACH") for _ in range(4)]
-        members.append(_make_learning(learning_type="WORKING_SOLUTION"))
+        # >60% FAILED_APPROACH -> anti_pattern (rule 1, majority case)
+        # 4/5 = 80% FAILED_APPROACH
+        members = [
+            _make_learning(learning_type="FAILED_APPROACH", session_id="s1", context="ctx1",
+                           created_at=datetime(2026, 1, 1, tzinfo=UTC))
+            for _ in range(4)
+        ]
+        members.append(
+            _make_learning(learning_type="WORKING_SOLUTION", session_id="s1", context="ctx1",
+                           created_at=datetime(2026, 1, 1, tzinfo=UTC))
+        )
         assert classify_pattern_heuristic(members) == "anti_pattern"
 
-    def test_cross_project(self):
-        members = [
-            _make_learning(session_id=f"s{i}", context=f"project{i}")
-            for i in range(5)
-        ]
-        assert classify_pattern_heuristic(members) == "cross_project"
+    # -- Rule 2: problem_solution --
 
     def test_problem_solution(self):
+        # Both ERROR_FIX and WORKING_SOLUTION present, combined >= 40%
+        # 2 ERROR_FIX + 1 WORKING_SOLUTION out of 3 = 100% combined
+        # Does NOT match anti_pattern (no FAILED_APPROACH)
         members = [
-            _make_learning(learning_type="ERROR_FIX", session_id="s1", context="ctx"),
-            _make_learning(learning_type="ERROR_FIX", session_id="s1", context="ctx"),
-            _make_learning(learning_type="WORKING_SOLUTION", session_id="s1", context="ctx"),
+            _make_learning(learning_type="ERROR_FIX", session_id="s1", context="ctx1",
+                           created_at=datetime(2026, 1, 1, tzinfo=UTC)),
+            _make_learning(learning_type="ERROR_FIX", session_id="s1", context="ctx1",
+                           created_at=datetime(2026, 1, 1, tzinfo=UTC)),
+            _make_learning(learning_type="WORKING_SOLUTION", session_id="s1", context="ctx1",
+                           created_at=datetime(2026, 1, 1, tzinfo=UTC)),
         ]
         assert classify_pattern_heuristic(members) == "problem_solution"
 
-    def test_expertise_recent(self):
-        now = datetime.now(UTC)
+    def test_problem_solution_at_40_percent_boundary(self):
+        # Exactly 40% combined ERROR_FIX + WORKING_SOLUTION -> problem_solution
+        # 2 ERROR_FIX + 2 WORKING_SOLUTION + 6 CODEBASE_PATTERN = 4/10 = 40%
+        # Does NOT match anti_pattern (no FAILED_APPROACH)
+        members = [
+            _make_learning(learning_type="ERROR_FIX", session_id="s1", context="ctx1",
+                           created_at=datetime(2026, 1, 1, tzinfo=UTC)),
+            _make_learning(learning_type="ERROR_FIX", session_id="s1", context="ctx1",
+                           created_at=datetime(2026, 1, 1, tzinfo=UTC)),
+            _make_learning(learning_type="WORKING_SOLUTION", session_id="s1", context="ctx1",
+                           created_at=datetime(2026, 1, 1, tzinfo=UTC)),
+            _make_learning(learning_type="WORKING_SOLUTION", session_id="s1", context="ctx1",
+                           created_at=datetime(2026, 1, 1, tzinfo=UTC)),
+        ] + [
+            _make_learning(learning_type="CODEBASE_PATTERN", session_id="s1", context="ctx1",
+                           created_at=datetime(2026, 1, 1, tzinfo=UTC))
+            for _ in range(6)
+        ]
+        assert classify_pattern_heuristic(members) == "problem_solution"
+
+    def test_problem_solution_requires_both_types(self):
+        # Pure ERROR_FIX (no WORKING_SOLUTION) should NOT match problem_solution
+        # 3 ERROR_FIX + 0 WORKING_SOLUTION -> rule 2 requires both present
+        # Falls through: 1 session, 1 context, 100% one type -> tool_cluster (rule 4)
+        members = [
+            _make_learning(learning_type="ERROR_FIX", session_id="s1", context="ctx1",
+                           created_at=datetime(2026, 1, 1, tzinfo=UTC))
+            for _ in range(3)
+        ]
+        assert classify_pattern_heuristic(members) != "problem_solution"
+
+    # -- Rule 3: expertise --
+
+    def test_expertise(self):
+        # 60% recent (last 30d) + >=60% one type + >=4 contexts + >=3 sessions
+        # 5 members, all recent, all WORKING_SOLUTION, 5 contexts, 5 sessions
+        # Does NOT match anti_pattern (no FAILED_APPROACH)
+        # Does NOT match problem_solution (no ERROR_FIX+WORKING_SOLUTION pair)
+        now = datetime(2026, 3, 31, tzinfo=UTC)
         members = [
             _make_learning(
+                learning_type="WORKING_SOLUTION",
                 session_id=f"s{i}",
-                context="same",
+                context=f"ctx{i}",
                 created_at=now - timedelta(days=i),
             )
             for i in range(5)
         ]
-        assert classify_pattern_heuristic(members) == "expertise"
+        assert classify_pattern_heuristic(members, reference_time=now) == "expertise"
+
+    def test_expertise_needs_3_sessions(self):
+        # Only 2 sessions -> should NOT match expertise (needs >=3)
+        # 5 members, all recent, all same type, 4 contexts, but only 2 sessions
+        # Falls through to tool_cluster (<=3 contexts? no, 4 contexts)
+        # Then cross_project (4 contexts >= 4)
+        now = datetime(2026, 3, 31, tzinfo=UTC)
+        members = [
+            _make_learning(learning_type="WORKING_SOLUTION", session_id="s1",
+                           context=f"ctx{i}", created_at=now - timedelta(days=1))
+            for i in range(4)
+        ] + [
+            _make_learning(learning_type="WORKING_SOLUTION", session_id="s2",
+                           context="ctx4", created_at=now - timedelta(days=1))
+        ]
+        result = classify_pattern_heuristic(members, reference_time=now)
+        assert result != "expertise"
+
+    def test_expertise_needs_4_contexts(self):
+        # Only 3 contexts -> should NOT match expertise (needs >=4)
+        # 6 members, all recent, all same type, 3 contexts, 3 sessions
+        # Falls through to tool_cluster (100% one type, <=3 contexts -> rule 4)
+        now = datetime(2026, 3, 31, tzinfo=UTC)
+        members = [
+            _make_learning(learning_type="WORKING_SOLUTION", session_id=f"s{i}",
+                           context=f"ctx{i}", created_at=now - timedelta(days=1))
+            for i in range(3)
+        ] + [
+            _make_learning(learning_type="WORKING_SOLUTION", session_id=f"s{i}",
+                           context=f"ctx{i}", created_at=now - timedelta(days=1))
+            for i in range(3)
+        ]
+        result = classify_pattern_heuristic(members, reference_time=now)
+        assert result != "expertise"
+        assert result == "tool_cluster"
+
+    # -- Rule 4: tool_cluster --
+
+    def test_tool_cluster_homogeneous_narrow(self):
+        # >=70% same type + <=3 contexts -> tool_cluster (rule 4)
+        # 5/5 = 100% CODEBASE_PATTERN, 1 context
+        # Does NOT match anti_pattern (not FAILED_APPROACH)
+        # Does NOT match problem_solution (no ERROR_FIX/WORKING_SOLUTION pair)
+        # Does NOT match expertise (only 1 context < 4)
+        members = [
+            _make_learning(learning_type="CODEBASE_PATTERN", session_id="s1", context="ctx1",
+                           created_at=datetime(2026, 1, 1, tzinfo=UTC))
+            for _ in range(5)
+        ]
+        assert classify_pattern_heuristic(members) == "tool_cluster"
+
+    def test_tool_cluster_boundary_at_70_percent(self):
+        # Exactly 70% same type + <=3 contexts -> tool_cluster
+        # 7/10 = 70% CODEBASE_PATTERN, 2 contexts
+        # Does NOT match problem_solution (no ERROR_FIX+WORKING_SOLUTION pair)
+        members = [
+            _make_learning(learning_type="CODEBASE_PATTERN", session_id="s1", context="ctx1",
+                           created_at=datetime(2026, 1, 1, tzinfo=UTC))
+            for _ in range(7)
+        ] + [
+            _make_learning(learning_type="ARCHITECTURAL_DECISION", session_id="s1",
+                           context="ctx2", created_at=datetime(2026, 1, 1, tzinfo=UTC))
+            for _ in range(3)
+        ]
+        assert classify_pattern_heuristic(members) == "tool_cluster"
+
+    # -- Rule 5: cross_project --
+
+    def test_cross_project_4_contexts(self):
+        # 4+ contexts -> cross_project (rule 5, context path)
+        # Does NOT match anti_pattern (no FAILED_APPROACH)
+        # Does NOT match problem_solution (no ERROR_FIX+WORKING_SOLUTION pair)
+        # Does NOT match expertise (not enough recent, single session)
+        # Does NOT match tool_cluster (4 contexts > 3)
+        members = [
+            _make_learning(learning_type="CODEBASE_PATTERN", session_id="s1",
+                           context=f"project{i}", created_at=datetime(2025, 1, 1, tzinfo=UTC))
+            for i in range(4)
+        ]
+        assert classify_pattern_heuristic(
+            members, reference_time=datetime(2026, 3, 31, tzinfo=UTC)
+        ) == "cross_project"
+
+    def test_cross_project_ratio_path(self):
+        # >=5 members AND session/member > 0.7 -> cross_project (rule 5, ratio path)
+        # 5 members, 5 sessions, ratio = 1.0, but only 3 contexts (<=3)
+        # Does NOT match tool_cluster because types are mixed (<70% any single type)
+        # 2 CODEBASE_PATTERN + 2 ARCHITECTURAL_DECISION + 1 USER_PREFERENCE = no type >=70%
+        members = [
+            _make_learning(learning_type="CODEBASE_PATTERN", session_id="s0",
+                           context="ctx1", created_at=datetime(2025, 1, 1, tzinfo=UTC)),
+            _make_learning(learning_type="CODEBASE_PATTERN", session_id="s1",
+                           context="ctx2", created_at=datetime(2025, 1, 1, tzinfo=UTC)),
+            _make_learning(learning_type="ARCHITECTURAL_DECISION", session_id="s2",
+                           context="ctx3", created_at=datetime(2025, 1, 1, tzinfo=UTC)),
+            _make_learning(learning_type="ARCHITECTURAL_DECISION", session_id="s3",
+                           context="ctx3", created_at=datetime(2025, 1, 1, tzinfo=UTC)),
+            _make_learning(learning_type="USER_PREFERENCE", session_id="s4",
+                           context="ctx3", created_at=datetime(2025, 1, 1, tzinfo=UTC)),
+        ]
+        assert classify_pattern_heuristic(
+            members, reference_time=datetime(2026, 3, 31, tzinfo=UTC)
+        ) == "cross_project"
+
+    def test_cross_project_small_cluster_no_ratio(self):
+        # 3 members, 3 sessions, ratio = 1.0 but <5 members -> ratio path blocked
+        # 3 contexts <= 3 -> context path blocked (needs >=4)
+        # Mixed types (no type >=70%) -> tool_cluster blocked too
+        # Falls to default tool_cluster
+        members = [
+            _make_learning(learning_type="CODEBASE_PATTERN", session_id="s0",
+                           context="ctx1", created_at=datetime(2025, 1, 1, tzinfo=UTC)),
+            _make_learning(learning_type="ARCHITECTURAL_DECISION", session_id="s1",
+                           context="ctx2", created_at=datetime(2025, 1, 1, tzinfo=UTC)),
+            _make_learning(learning_type="USER_PREFERENCE", session_id="s2",
+                           context="ctx3", created_at=datetime(2025, 1, 1, tzinfo=UTC)),
+        ]
+        result = classify_pattern_heuristic(
+            members, reference_time=datetime(2026, 3, 31, tzinfo=UTC)
+        )
+        assert result != "cross_project"
+
+    def test_4_context_gap_closed(self):
+        # A cluster with exactly 4 contexts should be classified (not fall through)
+        # 4 contexts, heterogeneous types -> not tool_cluster (4 > 3 contexts)
+        # 4 contexts >= 4 -> cross_project
+        members = [
+            _make_learning(learning_type="CODEBASE_PATTERN", session_id="s1",
+                           context="ctx1", created_at=datetime(2025, 1, 1, tzinfo=UTC)),
+            _make_learning(learning_type="ARCHITECTURAL_DECISION", session_id="s1",
+                           context="ctx2", created_at=datetime(2025, 1, 1, tzinfo=UTC)),
+            _make_learning(learning_type="USER_PREFERENCE", session_id="s1",
+                           context="ctx3", created_at=datetime(2025, 1, 1, tzinfo=UTC)),
+            _make_learning(learning_type="CODEBASE_PATTERN", session_id="s1",
+                           context="ctx4", created_at=datetime(2025, 1, 1, tzinfo=UTC)),
+        ]
+        result = classify_pattern_heuristic(
+            members, reference_time=datetime(2026, 3, 31, tzinfo=UTC)
+        )
+        # Must not be default tool_cluster; should be cross_project
+        assert result == "cross_project"
+
+    # -- Default / empty --
 
     def test_default_tool_cluster(self):
-        # Same session, same context -> falls through to default
+        # Same session, same context, same type -> falls through to default
+        # Does NOT match any rule above: no FAILED_APPROACH, no ERROR_FIX+WORKING_SOLUTION,
+        # not enough contexts for expertise or cross_project
+        # 100% one type + 1 context -> matches tool_cluster (rule 4)
         members = [
-            _make_learning(session_id="s1", context="ctx")
+            _make_learning(learning_type="WORKING_SOLUTION", session_id="s1", context="ctx1",
+                           created_at=datetime(2026, 1, 1, tzinfo=UTC))
             for _ in range(5)
         ]
         assert classify_pattern_heuristic(members) == "tool_cluster"

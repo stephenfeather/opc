@@ -615,6 +615,25 @@ def archive_session_jsonl(session_id: str, jsonl_path: Path | None = None):
         log(f"Archive error for {session_id}: {e}")
 
 
+def _calibrate_session_confidence(session_id: str):
+    """Run confidence calibration on learnings from a completed extraction."""
+    try:
+        import asyncio
+
+        from scripts.core.confidence_calibrator import calibrate_session
+
+        result = asyncio.run(calibrate_session(session_id))
+        stats = result["stats"]
+        if stats["total"] > 0:
+            log(
+                f"Confidence calibration for {session_id}: "
+                f"{stats['updated']} updated, "
+                f"{stats['unchanged']} unchanged"
+            )
+    except Exception as e:
+        log(f"Confidence calibration failed for {session_id}: {e}")
+
+
 def _extract_and_store_workflows(
     session_id: str,
     jsonl_path: Path,
@@ -749,6 +768,7 @@ def reap_completed_extractions():
                 f"exit={exit_code}, elapsed={elapsed}s{learnings_info})")
             if exit_code == 0:
                 mark_extracted(session_id)
+                _calibrate_session_confidence(session_id)
                 _extract_and_store_workflows(session_id, jsonl_path, project)
                 _generate_mini_handoff(session_id, jsonl_path, project)
                 archive_session_jsonl(session_id, jsonl_path)

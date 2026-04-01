@@ -21,6 +21,9 @@ backups/*.sql.gz
 # Worktrees
 .worktrees/
 
+# Claude Code
+CLAUDE.md
+
 # OS
 .DS_Store
 

@@ -353,12 +353,7 @@ async def get_temporal_stats(conn: Any) -> dict:
 async def get_feedback_stats(conn: Any) -> dict:
     """Report memory feedback statistics (all-time). Returns zeroes if table missing."""
     table_exists = await conn.fetchval(
-        """
-        SELECT EXISTS(
-            SELECT 1 FROM information_schema.tables
-            WHERE table_name = 'memory_feedback'
-        )
-        """
+        "SELECT to_regclass('public.memory_feedback') IS NOT NULL"
     )
     if not table_exists:
         return {

@@ -25,6 +25,7 @@ import json
 import sys
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 from dotenv import load_dotenv
 
@@ -49,6 +50,16 @@ async def store_feedback(
 ) -> dict[str, Any]:
     """Store feedback for a learning. Upserts on (learning_id, session_id)."""
     async with get_connection() as conn:
+        # Check table exists
+        table_exists = await conn.fetchval(
+            "SELECT to_regclass('public.memory_feedback') IS NOT NULL"
+        )
+        if not table_exists:
+            return {
+                "success": False,
+                "error": "memory_feedback table not found — run the migration first",
+            }
+
         # Verify learning exists
         exists = await conn.fetchval(
             "SELECT EXISTS(SELECT 1 FROM archival_memory WHERE id = $1::uuid)",
@@ -117,12 +128,7 @@ async def get_feedback_summary() -> dict[str, Any]:
     async with get_connection() as conn:
         # Check if table exists
         table_exists = await conn.fetchval(
-            """
-            SELECT EXISTS(
-                SELECT 1 FROM information_schema.tables
-                WHERE table_name = 'memory_feedback'
-            )
-            """
+            "SELECT to_regclass('public.memory_feedback') IS NOT NULL"
         )
         if not table_exists:
             return {
@@ -197,21 +203,39 @@ async def get_feedback_summary() -> dict[str, Any]:
     }
 
 
+def _uuid_arg(value: str) -> str:
+    """Validate that value is a well-formed UUID."""
+    try:
+        UUID(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Invalid UUID: {value}") from exc
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Memory feedback CLI")
     sub = parser.add_subparsers(dest="command", required=True)
 
     store_p = sub.add_parser("store", help="Store feedback for a learning")
-    store_p.add_argument("--learning-id", required=True, help="UUID of the learning")
+    store_p.add_argument(
+        "--learning-id", type=_uuid_arg, required=True, help="UUID of the learning"
+    )
     store_p.add_argument("--session-id", default="cli", help="Session identifier")
     store_p.add_argument("--context", default="", help="Why it was/wasn't helpful")
-    store_p.add_argument("--source", default="manual", help="Feedback source")
+    store_p.add_argument(
+        "--source",
+        default="manual",
+        choices=["manual", "hook", "auto"],
+        help="Feedback source",
+    )
     helpful_group = store_p.add_mutually_exclusive_group(required=True)
     helpful_group.add_argument("--helpful", action="store_true", dest="helpful")
     helpful_group.add_argument("--not-helpful", action="store_true", dest="not_helpful")
 
     get_p = sub.add_parser("get", help="Get feedback for a learning")
-    get_p.add_argument("--learning-id", required=True, help="UUID of the learning")
+    get_p.add_argument(
+        "--learning-id", type=_uuid_arg, required=True, help="UUID of the learning"
+    )
 
     sub.add_parser("summary", help="Get feedback summary statistics")
 
@@ -222,25 +246,27 @@ async def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    if args.command == "store":
-        helpful = args.helpful if hasattr(args, "helpful") else not args.not_helpful
-        result = await store_feedback(
-            learning_id=args.learning_id,
-            helpful=helpful,
-            session_id=args.session_id,
-            context=args.context,
-            source=args.source,
-        )
-    elif args.command == "get":
-        result = await get_feedback_for_learning(args.learning_id)
-    elif args.command == "summary":
-        result = await get_feedback_summary()
-    else:
-        parser.print_help()
-        return
+    try:
+        if args.command == "store":
+            helpful = args.helpful
+            result = await store_feedback(
+                learning_id=args.learning_id,
+                helpful=helpful,
+                session_id=args.session_id,
+                context=args.context,
+                source=args.source,
+            )
+        elif args.command == "get":
+            result = await get_feedback_for_learning(args.learning_id)
+        elif args.command == "summary":
+            result = await get_feedback_summary()
+        else:
+            parser.print_help()
+            return
 
-    print(json.dumps(result, indent=2, default=str))
-    await close_pool()
+        print(json.dumps(result, indent=2, default=str))
+    finally:
+        await close_pool()
 
 
 if __name__ == "__main__":

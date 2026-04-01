@@ -217,16 +217,16 @@ class TestBuildParser:
     def test_store_helpful(self):
         parser = build_parser()
         args = parser.parse_args([
-            "store", "--learning-id", "abc-123", "--helpful",
+            "store", "--learning-id", "00000000-0000-0000-0000-000000000001", "--helpful",
         ])
         assert args.command == "store"
-        assert args.learning_id == "abc-123"
+        assert args.learning_id == "00000000-0000-0000-0000-000000000001"
         assert args.helpful is True
 
     def test_store_not_helpful(self):
         parser = build_parser()
         args = parser.parse_args([
-            "store", "--learning-id", "abc-123", "--not-helpful",
+            "store", "--learning-id", "00000000-0000-0000-0000-000000000001", "--not-helpful",
         ])
         assert args.command == "store"
         assert args.not_helpful is True
@@ -234,15 +234,28 @@ class TestBuildParser:
     def test_store_requires_helpful_flag(self):
         parser = build_parser()
         with pytest.raises(SystemExit):
-            parser.parse_args(["store", "--learning-id", "abc-123"])
+            parser.parse_args(["store", "--learning-id", "00000000-0000-0000-0000-000000000001"])
 
     def test_get_command(self):
         parser = build_parser()
-        args = parser.parse_args(["get", "--learning-id", "abc-123"])
+        args = parser.parse_args(["get", "--learning-id", "00000000-0000-0000-0000-000000000001"])
         assert args.command == "get"
-        assert args.learning_id == "abc-123"
+        assert args.learning_id == "00000000-0000-0000-0000-000000000001"
 
     def test_summary_command(self):
         parser = build_parser()
         args = parser.parse_args(["summary"])
         assert args.command == "summary"
+
+    def test_rejects_invalid_uuid(self):
+        parser = build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["store", "--learning-id", "not-a-uuid", "--helpful"])
+
+    def test_rejects_invalid_source(self):
+        parser = build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args([
+                "store", "--learning-id", "00000000-0000-0000-0000-000000000001",
+                "--helpful", "--source", "invalid",
+            ])

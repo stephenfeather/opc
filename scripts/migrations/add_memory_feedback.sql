@@ -7,7 +7,8 @@ CREATE TABLE IF NOT EXISTS memory_feedback (
     session_id TEXT NOT NULL,
     helpful BOOLEAN NOT NULL,
     context TEXT,
-    source TEXT DEFAULT 'manual',
+    source TEXT NOT NULL DEFAULT 'manual'
+        CHECK (source IN ('manual', 'hook', 'auto')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 

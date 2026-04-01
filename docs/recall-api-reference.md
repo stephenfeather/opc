@@ -340,8 +340,8 @@ uv run python scripts/core/memory_feedback.py store \
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
 | `--learning-id` | Yes | — | UUID of the learning to rate |
-| `--helpful` | One of these | — | Mark as helpful |
-| `--not-helpful` | required | — | Mark as not helpful |
+| `--helpful` | One of two (required) | — | Mark as helpful |
+| `--not-helpful` | One of two (required) | — | Mark as not helpful |
 | `--session-id` | No | `"cli"` | Session identifier |
 | `--context` | No | `""` | Why it was/wasn't helpful |
 | `--source` | No | `"manual"` | Feedback source (e.g., `manual`, `hook`, `auto`) |
@@ -470,6 +470,6 @@ No flags required.
 
 Feedback stats appear in `memory_metrics.py` output under `feedback_alltime`:
 
-```
+```text
 Feedback (all-time):  7 helpful, 3 not helpful out of 10 (70.0% helpful), 5 unique learnings rated
 ```

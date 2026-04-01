@@ -7,30 +7,55 @@
       "query": "hook development patterns",
       "k": 5,
       "category": "codebase_pattern",
-      "tags": ["hooks", "typescript"],
+      "tags": [
+        "hooks",
+        "typescript"
+      ],
       "project": "opc",
       "description": "Find patterns for building Claude Code hooks",
-      "golden_keywords": ["hook", "PreToolUse", "PostToolUse", "hooks"]
+      "golden_keywords": [
+        "hook",
+        "PreToolUse",
+        "PostToolUse",
+        "hooks"
+      ]
     },
     {
       "id": "q002",
       "query": "database schema migration",
       "k": 5,
       "category": "project_specific",
-      "tags": ["database", "postgresql"],
+      "tags": [
+        "database",
+        "postgresql"
+      ],
       "project": "opc",
       "description": "Database schema and migration patterns",
-      "golden_keywords": ["migration", "schema", "ALTER", "CREATE TABLE", "postgresql"]
+      "golden_keywords": [
+        "migration",
+        "schema",
+        "ALTER",
+        "CREATE TABLE",
+        "postgresql"
+      ]
     },
     {
       "id": "q003",
       "query": "memory extraction pipeline",
       "k": 5,
       "category": "project_specific",
-      "tags": ["memory", "extraction"],
+      "tags": [
+        "memory",
+        "extraction"
+      ],
       "project": "opc",
       "description": "How memory extraction works",
-      "golden_keywords": ["extraction", "daemon", "memory", "pipeline"]
+      "golden_keywords": [
+        "extraction",
+        "daemon",
+        "memory",
+        "pipeline"
+      ]
     },
     {
       "id": "q004",
@@ -40,7 +65,12 @@
       "tags": [],
       "project": "opc",
       "description": "Recent bug fixes - tests recency signal",
-      "golden_keywords": ["fix", "bug", "error", "resolved"]
+      "golden_keywords": [
+        "fix",
+        "bug",
+        "error",
+        "resolved"
+      ]
     },
     {
       "id": "q005",
@@ -50,47 +80,87 @@
       "tags": [],
       "project": "opc",
       "description": "Find FAILED_APPROACH learnings - tests type_match",
-      "golden_keywords": ["failed", "didn't work", "avoid", "mistake"]
+      "golden_keywords": [
+        "failed",
+        "didn't work",
+        "avoid",
+        "mistake"
+      ]
     },
     {
       "id": "q006",
       "query": "TypeScript compilation errors",
       "k": 5,
       "category": "type_targeted",
-      "tags": ["typescript", "errors"],
+      "tags": [
+        "typescript",
+        "errors"
+      ],
       "project": "opc",
       "description": "Error fixes related to TypeScript",
-      "golden_keywords": ["typescript", "tsc", "compile", "type error"]
+      "golden_keywords": [
+        "typescript",
+        "tsc",
+        "compile",
+        "type error"
+      ]
     },
     {
       "id": "q007",
       "query": "hooks typescript build",
       "k": 5,
       "category": "tag_driven",
-      "tags": ["hooks", "typescript", "build"],
+      "tags": [
+        "hooks",
+        "typescript",
+        "build"
+      ],
       "project": "opc",
       "description": "Tag-heavy query testing tag_overlap signal",
-      "golden_keywords": ["hook", "typescript", "build", "compile", "npm"]
+      "golden_keywords": [
+        "hook",
+        "typescript",
+        "build",
+        "compile",
+        "npm"
+      ]
     },
     {
       "id": "q008",
       "query": "reranker contextual signals",
       "k": 5,
       "category": "project_specific",
-      "tags": ["reranker", "recall"],
+      "tags": [
+        "reranker",
+        "recall"
+      ],
       "project": "opc",
       "description": "Reranker implementation details",
-      "golden_keywords": ["reranker", "rerank", "signal", "weight", "contextual"]
+      "golden_keywords": [
+        "reranker",
+        "rerank",
+        "signal",
+        "weight",
+        "contextual"
+      ]
     },
     {
       "id": "q009",
       "query": "git worktree patterns",
       "k": 5,
       "category": "codebase_pattern",
-      "tags": ["git", "worktree"],
+      "tags": [
+        "git",
+        "worktree"
+      ],
       "project": "opc",
       "description": "Worktree usage patterns",
-      "golden_keywords": ["worktree", "git worktree", "branch", "isolation"]
+      "golden_keywords": [
+        "worktree",
+        "git worktree",
+        "branch",
+        "isolation"
+      ]
     },
     {
       "id": "q010",
@@ -100,87 +170,159 @@
       "tags": [],
       "project": null,
       "description": "Stress test: broad query, does reranking add signal or noise?",
-      "golden_keywords": ["error", "exception", "failure", "traceback"]
+      "golden_keywords": [
+        "error",
+        "exception",
+        "failure",
+        "traceback"
+      ]
     },
     {
       "id": "q011",
       "query": "general Python patterns",
       "k": 5,
       "category": "cross_project",
-      "tags": ["python"],
+      "tags": [
+        "python"
+      ],
       "project": null,
       "description": "Cross-project query with no project match",
-      "golden_keywords": ["python", "pattern", "idiom", "pythonic"]
+      "golden_keywords": [
+        "python",
+        "pattern",
+        "idiom",
+        "pythonic"
+      ]
     },
     {
       "id": "q012",
       "query": "MCP server implementation",
       "k": 5,
       "category": "codebase_pattern",
-      "tags": ["mcp", "server"],
+      "tags": [
+        "mcp",
+        "server"
+      ],
       "project": "opc",
       "description": "MCP server patterns and implementation",
-      "golden_keywords": ["mcp", "server", "tool", "handler"]
+      "golden_keywords": [
+        "mcp",
+        "server",
+        "tool",
+        "handler"
+      ]
     },
     {
       "id": "q013",
       "query": "test fixtures and mocking",
       "k": 5,
       "category": "codebase_pattern",
-      "tags": ["testing", "pytest"],
+      "tags": [
+        "testing",
+        "pytest"
+      ],
       "project": "opc",
       "description": "Testing patterns with pytest",
-      "golden_keywords": ["test", "mock", "fixture", "pytest", "assert"]
+      "golden_keywords": [
+        "test",
+        "mock",
+        "fixture",
+        "pytest",
+        "assert"
+      ]
     },
     {
       "id": "q014",
       "query": "subprocess execution patterns",
       "k": 5,
       "category": "codebase_pattern",
-      "tags": ["subprocess", "python"],
+      "tags": [
+        "subprocess",
+        "python"
+      ],
       "project": "opc",
       "description": "How to safely run subprocesses",
-      "golden_keywords": ["subprocess", "Popen", "asyncio", "process"]
+      "golden_keywords": [
+        "subprocess",
+        "Popen",
+        "asyncio",
+        "process"
+      ]
     },
     {
       "id": "q015",
       "query": "session coordination across terminals",
       "k": 5,
       "category": "project_specific",
-      "tags": ["session", "coordination", "database"],
+      "tags": [
+        "session",
+        "coordination",
+        "database"
+      ],
       "project": "opc",
       "description": "Cross-terminal session awareness",
-      "golden_keywords": ["session", "coordination", "terminal", "heartbeat", "claim"]
+      "golden_keywords": [
+        "session",
+        "coordination",
+        "terminal",
+        "heartbeat",
+        "claim"
+      ]
     },
     {
       "id": "q016",
       "query": "embedding vector search",
       "k": 5,
       "category": "project_specific",
-      "tags": ["embedding", "vector"],
+      "tags": [
+        "embedding",
+        "vector"
+      ],
       "project": "opc",
       "description": "Vector search and embedding patterns",
-      "golden_keywords": ["embedding", "vector", "cosine", "similarity", "bge"]
+      "golden_keywords": [
+        "embedding",
+        "vector",
+        "cosine",
+        "similarity",
+        "bge"
+      ]
     },
     {
       "id": "q017",
       "query": "YAML configuration format",
       "k": 5,
       "category": "codebase_pattern",
-      "tags": ["yaml", "config"],
+      "tags": [
+        "yaml",
+        "config"
+      ],
       "project": "opc",
       "description": "YAML format decisions and patterns",
-      "golden_keywords": ["yaml", "config", "format", "handoff"]
+      "golden_keywords": [
+        "yaml",
+        "config",
+        "format",
+        "handoff"
+      ]
     },
     {
       "id": "q018",
       "query": "skill development workflow",
       "k": 5,
       "category": "project_specific",
-      "tags": ["skill", "development"],
+      "tags": [
+        "skill",
+        "development"
+      ],
       "project": "opc",
       "description": "How to build Claude Code skills",
-      "golden_keywords": ["skill", "SKILL.md", "slash command", "workflow"]
+      "golden_keywords": [
+        "skill",
+        "SKILL.md",
+        "slash command",
+        "workflow"
+      ]
     },
     {
       "id": "q019",
@@ -190,37 +332,68 @@
       "tags": [],
       "project": null,
       "description": "Broad performance query - stress test",
-      "golden_keywords": ["performance", "optimize", "slow", "cache", "latency"]
+      "golden_keywords": [
+        "performance",
+        "optimize",
+        "slow",
+        "cache",
+        "latency"
+      ]
     },
     {
       "id": "q020",
       "query": "Braintrust logging and tracing",
       "k": 5,
       "category": "project_specific",
-      "tags": ["braintrust", "logging"],
+      "tags": [
+        "braintrust",
+        "logging"
+      ],
       "project": "opc",
       "description": "Braintrust integration patterns",
-      "golden_keywords": ["braintrust", "trace", "span", "logging"]
+      "golden_keywords": [
+        "braintrust",
+        "trace",
+        "span",
+        "logging"
+      ]
     },
     {
       "id": "q021",
       "query": "daemon process management",
       "k": 5,
       "category": "project_specific",
-      "tags": ["daemon", "process"],
+      "tags": [
+        "daemon",
+        "process"
+      ],
       "project": "opc",
       "description": "Daemon lifecycle and management",
-      "golden_keywords": ["daemon", "process", "start", "stop", "pid"]
+      "golden_keywords": [
+        "daemon",
+        "process",
+        "start",
+        "stop",
+        "pid"
+      ]
     },
     {
       "id": "q022",
       "query": "learning classification LLM",
       "k": 5,
       "category": "project_specific",
-      "tags": ["classification", "llm"],
+      "tags": [
+        "classification",
+        "llm"
+      ],
       "project": "opc",
       "description": "LLM-based learning classification",
-      "golden_keywords": ["classify", "classification", "llm", "learning_type"]
+      "golden_keywords": [
+        "classify",
+        "classification",
+        "llm",
+        "learning_type"
+      ]
     },
     {
       "id": "q023",
@@ -230,7 +403,13 @@
       "tags": [],
       "project": "opc",
       "description": "Find ARCHITECTURAL_DECISION learnings",
-      "golden_keywords": ["decision", "architecture", "chose", "rationale", "design"]
+      "golden_keywords": [
+        "decision",
+        "architecture",
+        "chose",
+        "rationale",
+        "design"
+      ]
     },
     {
       "id": "q024",
@@ -240,17 +419,29 @@
       "tags": [],
       "project": "opc",
       "description": "Tests behavior on items with zero recall count",
-      "golden_keywords": ["recall", "cold", "unused", "never"]
+      "golden_keywords": [
+        "recall",
+        "cold",
+        "unused",
+        "never"
+      ]
     },
     {
       "id": "q025",
       "query": "JSON serialization format",
       "k": 5,
       "category": "codebase_pattern",
-      "tags": ["json"],
+      "tags": [
+        "json"
+      ],
       "project": "opc",
       "description": "JSON output patterns",
-      "golden_keywords": ["json", "serialize", "format", "output"]
+      "golden_keywords": [
+        "json",
+        "serialize",
+        "format",
+        "output"
+      ]
     }
   ]
 }

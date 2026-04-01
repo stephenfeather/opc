@@ -83,6 +83,7 @@ async def get_pattern_representatives(
           AND dp.pattern_type IN ('anti_pattern', 'problem_solution')
           AND a.recall_count = 0
           AND a.superseded_by IS NULL
+        ORDER BY dp.confidence DESC, a.created_at DESC
         LIMIT $1
         """,
         k,
@@ -92,7 +93,7 @@ async def get_pattern_representatives(
         d = _row_to_dict(row)
         d["pattern_label"] = row.get("pattern_label")
         raw_conf = row.get("pattern_confidence")
-        d["pattern_confidence"] = float(raw_conf) if raw_conf else None
+        d["pattern_confidence"] = float(raw_conf) if raw_conf is not None else None
         results.append(d)
     return results
 
@@ -186,17 +187,20 @@ async def get_push_candidates(
     project: str, k: int = 5
 ) -> list[dict[str, Any]]:
     """Main entry: fetch and merge push candidates from PostgreSQL."""
+    from scripts.core.db.postgres_pool import get_pool
     from scripts.core.recall_learnings import get_backend
 
     if get_backend() != "postgres":
         return []
 
-    stale = await get_stale_learnings(project, k)
-    try:
-        patterns = await get_pattern_representatives(k)
-    except Exception:
-        logger.debug("detected_patterns table not available", exc_info=True)
-        patterns = []
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        stale = await get_stale_learnings(project, k, conn=conn)
+        try:
+            patterns = await get_pattern_representatives(k, conn=conn)
+        except Exception:
+            logger.debug("detected_patterns table not available", exc_info=True)
+            patterns = []
 
     return merge_candidates(patterns, stale, k)
 
@@ -210,7 +214,7 @@ async def main() -> int:
     )
     parser.add_argument(
         "--project",
-        default=os.environ.get("CLAUDE_PROJECT_DIR", "").rsplit("/", 1)[-1] or None,
+        default=Path(os.environ["CLAUDE_PROJECT_DIR"]).name if os.environ.get("CLAUDE_PROJECT_DIR") else None,
         help="Project name to filter by (default: auto-detect from CLAUDE_PROJECT_DIR)",
     )
     parser.add_argument(
@@ -255,12 +259,14 @@ async def main() -> int:
         return 1
 
     if not candidates:
+        empty = {
+            "push_source": "session_start",
+            "project": args.project,
+            "results": [],
+        }
+        # Always overwrite cache so stale data from previous runs isn't reused
+        write_cache_file(empty)
         if args.json_output:
-            empty = {
-                "push_source": "session_start",
-                "project": args.project,
-                "results": [],
-            }
             print(json.dumps(empty))
         return 0
 

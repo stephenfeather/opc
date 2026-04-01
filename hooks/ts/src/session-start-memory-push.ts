@@ -140,6 +140,7 @@ function main(): void {
   ].join('\n');
 
   console.log(JSON.stringify({
+    result: 'continue',
     hookSpecificOutput: {
       hookEventName: 'SessionStart',
       additionalContext: context

@@ -5,20 +5,16 @@ Validates that:
 2. truncate_content handles edge cases correctly
 3. format_results builds expected JSON structure
 4. get_push_candidates integrates queries and merge
-5. CLI argument handling works correctly
 """
 
 from __future__ import annotations
 
 import json
-import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts.core.push_learnings import (  # noqa: E402
     format_results,
@@ -214,6 +210,17 @@ class TestWriteCacheFile:
 # get_push_candidates (integration with mocked DB)
 # ---------------------------------------------------------------------------
 
+def _make_pool_mock() -> AsyncMock:
+    """Create an AsyncMock pool that supports `async with pool.acquire() as conn`."""
+    conn = MagicMock()
+    acquire_cm = MagicMock()
+    acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+    acquire_cm.__aexit__ = AsyncMock(return_value=False)
+    pool = AsyncMock()
+    pool.acquire = MagicMock(return_value=acquire_cm)
+    return pool
+
+
 class TestGetPushCandidates:
     @pytest.mark.asyncio
     async def test_returns_empty_for_sqlite(self):
@@ -244,7 +251,7 @@ class TestGetPushCandidates:
                 "scripts.core.push_learnings.get_pattern_representatives",
                 new_callable=AsyncMock, return_value=patterns,
             ),
-            patch("scripts.core.db.postgres_pool.get_pool", new_callable=AsyncMock),
+            patch("scripts.core.db.postgres_pool.get_pool", new_callable=AsyncMock, return_value=_make_pool_mock()),
         ):
             result = await get_push_candidates("opc", k=5)
 
@@ -268,7 +275,7 @@ class TestGetPushCandidates:
                 new_callable=AsyncMock,
                 side_effect=Exception("relation does not exist"),
             ),
-            patch("scripts.core.db.postgres_pool.get_pool", new_callable=AsyncMock),
+            patch("scripts.core.db.postgres_pool.get_pool", new_callable=AsyncMock, return_value=_make_pool_mock()),
         ):
             result = await get_push_candidates("opc", k=5)
 
@@ -287,49 +294,10 @@ class TestGetPushCandidates:
                 "scripts.core.push_learnings.get_pattern_representatives",
                 new_callable=AsyncMock, return_value=[],
             ),
-            patch("scripts.core.db.postgres_pool.get_pool", new_callable=AsyncMock),
+            patch("scripts.core.db.postgres_pool.get_pool", new_callable=AsyncMock, return_value=_make_pool_mock()),
         ):
             result = await get_push_candidates("opc", k=5)
 
         assert result == []
 
 
-# ---------------------------------------------------------------------------
-# Mock helpers
-# ---------------------------------------------------------------------------
-
-def _mock_row(
-    *,
-    id: str,
-    content: str,
-    confidence: str = "high",
-    learning_type: str = "WORKING_SOLUTION",
-    pattern_label: str | None = None,
-    pattern_confidence: float | None = None,
-) -> MagicMock:
-    """Create a mock asyncpg Record."""
-    metadata = json.dumps({
-        "type": "session_learning",
-        "learning_type": learning_type,
-        "confidence": confidence,
-    })
-    row = MagicMock()
-    row.__getitem__ = lambda self, key: {
-        "id": id,
-        "content": content,
-        "metadata": metadata,
-        "created_at": datetime(2026, 3, 15, tzinfo=UTC),
-        "recall_count": 0,
-        "pattern_label": pattern_label,
-        "pattern_confidence": pattern_confidence,
-    }[key]
-    row.get = lambda key, default=None: {
-        "id": id,
-        "content": content,
-        "metadata": metadata,
-        "created_at": datetime(2026, 3, 15, tzinfo=UTC),
-        "recall_count": 0,
-        "pattern_label": pattern_label,
-        "pattern_confidence": pattern_confidence,
-    }.get(key, default)
-    return row

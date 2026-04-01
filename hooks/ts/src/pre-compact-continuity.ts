@@ -27,7 +27,8 @@ interface PushCacheResult {
  * Returns formatted string or empty string if no recent push data.
  */
 function getMemoryPushContext(): string {
-  const pushFile = path.join(process.env.HOME || '', '.claude', 'cache', 'memory-push.json');
+  const homeDir = process.env.HOME || process.env.USERPROFILE || '';
+  const pushFile = path.join(homeDir, '.claude', 'cache', 'memory-push.json');
   if (!fs.existsSync(pushFile)) return '';
 
   try {
@@ -38,6 +39,11 @@ function getMemoryPushContext(): string {
 
     const pushData = JSON.parse(fs.readFileSync(pushFile, 'utf-8'));
     if (!pushData.results || pushData.results.length === 0) return '';
+
+    // Validate project to avoid leaking context across projects
+    const currentProject = (process.env.CLAUDE_PROJECT_DIR || process.cwd())
+      .replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? '';
+    if (pushData.project && currentProject && pushData.project !== currentProject) return '';
 
     const pushLines = pushData.results.map((r: PushCacheResult, i: number) => {
       const label = r.pattern_label ? `\n   ↳ Pattern: "${r.pattern_label}"` : '';

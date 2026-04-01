@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts.core.db.postgres_pool import reset_pool  # noqa: E402
 from scripts.core.memory_metrics import (  # noqa: E402
+    _get_version,
     build_parser,
     collect_all_metrics,
     format_human,
@@ -58,6 +59,10 @@ class TestParsePeriod:
         with pytest.raises(ValueError):
             parse_period("not-a-date:also-not")
 
+    def test_inverted_range_raises(self):
+        with pytest.raises(ValueError, match="start date.*after end date"):
+            parse_period("2026-04-01:2026-03-01")
+
 
 # ---------------------------------------------------------------------------
 # CLI argument parsing
@@ -75,6 +80,12 @@ class TestCLIParsing:
         args = parser.parse_args(["--human"])
         assert args.human is True
 
+    def test_json_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["--json"])
+        assert args.json is True
+        assert args.human is False
+
     def test_period_flag(self):
         parser = build_parser()
         args = parser.parse_args(["--period", "2026-03-01:2026-03-31"])
@@ -90,7 +101,7 @@ def _sample_metrics() -> dict:
     return {
         "generated_at": "2026-04-01T14:00:00+00:00",
         "period": None,
-        "version": "0.7.3",
+        "version": _get_version(),
         "totals": {
             "active_learnings": 100,
             "superseded_learnings": 10,
@@ -110,13 +121,13 @@ def _sample_metrics() -> dict:
             "ERROR_FIX": {"count": 30, "pct": 30.0},
             "CODEBASE_PATTERN": {"count": 30, "pct": 30.0},
         },
-        "dedup_stats": {
+        "dedup_stats_alltime": {
             "learnings_with_content_hash": 105,
             "learnings_without_content_hash": 5,
             "hash_coverage_pct": 95.5,
             "note": "Dedup rejections are not persisted; hash_coverage indicates dedup eligibility",
         },
-        "extraction_stats": {
+        "extraction_stats_alltime": {
             "total_sessions": 50,
             "extracted": 40,
             "pending": 5,
@@ -129,16 +140,16 @@ def _sample_metrics() -> dict:
             "total_active": 100,
             "never_recalled_pct": 30.0,
         },
-        "top_tags": [
+        "top_tags_alltime": [
             {"tag": "hooks", "count": 20},
             {"tag": "python", "count": 15},
         ],
-        "superseded": {
+        "superseded_alltime": {
             "superseded_count": 10,
             "total_learnings": 110,
             "superseded_pct": 9.1,
         },
-        "temporal": {
+        "temporal_alltime": {
             "oldest_learning": "2026-01-15T09:00:00+00:00",
             "newest_learning": "2026-04-01T13:00:00+00:00",
             "last_7_days": 8,
@@ -151,7 +162,8 @@ class TestHumanFormatter:
     def test_contains_header(self):
         output = format_human(_sample_metrics())
         assert "Memory Metrics Report" in output
-        assert "v0.7.3" in output
+        version = _get_version()
+        assert f"v{version}" in output
 
     def test_contains_totals(self):
         output = format_human(_sample_metrics())
@@ -195,7 +207,7 @@ class TestHumanFormatter:
             "superseded_learnings": 0,
             "total_learnings": 0,
         }
-        metrics["top_tags"] = []
+        metrics["top_tags_alltime"] = []
         metrics["confidence_distribution"] = {}
         metrics["classification_distribution"] = {}
         output = format_human(metrics)
@@ -211,15 +223,15 @@ class TestJSONStructure:
         metrics = _sample_metrics()
         serialized = json.dumps(metrics)
         parsed = json.loads(serialized)
-        assert parsed["version"] == "0.7.3"
+        assert parsed["version"] == _get_version()
 
     def test_all_top_level_keys_present(self):
         metrics = _sample_metrics()
         expected_keys = {
             "generated_at", "period", "totals", "per_session",
             "confidence_distribution", "classification_distribution",
-            "dedup_stats", "extraction_stats", "stale_learnings",
-            "top_tags", "superseded", "temporal", "version",
+            "dedup_stats_alltime", "extraction_stats_alltime", "stale_learnings",
+            "top_tags_alltime", "superseded_alltime", "temporal_alltime", "version",
         }
         assert set(metrics.keys()) == expected_keys
 
@@ -228,6 +240,31 @@ class TestJSONStructure:
 # Integration: collect_all_metrics against PostgreSQL
 # ---------------------------------------------------------------------------
 
+def _db_available() -> bool:
+    """Check if PostgreSQL is reachable."""
+    import os
+    return bool(
+        os.environ.get("CONTINUOUS_CLAUDE_DB_URL")
+        or os.environ.get("DATABASE_URL")
+        or os.environ.get("OPC_POSTGRES_URL")
+        # Default dev DB — check if docker is running
+        or _check_default_db()
+    )
+
+
+def _check_default_db() -> bool:
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["docker", "exec", "continuous-claude-postgres", "pg_isready"],
+            capture_output=True, timeout=3,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(not _db_available(), reason="PostgreSQL not available")
 class TestCollectMetrics:
     """Integration tests that hit the real database.
 
@@ -245,8 +282,8 @@ class TestCollectMetrics:
         expected_keys = {
             "generated_at", "period", "totals", "per_session",
             "confidence_distribution", "classification_distribution",
-            "dedup_stats", "extraction_stats", "stale_learnings",
-            "top_tags", "superseded", "temporal", "version",
+            "dedup_stats_alltime", "extraction_stats_alltime", "stale_learnings",
+            "top_tags_alltime", "superseded_alltime", "temporal_alltime", "version",
         }
         assert set(metrics.keys()) == expected_keys
 
@@ -275,20 +312,22 @@ class TestCollectMetrics:
     @pytest.mark.asyncio
     async def test_version_present(self):
         metrics = await collect_all_metrics()
-        assert metrics["version"] == "0.7.3"
+        assert metrics["version"] == _get_version()
 
     @pytest.mark.asyncio
     async def test_top_tags_is_list(self):
         metrics = await collect_all_metrics()
-        assert isinstance(metrics["top_tags"], list)
-        if metrics["top_tags"]:
-            assert "tag" in metrics["top_tags"][0]
-            assert "count" in metrics["top_tags"][0]
+        assert isinstance(metrics["top_tags_alltime"], list)
+        if metrics["top_tags_alltime"]:
+            assert "tag" in metrics["top_tags_alltime"][0]
+            assert "count" in metrics["top_tags_alltime"][0]
 
     @pytest.mark.asyncio
     async def test_pct_fields_are_floats(self):
         metrics = await collect_all_metrics()
         for level_data in metrics["confidence_distribution"].values():
             assert isinstance(level_data["pct"], float)
-        assert isinstance(metrics["extraction_stats"]["extraction_rate_pct"], float)
+        assert isinstance(
+            metrics["extraction_stats_alltime"]["extraction_rate_pct"], float
+        )
         assert isinstance(metrics["stale_learnings"]["never_recalled_pct"], float)

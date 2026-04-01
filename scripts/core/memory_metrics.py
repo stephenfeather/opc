@@ -25,7 +25,6 @@ import argparse
 import asyncio
 import faulthandler
 import json
-import os
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -33,10 +32,9 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-faulthandler.enable(
-    file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"),
-    all_threads=True,
-)
+_crash_log = Path.home() / ".claude" / "logs" / "opc_crash.log"
+_crash_log.parent.mkdir(parents=True, exist_ok=True)
+faulthandler.enable(file=_crash_log.open("a"), all_threads=True)
 
 # Load .env files
 global_env = Path.home() / ".claude" / ".env"
@@ -44,13 +42,20 @@ if global_env.exists():
     load_dotenv(global_env)
 load_dotenv()
 
-# Add project root to path
-project_dir = os.environ.get("CLAUDE_PROJECT_DIR", str(Path(__file__).parent.parent.parent))
-sys.path.insert(0, project_dir)
+# Add repository root to path
+repo_root = str(Path(__file__).parent.parent.parent)
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
 
 from scripts.core.db.postgres_pool import close_pool, get_connection  # noqa: E402
 
-VERSION = "0.7.3"
+
+def _get_version() -> str:
+    try:
+        from importlib.metadata import version
+        return version("mcp-execution")
+    except Exception:
+        return "0.7.3"
 
 
 # ---------------------------------------------------------------------------
@@ -67,10 +72,16 @@ def parse_period(period_str: str | None) -> tuple[datetime | None, datetime | No
     parts = period_str.split(":")
     if len(parts) != 2:
         raise ValueError(f"Invalid period format: {period_str!r}. Expected YYYY-MM-DD:YYYY-MM-DD")
-    start = datetime.strptime(parts[0].strip(), "%Y-%m-%d").replace(tzinfo=UTC)
-    end = datetime.strptime(parts[1].strip(), "%Y-%m-%d").replace(
+    start_str = parts[0].strip()
+    end_str = parts[1].strip()
+    start = datetime.strptime(start_str, "%Y-%m-%d").replace(tzinfo=UTC)
+    end = datetime.strptime(end_str, "%Y-%m-%d").replace(
         hour=23, minute=59, second=59, microsecond=999999, tzinfo=UTC
     )
+    if start > end:
+        raise ValueError(
+            f"Invalid period range: start date {start_str!r} is after end date {end_str!r}"
+        )
     return start, end
 
 
@@ -165,11 +176,20 @@ async def get_confidence_distribution(
         start, end,
     )
     total = sum(r["count"] for r in rows)
+    by_level = {r["level"]: r["count"] for r in rows}
+    canonical = ["high", "medium", "low"]
     result = {}
-    for r in rows:
-        result[r["level"]] = {
-            "count": r["count"],
-            "pct": round(100.0 * r["count"] / total, 1) if total else 0.0,
+    for level in canonical:
+        if level in by_level:
+            cnt = by_level.pop(level)
+            result[level] = {
+                "count": cnt,
+                "pct": round(100.0 * cnt / total, 1) if total else 0.0,
+            }
+    for level in sorted(by_level.keys()):
+        result[level] = {
+            "count": by_level[level],
+            "pct": round(100.0 * by_level[level] / total, 1) if total else 0.0,
         }
     return result
 
@@ -333,12 +353,12 @@ async def collect_all_metrics(
         per_session = await get_per_session_stats(conn, start, end)
         confidence = await get_confidence_distribution(conn, start, end)
         classification = await get_classification_distribution(conn, start, end)
-        dedup = await get_dedup_stats(conn)
-        extraction = await get_extraction_stats(conn)
+        dedup = await get_dedup_stats(conn)  # always all-time
+        extraction = await get_extraction_stats(conn)  # always all-time
         stale = await get_stale_learnings(conn, start, end)
-        tags = await get_top_tags(conn)
-        superseded = await get_superseded_stats(conn)
-        temporal = await get_temporal_stats(conn)
+        tags = await get_top_tags(conn)  # always all-time
+        superseded = await get_superseded_stats(conn)  # always all-time
+        temporal = await get_temporal_stats(conn)  # always all-time
 
     period = None
     if start or end:
@@ -354,13 +374,13 @@ async def collect_all_metrics(
         "per_session": per_session,
         "confidence_distribution": confidence,
         "classification_distribution": classification,
-        "dedup_stats": dedup,
-        "extraction_stats": extraction,
+        "dedup_stats_alltime": dedup,
+        "extraction_stats_alltime": extraction,
         "stale_learnings": stale,
-        "top_tags": tags,
-        "superseded": superseded,
-        "temporal": temporal,
-        "version": VERSION,
+        "top_tags_alltime": tags,
+        "superseded_alltime": superseded,
+        "temporal_alltime": temporal,
+        "version": _get_version(),
     }
 
 
@@ -402,13 +422,13 @@ def format_human(metrics: dict) -> str:
         lines.append(f"  {lt:28s}  {data['count']:4d}  ({data['pct']:.1f}%)")
     lines.append("")
 
-    d = metrics["dedup_stats"]
+    d = metrics["dedup_stats_alltime"]
     lines.append(f"Dedup:  {d['hash_coverage_pct']:.1f}% hash coverage "
                  f"({d['learnings_with_content_hash']} with, "
                  f"{d['learnings_without_content_hash']} without)")
     lines.append("")
 
-    e = metrics["extraction_stats"]
+    e = metrics["extraction_stats_alltime"]
     lines.append(f"Extraction:  {e['extracted']}/{e['total_sessions']} extracted "
                  f"({e['extraction_rate_pct']:.1f}%), "
                  f"{e['pending']} pending, {e['failed']} failed, {e['retried']} retried")
@@ -419,17 +439,17 @@ def format_human(metrics: dict) -> str:
                  f"({s['never_recalled_pct']:.1f}%)")
     lines.append("")
 
-    lines.append("Top Tags:")
-    for tag_data in metrics["top_tags"]:
+    lines.append("Top Tags (all-time):")
+    for tag_data in metrics["top_tags_alltime"]:
         lines.append(f"  {tag_data['tag']:20s}  {tag_data['count']:4d}")
     lines.append("")
 
-    sup = metrics["superseded"]
+    sup = metrics["superseded_alltime"]
     lines.append(f"Superseded:  {sup['superseded_count']}/{sup['total_learnings']} "
                  f"({sup['superseded_pct']:.1f}%)")
     lines.append("")
 
-    tmp = metrics["temporal"]
+    tmp = metrics["temporal_alltime"]
     lines.append(f"Temporal:  oldest {tmp['oldest_learning']}")
     lines.append(f"           newest {tmp['newest_learning']}")
     lines.append(f"           last 7d: {tmp['last_7_days']},  last 30d: {tmp['last_30_days']}")
@@ -445,10 +465,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Memory system health and quality metrics"
     )
-    parser.add_argument(
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument(
+        "--json",
+        action="store_true",
+        default=True,
+        help="JSON output (default)",
+    )
+    output.add_argument(
         "--human",
         action="store_true",
-        help="Human-readable output (default is JSON)",
+        help="Human-readable output",
     )
     parser.add_argument(
         "--period",

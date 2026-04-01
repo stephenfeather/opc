@@ -79,6 +79,24 @@ def format_json_output(results: list[dict[str, Any]], structured: bool = False) 
     return json.dumps({"results": json_results})
 
 
+def format_json_full_output(results: list[dict[str, Any]]) -> str:
+    """Format results with full metadata as JSON (for benchmarking).
+
+    Extends the standard JSON output with metadata, recall_count,
+    pattern_strength, and pattern_tags needed by the reranker sweep.
+    """
+    json_results = []
+    for result in results:
+        jr = _build_json_result(result)
+        metadata = result.get("metadata", {})
+        jr["metadata"] = metadata
+        jr["recall_count"] = result.get("recall_count", 0)
+        jr["pattern_strength"] = result.get("pattern_strength", 0.0)
+        jr["pattern_tags"] = result.get("pattern_tags", [])
+        json_results.append(jr)
+    return json.dumps({"results": json_results})
+
+
 def format_human_output(results: list[dict[str, Any]], structured: bool = False) -> str:
     """Format results as human-readable text.
 

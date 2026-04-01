@@ -1,0 +1,156 @@
+{
+  "timestamp": "2026-04-01T10:30:07.273177+00:00",
+  "num_queries": 25,
+  "configs": [
+    {
+      "name": "baseline",
+      "weights": {
+        "project_weight": 0.15,
+        "recency_weight": 0.05,
+        "confidence_weight": 0.05,
+        "recall_weight": 0.05,
+        "type_affinity_weight": 0.05,
+        "tag_overlap_weight": 0.05,
+        "pattern_weight": 0.05
+      },
+      "precision_at_k": 0.248,
+      "ndcg_at_k": 0.452,
+      "mrr": 0.388
+    },
+    {
+      "name": "no-project",
+      "weights": {
+        "project_weight": 0.0,
+        "recency_weight": 0.05,
+        "confidence_weight": 0.05,
+        "recall_weight": 0.05,
+        "type_affinity_weight": 0.05,
+        "tag_overlap_weight": 0.05,
+        "pattern_weight": 0.05
+      },
+      "precision_at_k": 0.248,
+      "ndcg_at_k": 0.4655,
+      "mrr": 0.408
+    },
+    {
+      "name": "heavy-project",
+      "weights": {
+        "project_weight": 0.3,
+        "recency_weight": 0.05,
+        "confidence_weight": 0.05,
+        "recall_weight": 0.05,
+        "type_affinity_weight": 0.05,
+        "tag_overlap_weight": 0.05,
+        "pattern_weight": 0.05
+      },
+      "precision_at_k": 0.248,
+      "ndcg_at_k": 0.452,
+      "mrr": 0.388
+    },
+    {
+      "name": "no-recency",
+      "weights": {
+        "project_weight": 0.15,
+        "recency_weight": 0.0,
+        "confidence_weight": 0.05,
+        "recall_weight": 0.05,
+        "type_affinity_weight": 0.05,
+        "tag_overlap_weight": 0.05,
+        "pattern_weight": 0.05
+      },
+      "precision_at_k": 0.24,
+      "ndcg_at_k": 0.4321,
+      "mrr": 0.3613
+    },
+    {
+      "name": "heavy-recency",
+      "weights": {
+        "project_weight": 0.15,
+        "recency_weight": 0.15,
+        "confidence_weight": 0.05,
+        "recall_weight": 0.05,
+        "type_affinity_weight": 0.05,
+        "tag_overlap_weight": 0.05,
+        "pattern_weight": 0.05
+      },
+      "precision_at_k": 0.24,
+      "ndcg_at_k": 0.4304,
+      "mrr": 0.3633
+    },
+    {
+      "name": "no-recall",
+      "weights": {
+        "project_weight": 0.15,
+        "recency_weight": 0.05,
+        "confidence_weight": 0.05,
+        "recall_weight": 0.0,
+        "type_affinity_weight": 0.05,
+        "tag_overlap_weight": 0.05,
+        "pattern_weight": 0.05
+      },
+      "precision_at_k": 0.264,
+      "ndcg_at_k": 0.4843,
+      "mrr": 0.4033
+    },
+    {
+      "name": "tags-heavy",
+      "weights": {
+        "project_weight": 0.1,
+        "recency_weight": 0.05,
+        "confidence_weight": 0.05,
+        "recall_weight": 0.05,
+        "type_affinity_weight": 0.05,
+        "tag_overlap_weight": 0.15,
+        "pattern_weight": 0.05
+      },
+      "precision_at_k": 0.272,
+      "ndcg_at_k": 0.4759,
+      "mrr": 0.398
+    },
+    {
+      "name": "type-heavy",
+      "weights": {
+        "project_weight": 0.1,
+        "recency_weight": 0.05,
+        "confidence_weight": 0.05,
+        "recall_weight": 0.05,
+        "type_affinity_weight": 0.15,
+        "tag_overlap_weight": 0.05,
+        "pattern_weight": 0.05
+      },
+      "precision_at_k": 0.248,
+      "ndcg_at_k": 0.452,
+      "mrr": 0.388
+    },
+    {
+      "name": "minimal-signals",
+      "weights": {
+        "project_weight": 0.1,
+        "recency_weight": 0.0,
+        "confidence_weight": 0.0,
+        "recall_weight": 0.0,
+        "type_affinity_weight": 0.0,
+        "tag_overlap_weight": 0.05,
+        "pattern_weight": 0.0
+      },
+      "precision_at_k": 0.288,
+      "ndcg_at_k": 0.4762,
+      "mrr": 0.4047
+    },
+    {
+      "name": "retrieval-only",
+      "weights": {
+        "project_weight": 0.0,
+        "recency_weight": 0.0,
+        "confidence_weight": 0.0,
+        "recall_weight": 0.0,
+        "type_affinity_weight": 0.0,
+        "tag_overlap_weight": 0.0,
+        "pattern_weight": 0.0
+      },
+      "precision_at_k": 0.28,
+      "ndcg_at_k": 0.4333,
+      "mrr": 0.3413
+    }
+  ]
+}

@@ -379,7 +379,7 @@ class TestClassifyPattern:
                            context="ctx4", created_at=now - timedelta(days=1))
         ]
         result = classify_pattern_heuristic(members, reference_time=now)
-        assert result != "expertise"
+        assert result == "cross_project"
 
     def test_expertise_needs_4_contexts(self):
         # Only 3 contexts -> should NOT match expertise (needs >=4)

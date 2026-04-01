@@ -272,7 +272,8 @@ class TestCollectMetrics:
             "generated_at", "period", "totals", "per_session",
             "confidence_distribution", "classification_distribution",
             "dedup_stats_alltime", "extraction_stats_alltime", "stale_learnings",
-            "top_tags_alltime", "superseded_alltime", "temporal_alltime", "version",
+            "top_tags_alltime", "superseded_alltime", "temporal_alltime",
+            "feedback_alltime", "version",
         }
         assert set(metrics.keys()) == expected_keys
 

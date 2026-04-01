@@ -319,3 +319,157 @@ Two layers, checked in order:
 
 1. **Semantic dedup** — Cosine similarity >= 0.92 against all existing learnings (cross-session). Returns `skipped` with `existing_id`.
 2. **Content hash dedup** — SHA-256 of exact content. Returns `skipped` without `existing_id`.
+
+---
+
+# Memory Feedback API Reference
+
+`scripts/core/memory_feedback.py` — Track whether recalled learnings were actually useful.
+
+## Subcommands
+
+### `store` — Record feedback for a learning
+
+```bash
+uv run python scripts/core/memory_feedback.py store \
+  --learning-id <uuid> --helpful --session-id <sid>
+```
+
+#### Flags
+
+| Flag | Required | Default | Description |
+|------|----------|---------|-------------|
+| `--learning-id` | Yes | — | UUID of the learning to rate |
+| `--helpful` | One of these | — | Mark as helpful |
+| `--not-helpful` | required | — | Mark as not helpful |
+| `--session-id` | No | `"cli"` | Session identifier |
+| `--context` | No | `""` | Why it was/wasn't helpful |
+| `--source` | No | `"manual"` | Feedback source (e.g., `manual`, `hook`, `auto`) |
+
+`--helpful` and `--not-helpful` are mutually exclusive; exactly one is required.
+
+Upserts on `(learning_id, session_id)` — submitting again for the same pair updates the existing feedback.
+
+#### Success Response
+
+```json
+{
+  "success": true,
+  "feedback_id": "770840f8-7a35-44b6-9cb1-9b8fda3dfbf4",
+  "learning_id": "820c9584-08ee-4d49-b932-a7ff5334ec0a",
+  "helpful": true,
+  "created_at": "2026-04-01T23:09:14.622523+00:00"
+}
+```
+
+#### Error Response (learning not found)
+
+```json
+{
+  "success": false,
+  "error": "Learning 00000000-0000-0000-0000-000000000000 not found"
+}
+```
+
+---
+
+### `get` — Retrieve feedback for a specific learning
+
+```bash
+uv run python scripts/core/memory_feedback.py get --learning-id <uuid>
+```
+
+#### Flags
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--learning-id` | Yes | UUID of the learning |
+
+#### Response
+
+```json
+{
+  "learning_id": "820c9584-08ee-4d49-b932-a7ff5334ec0a",
+  "total_feedback": 2,
+  "helpful_count": 1,
+  "not_helpful_count": 1,
+  "feedback": [
+    {
+      "id": "770840f8-7a35-44b6-9cb1-9b8fda3dfbf4",
+      "session_id": "session-abc",
+      "helpful": true,
+      "context": "prevented me from repeating a known mistake",
+      "source": "manual",
+      "created_at": "2026-04-01T23:09:14.622523+00:00"
+    },
+    {
+      "id": "88812345-aaaa-bbbb-cccc-dddddddddddd",
+      "session_id": "session-xyz",
+      "helpful": false,
+      "context": null,
+      "source": "manual",
+      "created_at": "2026-04-01T20:00:00.000000+00:00"
+    }
+  ]
+}
+```
+
+---
+
+### `summary` — Aggregate feedback statistics
+
+```bash
+uv run python scripts/core/memory_feedback.py summary
+```
+
+No flags required.
+
+#### Response
+
+```json
+{
+  "total_feedback": 10,
+  "helpful_count": 7,
+  "not_helpful_count": 3,
+  "unique_learnings_rated": 5,
+  "helpfulness_rate": 70.0,
+  "top_helpful": [
+    {
+      "learning_id": "820c9584-08ee-4d49-b932-a7ff5334ec0a",
+      "content": "Patching get_pool at postgres_pool source module level...",
+      "helpful_count": 3
+    }
+  ],
+  "top_not_helpful": [
+    {
+      "learning_id": "aaaabbbb-cccc-dddd-eeee-ffffffffffff",
+      "content": "Some irrelevant learning that kept getting surfaced...",
+      "not_helpful_count": 2
+    }
+  ]
+}
+```
+
+`top_helpful` and `top_not_helpful` each return up to 5 entries. Content is truncated to 120 characters.
+
+## Database Table
+
+`memory_feedback` — stores one feedback record per `(learning_id, session_id)` pair.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | UUID | Primary key |
+| `learning_id` | UUID | FK to `archival_memory.id` (CASCADE delete) |
+| `session_id` | TEXT | Which session provided the feedback |
+| `helpful` | BOOLEAN | Was the learning useful? |
+| `context` | TEXT | Optional explanation |
+| `source` | TEXT | `manual`, `hook`, `auto`, etc. |
+| `created_at` | TIMESTAMPTZ | When feedback was recorded |
+
+## Metrics Integration
+
+Feedback stats appear in `memory_metrics.py` output under `feedback_alltime`:
+
+```
+Feedback (all-time):  7 helpful, 3 not helpful out of 10 (70.0% helpful), 5 unique learnings rated
+```

@@ -1,9 +1,9 @@
-// hooks/ts/src/session-start-memory-push.ts
+// src/session-start-memory-push.ts
 import { readFileSync as readFileSync2, existsSync as existsSync2 } from "fs";
 import { spawnSync } from "child_process";
 import { join as join2 } from "path";
 
-// hooks/ts/src/shared/opc-path.ts
+// src/shared/opc-path.ts
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
 function getOpcDirFromConfig() {
@@ -47,7 +47,7 @@ function getOpcDir() {
   return null;
 }
 
-// hooks/ts/src/session-start-memory-push.ts
+// src/session-start-memory-push.ts
 function main() {
   let input;
   try {
@@ -122,7 +122,7 @@ function main() {
     return;
   }
   const resultLines = data.results.map((r, i) => {
-    const base = `${i + 1}. [${r.learning_type}|${r.confidence}] ${r.content} (id: ${r.id.slice(0, 8)})`;
+    const base = `${i + 1}. [${r.learning_type}|${r.confidence}] ${r.content} (id: ${r.id})`;
     const label = r.pattern_label ? `
    \u21B3 Pattern: "${r.pattern_label}"` : "";
     return base + label;
@@ -130,7 +130,8 @@ function main() {
   const context = [
     `PROACTIVE MEMORY (${data.results.length} learnings for "${projectName}"):`,
     resultLines,
-    "These were surfaced proactively. Use /recall for full content."
+    "These were surfaced proactively. Use /recall for full content.",
+    'If any learning helps or misleads you, submit feedback: mcp__opc-memory__store_feedback(learning_id="<id>", helpful=true/false)'
   ].join("\n");
   console.log(JSON.stringify({
     result: "continue",

@@ -126,7 +126,7 @@ function main(): void {
   // Format for Claude's context
   const resultLines = data.results.map((r, i) => {
     const base = `${i + 1}. [${r.learning_type}|${r.confidence}] `
-      + `${r.content} (id: ${r.id.slice(0, 8)})`;
+      + `${r.content} (id: ${r.id})`;
     const label = r.pattern_label
       ? `\n   ↳ Pattern: "${r.pattern_label}"`
       : '';
@@ -137,6 +137,7 @@ function main(): void {
     `PROACTIVE MEMORY (${data.results.length} learnings for "${projectName}"):`,
     resultLines,
     'These were surfaced proactively. Use /recall for full content.',
+    'If any learning helps or misleads you, submit feedback: mcp__opc-memory__store_feedback(learning_id="<id>", helpful=true/false)',
   ].join('\n');
 
   console.log(JSON.stringify({

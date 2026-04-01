@@ -66,6 +66,7 @@ from scripts.core.recall_backends import (  # noqa: E402, F401
 # Re-export formatters
 from scripts.core.recall_formatters import (  # noqa: E402, F401
     format_human_output,
+    format_json_full_output,
     format_json_output,
     format_result_preview,
     group_by_type,
@@ -250,6 +251,11 @@ async def main() -> int:
         help="Output results as JSON (for programmatic use)",
     )
     parser.add_argument(
+        "--json-full",
+        action="store_true",
+        help="Output full result metadata as JSON (for benchmarking)",
+    )
+    parser.add_argument(
         "--text-only",
         action="store_true",
         help="Use text search only (faster, no embeddings)",
@@ -304,7 +310,7 @@ async def main() -> int:
     fetch_k = args.k if args.no_rerank else max(3 * args.k, 50)
 
     # JSON mode: suppress human-readable output
-    if not args.json:
+    if not args.json and not args.json_full:
         print(f'Recalling learnings for: "{args.query}"')
         print(f"Provider: {args.provider}")
         print()
@@ -314,7 +320,7 @@ async def main() -> int:
 
         if backend == "sqlite":
             # SQLite only supports text search (no pgvector)
-            if not args.text_only and not args.json:
+            if not args.text_only and not args.json and not args.json_full:
                 print("  (SQLite backend - using text search)")
             results = await search_learnings_sqlite(args.query, fetch_k)
         elif args.text_only:
@@ -340,7 +346,7 @@ async def main() -> int:
                 similarity_threshold=args.threshold * 0.01,  # RRF scores are ~0.01-0.03 range
             )
     except Exception as e:
-        if args.json:
+        if args.json or args.json_full:
             print(json.dumps({"error": str(e), "results": []}))
         else:
             print(f"Error: {e}", file=sys.stderr)
@@ -383,7 +389,10 @@ async def main() -> int:
     await record_recall([r["id"] for r in results])
 
     # Output results
-    if args.json:
+    if args.json_full:
+        # Full metadata output for benchmarking
+        print(format_json_full_output(results))
+    elif args.json:
         print(format_json_output(results, structured=args.structured))
     else:
         print(format_human_output(results, structured=args.structured))

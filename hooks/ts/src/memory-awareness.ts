@@ -119,11 +119,13 @@ function checkMemoryRelevance(intent: string, projectDir: string): MemoryMatch |
     .replace(/\s+/g, ' ')             // Collapse whitespace
     .trim();
 
-  // Derive project tag from CLAUDE_PROJECT_DIR for relevance filtering
+  // Derive project tag from CLAUDE_PROJECT_DIR to boost relevance via --tags (not a hard filter)
   const projectTag = projectDir ? projectDir.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? '' : '';
+  // Guard against tags starting with "-" to avoid them being parsed as CLI options
+  const safeProjectTag = projectTag && !projectTag.startsWith('-') ? projectTag : '';
 
   // Use text-only for fast checking (< 1s), user can run /recall for semantic
-  const tagArgs = projectTag ? ['--tags', projectTag] : [];
+  const tagArgs = safeProjectTag ? ['--tags', safeProjectTag] : [];
   const result = spawnSync('uv', [
     'run', 'python', 'scripts/core/recall_learnings.py',
     '--query', searchTerm,  // Single keyword for text match

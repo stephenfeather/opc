@@ -483,7 +483,7 @@ class TestClassifyPattern:
         result = classify_pattern_heuristic(
             members, reference_time=datetime(2026, 3, 31, tzinfo=UTC)
         )
-        assert result != "cross_project"
+        assert result == "tool_cluster"
 
     def test_4_context_gap_closed(self):
         # A cluster with exactly 4 contexts should be classified (not fall through)

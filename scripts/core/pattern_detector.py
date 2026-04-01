@@ -375,7 +375,7 @@ def classify_pattern_heuristic(members: list[Learning], reference_time: datetime
 
     # 3. Expertise: temporally concentrated + type-homogeneous + context-diverse + multi-session
     now = reference_time or datetime.now(UTC)
-    recent = [m for m in members if (now - m.created_at).days <= 30]
+    recent = [m for m in members if (now - m.created_at).total_seconds() <= 30 * 24 * 3600]
     max_type_count = max(types.values())
     if (len(recent) >= len(members) * 0.6
             and max_type_count / total >= 0.6

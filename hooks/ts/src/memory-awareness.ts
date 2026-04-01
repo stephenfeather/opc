@@ -120,7 +120,7 @@ function checkMemoryRelevance(intent: string, projectDir: string): MemoryMatch |
     .trim();
 
   // Derive project tag from CLAUDE_PROJECT_DIR for relevance filtering
-  const projectTag = projectDir ? projectDir.split('/').pop() || '' : '';
+  const projectTag = projectDir ? projectDir.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? '' : '';
 
   // Use text-only for fast checking (< 1s), user can run /recall for semantic
   const tagArgs = projectTag ? ['--tags', projectTag] : [];

@@ -352,8 +352,8 @@ async def main() -> int:
             print(f"Error: {e}", file=sys.stderr)
         return 1
 
-    # Enrich with pattern strength for reranker (graceful if tables missing)
-    if not args.no_rerank and backend == "postgres":
+    # Enrich with pattern strength for reranker or full JSON export
+    if (not args.no_rerank or args.json_full) and backend == "postgres":
         results = await enrich_with_pattern_strength(results)
 
     # Hard-filter by tags BEFORE reranking (so reranker sees filtered pool)
@@ -385,8 +385,10 @@ async def main() -> int:
         )
         results = rerank(results, ctx, k=args.k)
 
-    # Record recall ONLY for final results (after rerank trims)
-    await record_recall([r["id"] for r in results])
+    # Record recall ONLY for final results (after rerank trims).
+    # Skip when --json-full is set (benchmarking mode, read-only).
+    if not args.json_full:
+        await record_recall([r["id"] for r in results])
 
     # Output results
     if args.json_full:

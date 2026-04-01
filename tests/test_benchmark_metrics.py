@@ -32,6 +32,23 @@ class TestIsRelevant:
     def test_empty_golden(self):
         assert not is_relevant("x", "content", [], [])
 
+    def test_golden_ids_authoritative_over_keywords(self):
+        # When golden_ids exist, keyword match is ignored
+        assert not is_relevant(
+            "x", "hook code", ["abc", "def"], ["hook"]
+        )
+
+    def test_golden_ids_present_id_matches(self):
+        # ID match still works when both are present
+        assert is_relevant(
+            "abc", "unrelated", ["abc", "def"], ["hook"]
+        )
+
+    def test_partial_golden_ids_hit_and_miss(self):
+        # Only IDs in golden set are relevant
+        assert is_relevant("a", "x", ["a", "b", "c"], [])
+        assert not is_relevant("d", "x", ["a", "b", "c"], [])
+
 
 class TestPrecisionAtK:
     def test_perfect(self):

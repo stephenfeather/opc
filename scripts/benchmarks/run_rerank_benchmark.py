@@ -77,9 +77,13 @@ def is_relevant(
     golden_ids: list[str],
     golden_keywords: list[str],
 ) -> bool:
-    """Check if a result is relevant based on golden IDs or keywords."""
-    if golden_ids and result_id in golden_ids:
-        return True
+    """Check if a result is relevant based on golden IDs or keywords.
+
+    When golden_ids are present they are authoritative — keyword matching
+    is only used as a fallback when no curated IDs exist.
+    """
+    if golden_ids:
+        return result_id in golden_ids
     if golden_keywords:
         content_lower = content.lower()
         return any(kw.lower() in content_lower for kw in golden_keywords)
@@ -124,12 +128,20 @@ def compute_ndcg(
         ) else 0.0
         dcg += rel / math.log2(i + 2)  # i+2 because rank is 1-indexed
 
-    # Compute ideal DCG (all relevant items at top)
-    num_relevant = sum(
-        1
-        for rid, content in zip(result_ids, result_contents)
-        if is_relevant(rid, content, golden_ids, golden_keywords)
-    )
+    # Compute ideal DCG (all relevant items at top).
+    # Use the full golden set size, not just retrieved relevant items,
+    # so IDCG reflects total judged positives.
+    if golden_ids:
+        num_relevant = len(golden_ids)
+    elif golden_keywords:
+        # Keywords: count from retrieved results (no external ground truth)
+        num_relevant = sum(
+            1
+            for rid, content in zip(result_ids, result_contents)
+            if is_relevant(rid, content, golden_ids, golden_keywords)
+        )
+    else:
+        num_relevant = 0
     idcg = sum(1.0 / math.log2(i + 2) for i in range(min(num_relevant, k)))
 
     if idcg == 0.0:
@@ -636,22 +648,26 @@ WEIGHT_SWEEPS: list[dict] = [
 
 async def fetch_full_results(
     queries: list[dict],
-    fetch_k: int = 20,
+    fetch_k: int = 50,
 ) -> dict[str, list[dict]]:
     """Fetch full-metadata results for all queries (no reranking, large k).
 
     Uses --json-full to get all metadata fields needed by the reranker.
+    fetch_k matches the adaptive over-fetch depth used in the rerank path
+    (max(3*k, 50)) so sweep configs operate on the same candidate pool.
     Returns a mapping of query_id -> list of result dicts.
     """
     cache: dict[str, list[dict]] = {}
 
     async def fetch_one(q: dict) -> tuple[str, list[dict]]:
         qid = q["id"]
+        # Match the adaptive over-fetch from recall_learnings.py
+        candidate_k = max(3 * fetch_k, 50)
         cmd = [
             sys.executable,
             "scripts/core/recall_learnings.py",
             "--query", q["query"],
-            "--k", str(fetch_k),
+            "--k", str(candidate_k),
             "--json-full",
             "--no-rerank",
         ]
@@ -898,8 +914,8 @@ async def async_main() -> int:
     # Weight sweep mode
     if args.sweep:
         print("\n--- Weight Sensitivity Sweep ---")
-        print("Fetching full-metadata results with k=20 for reranker input...")
-        cached = await fetch_full_results(queries, fetch_k=20)
+        print("Fetching full-metadata results for reranker input...")
+        cached = await fetch_full_results(queries)
         print(
             f"Cached {len(cached)} query result sets. "
             f"Running {len(WEIGHT_SWEEPS)} configs..."

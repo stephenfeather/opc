@@ -14,6 +14,42 @@ interface HookOutput {
   systemMessage?: string;
 }
 
+interface PushCacheResult {
+  id: string;
+  content: string;
+  learning_type: string;
+  confidence: string;
+  pattern_label: string | null;
+}
+
+/**
+ * Read memory push cache and format for re-injection through compaction.
+ * Returns formatted string or empty string if no recent push data.
+ */
+function getMemoryPushContext(): string {
+  const pushFile = path.join(process.env.HOME || '', '.claude', 'cache', 'memory-push.json');
+  if (!fs.existsSync(pushFile)) return '';
+
+  try {
+    const stat = fs.statSync(pushFile);
+    const ageMs = Date.now() - stat.mtimeMs;
+    // Skip if older than 2 hours
+    if (ageMs > 2 * 60 * 60 * 1000) return '';
+
+    const pushData = JSON.parse(fs.readFileSync(pushFile, 'utf-8'));
+    if (!pushData.results || pushData.results.length === 0) return '';
+
+    const pushLines = pushData.results.map((r: PushCacheResult, i: number) => {
+      const label = r.pattern_label ? `\n   ↳ Pattern: "${r.pattern_label}"` : '';
+      return `${i + 1}. [${r.learning_type}|${r.confidence}] ${r.content} (id: ${r.id.slice(0, 8)})${label}`;
+    }).join('\n');
+
+    return `\nPROACTIVE MEMORY (carried through compaction):\n${pushLines}`;
+  } catch {
+    return '';
+  }
+}
+
 async function main() {
   const input: PreCompactInput = JSON.parse(await readStdin());
   const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
@@ -79,16 +115,18 @@ async function main() {
       ? `[PreCompact:auto] Created YAML handoff: thoughts/shared/handoffs/${sessionName}/${handoffFile}`
       : `[PreCompact:auto] Session summary auto-appended to ${mostRecent}`;
 
+    const pushContext = getMemoryPushContext();
     const output: HookOutput = {
       continue: true,
-      systemMessage: message
+      systemMessage: message + pushContext
     };
     console.log(JSON.stringify(output));
   } else {
     // Manual compact: warn user (cannot block, just inform)
+    const pushContext = getMemoryPushContext();
     const output: HookOutput = {
       continue: true,
-      systemMessage: `[PreCompact] Consider updating ledger before compacting: /continuity_ledger\nLedger: ${mostRecent}`
+      systemMessage: `[PreCompact] Consider updating ledger before compacting: /continuity_ledger\nLedger: ${mostRecent}` + pushContext
     };
     console.log(JSON.stringify(output));
   }

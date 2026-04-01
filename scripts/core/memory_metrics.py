@@ -350,6 +350,39 @@ async def get_temporal_stats(conn: Any) -> dict:
     }
 
 
+async def get_feedback_stats(conn: Any) -> dict:
+    """Report memory feedback statistics (all-time). Returns zeroes if table missing."""
+    table_exists = await conn.fetchval(
+        "SELECT to_regclass('public.memory_feedback') IS NOT NULL"
+    )
+    if not table_exists:
+        return {
+            "total_feedback": 0,
+            "helpful": 0,
+            "not_helpful": 0,
+            "unique_learnings_rated": 0,
+            "helpfulness_rate_pct": 0.0,
+        }
+    row = await conn.fetchrow(
+        """
+        SELECT
+            COUNT(*) AS total,
+            COUNT(*) FILTER (WHERE helpful) AS helpful,
+            COUNT(*) FILTER (WHERE NOT helpful) AS not_helpful,
+            COUNT(DISTINCT learning_id) AS unique_learnings
+        FROM memory_feedback
+        """
+    )
+    total = row["total"]
+    return {
+        "total_feedback": total,
+        "helpful": row["helpful"],
+        "not_helpful": row["not_helpful"],
+        "unique_learnings_rated": row["unique_learnings"],
+        "helpfulness_rate_pct": round(row["helpful"] / total * 100, 1) if total > 0 else 0.0,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Collector
 # ---------------------------------------------------------------------------
@@ -369,6 +402,7 @@ async def collect_all_metrics(
         tags = await get_top_tags(conn)  # always all-time
         superseded = await get_superseded_stats(conn)  # always all-time
         temporal = await get_temporal_stats(conn)  # always all-time
+        feedback = await get_feedback_stats(conn)  # always all-time
 
     period = None
     if start or end:
@@ -390,6 +424,7 @@ async def collect_all_metrics(
         "top_tags_alltime": tags,
         "superseded_alltime": superseded,
         "temporal_alltime": temporal,
+        "feedback_alltime": feedback,
         "version": _get_version(),
     }
 
@@ -463,6 +498,18 @@ def format_human(metrics: dict) -> str:
     lines.append(f"Temporal (all-time):  oldest {tmp['oldest_learning']}")
     lines.append(f"           newest {tmp['newest_learning']}")
     lines.append(f"           last 7d: {tmp['last_7_days']},  last 30d: {tmp['last_30_days']}")
+    lines.append("")
+
+    fb = metrics.get("feedback_alltime", {})
+    total_fb = fb.get("total_feedback", 0)
+    if total_fb > 0:
+        lines.append(
+            f"Feedback (all-time):  {fb['helpful']} helpful, {fb['not_helpful']} not helpful "
+            f"out of {total_fb} ({fb['helpfulness_rate_pct']:.1f}% helpful), "
+            f"{fb['unique_learnings_rated']} unique learnings rated"
+        )
+    else:
+        lines.append("Feedback (all-time):  No feedback recorded yet")
 
     return "\n".join(lines)
 

@@ -41,6 +41,15 @@ class TestCacheKey:
 
         assert cache_key("a") != cache_key("b")
 
+    def test_kwargs_affect_key(self):
+        from scripts.core.db.embedding_service import cache_key
+
+        key_doc = cache_key("text", input_type="document")
+        key_query = cache_key("text", input_type="query")
+        key_plain = cache_key("text")
+        assert key_doc != key_query
+        assert key_doc != key_plain
+
     def test_empty_string(self):
         from scripts.core.db.embedding_service import cache_key
 
@@ -259,6 +268,20 @@ class TestEmbeddingService:
         results = await service.embed_batch(["alpha", "beta"])
         assert len(results) == 2
         assert service.cache_size() == 2
+
+    async def test_cache_isolates_by_kwargs(self):
+        """Different input_type kwargs should produce separate cache entries."""
+        from scripts.core.db.embedding_service import EmbeddingService
+
+        service = EmbeddingService(provider="mock", cache_enabled=True)
+        doc = await service.embed("same text", input_type="document")
+        await service.embed("same text", input_type="query")
+        # Mock provider ignores input_type, but cache keys should differ
+        assert service.cache_size() == 2
+        # Verify batch also respects kwargs
+        batch = await service.embed_batch(["same text"], input_type="document")
+        assert service.cache_size() == 2  # hit existing cache
+        assert batch[0] == doc
 
     async def test_clear_cache(self):
         from scripts.core.db.embedding_service import EmbeddingService

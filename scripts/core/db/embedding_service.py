@@ -30,16 +30,23 @@ from collections.abc import Iterator
 # ---------------------------------------------------------------------------
 
 
-def cache_key(text: str) -> str:
-    """Generate cache key from text content hash.
+def cache_key(text: str, **kwargs) -> str:
+    """Generate cache key from text content and embedding parameters.
+
+    Incorporates kwargs (e.g. input_type) so that different embedding modes
+    for the same text produce different cache entries.
 
     Args:
         text: Text to hash
+        **kwargs: Additional parameters that affect embedding output
 
     Returns:
-        SHA-256 hex digest of text
+        SHA-256 hex digest incorporating text and kwargs
     """
-    return hashlib.sha256(text.encode()).hexdigest()
+    parts = [text]
+    for k in sorted(kwargs):
+        parts.append(f"{k}={kwargs[k]}")
+    return hashlib.sha256("\0".join(parts).encode()).hexdigest()
 
 
 def generate_mock_embedding(text: str, dimension: int) -> list[float]:
@@ -172,26 +179,23 @@ def create_provider(
     Raises:
         ValueError: If provider name is unknown or required config is missing
     """
-    import os
-
-    from scripts.core.db.embedding_providers import (
-        LocalEmbeddingProvider,
-        OllamaEmbeddingProvider,
-        OpenAIEmbeddingProvider,
-        VoyageEmbeddingProvider,
-    )
-
     if name == "mock":
         dim = dimension if dimension is not None else MockEmbeddingProvider.DEFAULT_DIMENSION
         return MockEmbeddingProvider(dimension=dim)
 
+    import os
+
     if name == "openai":
+        from scripts.core.db.embedding_providers import OpenAIEmbeddingProvider
+
         return OpenAIEmbeddingProvider(
             max_batch_size=max_batch_size,
             max_retries=max_retries,
         )
 
     if name == "voyage":
+        from scripts.core.db.embedding_providers import VoyageEmbeddingProvider
+
         voyage_model = (
             model if model is not None
             else os.getenv("VOYAGE_EMBEDDING_MODEL", "voyage-3")
@@ -203,6 +207,8 @@ def create_provider(
         )
 
     if name.startswith("voyage-"):
+        from scripts.core.db.embedding_providers import VoyageEmbeddingProvider
+
         return VoyageEmbeddingProvider(
             model=name,
             max_batch_size=max_batch_size,
@@ -210,11 +216,15 @@ def create_provider(
         )
 
     if name == "local":
+        from scripts.core.db.embedding_providers import LocalEmbeddingProvider
+
         local_model = model if model is not None else "BAAI/bge-large-en-v1.5"
         device = kwargs.get("device", None)
         return LocalEmbeddingProvider(model=local_model, device=device)
 
     if name == "ollama":
+        from scripts.core.db.embedding_providers import OllamaEmbeddingProvider
+
         ollama_model = model if model is not None else None
         ollama_host = kwargs.get("host", None)
         return OllamaEmbeddingProvider(model=ollama_model, host=ollama_host)
@@ -269,7 +279,7 @@ class EmbeddingService:
     async def embed(self, text: str, **kwargs) -> list[float]:
         """Generate embedding for text with optional caching."""
         if self.cache_enabled:
-            key = cache_key(text)
+            key = cache_key(text, **kwargs)
             async with self._cache_lock:
                 if key in self._cache:
                     return self._cache[key]
@@ -278,7 +288,7 @@ class EmbeddingService:
 
         if self.cache_enabled:
             async with self._cache_lock:
-                self._cache[cache_key(text)] = embedding
+                self._cache[cache_key(text, **kwargs)] = embedding
 
         return embedding
 
@@ -293,7 +303,7 @@ class EmbeddingService:
         async with self._cache_lock:
             for i, text in enumerate(texts):
                 if self.cache_enabled:
-                    key = cache_key(text)
+                    key = cache_key(text, **kwargs)
                     if key in self._cache:
                         results[i] = self._cache[key]
                         continue
@@ -312,7 +322,7 @@ class EmbeddingService:
                 for idx, text, embedding in zip(indices, remaining_list, new_embeddings):
                     results[idx] = embedding
                     if self.cache_enabled:
-                        self._cache[cache_key(text)] = embedding
+                        self._cache[cache_key(text, **kwargs)] = embedding
 
         return [r for r in results if r is not None]
 

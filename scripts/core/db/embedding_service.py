@@ -418,19 +418,25 @@ class LocalEmbeddingProvider(EmbeddingProvider):
         os.environ["TQDM_DISABLE"] = "1"
         # Redirect both stdout and stderr at the OS file descriptor level
         # to catch C-level output that sys.stderr redirect misses
-        devnull = os.open(os.devnull, os.O_WRONLY)
-        old_stdout_fd = os.dup(1)
-        old_stderr_fd = os.dup(2)
+        devnull_fd = -1
+        old_stdout_fd = -1
+        old_stderr_fd = -1
         try:
-            os.dup2(devnull, 1)
-            os.dup2(devnull, 2)
+            devnull_fd = os.open(os.devnull, os.O_WRONLY)
+            old_stdout_fd = os.dup(1)
+            old_stderr_fd = os.dup(2)
+            os.dup2(devnull_fd, 1)
+            os.dup2(devnull_fd, 2)
             self._model = SentenceTransformer(model, device=device)
         finally:
-            os.dup2(old_stdout_fd, 1)
-            os.dup2(old_stderr_fd, 2)
-            os.close(devnull)
-            os.close(old_stdout_fd)
-            os.close(old_stderr_fd)
+            if old_stderr_fd >= 0:
+                os.dup2(old_stderr_fd, 2)
+                os.close(old_stderr_fd)
+            if old_stdout_fd >= 0:
+                os.dup2(old_stdout_fd, 1)
+                os.close(old_stdout_fd)
+            if devnull_fd >= 0:
+                os.close(devnull_fd)
             if prev_env is None:
                 os.environ.pop("TQDM_DISABLE", None)
             else:

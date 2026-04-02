@@ -12,10 +12,9 @@ Tests cover:
 from __future__ import annotations
 
 import hashlib
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # Pure function tests
@@ -283,6 +282,22 @@ class TestEmbeddingService:
             result = await service.embed("test")
             assert len(result) == 1536
 
+    async def test_embed_batch_cardinality_mismatch_raises(self):
+        """Provider returning wrong number of embeddings should raise."""
+        from scripts.core.db.embedding_service import EmbeddingError, EmbeddingService
+
+        service = EmbeddingService(provider="mock", cache_enabled=False)
+        # Monkey-patch provider to return fewer embeddings than requested
+        original = service._provider.embed_batch
+
+        async def short_batch(texts, **kwargs):
+            result = await original(texts, **kwargs)
+            return result[:-1]  # Drop last embedding
+
+        service._provider.embed_batch = short_batch
+        with pytest.raises(EmbeddingError, match="returned 1 embeddings for 2 texts"):
+            await service.embed_batch(["a", "b"])
+
 
 # ---------------------------------------------------------------------------
 # Backwards compatibility tests
@@ -387,6 +402,19 @@ class TestEmbeddingProviders:
 
         provider = OllamaEmbeddingProvider(model="mxbai-embed-large")
         assert provider.dimension == 1024
+
+    def test_ollama_tls_enabled_by_default(self):
+        from scripts.core.db.embedding_providers import OllamaEmbeddingProvider
+
+        provider = OllamaEmbeddingProvider()
+        assert provider._client._transport._pool._ssl_context is not None
+
+    def test_ollama_tls_can_be_disabled(self):
+        from scripts.core.db.embedding_providers import OllamaEmbeddingProvider
+
+        provider = OllamaEmbeddingProvider(verify_tls=False)
+        # When verify=False, httpx still creates the client successfully
+        assert provider._client is not None
 
 
 # ---------------------------------------------------------------------------

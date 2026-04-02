@@ -326,10 +326,11 @@ class OllamaEmbeddingProvider(EmbeddingProvider):
         self,
         model: str | None = None,
         host: str | None = None,
+        verify_tls: bool = True,
     ):
         self.model = model or os.getenv("OLLAMA_EMBED_MODEL", self.DEFAULT_MODEL)
         self.host = host or os.getenv("OLLAMA_HOST", self.DEFAULT_HOST)
-        self._client = httpx.AsyncClient(timeout=30.0, verify=False)
+        self._client = httpx.AsyncClient(timeout=30.0, verify=verify_tls)
         self._dimension = self.MODELS.get(self.model, 768)
 
     async def embed(self, text: str, **kwargs) -> list[float]:

@@ -301,11 +301,15 @@ class EmbeddingService:
 
         if texts_to_embed:
             indices, remaining_texts = zip(*texts_to_embed)
-            new_embeddings = await self._provider.embed_batch(
-                list(remaining_texts), **kwargs
-            )
+            remaining_list = list(remaining_texts)
+            new_embeddings = await self._provider.embed_batch(remaining_list, **kwargs)
+            if len(new_embeddings) != len(remaining_list):
+                raise EmbeddingError(
+                    f"Provider returned {len(new_embeddings)} embeddings "
+                    f"for {len(remaining_list)} texts"
+                )
             async with self._cache_lock:
-                for idx, text, embedding in zip(indices, remaining_texts, new_embeddings):
+                for idx, text, embedding in zip(indices, remaining_list, new_embeddings):
                     results[idx] = embedding
                     if self.cache_enabled:
                         self._cache[cache_key(text)] = embedding
@@ -334,20 +338,29 @@ class EmbeddingService:
 
 
 # ---------------------------------------------------------------------------
-# Backwards-compatible re-exports from embedding_providers
+# Backwards-compatible lazy re-exports from embedding_providers
 # ---------------------------------------------------------------------------
 # These ensure existing imports like:
 #   from scripts.core.db.embedding_service import VoyageEmbeddingProvider
-# continue to work.
+# continue to work without creating a circular import at module load time.
 
-from scripts.core.db.embedding_providers import (  # noqa: E402, F401
-    LocalEmbeddingProvider,
-    OllamaEmbeddingProvider,
-    OpenAIEmbeddingProvider,
-    VoyageEmbeddingProvider,
-)
+_PROVIDER_REEXPORTS = {
+    "OpenAIEmbeddingProvider",
+    "VoyageEmbeddingProvider",
+    "LocalEmbeddingProvider",
+    "OllamaEmbeddingProvider",
+}
 
-__all__ = [
+
+def __getattr__(name: str):  # noqa: N807
+    if name in _PROVIDER_REEXPORTS:
+        from scripts.core.db import embedding_providers
+
+        return getattr(embedding_providers, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ = [  # noqa: F822
     "EmbeddingError",
     "EmbeddingProvider",
     "EmbeddingService",

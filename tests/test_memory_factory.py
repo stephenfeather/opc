@@ -5,6 +5,7 @@ Tests pure validation functions and I/O factory functions with mocked backends.
 
 from __future__ import annotations
 
+import pathlib
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -41,11 +42,11 @@ class TestValidateBackendType:
         assert "mysql" in error
 
     def test_empty_string_is_invalid(self) -> None:
-        is_valid, error = validate_backend_type("")
+        is_valid, _ = validate_backend_type("")
         assert is_valid is False
 
     def test_none_is_invalid(self) -> None:
-        is_valid, error = validate_backend_type(None)  # type: ignore[arg-type]
+        is_valid, _ = validate_backend_type(None)  # type: ignore[arg-type]
         assert is_valid is False
 
 
@@ -228,9 +229,13 @@ class TestCreateMemoryService:
         ):
             await create_memory_service("sqlite", session_id="test-3")
 
-    async def test_sqlite_passes_db_path_kwarg(self) -> None:
+        # Validation runs before connect — connection should not be opened
+        mock_service.connect.assert_not_awaited()
+
+    async def test_sqlite_passes_db_path_kwarg(self, tmp_path: pathlib.Path) -> None:
         from scripts.core.db.memory_factory import create_memory_service
 
+        db_path = str(tmp_path / "test.db")
         mock_service = MagicMock()
         for method in PROTOCOL_METHODS:
             setattr(mock_service, method, AsyncMock())
@@ -242,9 +247,9 @@ class TestCreateMemoryService:
             "scripts.core.db.memory_factory._import_sqlite_backend",
             return_value=mock_cls,
         ):
-            await create_memory_service("sqlite", session_id="s1", db_path="/tmp/test.db")
+            await create_memory_service("sqlite", session_id="s1", db_path=db_path)
 
-        mock_cls.assert_called_once_with(session_id="s1", db_path="/tmp/test.db")
+        mock_cls.assert_called_once_with(session_id="s1", db_path=db_path)
 
 
 # ---------------------------------------------------------------------------

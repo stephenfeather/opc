@@ -84,7 +84,7 @@ def _import_postgres_backend() -> type:
         from .memory_service_pg import MemoryServicePG
     except ImportError as e:
         raise ImportError(
-            f"Postgres backend requires: uv pip install asyncpg pgvector\nOriginal error: {e}"
+            f"Postgres backend requires: uv pip install asyncpg\nOriginal error: {e}"
         ) from e
     return MemoryServicePG
 
@@ -127,14 +127,13 @@ async def create_memory_service(
         cls = _import_postgres_backend()
         service = cls(session_id=session_id, agent_id=agent_id)
 
-    await service.connect()
-
     missing = validate_backend(service)
     if missing:
         raise TypeError(
             f"Backend {type(service).__name__} missing protocol methods: {', '.join(missing)}"
         )
 
+    await service.connect()
     return service
 
 
@@ -148,7 +147,7 @@ def check_backend_available(backend: str) -> tuple[bool, str]:
         try:
             import asyncpg  # noqa: F401
         except ImportError:
-            return False, "postgres backend requires: uv pip install asyncpg pgvector"
+            return False, "postgres backend requires: uv pip install asyncpg"
     elif backend == "sqlite":
         try:
             from .memory_service import MemoryService  # noqa: F401

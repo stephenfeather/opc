@@ -19,6 +19,43 @@ import httpx
 
 from scripts.core.db.embedding_service import EmbeddingError, EmbeddingProvider
 
+# ---------------------------------------------------------------------------
+# Host validation
+# ---------------------------------------------------------------------------
+
+_LOOPBACK_PREFIXES = ("127.", "::1", "0.0.0.0")
+_LOOPBACK_HOSTNAMES = {"localhost"}
+
+
+def _validate_ollama_host(host: str) -> None:
+    """Validate Ollama host URL for scheme and SSRF safety.
+
+    Allows http:// and https:// schemes only. Non-loopback hosts
+    over plain http:// are rejected to prevent accidental SSRF
+    against internal services.
+
+    Raises:
+        ValueError: If scheme is invalid or non-loopback http target
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(host)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"Ollama host must use http:// or https:// scheme, got: {host}"
+        )
+    hostname = (parsed.hostname or "").lower()
+    is_loopback = (
+        hostname in _LOOPBACK_HOSTNAMES
+        or any(hostname.startswith(p) for p in _LOOPBACK_PREFIXES)
+    )
+    if parsed.scheme == "http" and not is_loopback:
+        raise ValueError(
+            f"Ollama host over plain http:// is only allowed for loopback addresses. "
+            f"Got: {host}. Use https:// for remote hosts."
+        )
+
+
 # Module-level crash log file handle, kept open for faulthandler's lifetime.
 _crash_log_file = None
 
@@ -106,9 +143,12 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
                 last_error = e
                 if attempt < self.max_retries - 1:
                     await asyncio.sleep(self.RETRY_DELAY * (attempt + 1))
+        status = ""
+        if isinstance(last_error, httpx.HTTPStatusError):
+            status = f" (HTTP {last_error.response.status_code})"
         raise EmbeddingError(
             f"OpenAI API call failed after {self.max_retries} attempts: "
-            f"{type(last_error).__name__}"
+            f"{type(last_error).__name__}{status}"
         ) from None
 
     @property
@@ -303,7 +343,7 @@ class LocalEmbeddingProvider(EmbeddingProvider):
         self._dimension = self._model.get_sentence_embedding_dimension()
 
     async def embed(self, text: str, **kwargs) -> list[float]:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None, lambda: self._model.encode(text, convert_to_numpy=True).tolist()
         )
@@ -311,7 +351,7 @@ class LocalEmbeddingProvider(EmbeddingProvider):
     async def embed_batch(self, texts: list[str], **kwargs) -> list[list[float]]:
         if not texts:
             return []
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None, lambda: self._model.encode(texts, convert_to_numpy=True).tolist()
         )
@@ -349,13 +389,8 @@ class OllamaEmbeddingProvider(EmbeddingProvider):
     ):
         self.model = model or os.getenv("OLLAMA_EMBED_MODEL", self.DEFAULT_MODEL)
         self.host = host or os.getenv("OLLAMA_HOST", self.DEFAULT_HOST)
-        from urllib.parse import urlparse
-
-        parsed = urlparse(self.host)
-        if parsed.scheme not in ("http", "https"):
-            raise ValueError(
-                f"Ollama host must use http:// or https:// scheme, got: {self.host}"
-            )
+        self.verify_tls = verify_tls
+        _validate_ollama_host(self.host)
         self._client = httpx.AsyncClient(timeout=30.0, verify=verify_tls)
         self._dimension = self.MODELS.get(self.model, 768)
 

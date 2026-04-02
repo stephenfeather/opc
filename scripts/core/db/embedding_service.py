@@ -78,7 +78,12 @@ def chunk_texts(texts: list[str], max_size: int) -> Iterator[list[str]]:
 
     Yields:
         Lists of texts, each with at most max_size elements
+
+    Raises:
+        ValueError: If max_size is not positive
     """
+    if max_size <= 0:
+        raise ValueError("max_size must be greater than 0")
     for i in range(0, len(texts), max_size):
         yield texts[i : i + max_size]
 
@@ -332,7 +337,12 @@ class EmbeddingService:
                     if self.cache_enabled:
                         self._cache[cache_key(text, **kwargs)] = embedding
 
-        return [r for r in results if r is not None]
+        missing = [i for i, r in enumerate(results) if r is None]
+        if missing:
+            raise EmbeddingError(
+                f"Embedding results missing for indices: {missing}"
+            )
+        return results  # type: ignore[return-value]
 
     @property
     def dimension(self) -> int:

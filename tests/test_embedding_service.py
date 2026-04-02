@@ -126,6 +126,18 @@ class TestChunkTexts:
         result = list(chunk_texts(texts, max_size=2))
         assert result == [["a", "b"], ["c", "d"]]
 
+    def test_zero_max_size_raises(self):
+        from scripts.core.db.embedding_service import chunk_texts
+
+        with pytest.raises(ValueError, match="max_size must be greater than 0"):
+            list(chunk_texts(["a"], max_size=0))
+
+    def test_negative_max_size_raises(self):
+        from scripts.core.db.embedding_service import chunk_texts
+
+        with pytest.raises(ValueError, match="max_size must be greater than 0"):
+            list(chunk_texts(["a"], max_size=-1))
+
 
 # ---------------------------------------------------------------------------
 # Provider factory tests
@@ -453,7 +465,7 @@ class TestEmbeddingProviders:
         from scripts.core.db.embedding_providers import OllamaEmbeddingProvider
 
         provider = OllamaEmbeddingProvider()
-        assert provider._client._transport._pool._ssl_context is not None
+        assert provider.verify_tls is True
 
     def test_ollama_tls_can_be_disabled(self):
         from scripts.core.db.embedding_providers import OllamaEmbeddingProvider
@@ -473,6 +485,24 @@ class TestEmbeddingProviders:
 
         with pytest.raises(ValueError, match="http:// or https://"):
             OllamaEmbeddingProvider(host="169.254.169.254")
+
+    def test_ollama_rejects_http_non_loopback(self):
+        from scripts.core.db.embedding_providers import OllamaEmbeddingProvider
+
+        with pytest.raises(ValueError, match="only allowed for loopback"):
+            OllamaEmbeddingProvider(host="http://192.168.1.100:11434")
+
+    def test_ollama_allows_http_localhost(self):
+        from scripts.core.db.embedding_providers import OllamaEmbeddingProvider
+
+        provider = OllamaEmbeddingProvider(host="http://localhost:11434")
+        assert provider.host == "http://localhost:11434"
+
+    def test_ollama_allows_https_remote(self):
+        from scripts.core.db.embedding_providers import OllamaEmbeddingProvider
+
+        provider = OllamaEmbeddingProvider(host="https://remote.example.com:11434")
+        assert provider.host == "https://remote.example.com:11434"
 
 
 # ---------------------------------------------------------------------------

@@ -462,6 +462,18 @@ class TestEmbeddingProviders:
         # When verify=False, httpx still creates the client successfully
         assert provider._client is not None
 
+    def test_ollama_rejects_invalid_scheme(self):
+        from scripts.core.db.embedding_providers import OllamaEmbeddingProvider
+
+        with pytest.raises(ValueError, match="http:// or https://"):
+            OllamaEmbeddingProvider(host="ftp://evil.example.com")
+
+    def test_ollama_rejects_no_scheme(self):
+        from scripts.core.db.embedding_providers import OllamaEmbeddingProvider
+
+        with pytest.raises(ValueError, match="http:// or https://"):
+            OllamaEmbeddingProvider(host="169.254.169.254")
+
 
 # ---------------------------------------------------------------------------
 # EmbeddingError tests

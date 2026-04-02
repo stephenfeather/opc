@@ -30,7 +30,8 @@ def _enable_faulthandler(faulthandler_mod) -> None:
         return  # already enabled
     crash_log_path = os.path.expanduser("~/.claude/logs/opc_crash.log")
     os.makedirs(os.path.dirname(crash_log_path), exist_ok=True)
-    _crash_log_file = open(crash_log_path, "a")  # noqa: SIM115
+    fd = os.open(crash_log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    _crash_log_file = os.fdopen(fd, "a")
     faulthandler_mod.enable(file=_crash_log_file, all_threads=True)
 
 
@@ -106,8 +107,9 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
                 if attempt < self.max_retries - 1:
                     await asyncio.sleep(self.RETRY_DELAY * (attempt + 1))
         raise EmbeddingError(
-            f"API call failed after {self.max_retries} attempts: {last_error}"
-        )
+            f"OpenAI API call failed after {self.max_retries} attempts: "
+            f"{type(last_error).__name__}"
+        ) from None
 
     @property
     def dimension(self) -> int:
@@ -185,7 +187,6 @@ class VoyageEmbeddingProvider(EmbeddingProvider):
         self, texts: list[str], input_type: str = "document"
     ) -> list[list[float]]:
         last_error: Exception | None = None
-        last_response_text: str | None = None
         for attempt in range(self.max_retries):
             try:
                 response = await self._client.post(
@@ -200,7 +201,6 @@ class VoyageEmbeddingProvider(EmbeddingProvider):
                         "input_type": input_type,
                     },
                 )
-                last_response_text = response.text
                 response.raise_for_status()
                 data = response.json()
                 sorted_data = sorted(data["data"], key=lambda x: x.get("index", 0))
@@ -213,11 +213,13 @@ class VoyageEmbeddingProvider(EmbeddingProvider):
                 last_error = e
                 if attempt < self.max_retries - 1:
                     await asyncio.sleep(self.RETRY_DELAY * (attempt + 1))
-        error_msg = f"Voyage API call failed after {self.max_retries} attempts.\n"
-        error_msg += f"Last error: {type(last_error).__name__}: {last_error}\n"
-        if last_response_text:
-            error_msg += f"Response body: {last_response_text[:500]}"
-        raise EmbeddingError(error_msg)
+        status = ""
+        if isinstance(last_error, httpx.HTTPStatusError):
+            status = f" (HTTP {last_error.response.status_code})"
+        raise EmbeddingError(
+            f"Voyage API call failed after {self.max_retries} attempts: "
+            f"{type(last_error).__name__}{status}"
+        ) from None
 
     @property
     def dimension(self) -> int:
@@ -347,6 +349,13 @@ class OllamaEmbeddingProvider(EmbeddingProvider):
     ):
         self.model = model or os.getenv("OLLAMA_EMBED_MODEL", self.DEFAULT_MODEL)
         self.host = host or os.getenv("OLLAMA_HOST", self.DEFAULT_HOST)
+        from urllib.parse import urlparse
+
+        parsed = urlparse(self.host)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(
+                f"Ollama host must use http:// or https:// scheme, got: {self.host}"
+            )
         self._client = httpx.AsyncClient(timeout=30.0, verify=verify_tls)
         self._dimension = self.MODELS.get(self.model, 768)
 

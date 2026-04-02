@@ -10,10 +10,13 @@ Structure (FP):
 - I/O:  create_memory_service, get_default_backend, create_default_memory_service
 """
 
-import os
-from typing import Any, Literal
+from __future__ import annotations
 
-from .memory_protocol import MemoryBackend
+import os
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from .memory_protocol import MemoryBackend
 
 BackendType = Literal["sqlite", "postgres"]
 
@@ -135,19 +138,44 @@ async def create_memory_service(
     return service
 
 
+def check_backend_available(backend: str) -> tuple[bool, str]:
+    """Check whether *backend*'s dependencies can be imported.
+
+    Returns:
+        (True, "") on success, (False, error_message) on failure.
+    """
+    if backend == "postgres":
+        try:
+            import asyncpg  # noqa: F401
+        except ImportError:
+            return False, "postgres backend requires: uv pip install asyncpg pgvector"
+    elif backend == "sqlite":
+        try:
+            from .memory_service import MemoryService  # noqa: F401
+        except ImportError:
+            return False, "sqlite backend requires memory_service module and aiosqlite"
+    return True, ""
+
+
 def get_default_backend() -> BackendType:
     """Read backend preference from AGENTICA_MEMORY_BACKEND env var.
+
+    Validates the backend type and checks that its dependencies are available.
 
     Returns:
         "sqlite" (default) or "postgres".
 
     Raises:
         ValueError: If env var contains an unrecognised value.
+        ImportError: If the selected backend's dependencies are unavailable.
     """
     backend = os.environ.get("AGENTICA_MEMORY_BACKEND", "sqlite")
     is_valid, error = validate_backend_type(backend)
     if not is_valid:
         raise ValueError(error)
+    available, dep_error = check_backend_available(backend)
+    if not available:
+        raise ImportError(dep_error)
     return backend  # type: ignore[return-value]
 
 

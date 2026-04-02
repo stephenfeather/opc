@@ -11,6 +11,7 @@ import pytest
 
 from scripts.core.db.memory_factory import (
     PROTOCOL_METHODS,
+    check_backend_available,
     validate_backend,
     validate_backend_type,
 )
@@ -114,6 +115,37 @@ class TestProtocolMethods:
 
     def test_is_tuple(self) -> None:
         assert isinstance(PROTOCOL_METHODS, tuple)
+
+
+# ---------------------------------------------------------------------------
+# check_backend_available
+# ---------------------------------------------------------------------------
+
+
+class TestCheckBackendAvailable:
+    """Tests for check_backend_available() — dependency validation."""
+
+    def test_postgres_available_when_asyncpg_installed(self) -> None:
+        ok, err = check_backend_available("postgres")
+        assert ok is True
+        assert err == ""
+
+    def test_postgres_unavailable_when_asyncpg_missing(self) -> None:
+        with patch.dict("sys.modules", {"asyncpg": None}):
+            ok, err = check_backend_available("postgres")
+            assert ok is False
+            assert "asyncpg" in err
+
+    def test_sqlite_unavailable_in_this_codebase(self) -> None:
+        """No memory_service module exists, so sqlite is unavailable."""
+        ok, err = check_backend_available("sqlite")
+        assert ok is False
+        assert "sqlite" in err
+
+    def test_unknown_backend_returns_true(self) -> None:
+        """Unknown backends pass availability (caught by type validation)."""
+        ok, _ = check_backend_available("redis")
+        assert ok is True
 
 
 # ---------------------------------------------------------------------------
@@ -223,12 +255,28 @@ class TestCreateMemoryService:
 class TestGetDefaultBackend:
     """Tests for get_default_backend() — reads env vars."""
 
-    def test_defaults_to_sqlite(self) -> None:
+    def test_defaults_to_sqlite_when_available(self) -> None:
         from scripts.core.db.memory_factory import get_default_backend
 
-        with patch.dict("os.environ", {}, clear=True):
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch(
+                "scripts.core.db.memory_factory.check_backend_available",
+                return_value=(True, ""),
+            ),
+        ):
             result = get_default_backend()
         assert result == "sqlite"
+
+    def test_default_sqlite_raises_import_error_when_unavailable(self) -> None:
+        """In this codebase, sqlite module is missing so default fails fast."""
+        from scripts.core.db.memory_factory import get_default_backend
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            pytest.raises(ImportError, match="sqlite"),
+        ):
+            get_default_backend()
 
     def test_reads_postgres_from_env(self) -> None:
         from scripts.core.db.memory_factory import get_default_backend

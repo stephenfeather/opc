@@ -33,6 +33,8 @@ class ExtractedRelation:
     target: str  # entity canonical name
     relation: str
     confidence: float = 1.0
+    source_type: str | None = None  # entity type for typed resolution
+    target_type: str | None = None  # entity type for typed resolution
 
 
 # ---------------------------------------------------------------------------
@@ -265,13 +267,19 @@ def extract_relations(
         return []
 
     relations: list[ExtractedRelation] = []
-    seen_rels: set[tuple[str, str, str]] = set()
+    seen_rels: set[tuple[str, str | None, str, str | None, str]] = set()
 
-    def _add_rel(src: str, tgt: str, rel: str, conf: float = 1.0):
-        key = (src, tgt, rel)
+    def _add_rel(
+        src: str, tgt: str, rel: str, conf: float = 1.0,
+        src_type: str | None = None, tgt_type: str | None = None,
+    ):
+        key = (src, src_type, tgt, tgt_type, rel)
         if key not in seen_rels and src != tgt:
             seen_rels.add(key)
-            relations.append(ExtractedRelation(src, tgt, rel, conf))
+            relations.append(ExtractedRelation(
+                src, tgt, rel, conf,
+                source_type=src_type, target_type=tgt_type,
+            ))
 
     # Split into sentences for co-occurrence
     sentences = _RE_SENTENCE.split(content)
@@ -289,8 +297,8 @@ def extract_relations(
                 # Use position of name in sentence for ordering
                 pos = sent.lower().find(e.name)
                 sent_entities.append((sent_offset + pos if pos >= 0 else sent_end, e))
-        # Sort by position to get stable source/target directionality
-        sent_entities.sort(key=lambda x: x[0])
+        # Sort by position, then entity_type for deterministic ordering of same-name entities
+        sent_entities.sort(key=lambda x: (x[0], x[1].entity_type))
         sent_entities = [e for _, e in sent_entities]
 
         # Pairwise relation inference within sentence
@@ -298,20 +306,27 @@ def extract_relations(
             for e2 in sent_entities[i + 1:]:
                 # Check for specific relation signals
                 if _RE_SUPERSEDES.search(sent):
-                    _add_rel(e1.name, e2.name, "supersedes", 0.8)
+                    _add_rel(e1.name, e2.name, "supersedes", 0.8,
+                             e1.entity_type, e2.entity_type)
                 elif _RE_SOLVES.search(sent):
                     if e2.entity_type == "error":
-                        _add_rel(e1.name, e2.name, "solves", 0.9)
+                        _add_rel(e1.name, e2.name, "solves", 0.9,
+                                 e1.entity_type, e2.entity_type)
                     elif e1.entity_type == "error":
-                        _add_rel(e2.name, e1.name, "solves", 0.9)
+                        _add_rel(e2.name, e1.name, "solves", 0.9,
+                                 e2.entity_type, e1.entity_type)
                     else:
-                        _add_rel(e1.name, e2.name, "solves", 0.7)
+                        _add_rel(e1.name, e2.name, "solves", 0.7,
+                                 e1.entity_type, e2.entity_type)
                 elif _RE_CONFLICTS.search(sent):
-                    _add_rel(e1.name, e2.name, "conflicts_with", 0.8)
+                    _add_rel(e1.name, e2.name, "conflicts_with", 0.8,
+                             e1.entity_type, e2.entity_type)
                 elif _RE_USES.search(sent):
-                    _add_rel(e1.name, e2.name, "uses", 0.7)
+                    _add_rel(e1.name, e2.name, "uses", 0.7,
+                             e1.entity_type, e2.entity_type)
                 else:
-                    _add_rel(e1.name, e2.name, "related_to", 0.5)
+                    _add_rel(e1.name, e2.name, "related_to", 0.5,
+                             e1.entity_type, e2.entity_type)
 
         sent_offset = sent_end + 1  # +1 for the split delimiter
 
@@ -325,8 +340,8 @@ def extract_relations(
             dir2 = f2.name.rsplit("/", 1)[0]
             if dir1 == dir2:
                 dirs_seen.add(dir1)
-                _add_rel(dir1, f1.name, "contains", 0.9)
-                _add_rel(dir1, f2.name, "contains", 0.9)
+                _add_rel(dir1, f1.name, "contains", 0.9, "file", "file")
+                _add_rel(dir1, f2.name, "contains", 0.9, "file", "file")
 
     # Materialize directory entities so store_entities_and_edges can resolve IDs
     for d in dirs_seen:
@@ -346,6 +361,23 @@ def extract_relations(
 # ---------------------------------------------------------------------------
 # Database persistence
 # ---------------------------------------------------------------------------
+
+
+def _resolve_entity_id(
+    name_type_to_id: dict[tuple[str, str], str],
+    name: str,
+    entity_type: str | None,
+) -> str | None:
+    """Resolve entity UUID preferring typed lookup, falling back to first match by name."""
+    if entity_type:
+        eid = name_type_to_id.get((name, entity_type))
+        if eid:
+            return eid
+    # Fallback: first entity with this name (for directory containment etc.)
+    for (n, _t), eid in name_type_to_id.items():
+        if n == name:
+            return eid
+    return None
 
 
 async def store_entities_and_edges(
@@ -370,8 +402,6 @@ async def store_entities_and_edges(
         async with conn.transaction():
             # Map (canonical_name, entity_type) -> entity UUID for edge insertion
             name_type_to_id: dict[tuple[str, str], str] = {}
-            # Also keep name-only lookup for edge resolution (first match)
-            name_to_id: dict[str, str] = {}
 
             # Upsert entities — get or create, but do NOT increment mention_count yet
             for e in entities:
@@ -391,8 +421,6 @@ async def store_entities_and_edges(
                 if row:
                     eid = str(row["id"])
                     name_type_to_id[(e.name, e.entity_type)] = eid
-                    if e.name not in name_to_id:
-                        name_to_id[e.name] = eid
                     entity_count += 1
 
             # Insert entity mentions — the dedup gate.
@@ -426,33 +454,22 @@ async def store_entities_and_edges(
                         eid,
                     )
 
-            # Upsert edges — only add weight for new (memory_id, source, target, relation)
+            # Upsert edges — one row per (source, target, relation, memory_id)
             for rel in relations:
-                src_id = name_to_id.get(rel.source)
-                tgt_id = name_to_id.get(rel.target)
+                src_id = _resolve_entity_id(
+                    name_type_to_id, rel.source, rel.source_type
+                )
+                tgt_id = _resolve_entity_id(
+                    name_type_to_id, rel.target, rel.target_type
+                )
                 if not src_id or not tgt_id:
                     continue
-                # Check if this exact edge already exists for this memory_id
-                existing = await conn.fetchval(
-                    """
-                    SELECT 1 FROM kg_edges
-                    WHERE source_id = $1::uuid AND target_id = $2::uuid
-                      AND relation = $3 AND memory_id = $4::uuid
-                    """,
-                    src_id,
-                    tgt_id,
-                    rel.relation,
-                    memory_id,
-                )
-                if existing:
-                    continue
-                await conn.execute(
+                inserted = await conn.fetchval(
                     """
                     INSERT INTO kg_edges (source_id, target_id, relation, weight, memory_id)
                     VALUES ($1::uuid, $2::uuid, $3, $4, $5::uuid)
-                    ON CONFLICT (source_id, target_id, relation) DO UPDATE SET
-                        weight = kg_edges.weight + $4,
-                        updated_at = NOW()
+                    ON CONFLICT (source_id, target_id, relation, memory_id) DO NOTHING
+                    RETURNING TRUE
                     """,
                     src_id,
                     tgt_id,
@@ -460,7 +477,8 @@ async def store_entities_and_edges(
                     rel.confidence,
                     memory_id,
                 )
-                edge_count += 1
+                if inserted:
+                    edge_count += 1
 
     return {
         "entities": entity_count,

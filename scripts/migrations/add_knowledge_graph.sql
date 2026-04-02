@@ -38,15 +38,17 @@ CREATE TABLE IF NOT EXISTS kg_edges (
     target_id UUID NOT NULL REFERENCES kg_entities(id) ON DELETE CASCADE,
     relation TEXT NOT NULL,               -- uses, contains, solves, related_to, etc.
     weight FLOAT NOT NULL DEFAULT 1.0,    -- co-occurrence strength
-    memory_id UUID REFERENCES archival_memory(id) ON DELETE SET NULL,
+    memory_id UUID NOT NULL REFERENCES archival_memory(id) ON DELETE CASCADE,
     metadata JSONB DEFAULT '{}',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Unique edge per (source, target, relation) to allow weight accumulation
-CREATE UNIQUE INDEX IF NOT EXISTS idx_kg_edge_unique
-    ON kg_edges(source_id, target_id, relation);
+-- Replace old 3-column unique index with 4-column per-learning provenance index.
+-- DROP first because IF NOT EXISTS is a no-op when the name already exists.
+DROP INDEX IF EXISTS idx_kg_edge_unique;
+CREATE UNIQUE INDEX idx_kg_edge_unique
+    ON kg_edges(source_id, target_id, relation, memory_id);
 
 -- Traversal indexes (both directions for undirected queries)
 CREATE INDEX IF NOT EXISTS idx_kg_edge_source ON kg_edges(source_id);

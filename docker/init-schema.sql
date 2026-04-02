@@ -268,14 +268,14 @@ CREATE TABLE IF NOT EXISTS kg_edges (
     target_id UUID NOT NULL REFERENCES kg_entities(id) ON DELETE CASCADE,
     relation TEXT NOT NULL,
     weight FLOAT NOT NULL DEFAULT 1.0,
-    memory_id UUID REFERENCES archival_memory(id) ON DELETE SET NULL,
+    memory_id UUID NOT NULL REFERENCES archival_memory(id) ON DELETE CASCADE,
     metadata JSONB DEFAULT '{}',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_kg_edge_unique
-    ON kg_edges(source_id, target_id, relation);
+    ON kg_edges(source_id, target_id, relation, memory_id);
 CREATE INDEX IF NOT EXISTS idx_kg_edge_source ON kg_edges(source_id);
 CREATE INDEX IF NOT EXISTS idx_kg_edge_target ON kg_edges(target_id);
 CREATE INDEX IF NOT EXISTS idx_kg_edge_relation ON kg_edges(relation);

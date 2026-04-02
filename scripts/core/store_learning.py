@@ -495,6 +495,73 @@ def _try_calibrate_confidence(
 
 
 # ===========================================================================
+# Async I/O: Knowledge Graph Indexing (non-fatal side effects)
+# ===========================================================================
+
+
+async def _try_index_kg(memory_id: str, content: str) -> dict[str, Any] | None:
+    """Extract entities/relations from content and store KG edges.
+
+    Non-fatal -- returns None on any failure. Only runs for postgres backend.
+    """
+    try:
+        from scripts.core.kg_extractor import (
+            extract_entities,
+            extract_relations,
+            store_entities_and_edges,
+        )
+
+        entities = extract_entities(content)
+        if not entities:
+            return None
+        relations = extract_relations(content, entities)
+        kg_stats = await store_entities_and_edges(memory_id, entities, relations)
+        logger.info(
+            "KG indexed: %d entities, %d edges, %d mentions",
+            kg_stats["entities"],
+            kg_stats["edges"],
+            kg_stats["mentions"],
+        )
+        return kg_stats
+    except Exception as e:
+        logger.warning("KG extraction failed (non-fatal): %s", str(e)[:200])
+        return None
+
+
+async def _try_backfill_kg(content_hash: str, content: str) -> None:
+    """Backfill KG for an existing learning matched by content_hash.
+
+    store_entities_and_edges is idempotent, so repeated calls are safe.
+    Non-fatal -- logs and returns on any failure.
+    """
+    try:
+        from scripts.core.db.postgres_pool import get_pool
+        from scripts.core.kg_extractor import (
+            extract_entities,
+            extract_relations,
+            store_entities_and_edges,
+        )
+
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            existing_id = await conn.fetchval(
+                "SELECT id FROM archival_memory WHERE content_hash = $1",
+                content_hash,
+            )
+        if not existing_id:
+            return
+        existing_id_str = str(existing_id)
+        entities = extract_entities(content)
+        if not entities:
+            return
+        relations = extract_relations(content, entities)
+        await store_entities_and_edges(existing_id_str, entities, relations)
+        logger.info("KG backfilled for dedup learning %s", existing_id_str)
+    except Exception as e:
+        logger.warning("KG backfill on dedup failed (non-fatal): %s", str(e)[:200])
+
+
+# ===========================================================================
 # Async I/O: Store Handlers
 # ===========================================================================
 
@@ -632,6 +699,8 @@ async def store_learning_v2(
 
         # content_hash dedup returns empty string
         if not memory_id:
+            if backend == "postgres":
+                await _try_backfill_kg(content_hash, content)
             _record_rejection(
                 session_id,
                 project=project,
@@ -645,6 +714,11 @@ async def store_learning_v2(
                 "reason": "duplicate (content_hash match)",
             }
 
+        # Knowledge graph indexing (non-fatal, postgres-only)
+        kg_stats: dict[str, Any] | None = None
+        if backend == "postgres":
+            kg_stats = await _try_index_kg(memory_id, content)
+
         result_dict: dict[str, Any] = {
             "success": True,
             "memory_id": memory_id,
@@ -654,6 +728,8 @@ async def store_learning_v2(
         }
         if supersedes and backend == "postgres":
             result_dict["superseded"] = supersedes
+        if kg_stats:
+            result_dict["kg_stats"] = kg_stats
         return result_dict
 
     except Exception as e:

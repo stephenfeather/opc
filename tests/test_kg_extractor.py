@@ -258,3 +258,69 @@ class TestRealLearnings:
         types_found = {e.entity_type for e in entities}
         assert "config" in types_found  # OPC_DIR
         assert "tool" in types_found    # uv
+
+
+class TestRelationTypedResolution:
+    """Regression tests for typed entity resolution in relations (issue: overlapping names)."""
+
+    def test_pytest_overlapping_types_carry_entity_type(self):
+        """pytest appears as tool, module, and library — relations should carry types."""
+        content = "Using pytest to test the asyncpg connection pool"
+        entities = extract_entities(content)
+        pytest_entities = [e for e in entities if e.name == "pytest"]
+        # pytest should be extracted as at least tool and library
+        pytest_types = {e.entity_type for e in pytest_entities}
+        assert len(pytest_types) >= 2, f"Expected multiple types for pytest, got {pytest_types}"
+
+        relations = extract_relations(content, entities)
+        # Relations should have source_type and target_type set
+        for rel in relations:
+            assert rel.source_type is not None, (
+                f"Relation {rel.source}->{rel.target} missing source_type"
+            )
+            assert rel.target_type is not None, (
+                f"Relation {rel.source}->{rel.target} missing target_type"
+            )
+
+    def test_overlapping_names_produce_typed_dedup(self):
+        """Same-name entities with different types get separate relations."""
+        content = "Using pytest to test the asyncpg connection pool"
+        entities = extract_entities(content)
+        relations = extract_relations(content, entities)
+
+        # With type-aware dedup, pytest-as-tool and pytest-as-library
+        # should each get their own relation to asyncpg
+        pytest_asyncpg_rels = [
+            r for r in relations
+            if r.source == "pytest" and r.target == "asyncpg"
+        ]
+        source_types = {r.source_type for r in pytest_asyncpg_rels}
+        # Should have at least 2 different source types (tool, library)
+        assert len(source_types) >= 2, (
+            f"Expected multiple typed relations for pytest->asyncpg, "
+            f"got source_types={source_types}"
+        )
+
+    def test_deterministic_relations_across_runs(self):
+        """Same input must produce identical relations every time."""
+        content = "Using pytest to test the asyncpg connection pool"
+        # Run extraction 10 times and verify all produce identical output
+        baseline_entities = extract_entities(content)
+        baseline_rels = extract_relations(content, baseline_entities)
+        baseline_keys = sorted(
+            (r.source, r.source_type, r.target, r.target_type, r.relation)
+            for r in baseline_rels
+        )
+
+        for _ in range(9):
+            entities = extract_entities(content)
+            rels = extract_relations(content, entities)
+            keys = sorted(
+                (r.source, r.source_type, r.target, r.target_type, r.relation)
+                for r in rels
+            )
+            assert keys == baseline_keys, (
+                f"Nondeterministic relation output:\n"
+                f"  baseline: {baseline_keys}\n"
+                f"  this run: {keys}"
+            )

@@ -22,6 +22,11 @@ This project began as a fork of [Continuous-Claude-v3](https://github.com/parcad
 - **LLM learning classification** - Auto-classifies learnings by type using a tuned prompt with eval harness (84.3% accuracy), wired into pattern detection
 - **Project-scoped extraction** - Daemon passes project context through both LLM and workflow extraction paths, enabling project-match reranking
 - **Per-project extraction opt-out** - Drop a `.claude/no-extract` sentinel file in any project to suppress memory extraction by both the daemon and the `--learn` skill
+- **Memory feedback** - Track learning usefulness with per-session feedback (helpful/not helpful), surfaced in recall hints and feedback summaries
+- **Active memory push** - Proactively surfaces relevant learnings at session start and on prompt submission via hooks, reducing stale learning rates
+- **Memory metrics** - CLI health dashboard reporting totals, confidence distribution, extraction stats, tag usage, and temporal trends (`--human` or `--json`)
+- **TF-IDF query expansion** - Expands text queries with semantically related terms before hybrid RRF search using pseudo-relevance feedback over vector neighbors and corpus IDF scoring (`--no-expand` to disable)
+- **Rerank A/B benchmarking** - Golden-set bootstrap tool and sweep framework for tuning reranker weights with measurable accuracy metrics
 
 ## Project Structure
 
@@ -30,10 +35,13 @@ scripts/core/              Core memory system
   recall_learnings.py        Semantic search over stored learnings
   store_learning.py          Persist learnings to PostgreSQL
   memory_daemon.py           Background extraction and handoff generation
+  memory_metrics.py          Memory system health and quality metrics
   reranker.py                Contextual reranking with adaptive overfetch
+  query_expansion.py         TF-IDF query expansion for hybrid RRF recall
   pattern_detector.py        Cross-session pattern detection
   pattern_batch.py           Batch pattern analysis
   pattern_report.py          Pattern reporting
+  push_learnings.py          Active memory push for proactive recall
   artifact_index.py          Artifact indexing and querying
   artifact_query.py          Artifact querying interface
   artifact_mark.py           Artifact marking
@@ -94,9 +102,11 @@ The complete database schema is in [`docker/init-schema.sql`](docker/init-schema
 - **`sessions`** — 10 extra columns for the memory daemon extraction pipeline, process liveness, transcript archival, and multi-host coordination
 - **`archival_memory`** — Extra columns for embedding provenance (`embedding_model`), deduplication (`content_hash`), multi-host support (`host_id`), learning chains (`superseded_by`), temporal decay (`recall_count`, `last_recalled_at`), and project scoping (`project`)
 - **`memory_tags`** — Tag table for categorizing learnings with fast lookup
+- **`memory_feedback`** — Per-session learning usefulness feedback with upsert on (learning_id, session_id)
 - **`cross_session_patterns`** — Detected patterns across sessions (recurring errors, tool preferences, decisions)
 - **`continuity`** — Session state snapshots (continuity ledger system)
 - **`plans`** — Indexed implementation plans
+- **`archival_memory` HNSW index** — Approximate nearest-neighbor index on embeddings for fast vector search
 
 ## Hook Scripts
 

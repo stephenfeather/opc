@@ -54,7 +54,7 @@ class FakeCursor:
         try:
             return next(self._rows)
         except StopIteration:
-            raise StopAsyncIteration
+            raise StopAsyncIteration from None
 
 
 def _make_pool_and_conn(**conn_overrides):

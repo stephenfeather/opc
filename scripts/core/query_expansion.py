@@ -103,10 +103,13 @@ def load_idf_index(path: Path | None = None) -> IDFIndex | None:
         return None
 
 
-async def build_idf_index() -> IDFIndex:
+async def build_idf_index(path: Path | None = None) -> IDFIndex:
     """Build IDF index from all active learnings in the database.
 
     Uses a cursor to stream rows instead of loading the entire corpus into RAM.
+
+    Args:
+        path: Where to save the index. Defaults to _IDF_CACHE_PATH.
     """
     from scripts.core.db.postgres_pool import get_pool
 
@@ -133,7 +136,7 @@ async def build_idf_index() -> IDFIndex:
         doc_count=doc_count,
         built_at=datetime.now(UTC).isoformat(),
     )
-    save_idf_index(index)
+    save_idf_index(index, path)
     logger.info("Built IDF index: %d docs, %d terms", doc_count, len(word_df))
     return index
 
@@ -182,7 +185,7 @@ async def get_idf_index(
             except (ValueError, TypeError):
                 pass  # bad timestamp, rebuild
 
-    return await build_idf_index()
+    return await build_idf_index(path)
 
 
 async def expand_query(
@@ -208,7 +211,7 @@ async def expand_query(
     Returns:
         OR-joined tsquery string: "original | term1 | term2 | ..."
     """
-    from scripts.core.db.postgres_pool import get_pool, init_pgvector
+    from scripts.core.db.postgres_pool import get_pool
 
     # Build original query terms for the OR string
     original_tokens = set(_tokenize(query))
@@ -223,10 +226,9 @@ async def expand_query(
         fallback = re.sub(r"[^a-zA-Z0-9]", "", query.lower().split()[0]) if query.strip() else ""
         original_words = [fallback] if fallback else [""]
 
-    # Fetch vector neighbors
+    # Fetch vector neighbors (pool init registers pgvector codec per connection)
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await init_pgvector(conn)
         rows = await conn.fetch(
             """
             SELECT content FROM archival_memory

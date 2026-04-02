@@ -158,7 +158,7 @@ class TestRRFRecallBoost:
              patch(pgvector_patch, new_callable=AsyncMock), \
              patch(embed_patch, return_value=mock_embedder):
             from scripts.core.recall_learnings import search_learnings_hybrid_rrf
-            results = await search_learnings_hybrid_rrf("test query", k=5)
+            results = await search_learnings_hybrid_rrf("test query", k=5, expand=False)
 
         assert len(results) == 1
         assert results[0]["recall_count"] == 5
@@ -207,7 +207,7 @@ class TestRRFRecallBoost:
              patch(pgvector_patch, new_callable=AsyncMock), \
              patch(embed_patch, return_value=mock_embedder):
             from scripts.core.recall_learnings import search_learnings_hybrid_rrf
-            results = await search_learnings_hybrid_rrf("test query", k=5)
+            results = await search_learnings_hybrid_rrf("test query", k=5, expand=False)
 
         assert len(results) == 1
         assert results[0]["similarity"] == 0.023

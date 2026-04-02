@@ -9,17 +9,24 @@ Both SQLite and PostgreSQL implementations satisfy this protocol.
 import inspect
 from typing import Any, Protocol, runtime_checkable
 
+_VARIADIC_KINDS = frozenset({
+    inspect.Parameter.VAR_POSITIONAL,
+    inspect.Parameter.VAR_KEYWORD,
+})
+
 
 def _get_protocol_methods() -> dict[str, inspect.Signature]:
     """Extract method names and signatures from MemoryBackend Protocol.
 
+    Uses __protocol_attrs__ to enumerate only the declared protocol members,
+    avoiding inherited metaclass/ABC callables like register().
+
     Returns:
         Dict mapping method name to its inspect.Signature.
     """
+    attrs = getattr(MemoryBackend, "__protocol_attrs__", set())
     methods: dict[str, inspect.Signature] = {}
-    for name in dir(MemoryBackend):
-        if name.startswith("_"):
-            continue
+    for name in attrs:
         attr = getattr(MemoryBackend, name, None)
         if callable(attr):
             methods[name] = inspect.signature(attr)
@@ -33,8 +40,10 @@ def _check_signature_compatible(
 ) -> list[str]:
     """Check that actual_sig can accept calls shaped like expected_sig.
 
-    Verifies parameter count, and that positional parameters in the protocol
-    are also positional (not keyword-only) in the implementation.
+    Verifies:
+    - Required parameter count matches (excluding *args/**kwargs).
+    - Positional params in the protocol are positional in the implementation.
+    - Implementations using **kwargs satisfy any missing required params.
 
     Args:
         name: Method name (for error messages).
@@ -46,25 +55,37 @@ def _check_signature_compatible(
     """
     errors: list[str] = []
     expected_params = [
-        p for p in expected_sig.parameters.values() if p.name != "self"
+        p for p in expected_sig.parameters.values()
+        if p.name != "self" and p.kind not in _VARIADIC_KINDS
     ]
     actual_params = list(actual_sig.parameters.values())
+    has_var_positional = any(
+        p.kind == inspect.Parameter.VAR_POSITIONAL for p in actual_params
+    )
+    has_var_keyword = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in actual_params
+    )
+    actual_non_variadic = [
+        p for p in actual_params if p.kind not in _VARIADIC_KINDS
+    ]
 
     expected_required = [
         p for p in expected_params
         if p.default is inspect.Parameter.empty
     ]
     actual_required = [
-        p for p in actual_params
+        p for p in actual_non_variadic
         if p.default is inspect.Parameter.empty
     ]
 
-    if len(actual_required) != len(expected_required):
-        errors.append(
-            f"method {name} expects {len(expected_required)} required params, "
-            f"got {len(actual_required)}"
-        )
-        return errors
+    # If impl has *args or **kwargs, it can absorb extra params
+    if not (has_var_positional or has_var_keyword):
+        if len(actual_required) != len(expected_required):
+            errors.append(
+                f"method {name} expects {len(expected_required)} required params, "
+                f"got {len(actual_required)}"
+            )
+            return errors
 
     # Check that positional params in protocol are positional in impl
     for ep in expected_params:
@@ -72,9 +93,7 @@ def _check_signature_compatible(
             inspect.Parameter.POSITIONAL_ONLY,
             inspect.Parameter.POSITIONAL_OR_KEYWORD,
         ):
-            matching = [
-                ap for ap in actual_params if ap.name == ep.name
-            ]
+            matching = [ap for ap in actual_non_variadic if ap.name == ep.name]
             if matching and matching[0].kind == inspect.Parameter.KEYWORD_ONLY:
                 errors.append(
                     f"method {name} param '{ep.name}' is keyword-only "

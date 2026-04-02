@@ -223,9 +223,9 @@ class TestMemoryBackendProtocol:
 
     def test_protocol_is_a_protocol(self) -> None:
         """MemoryBackend should be a typing.Protocol subclass."""
-        assert hasattr(MemoryBackend, "__protocol_attrs__") or issubclass(
-            MemoryBackend, object
-        )
+        from typing import is_protocol
+
+        assert is_protocol(MemoryBackend)
 
     def test_protocol_defines_expected_methods(self) -> None:
         """Protocol should define all expected async method stubs."""
@@ -275,17 +275,38 @@ class TestStructuralTyping:
 class TestNoSideEffects:
     """Protocol module should be free of import-time side effects."""
 
-    def test_no_faulthandler_in_module(self) -> None:
-        """The protocol module should not enable faulthandler at import time."""
-        import inspect
+    def test_no_faulthandler_in_source(self) -> None:
+        """Module source should not contain faulthandler.enable calls."""
+        import inspect as _inspect
         import sys
 
         module_name = "scripts.core.db.memory_protocol"
         if module_name in sys.modules:
-            source = inspect.getsource(sys.modules[module_name])
+            source = _inspect.getsource(sys.modules[module_name])
             assert "faulthandler.enable" not in source, (
                 "Protocol module should not have faulthandler side effects"
             )
+
+    def test_import_does_not_enable_faulthandler(self) -> None:
+        """Re-importing the module should not toggle faulthandler state."""
+        import faulthandler
+        import importlib
+        import sys
+
+        module_name = "scripts.core.db.memory_protocol"
+        # Remove cached module so import runs init code again
+        saved = sys.modules.pop(module_name, None)
+        try:
+            before = faulthandler.is_enabled()
+            importlib.import_module(module_name)
+            after = faulthandler.is_enabled()
+            assert before == after, (
+                f"faulthandler state changed on import: {before} -> {after}"
+            )
+        finally:
+            # Restore original module to avoid side effects on other tests
+            if saved is not None:
+                sys.modules[module_name] = saved
 
 
 # ---------------------------------------------------------------------------
@@ -357,3 +378,50 @@ class TestValidateBackend:
         assert not is_valid
         kw_errors = [e for e in errors if "keyword-only" in e]
         assert len(kw_errors) >= 5, f"Expected >=5 kw-only errors, got: {kw_errors}"
+
+    def test_kwargs_backend_passes_validation(self) -> None:
+        """Backend using **kwargs for forward-compatibility should pass.
+
+        Implementations may use **kwargs to accept future protocol params
+        without breaking. The validator should treat this as compatible.
+        """
+
+        class KwargsBackend:
+            async def set_core(self, key: str, value: str, **kw: Any) -> None:
+                pass
+
+            async def get_core(self, key: str, **kw: Any) -> str | None:
+                return None
+
+            async def list_core_keys(self, **kw: Any) -> list[str]:
+                return []
+
+            async def delete_core(self, key: str, **kw: Any) -> None:
+                pass
+
+            async def get_all_core(self, **kw: Any) -> dict[str, str]:
+                return {}
+
+            async def store(self, content: str, **kw: Any) -> str:
+                return "id"
+
+            async def search(self, query: str, limit: int = 10, **kw: Any) -> list[dict[str, Any]]:
+                return []
+
+            async def delete_archival(self, memory_id: str, **kw: Any) -> None:
+                pass
+
+            async def recall(self, query: str, **kw: Any) -> str:
+                return ""
+
+            async def to_context(self, **kw: Any) -> str:
+                return ""
+
+            async def connect(self, **kw: Any) -> None:
+                pass
+
+            async def close(self, **kw: Any) -> None:
+                pass
+
+        is_valid, errors = validate_backend(KwargsBackend())
+        assert is_valid, f"KwargsBackend should pass validation, got errors: {errors}"

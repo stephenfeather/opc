@@ -19,6 +19,20 @@ import httpx
 
 from scripts.core.db.embedding_service import EmbeddingError, EmbeddingProvider
 
+# Module-level crash log file handle, kept open for faulthandler's lifetime.
+_crash_log_file = None
+
+
+def _enable_faulthandler(faulthandler_mod) -> None:
+    """Enable faulthandler for native crash dumps without leaking fds."""
+    global _crash_log_file  # noqa: PLW0603
+    if _crash_log_file is not None:
+        return  # already enabled
+    crash_log_path = os.path.expanduser("~/.claude/logs/opc_crash.log")
+    os.makedirs(os.path.dirname(crash_log_path), exist_ok=True)
+    _crash_log_file = open(crash_log_path, "a")  # noqa: SIM115
+    faulthandler_mod.enable(file=_crash_log_file, all_threads=True)
+
 
 class OpenAIEmbeddingProvider(EmbeddingProvider):
     """OpenAI text-embedding-3-small provider.
@@ -242,7 +256,10 @@ class LocalEmbeddingProvider(EmbeddingProvider):
                 "Install with: pip install sentence-transformers torch"
             )
 
+        import faulthandler
         import logging as _logging
+
+        _enable_faulthandler(faulthandler)
 
         self.model_name = model
         loggers_to_quiet = [

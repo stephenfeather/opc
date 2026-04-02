@@ -175,6 +175,29 @@ class TestCreateProvider:
             provider = create_provider("voyage-3")
             assert provider.dimension == 1024
 
+    def test_openai_explicit_api_key(self):
+        """Explicit api_key should be forwarded, not env var."""
+        from scripts.core.db.embedding_service import create_provider
+
+        with patch.dict("os.environ", {}, clear=True):
+            provider = create_provider("openai", api_key="explicit-key")
+            assert provider.api_key == "explicit-key"
+
+    def test_voyage_explicit_api_key(self):
+        """Explicit api_key should be forwarded to Voyage provider."""
+        from scripts.core.db.embedding_service import create_provider
+
+        with patch.dict("os.environ", {}, clear=True):
+            provider = create_provider("voyage", api_key="explicit-key")
+            assert provider.api_key == "explicit-key"
+
+    def test_ollama_verify_tls_passthrough(self):
+        """verify_tls should be forwarded to Ollama provider."""
+        from scripts.core.db.embedding_service import create_provider
+
+        provider = create_provider("ollama", verify_tls=False)
+        assert provider._client is not None
+
 
 # ---------------------------------------------------------------------------
 # MockEmbeddingProvider tests

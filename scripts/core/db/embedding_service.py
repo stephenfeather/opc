@@ -185,10 +185,13 @@ def create_provider(
 
     import os
 
+    api_key = kwargs.get("api_key", None)
+
     if name == "openai":
         from scripts.core.db.embedding_providers import OpenAIEmbeddingProvider
 
         return OpenAIEmbeddingProvider(
+            api_key=api_key,
             max_batch_size=max_batch_size,
             max_retries=max_retries,
         )
@@ -202,6 +205,7 @@ def create_provider(
         )
         return VoyageEmbeddingProvider(
             model=voyage_model,
+            api_key=api_key,
             max_batch_size=max_batch_size,
             max_retries=max_retries,
         )
@@ -211,6 +215,7 @@ def create_provider(
 
         return VoyageEmbeddingProvider(
             model=name,
+            api_key=api_key,
             max_batch_size=max_batch_size,
             max_retries=max_retries,
         )
@@ -227,7 +232,10 @@ def create_provider(
 
         ollama_model = model if model is not None else None
         ollama_host = kwargs.get("host", None)
-        return OllamaEmbeddingProvider(model=ollama_model, host=ollama_host)
+        verify_tls = kwargs.get("verify_tls", True)
+        return OllamaEmbeddingProvider(
+            model=ollama_model, host=ollama_host, verify_tls=verify_tls
+        )
 
     raise ValueError(f"Unknown provider: {name}")
 

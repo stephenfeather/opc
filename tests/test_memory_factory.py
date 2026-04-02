@@ -143,10 +143,11 @@ class TestCheckBackendAvailable:
         assert ok is False
         assert "sqlite" in err
 
-    def test_unknown_backend_returns_true(self) -> None:
-        """Unknown backends pass availability (caught by type validation)."""
-        ok, _ = check_backend_available("redis")
-        assert ok is True
+    def test_unknown_backend_returns_false(self) -> None:
+        """Unknown backends are rejected by availability check."""
+        ok, err = check_backend_available("redis")
+        assert ok is False
+        assert "redis" in err
 
 
 # ---------------------------------------------------------------------------
@@ -332,11 +333,6 @@ class TestCreateDefaultMemoryService:
 
         mock_create.assert_awaited_once_with("sqlite", "sess-1", "ag-1")
         assert result is mock_backend
-
-
-# ---------------------------------------------------------------------------
-# Module-level: no faulthandler side-effect
-# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------

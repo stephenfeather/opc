@@ -143,6 +143,9 @@ def check_backend_available(backend: str) -> tuple[bool, str]:
     Returns:
         (True, "") on success, (False, error_message) on failure.
     """
+    is_valid, error = validate_backend_type(backend)
+    if not is_valid:
+        return False, error
     if backend == "postgres":
         try:
             import asyncpg  # noqa: F401

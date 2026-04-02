@@ -177,6 +177,20 @@ CREATE INDEX IF NOT EXISTS idx_feedback_created ON memory_feedback(created_at DE
 CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_unique_per_session
     ON memory_feedback(learning_id, session_id);
 
+-- Backfill Log: Track extraction attempts by S3 UUID so sessions without
+-- a DB row in `sessions` still get marked and aren't re-processed.
+CREATE TABLE IF NOT EXISTS backfill_log (
+    s3_uuid TEXT PRIMARY KEY,
+    session_id TEXT,
+    project TEXT,
+    status TEXT NOT NULL,
+    learnings_stored INTEGER DEFAULT 0,
+    file_size_bytes BIGINT,
+    processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_backfill_log_status ON backfill_log(status);
+
 -- Plans: Indexed implementation plans for cross-session discovery
 CREATE TABLE IF NOT EXISTS plans (
     id TEXT PRIMARY KEY,

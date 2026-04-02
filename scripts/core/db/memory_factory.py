@@ -1,20 +1,97 @@
 """Memory backend factory for creating SQLite or PostgreSQL backends.
 
 Provides factory functions for backend instantiation with:
-- Explicit backend selection
-- Environment-based configuration
-- Dependency validation
+- Explicit backend selection via validate_backend_type()
+- Protocol conformance checking via validate_backend()
+- Environment-based configuration via get_default_backend()
+
+Structure (FP):
+- Pure: validate_backend_type, validate_backend, PROTOCOL_METHODS
+- I/O:  create_memory_service, get_default_backend, create_default_memory_service
 """
 
-import faulthandler
+from __future__ import annotations
+
 import os
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
-from .memory_protocol import MemoryBackend
-
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
+if TYPE_CHECKING:
+    from .memory_protocol import MemoryBackend
 
 BackendType = Literal["sqlite", "postgres"]
+
+_VALID_BACKENDS: tuple[str, ...] = ("sqlite", "postgres")
+
+PROTOCOL_METHODS: tuple[str, ...] = (
+    "set_core",
+    "get_core",
+    "list_core_keys",
+    "delete_core",
+    "get_all_core",
+    "store",
+    "search",
+    "delete_archival",
+    "recall",
+    "to_context",
+    "connect",
+    "close",
+)
+
+
+# ---------------------------------------------------------------------------
+# Pure validation functions
+# ---------------------------------------------------------------------------
+
+
+def validate_backend_type(backend: str) -> tuple[bool, str]:
+    """Check whether *backend* is a recognised backend name.
+
+    Returns:
+        (True, "") on success, (False, error_message) on failure.
+    """
+    if backend not in _VALID_BACKENDS:
+        return False, f"Unknown backend: {backend!r}. Must be one of {_VALID_BACKENDS}"
+    return True, ""
+
+
+def validate_backend(backend: object) -> list[str]:
+    """Return protocol methods missing from *backend*.
+
+    An empty list means *backend* satisfies MemoryBackend.
+    """
+    return [m for m in PROTOCOL_METHODS if not hasattr(backend, m)]
+
+
+# ---------------------------------------------------------------------------
+# I/O helper: lazy imports (isolated for testability)
+# ---------------------------------------------------------------------------
+
+
+def _import_sqlite_backend() -> type:
+    """Import and return the SQLite MemoryService class."""
+    try:
+        from .memory_service import MemoryService
+    except ImportError as e:
+        raise ImportError(
+            f"SQLite backend requires: uv pip install aiosqlite\nOriginal error: {e}"
+        ) from e
+    return MemoryService
+
+
+def _import_postgres_backend() -> type:
+    """Import and return the PostgreSQL MemoryServicePG class."""
+    try:
+        from .memory_service_pg import MemoryServicePG
+    except ImportError as e:
+        raise ImportError(
+            f"Postgres backend requires: uv pip install asyncpg\nOriginal error: {e}"
+        ) from e
+    return MemoryServicePG
+
+
+# ---------------------------------------------------------------------------
+# I/O factory functions
+# ---------------------------------------------------------------------------
 
 
 async def create_memory_service(
@@ -29,93 +106,79 @@ async def create_memory_service(
         backend: "sqlite" or "postgres"
         session_id: Session identifier for isolation
         agent_id: Optional agent identifier within session
-        **kwargs: Backend-specific options
-            - db_path: For SQLite (Path)
-            - connection_string: For Postgres (str, optional)
+        **kwargs: Backend-specific options (e.g. db_path for SQLite)
 
     Returns:
-        MemoryBackend implementation (satisfies Protocol)
+        Connected MemoryBackend implementation.
 
     Raises:
-        ValueError: If backend type is unknown
-        ImportError: If required backend dependencies not installed
-
-    Examples:
-        # SQLite (development)
-        memory = await create_memory_service("sqlite", session_id="test-123")
-
-        # PostgreSQL (production)
-        memory = await create_memory_service(
-            "postgres",
-            session_id="prod-abc",
-            agent_id="agent-1"
-        )
+        ValueError: If backend type is unknown.
+        ImportError: If required backend dependencies not installed.
+        TypeError: If created service does not satisfy MemoryBackend protocol.
     """
+    is_valid, error = validate_backend_type(backend)
+    if not is_valid:
+        raise ValueError(error)
+
     if backend == "sqlite":
-        try:
-            from .memory_service import MemoryService
-        except ImportError as e:
-            raise ImportError(
-                f"SQLite backend requires: uv pip install aiosqlite\nOriginal error: {e}"
-            ) from e
+        cls = _import_sqlite_backend()
+        service = cls(session_id=session_id, db_path=kwargs.get("db_path"))
+    else:  # postgres
+        cls = _import_postgres_backend()
+        service = cls(session_id=session_id, agent_id=agent_id)
 
-        db_path = kwargs.get("db_path")
-        service = MemoryService(session_id=session_id, db_path=db_path)
-        await service.connect()
-        return service
-
-    elif backend == "postgres":
-        try:
-            from .memory_service_pg import MemoryServicePG
-        except ImportError as e:
-            raise ImportError(
-                f"Postgres backend requires: uv pip install asyncpg pgvector\nOriginal error: {e}"
-            ) from e
-
-        service = MemoryServicePG(session_id=session_id, agent_id=agent_id)
-        await service.connect()
-        return service
-
-    else:
-        raise ValueError(f"Unknown backend: {backend}. Must be 'sqlite' or 'postgres'")
-
-
-def get_default_backend() -> BackendType:
-    """Get default backend from environment.
-
-    Reads from AGENTICA_MEMORY_BACKEND environment variable.
-
-    Defaults:
-        AGENTICA_MEMORY_BACKEND=sqlite (default, development)
-        AGENTICA_MEMORY_BACKEND=postgres (production)
-
-    Returns:
-        Backend type
-
-    Raises:
-        ValueError: If invalid backend specified
-        ImportError: If backend dependencies not available
-    """
-    backend = os.environ.get("AGENTICA_MEMORY_BACKEND", "sqlite")
-
-    if backend not in ("sqlite", "postgres"):
-        raise ValueError(
-            f"Invalid AGENTICA_MEMORY_BACKEND: {backend}. Must be 'sqlite' or 'postgres'"
+    missing = validate_backend(service)
+    if missing:
+        raise TypeError(
+            f"Backend {type(service).__name__} missing protocol methods: {', '.join(missing)}"
         )
 
-    # Validate backend dependencies
+    await service.connect()
+    return service
+
+
+def check_backend_available(backend: str) -> tuple[bool, str]:
+    """Check whether *backend*'s dependencies can be imported.
+
+    Returns:
+        (True, "") on success, (False, error_message) on failure.
+    """
+    is_valid, error = validate_backend_type(backend)
+    if not is_valid:
+        return False, error
     if backend == "postgres":
         try:
             import asyncpg  # noqa: F401
-        except ImportError as e:
-            raise ImportError("postgres backend requires: uv pip install asyncpg pgvector") from e
+        except ImportError:
+            return False, "postgres backend requires: uv pip install asyncpg"
     elif backend == "sqlite":
         try:
-            import aiosqlite  # noqa: F401
-        except ImportError as e:
-            raise ImportError("sqlite backend requires: uv pip install aiosqlite") from e
+            from .memory_service import MemoryService  # noqa: F401
+        except ImportError:
+            return False, "sqlite backend requires memory_service module and aiosqlite"
+    return True, ""
 
-    return backend  # type: ignore
+
+def get_default_backend() -> BackendType:
+    """Read backend preference from AGENTICA_MEMORY_BACKEND env var.
+
+    Validates the backend type and checks that its dependencies are available.
+
+    Returns:
+        "sqlite" (default) or "postgres".
+
+    Raises:
+        ValueError: If env var contains an unrecognised value.
+        ImportError: If the selected backend's dependencies are unavailable.
+    """
+    backend = os.environ.get("AGENTICA_MEMORY_BACKEND", "sqlite")
+    is_valid, error = validate_backend_type(backend)
+    if not is_valid:
+        raise ValueError(error)
+    available, dep_error = check_backend_available(backend)
+    if not available:
+        raise ImportError(dep_error)
+    return backend  # type: ignore[return-value]
 
 
 async def create_default_memory_service(
@@ -124,25 +187,14 @@ async def create_default_memory_service(
 ) -> MemoryBackend:
     """Create memory service using environment config.
 
-    Automatically selects backend based on AGENTICA_MEMORY_BACKEND env var.
+    Delegates to get_default_backend() then create_memory_service().
 
     Args:
         session_id: Session identifier for isolation
         agent_id: Optional agent identifier within session
 
     Returns:
-        MemoryBackend implementation
-
-    Raises:
-        ValueError: If invalid backend specified in environment
-        ImportError: If required backend dependencies not installed
-
-    Example:
-        # Set in environment or .env
-        AGENTICA_MEMORY_BACKEND=postgres
-
-        # In code
-        memory = await create_default_memory_service(session_id="my-session")
+        Connected MemoryBackend implementation.
     """
     backend = get_default_backend()
     return await create_memory_service(backend, session_id, agent_id)

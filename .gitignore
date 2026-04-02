@@ -15,14 +15,16 @@ backups/*.sql.gz
 # Caches
 .ruff_cache/
 .tldr/
-.claude/cache/
-.claude/tsc-cache/
+
+# Claude Code
+.claude/
+CLAUDE.md
 
 # Worktrees
 .worktrees/
 
-# Claude Code
-CLAUDE.md
+# Thoughts (session handoffs, plans, historical context)
+thoughts/
 
 # OS
 .DS_Store

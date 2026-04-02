@@ -94,10 +94,13 @@ def _encode_vector(v: list[float] | str) -> str:
 
 def _decode_vector(v: str) -> list[float]:
     """Decode a pgvector string to a list of floats."""
-    return [float(x) for x in v.strip().strip("[]").split(",")]
+    inner = v.strip().strip("[]")
+    if not inner:
+        return []
+    return [float(x) for x in inner.split(",")]
 
 
-def build_pool_config(max_size_str: str) -> dict:
+def build_pool_config(max_size_str: str) -> dict[str, int]:
     """Build pool configuration from a max-size string.
 
     Args:
@@ -143,8 +146,8 @@ def resolve_connection_url(
     3. opc_postgres_url — legacy (hooks)
     4. Development default only if environment is explicitly local
 
-    The dev default is only used when environment is one of: "development",
-    "test", or "" (unset). Any other environment (production, staging, etc.)
+    The dev default is only used when environment is "development" or ""
+    (unset). Any other environment (production, staging, test, etc.)
     requires an explicit URL.
 
     Args:
@@ -178,7 +181,7 @@ def resolve_connection_url(
 # ---------------------------------------------------------------------------
 
 
-def _get_pool_config() -> dict:
+def _get_pool_config() -> dict[str, int]:
     """Read pool config from environment and delegate to build_pool_config."""
     return build_pool_config(
         max_size_str=os.environ.get("AGENTICA_MAX_POOL_SIZE", "10"),
@@ -344,7 +347,7 @@ async def health_check(log_errors: bool = False) -> tuple[bool, str | None]:
         if log_errors:
             _logger.warning("Health check failed: %s", _sanitize_log_message(str(e)))
         return (False, error_type)
-    except Exception as e:
+    except (OSError, TimeoutError, RuntimeError) as e:
         error_type = type(e).__name__
         if log_errors:
             sanitized = _sanitize_log_message(str(e))

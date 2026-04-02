@@ -96,6 +96,12 @@ class TestDecodeVector:
         result = _decode_vector("  [1.0, 2.0, 3.0]  ")
         assert result == [1.0, 2.0, 3.0]
 
+    def test_empty_vector(self):
+        assert _decode_vector("[]") == []
+
+    def test_empty_vector_with_whitespace(self):
+        assert _decode_vector("  []  ") == []
+
 
 # ---------------------------------------------------------------------------
 # Pure functions: build_pool_config
@@ -472,7 +478,7 @@ class TestHealthCheck:
 
     async def test_failure_returns_false_with_error_type(self):
         mock_conn = AsyncMock()
-        mock_conn.fetchval.side_effect = Exception("conn failed")
+        mock_conn.fetchval.side_effect = OSError("conn failed")
 
         mock_pool = MagicMock()
         mock_pool.acquire.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
@@ -485,7 +491,31 @@ class TestHealthCheck:
         ):
             is_healthy, error = await health_check()
             assert is_healthy is False
-            assert error is not None
+            assert error == "OSError"
+
+    async def test_log_errors_sanitizes_credentials(self, caplog):
+        mock_conn = AsyncMock()
+        mock_conn.fetchval.side_effect = OSError(
+            "connection to postgresql://user:secret@host:5432/db refused"
+        )
+
+        mock_pool = MagicMock()
+        mock_pool.acquire.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        with patch(
+            "scripts.core.db.postgres_pool.asyncpg.create_pool",
+            new_callable=AsyncMock,
+            return_value=mock_pool,
+        ):
+            import logging
+
+            with caplog.at_level(logging.WARNING):
+                is_healthy, error = await health_check(log_errors=True)
+
+            assert is_healthy is False
+            assert "secret" not in caplog.text
+            assert "***@host" in caplog.text
 
 
 # ---------------------------------------------------------------------------

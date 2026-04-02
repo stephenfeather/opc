@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Track stale learning rate over time. Appends daily readings to a CSV log."""
+"""Track stale learning rate over time with date-keyed CSV upserts."""
 
 import asyncio
 import csv
 import fcntl
+import os
 import sys
 import tempfile
 from datetime import UTC, datetime
@@ -104,7 +105,7 @@ def upsert_csv_row(
                 dir=str(log_path.parent), suffix=".csv.tmp"
             )
             try:
-                with open(tmp_fd, "w", newline="") as f:
+                with os.fdopen(tmp_fd, "w", newline="") as f:
                     writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
                     writer.writeheader()
                     writer.writerows(updated_rows)

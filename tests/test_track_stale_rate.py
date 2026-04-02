@@ -5,8 +5,11 @@ import io
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from scripts.core.track_stale_rate import (
     _build_upserted_rows,
+    _cli_main,
     compute_stale_stats,
     fetch_stale_counts,
     format_stale_line,
@@ -274,3 +277,26 @@ class TestMain:
         assert row["total"] == "100"
         assert row["stale"] == "25"
         assert row["stale_pct"] == "25.0"
+
+
+# --- _cli_main (lifecycle) ---
+
+
+class TestCliMain:
+    @patch("scripts.core.track_stale_rate.close_pool", new_callable=AsyncMock)
+    @patch("scripts.core.track_stale_rate.main", new_callable=AsyncMock)
+    async def test_closes_pool_on_success(self, mock_main, mock_close_pool):
+        await _cli_main()
+
+        mock_main.assert_awaited_once()
+        mock_close_pool.assert_awaited_once()
+
+    @patch("scripts.core.track_stale_rate.close_pool", new_callable=AsyncMock)
+    @patch("scripts.core.track_stale_rate.main", new_callable=AsyncMock)
+    async def test_closes_pool_on_error(self, mock_main, mock_close_pool):
+        mock_main.side_effect = RuntimeError("db failure")
+
+        with pytest.raises(RuntimeError, match="db failure"):
+            await _cli_main()
+
+        mock_close_pool.assert_awaited_once()

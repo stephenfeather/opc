@@ -8,9 +8,11 @@ Two-phase extraction:
 
 Usage:
     python extract_thinking_blocks.py --jsonl path/to/session.jsonl
-    python extract_thinking_blocks.py --jsonl path/to/session.jsonl --filter  # only perception signals
+    python extract_thinking_blocks.py --jsonl path/to/session.jsonl --filter
     python extract_thinking_blocks.py --jsonl path/to/session.jsonl --output /tmp/blocks.txt
 """
+
+from __future__ import annotations
 
 import argparse
 import faulthandler
@@ -19,8 +21,6 @@ import os
 import re
 import sys
 from pathlib import Path
-
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
 # Perception change signal patterns (Alan Kay "point of view" moments)
 PERCEPTION_SIGNALS = [
@@ -71,66 +71,141 @@ PERCEPTION_SIGNALS = [
 PERCEPTION_PATTERN = re.compile("|".join(PERCEPTION_SIGNALS), re.IGNORECASE)
 
 
-def extract_thinking_blocks(jsonl_path: Path, filter_perception: bool = False) -> list[dict]:
+# ---------------------------------------------------------------------------
+# Pure functions
+# ---------------------------------------------------------------------------
+
+
+def has_perception_signal(text: str) -> bool:
+    """Check whether text contains any perception change signal."""
+    return bool(PERCEPTION_PATTERN.search(text))
+
+
+def parse_jsonl_entry(line: str, *, line_num: int = 0) -> list[dict]:
+    """Parse a single JSONL line and return extracted thinking blocks.
+
+    Returns an empty list when the line is invalid JSON, a non-message type,
+    or contains no thinking blocks.
     """
-    Stream through JSONL and extract thinking blocks.
+    try:
+        data = json.loads(line.strip())
+    except (json.JSONDecodeError, ValueError):
+        return []
 
-    Args:
-        jsonl_path: Path to session JSONL file
-        filter_perception: If True, only return blocks with perception signals
+    if data.get("type") not in ("assistant", "user"):
+        return []
 
-    Yields:
-        Dict with 'thinking', 'timestamp', 'line_num', 'has_perception_signal'
-    """
-    blocks = []
+    message = data.get("message")
+    if not isinstance(message, dict):
+        return []
 
-    with open(jsonl_path) as f:
-        for line_num, line in enumerate(f, 1):
-            try:
-                data = json.loads(line.strip())
-            except json.JSONDecodeError:
-                continue
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
 
-            # Skip non-message types
-            if data.get('type') not in ('assistant', 'user'):
-                continue
-
-            message = data.get('message', {})
-            content = message.get('content')
-
-            # Content can be string or array
-            if not isinstance(content, list):
-                continue
-
-            # Extract thinking blocks from content array
-            for item in content:
-                if isinstance(item, dict) and item.get('type') == 'thinking':
-                    thinking_text = item.get('thinking', '')
-                    if not thinking_text:
-                        continue
-
-                    has_signal = bool(PERCEPTION_PATTERN.search(thinking_text))
-
-                    if filter_perception and not has_signal:
-                        continue
-
-                    blocks.append({
-                        'thinking': thinking_text,
-                        'timestamp': data.get('timestamp'),
-                        'line_num': line_num,
-                        'has_perception_signal': has_signal,
-                    })
-
+    blocks: list[dict] = []
+    for item in content:
+        if not isinstance(item, dict) or item.get("type") != "thinking":
+            continue
+        thinking_text = item.get("thinking", "")
+        if not isinstance(thinking_text, str) or not thinking_text:
+            continue
+        blocks.append(
+            {
+                "thinking": thinking_text,
+                "timestamp": data.get("timestamp"),
+                "line_num": line_num,
+                "has_perception_signal": has_perception_signal(thinking_text),
+            }
+        )
     return blocks
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Extract thinking blocks from session JSONL')
-    parser.add_argument('--jsonl', required=True, help='Path to session JSONL file')
-    parser.add_argument('--filter', action='store_true', help='Only extract blocks with perception signals')
-    parser.add_argument('--output', help='Output file (default: stdout)')
-    parser.add_argument('--format', choices=['text', 'json'], default='text', help='Output format')
-    parser.add_argument('--stats', action='store_true', help='Show statistics only')
+def compute_stats(blocks: list[dict]) -> dict:
+    """Compute summary statistics for a list of thinking blocks."""
+    total = len(blocks)
+    with_signal = sum(1 for b in blocks if b["has_perception_signal"])
+    return {
+        "total": total,
+        "with_signal": with_signal,
+        "ratio": (with_signal / total * 100) if total > 0 else None,
+    }
+
+
+def format_blocks_text(blocks: list[dict]) -> str:
+    """Format thinking blocks as human-readable text."""
+    if not blocks:
+        return ""
+    return "\n\n---\n\n".join(
+        f"[Line {b['line_num']}] {'*' if b['has_perception_signal'] else ''}\n{b['thinking']}"
+        for b in blocks
+    )
+
+
+def format_blocks_json(blocks: list[dict]) -> str:
+    """Format thinking blocks as indented JSON."""
+    return json.dumps(blocks, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# I/O boundary
+# ---------------------------------------------------------------------------
+
+
+def extract_thinking_blocks(
+    jsonl_path: Path, *, filter_perception: bool = False
+) -> list[dict]:
+    """Read a JSONL file and extract thinking blocks.
+
+    Args:
+        jsonl_path: Path to session JSONL file.
+        filter_perception: If True, only return blocks with perception signals.
+
+    Returns:
+        List of dicts with 'thinking', 'timestamp', 'line_num',
+        'has_perception_signal'.
+    """
+    blocks: list[dict] = []
+    with open(jsonl_path) as f:
+        for line_num, line in enumerate(f, 1):
+            parsed = parse_jsonl_entry(line, line_num=line_num)
+            if filter_perception:
+                blocks.extend(b for b in parsed if b["has_perception_signal"])
+            else:
+                blocks.extend(parsed)
+    return blocks
+
+
+_faulthandler_file = None
+
+
+def _enable_faulthandler() -> None:
+    """Best-effort crash logging — idempotent, does not raise if unavailable."""
+    global _faulthandler_file  # noqa: PLW0603
+    if _faulthandler_file is not None:
+        return
+    try:
+        log_path = os.path.expanduser("~/.claude/logs/opc_crash.log")
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        _faulthandler_file = open(log_path, "a")  # noqa: SIM115
+        faulthandler.enable(file=_faulthandler_file)
+    except OSError:
+        pass
+
+
+def main() -> None:
+    """CLI entry point — handles arg parsing, file I/O, and output."""
+    _enable_faulthandler()
+    parser = argparse.ArgumentParser(description="Extract thinking blocks from session JSONL")
+    parser.add_argument("--jsonl", required=True, help="Path to session JSONL file")
+    parser.add_argument(
+        "--filter", action="store_true", help="Only extract blocks with perception signals"
+    )
+    parser.add_argument("--output", help="Output file (default: stdout)")
+    parser.add_argument(
+        "--format", choices=["text", "json"], default="text", help="Output format"
+    )
+    parser.add_argument("--stats", action="store_true", help="Show statistics only")
 
     args = parser.parse_args()
 
@@ -139,27 +214,17 @@ def main():
         print(f"Error: File not found: {jsonl_path}", file=sys.stderr)
         sys.exit(1)
 
-    # Extract blocks
     blocks = extract_thinking_blocks(jsonl_path, filter_perception=args.filter)
 
     if args.stats:
-        total = len(blocks)
-        with_signal = sum(1 for b in blocks if b['has_perception_signal'])
-        print(f"Total thinking blocks: {total}")
-        print(f"With perception signals: {with_signal}")
-        print(f"Ratio: {with_signal/total*100:.1f}%" if total > 0 else "Ratio: N/A")
+        stats = compute_stats(blocks)
+        print(f"Total thinking blocks: {stats['total']}")
+        print(f"With perception signals: {stats['with_signal']}")
+        print(f"Ratio: {stats['ratio']:.1f}%" if stats["ratio"] is not None else "Ratio: N/A")
         return
 
-    # Format output
-    if args.format == 'json':
-        output = json.dumps(blocks, indent=2)
-    else:
-        output = '\n\n---\n\n'.join(
-            f"[Line {b['line_num']}] {'*' if b['has_perception_signal'] else ''}\n{b['thinking']}"
-            for b in blocks
-        )
+    output = format_blocks_json(blocks) if args.format == "json" else format_blocks_text(blocks)
 
-    # Write output
     if args.output:
         Path(args.output).write_text(output)
         print(f"Wrote {len(blocks)} blocks to {args.output}", file=sys.stderr)
@@ -167,5 +232,5 @@ def main():
         print(output)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

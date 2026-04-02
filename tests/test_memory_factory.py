@@ -356,6 +356,20 @@ class TestRealImportPaths:
         with pytest.raises(ImportError, match="SQLite backend requires"):
             await create_memory_service("sqlite", session_id="test-real")
 
+    def test_postgres_import_returns_class(self) -> None:
+        """Postgres backend module exists and can be imported."""
+        from scripts.core.db.memory_factory import _import_postgres_backend
+
+        cls = _import_postgres_backend()
+        assert cls is not None
+        assert cls.__name__ == "MemoryServicePG"
+
+    def test_postgres_backend_available(self) -> None:
+        """check_backend_available('postgres') succeeds with asyncpg installed."""
+        ok, err = check_backend_available("postgres")
+        assert ok is True
+        assert err == ""
+
 
 # ---------------------------------------------------------------------------
 # Module-level: no faulthandler side-effect

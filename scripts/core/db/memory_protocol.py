@@ -6,13 +6,114 @@ Uses Protocol for structural typing (duck typing with type checking).
 Both SQLite and PostgreSQL implementations satisfy this protocol.
 """
 
-import faulthandler
-import os
-from typing import Any, Protocol
-
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
+import inspect
+from typing import Any, Protocol, runtime_checkable
 
 
+def _get_protocol_methods() -> dict[str, inspect.Signature]:
+    """Extract method names and signatures from MemoryBackend Protocol.
+
+    Returns:
+        Dict mapping method name to its inspect.Signature.
+    """
+    methods: dict[str, inspect.Signature] = {}
+    for name in dir(MemoryBackend):
+        if name.startswith("_"):
+            continue
+        attr = getattr(MemoryBackend, name, None)
+        if callable(attr):
+            methods[name] = inspect.signature(attr)
+    return methods
+
+
+def _check_signature_compatible(
+    name: str,
+    expected_sig: inspect.Signature,
+    actual_sig: inspect.Signature,
+) -> list[str]:
+    """Check that actual_sig can accept calls shaped like expected_sig.
+
+    Verifies parameter count, and that positional parameters in the protocol
+    are also positional (not keyword-only) in the implementation.
+
+    Args:
+        name: Method name (for error messages).
+        expected_sig: Signature from the Protocol (excludes self).
+        actual_sig: Signature from the instance method (self already bound).
+
+    Returns:
+        List of error strings (empty if compatible).
+    """
+    errors: list[str] = []
+    expected_params = [
+        p for p in expected_sig.parameters.values() if p.name != "self"
+    ]
+    actual_params = list(actual_sig.parameters.values())
+
+    expected_required = [
+        p for p in expected_params
+        if p.default is inspect.Parameter.empty
+    ]
+    actual_required = [
+        p for p in actual_params
+        if p.default is inspect.Parameter.empty
+    ]
+
+    if len(actual_required) != len(expected_required):
+        errors.append(
+            f"method {name} expects {len(expected_required)} required params, "
+            f"got {len(actual_required)}"
+        )
+        return errors
+
+    # Check that positional params in protocol are positional in impl
+    for ep in expected_params:
+        if ep.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            matching = [
+                ap for ap in actual_params if ap.name == ep.name
+            ]
+            if matching and matching[0].kind == inspect.Parameter.KEYWORD_ONLY:
+                errors.append(
+                    f"method {name} param '{ep.name}' is keyword-only "
+                    f"but protocol expects positional"
+                )
+    return errors
+
+
+def validate_backend(instance: object) -> tuple[bool, list[str]]:
+    """Validate that an object fully satisfies the MemoryBackend protocol.
+
+    Goes beyond isinstance (which only checks attribute names) by verifying:
+    1. Every required method exists on the instance.
+    2. Every method is a coroutine function (async def).
+    3. Every method's signature is call-compatible with the protocol.
+
+    Args:
+        instance: Object to validate.
+
+    Returns:
+        Tuple of (is_valid, list_of_errors). Empty error list means valid.
+    """
+    errors: list[str] = []
+    protocol_methods = _get_protocol_methods()
+
+    for name, expected_sig in protocol_methods.items():
+        method = getattr(instance, name, None)
+        if method is None:
+            errors.append(f"missing method: {name}")
+            continue
+        if not inspect.iscoroutinefunction(method):
+            errors.append(f"method {name} is not a coroutine function")
+            continue
+        actual_sig = inspect.signature(method)
+        errors.extend(_check_signature_compatible(name, expected_sig, actual_sig))
+    return (len(errors) == 0, errors)
+
+
+@runtime_checkable
 class MemoryBackend(Protocol):
     """Protocol for memory service backends.
 

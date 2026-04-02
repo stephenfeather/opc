@@ -88,6 +88,8 @@ CREATE INDEX IF NOT EXISTS idx_archival_last_recalled ON archival_memory(last_re
 CREATE INDEX IF NOT EXISTS idx_archival_superseded ON archival_memory(superseded_by) WHERE superseded_by IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_archival_active ON archival_memory(superseded_by) WHERE superseded_by IS NULL;
 CREATE INDEX IF NOT EXISTS idx_archival_project ON archival_memory(project) WHERE project IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_archival_embedding_hnsw ON archival_memory
+    USING hnsw(embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
 
 -- Memory Tags: Structured tag storage for archival_memory entries
 CREATE TABLE IF NOT EXISTS memory_tags (

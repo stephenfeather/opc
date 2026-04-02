@@ -33,7 +33,9 @@ async def search_learnings_text_only_postgres(query: str, k: int = 5) -> list[di
     async with pool.acquire() as conn:
         # Try full-text search using plainto_tsquery (flexible OR semantics)
         # Strip meta-words and normalize for better matching
-        meta_words = {'help', 'want', 'need', 'show', 'tell', 'find', 'look', 'please', 'with', 'for'}
+        from scripts.core.query_expansion import STOPWORDS
+
+        meta_words = STOPWORDS
         clean_query = query.lower().replace('-', ' ')  # "multi-terminal" -> "multi terminal"
         clean_query = ' '.join(w for w in clean_query.split() if w not in meta_words)
         if not clean_query.strip():
@@ -233,6 +235,8 @@ async def search_learnings_hybrid_rrf(
     provider: str = "local",
     rrf_k: int = 60,
     similarity_threshold: float = 0.0,
+    expand: bool = True,
+    max_expansion_terms: int = 5,
 ) -> list[dict[str, Any]]:
     """Hybrid RRF search combining text and vector rankings.
 
@@ -245,6 +249,8 @@ async def search_learnings_hybrid_rrf(
         provider: Embedding provider
         rrf_k: RRF constant (default 60)
         similarity_threshold: Minimum RRF score to include
+        expand: If True, expand query with TF-IDF related terms
+        max_expansion_terms: Number of expansion terms to add
 
     Returns:
         List of learnings with RRF scores
@@ -261,8 +267,28 @@ async def search_learnings_hybrid_rrf(
     finally:
         await embedder.aclose()
 
-    def _build_rrf_cte(*, chain_filter: bool) -> str:
+    # Query expansion: find related terms via TF-IDF over vector neighbors
+    text_query = query
+    use_tsquery = False
+    if expand:
+        try:
+            from scripts.core.query_expansion import expand_query
+
+            expanded = await expand_query(
+                query,
+                query_embedding,
+                max_expansion_terms=max_expansion_terms,
+            )
+            if expanded != query:
+                text_query = expanded
+                use_tsquery = True
+                logger.debug("Expanded query: %r -> %r", query, expanded)
+        except Exception:
+            logger.debug("Query expansion failed, using original", exc_info=True)
+
+    def _build_rrf_cte(*, chain_filter: bool, use_tsquery: bool = False) -> str:
         chain_clause = "\n                AND superseded_by IS NULL" if chain_filter else ""
+        tsquery_fn = "to_tsquery" if use_tsquery else "plainto_tsquery"
         return f"""
             WITH fts_ranked AS (
                 SELECT
@@ -270,12 +296,12 @@ async def search_learnings_hybrid_rrf(
                     ROW_NUMBER() OVER (
                         ORDER BY ts_rank(
                             to_tsvector('english', content),
-                            plainto_tsquery('english', $1)
+                            {tsquery_fn}('english', $1)
                         ) DESC
                     ) as fts_rank
                 FROM archival_memory
                 WHERE metadata->>'type' = 'session_learning'{chain_clause}
-                AND to_tsvector('english', content) @@ plainto_tsquery('english', $1)
+                AND to_tsvector('english', content) @@ {tsquery_fn}('english', $1)
             ),
             vector_ranked AS (
                 SELECT
@@ -296,8 +322,8 @@ async def search_learnings_hybrid_rrf(
                 FULL OUTER JOIN vector_ranked v ON f.id = v.id
             )"""
 
-    _RRF_CTE = _build_rrf_cte(chain_filter=True)
-    _RRF_CTE_PLAIN = _build_rrf_cte(chain_filter=False)
+    _RRF_CTE = _build_rrf_cte(chain_filter=True, use_tsquery=use_tsquery)
+    _RRF_CTE_PLAIN = _build_rrf_cte(chain_filter=False, use_tsquery=use_tsquery)
 
     _BOOSTED_TAIL = """
             SELECT
@@ -345,7 +371,7 @@ async def search_learnings_hybrid_rrf(
     has_decay_columns = True
     async with pool.acquire() as conn:
         await init_pgvector(conn)
-        query_args = (query, str(query_embedding), rrf_k, k * 2)
+        query_args = (text_query, str(query_embedding), rrf_k, k * 2)
 
         try:
             rows = await conn.fetch(_BOOSTED_SELECT, *query_args)
@@ -360,6 +386,19 @@ async def search_learnings_hybrid_rrf(
                 rows = await conn.fetch(
                     _PLAIN_SELECT_NO_CHAIN, *query_args
                 )
+
+        # Fallback: if to_tsquery failed (malformed expansion), retry with plainto_tsquery
+        if not rows and use_tsquery:
+            logger.debug("Expanded tsquery returned no results, falling back to plainto_tsquery")
+            plain_cte = _build_rrf_cte(chain_filter=True, use_tsquery=False)
+            plain_args = (query, str(query_embedding), rrf_k, k * 2)
+            try:
+                if has_decay_columns:
+                    rows = await conn.fetch(plain_cte + _BOOSTED_TAIL, *plain_args)
+                else:
+                    rows = await conn.fetch(plain_cte + _PLAIN_TAIL, *plain_args)
+            except Exception:
+                logger.debug("plainto_tsquery fallback also failed", exc_info=True)
 
     results = []
     for row in rows:

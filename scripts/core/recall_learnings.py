@@ -295,6 +295,22 @@ async def main() -> int:
         help="Bypass contextual re-ranking (use raw retrieval scores)",
     )
     parser.add_argument(
+        "--no-expand",
+        action="store_true",
+        help="Disable TF-IDF query expansion for hybrid RRF search",
+    )
+    parser.add_argument(
+        "--expand-terms",
+        type=int,
+        default=5,
+        help="Number of expansion terms to add (default: 5)",
+    )
+    parser.add_argument(
+        "--rebuild-idf",
+        action="store_true",
+        help="Force rebuild of the IDF index before searching",
+    )
+    parser.add_argument(
         "--project",
         help="Project context for re-ranking (default: auto-detect from CLAUDE_PROJECT_DIR)",
     )
@@ -339,11 +355,17 @@ async def main() -> int:
             )
         else:
             # Default: Hybrid RRF search (text + vector combined)
+            if args.rebuild_idf:
+                from scripts.core.query_expansion import get_idf_index
+
+                await get_idf_index(force_rebuild=True)
             results = await search_learnings_hybrid_rrf(
                 query=args.query,
                 k=fetch_k,
                 provider=args.provider,
                 similarity_threshold=args.threshold * 0.01,  # RRF scores are ~0.01-0.03 range
+                expand=not args.no_expand,
+                max_expansion_terms=args.expand_terms,
             )
     except Exception as e:
         if args.json or args.json_full:

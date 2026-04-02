@@ -135,6 +135,7 @@ def _sample_metrics() -> dict:
             "failed": 3,
             "retried": 2,
             "extraction_rate_pct": 80.0,
+            "learnings_per_extraction": 2.50,
         },
         "stale_learnings": {
             "never_recalled": 30,

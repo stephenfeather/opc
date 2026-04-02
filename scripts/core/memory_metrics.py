@@ -411,6 +411,18 @@ async def collect_all_metrics(
             "to": end.isoformat() if end else None,
         }
 
+    # Compute learnings-per-extraction from consistent all-time scope
+    extracted = extraction["extracted"]
+    all_time_learnings = totals["total_learnings"]
+    if start or end:
+        # totals is period-filtered; get all-time count for this ratio
+        async with get_connection() as conn:
+            all_time = await get_totals(conn, None, None)
+        all_time_learnings = all_time["total_learnings"]
+    extraction["learnings_per_extraction"] = (
+        round(all_time_learnings / extracted, 2) if extracted else 0.0
+    )
+
     return {
         "generated_at": datetime.now(UTC).isoformat(),
         "period": period,
@@ -477,6 +489,8 @@ def format_human(metrics: dict) -> str:
     lines.append(f"Extraction (all-time):  {e['extracted']}/{e['total_sessions']} extracted "
                  f"({e['extraction_rate_pct']:.1f}%), "
                  f"{e['pending']} pending, {e['failed']} failed, {e['retried']} retried")
+    lpe = e.get("learnings_per_extraction", 0.0)
+    lines.append(f"  Learnings/Extraction:  {lpe:.2f}")
     lines.append("")
 
     s = metrics["stale_learnings"]

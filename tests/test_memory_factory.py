@@ -286,6 +286,34 @@ class TestCreateDefaultMemoryService:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Integration: real import paths (non-mocked)
+# ---------------------------------------------------------------------------
+
+
+class TestRealImportPaths:
+    """Verify real import behavior without mocking."""
+
+    def test_sqlite_import_raises_when_module_missing(self) -> None:
+        """SQLite backend module does not exist in this codebase."""
+        from scripts.core.db.memory_factory import _import_sqlite_backend
+
+        with pytest.raises(ImportError):
+            _import_sqlite_backend()
+
+    async def test_create_memory_service_sqlite_raises_import_error(self) -> None:
+        """End-to-end: requesting sqlite fails with ImportError."""
+        from scripts.core.db.memory_factory import create_memory_service
+
+        with pytest.raises(ImportError, match="SQLite backend requires"):
+            await create_memory_service("sqlite", session_id="test-real")
+
+
+# ---------------------------------------------------------------------------
+# Module-level: no faulthandler side-effect
+# ---------------------------------------------------------------------------
+
+
 class TestModuleLevelCleanliness:
     """Ensure the refactored module has no side effects at import time."""
 

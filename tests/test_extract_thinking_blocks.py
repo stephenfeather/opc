@@ -143,6 +143,12 @@ class TestParseJsonlEntry:
     def test_invalid_json_returns_empty(self):
         assert parse_jsonl_entry("not json at all") == []
 
+    def test_skips_non_dict_json_root(self):
+        """Valid JSON but not a dict (e.g., array, number, string)."""
+        assert parse_jsonl_entry("[1, 2, 3]") == []
+        assert parse_jsonl_entry("42") == []
+        assert parse_jsonl_entry('"just a string"') == []
+
     def test_skips_non_dict_message(self):
         """Schema drift: message is a string instead of a dict."""
         line = json.dumps({"type": "assistant", "message": "oops"})

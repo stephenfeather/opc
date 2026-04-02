@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import atexit
 import faulthandler
 import json
 import os
@@ -90,6 +91,9 @@ def parse_jsonl_entry(line: str, *, line_num: int = 0) -> list[dict]:
     try:
         data = json.loads(line.strip())
     except (json.JSONDecodeError, ValueError):
+        return []
+
+    if not isinstance(data, dict):
         return []
 
     if data.get("type") not in ("assistant", "user"):
@@ -188,7 +192,8 @@ def _enable_faulthandler() -> None:
         log_path = os.path.expanduser("~/.claude/logs/opc_crash.log")
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         _faulthandler_file = open(log_path, "a")  # noqa: SIM115
-        faulthandler.enable(file=_faulthandler_file)
+        faulthandler.enable(file=_faulthandler_file, all_threads=True)
+        atexit.register(_faulthandler_file.close)
     except OSError:
         pass
 

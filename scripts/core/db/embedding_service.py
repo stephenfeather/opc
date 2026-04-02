@@ -395,8 +395,22 @@ class LocalEmbeddingProvider(EmbeddingProvider):
                 "Install with: pip install sentence-transformers torch"
             )
 
+        import logging as _logging
+        import os
+        import sys
+
         self.model_name = model
-        self._model = SentenceTransformer(model, device=device)
+        # Suppress noisy model loading output (progress bar + weight report)
+        prev_level = _logging.getLogger("sentence_transformers").level
+        _logging.getLogger("sentence_transformers").setLevel(_logging.WARNING)
+        prev_stderr = sys.stderr
+        try:
+            sys.stderr = open(os.devnull, "w")
+            self._model = SentenceTransformer(model, device=device)
+        finally:
+            sys.stderr.close()
+            sys.stderr = prev_stderr
+            _logging.getLogger("sentence_transformers").setLevel(prev_level)
         self._dimension = self._model.get_sentence_embedding_dimension()
 
     async def embed(self, text: str, **kwargs) -> list[float]:

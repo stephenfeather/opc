@@ -395,22 +395,48 @@ class LocalEmbeddingProvider(EmbeddingProvider):
                 "Install with: pip install sentence-transformers torch"
             )
 
+        import contextlib
         import logging as _logging
         import os
         import sys
 
         self.model_name = model
-        # Suppress noisy model loading output (progress bar + weight report)
-        prev_level = _logging.getLogger("sentence_transformers").level
-        _logging.getLogger("sentence_transformers").setLevel(_logging.WARNING)
-        prev_stderr = sys.stderr
+        # Suppress noisy model loading output:
+        # - tqdm progress bar (stderr)
+        # - BertModel LOAD REPORT (stderr, sometimes C-level)
+        # - sentence_transformers INFO logs
+        loggers_to_quiet = [
+            "sentence_transformers",
+            "transformers",
+            "safetensors",
+            "torch",
+        ]
+        prev_levels = {name: _logging.getLogger(name).level for name in loggers_to_quiet}
+        for name in loggers_to_quiet:
+            _logging.getLogger(name).setLevel(_logging.ERROR)
+        prev_env = os.environ.get("TQDM_DISABLE")
+        os.environ["TQDM_DISABLE"] = "1"
+        # Redirect both stdout and stderr at the OS file descriptor level
+        # to catch C-level output that sys.stderr redirect misses
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        old_stdout_fd = os.dup(1)
+        old_stderr_fd = os.dup(2)
         try:
-            sys.stderr = open(os.devnull, "w")
+            os.dup2(devnull, 1)
+            os.dup2(devnull, 2)
             self._model = SentenceTransformer(model, device=device)
         finally:
-            sys.stderr.close()
-            sys.stderr = prev_stderr
-            _logging.getLogger("sentence_transformers").setLevel(prev_level)
+            os.dup2(old_stdout_fd, 1)
+            os.dup2(old_stderr_fd, 2)
+            os.close(devnull)
+            os.close(old_stdout_fd)
+            os.close(old_stderr_fd)
+            if prev_env is None:
+                os.environ.pop("TQDM_DISABLE", None)
+            else:
+                os.environ["TQDM_DISABLE"] = prev_env
+            for name in loggers_to_quiet:
+                _logging.getLogger(name).setLevel(prev_levels[name])
         self._dimension = self._model.get_sentence_embedding_dimension()
 
     async def embed(self, text: str, **kwargs) -> list[float]:

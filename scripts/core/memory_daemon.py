@@ -902,8 +902,20 @@ def _check_pattern_detection():
     rc = _pattern_proc.poll()
     if rc is not None:
         if rc == 0:
-            stdout = _pattern_proc.stdout.read().decode()[:200]
-            log(f"Pattern detection completed: {stdout}")
+            stdout = _pattern_proc.stdout.read().decode()
+            try:
+                import json as _json
+                data = _json.loads(stdout)
+                total = data.get("patterns_detected", "?")
+                analyzed = data.get("learnings_analyzed", "?")
+                by_type = data.get("patterns_by_type", {})
+                type_summary = ", ".join(
+                    f"{k}={v}" for k, v in sorted(by_type.items())
+                )
+                log(f"Pattern detection completed: {total} patterns "
+                    f"from {analyzed} learnings ({type_summary})")
+            except (_json.JSONDecodeError, KeyError):
+                log(f"Pattern detection completed: {stdout[:200]}")
         else:
             stderr = _pattern_proc.stderr.read().decode()[:200]
             log(f"Pattern detection failed (rc={rc}): {stderr}")

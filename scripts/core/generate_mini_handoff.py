@@ -49,6 +49,18 @@ def parse_state_events(lines: Iterable[str]) -> list[dict]:
     return parse_jsonl_entries(lines)
 
 
+def _iter_parsed_lines(lines: Iterable[str]) -> Iterable[dict]:
+    """Yield parsed JSON dicts from lines, skipping malformed ones. Lazy."""
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            yield json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+
 # ---------------------------------------------------------------------------
 # Pure extractors: entries -> derived data
 # ---------------------------------------------------------------------------
@@ -173,22 +185,89 @@ def _extract_date(timestamp_str: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Pure assembly: extractors -> handoff dict
+# Single-pass streaming accumulator
 # ---------------------------------------------------------------------------
 
 
-def build_handoff_from_entries(
-    entries: list[dict], session_id: str, project_dir: str
-) -> dict:
-    """Build handoff dict from parsed JSONL entries (pure function)."""
-    files = extract_files_touched(entries)
-    commands = extract_commands_run(entries)
-    git_state = extract_git_state(commands)
-    timestamps = extract_timestamps(entries)
-    tool_usage = extract_tool_counts(entries)
-    date_str = _extract_date(timestamps["first_timestamp"])
+def _accumulate_from_entries(entries: Iterable[dict]) -> dict:
+    """Single-pass accumulation of all extracted data from entry stream.
 
-    recent_commands = [c["command"] for c in commands[-50:]]
+    Processes each entry exactly once, discarding it after extraction.
+    Returns a raw accumulation dict (not a handoff — use _assemble_handoff).
+    """
+    read_files: list[str] = []
+    edit_files: list[str] = []
+    write_files: list[str] = []
+    seen_reads: set[str] = set()
+    commands: list[dict] = []
+    tool_counts: dict[str, int] = {}
+    first_ts = ""
+    last_ts = ""
+
+    for entry in entries:
+        ts = entry.get("timestamp", "")
+        if ts:
+            if not first_ts:
+                first_ts = ts
+            last_ts = ts
+
+        if entry.get("type") != "assistant":
+            continue
+
+        content = entry.get("message", {}).get("content", [])
+        if not isinstance(content, list):
+            continue
+
+        timestamp = entry.get("timestamp", "")
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+
+            tool_name = block.get("name", "unknown")
+            tool_input = block.get("input", {})
+            tool_counts[tool_name] = tool_counts.get(tool_name, 0) + 1
+
+            file_path = tool_input.get("file_path", "")
+            if file_path:
+                if tool_name == "Read":
+                    if file_path not in seen_reads:
+                        read_files.append(file_path)
+                        seen_reads.add(file_path)
+                elif tool_name in ("Edit", "MultiEdit"):
+                    if file_path not in edit_files:
+                        edit_files.append(file_path)
+                elif tool_name == "Write":
+                    if file_path not in write_files:
+                        write_files.append(file_path)
+
+            if tool_name == "Bash":
+                command = tool_input.get("command", "")
+                if command:
+                    commands.append(
+                        {"command": command[:500], "timestamp": timestamp}
+                    )
+
+    created = [f for f in write_files if f not in seen_reads]
+    modified = list(
+        dict.fromkeys(edit_files + [f for f in write_files if f in seen_reads])
+    )
+
+    return {
+        "read_files": read_files,
+        "modified": modified,
+        "created": created,
+        "commands": commands,
+        "tool_counts": dict(sorted(tool_counts.items(), key=lambda x: -x[1])),
+        "first_ts": first_ts,
+        "last_ts": last_ts,
+    }
+
+
+def _assemble_handoff(acc: dict, session_id: str) -> dict:
+    """Assemble a handoff dict from accumulation results."""
+    git_state = extract_git_state(acc["commands"])
+    date_str = _extract_date(acc["first_ts"])
+    recent_commands = [c["command"] for c in acc["commands"][-50:]]
 
     return {
         "session": session_id,
@@ -197,15 +276,31 @@ def build_handoff_from_entries(
         "outcome": "auto-extracted",
         "goal": "Auto-extracted session summary",
         "files": {
-            "read": files["read"],
-            "modified": files["modified"],
-            "created": files["created"],
+            "read": acc["read_files"],
+            "modified": acc["modified"],
+            "created": acc["created"],
         },
         "commands_run": recent_commands,
         "git_state": git_state,
-        "tool_usage": tool_usage,
-        "duration": timestamps,
+        "tool_usage": acc["tool_counts"],
+        "duration": {
+            "first_timestamp": acc["first_ts"],
+            "last_timestamp": acc["last_ts"],
+        },
     }
+
+
+# ---------------------------------------------------------------------------
+# Pure assembly: extractors -> handoff dict (list-based, for testing)
+# ---------------------------------------------------------------------------
+
+
+def build_handoff_from_entries(
+    entries: list[dict], session_id: str, project_dir: str
+) -> dict:
+    """Build handoff dict from parsed JSONL entries (pure function)."""
+    acc = _accumulate_from_entries(entries)
+    return _assemble_handoff(acc, session_id)
 
 
 def build_handoff_from_state_events(
@@ -350,8 +445,8 @@ def generate_handoff(
         return build_handoff_from_state_events(events, session_id, project_dir)
     elif jsonl_path and jsonl_path.exists():
         with open(jsonl_path) as f:
-            entries = parse_jsonl_entries(f)
-        return build_handoff_from_entries(entries, session_id, project_dir)
+            acc = _accumulate_from_entries(_iter_parsed_lines(f))
+        return _assemble_handoff(acc, session_id)
     else:
         raise ValueError("No data source provided (need jsonl_path or state_file)")
 

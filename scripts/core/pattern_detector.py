@@ -18,6 +18,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 import numpy as np
+
+from scripts.core.config import get_config as _get_config
+
+_patterns_cfg = _get_config().patterns
 from scipy.sparse.csgraph import connected_components
 from scipy.sparse import csr_matrix
 from sklearn.cluster import HDBSCAN
@@ -61,8 +65,8 @@ class DetectedPattern:
 
 def cluster_by_embeddings(
     learnings: list[Learning],
-    min_cluster_size: int = 5,
-    min_samples: int = 3,
+    min_cluster_size: int = _patterns_cfg.min_cluster_size,
+    min_samples: int = _patterns_cfg.min_samples,
 ) -> list[list[int]]:
     """Cluster learnings by embedding similarity using HDBSCAN.
 
@@ -127,7 +131,7 @@ def compute_tag_idf(
 
 def detect_noise_tags(
     tag_idf: dict[str, float],
-    threshold_percentile: float = 10,
+    threshold_percentile: float = _patterns_cfg.tag_noise_percentile,
 ) -> set[str]:
     """Tags with IDF in the bottom percentile are noise.
 
@@ -145,8 +149,8 @@ def detect_noise_tags(
 
 def cluster_by_tags(
     learnings: list[Learning],
-    min_cooccurrence: float = 1.0,
-    min_component_size: int = 5,
+    min_cooccurrence: float = _patterns_cfg.min_cooccurrence,
+    min_component_size: int = _patterns_cfg.min_component_size,
     exclude_tags: set[str] | None = None,
     tag_idf: dict[str, float] | None = None,
 ) -> list[list[int]]:
@@ -229,7 +233,7 @@ def cluster_by_tags(
     for members in components.values():
         if len(members) < min_component_size:
             continue
-        if len(members) <= 20:
+        if len(members) <= _patterns_cfg.max_cluster_size:
             clusters.append(members)
         else:
             # Split large components by raising threshold
@@ -292,7 +296,7 @@ def _split_large_component(
 def fuse_clusters(
     embedding_clusters: list[list[int]],
     tag_clusters: list[list[int]],
-    overlap_threshold: float = 0.3,
+    overlap_threshold: float = _patterns_cfg.overlap_threshold,
 ) -> list[list[int]]:
     """Merge embedding and tag clusters using Jaccard overlap.
 
@@ -364,31 +368,35 @@ def classify_pattern_heuristic(members: list[Learning], reference_time: datetime
     # 1. Anti-pattern: all or majority FAILED_APPROACH
     if len(types) == 1 and "FAILED_APPROACH" in types:
         return "anti_pattern"
-    if types.get("FAILED_APPROACH", 0) / total > 0.6:
+    if types.get("FAILED_APPROACH", 0) / total > _patterns_cfg.anti_pattern_threshold:
         return "anti_pattern"
 
     # 2. Problem-solution: both ERROR_FIX and WORKING_SOLUTION present, combined >=40%
     error_fix = types.get("ERROR_FIX", 0)
     working_sol = types.get("WORKING_SOLUTION", 0)
-    if error_fix > 0 and working_sol > 0 and (error_fix + working_sol) / total >= 0.4:
+    if error_fix > 0 and working_sol > 0 and (error_fix + working_sol) / total >= _patterns_cfg.problem_solution_threshold:
         return "problem_solution"
 
     # 3. Expertise: temporally concentrated + type-homogeneous + context-diverse + multi-session
     now = reference_time or datetime.now(UTC)
-    recent = [m for m in members if (now - m.created_at).total_seconds() <= 30 * 24 * 3600]
+    recent = [
+        m for m in members
+        if (now - m.created_at).total_seconds() <= _patterns_cfg.cross_project_days * 24 * 3600
+    ]
     max_type_count = max(types.values())
-    if (len(recent) >= len(members) * 0.6
-            and max_type_count / total >= 0.6
-            and len(contexts) >= 4
-            and len(sessions) >= 3):
+    if (len(recent) >= len(members) * _patterns_cfg.expertise_threshold
+            and max_type_count / total >= _patterns_cfg.expertise_threshold
+            and len(contexts) >= _patterns_cfg.cross_project_contexts
+            and len(sessions) >= _patterns_cfg.cross_project_sessions):
         return "expertise"
 
     # 4. Tool cluster: highly homogeneous type + narrow context
-    if max_type_count / total >= 0.7 and len(contexts) <= 3:
+    if max_type_count / total >= _patterns_cfg.tool_cluster_threshold and len(contexts) <= 3:
         return "tool_cluster"
 
     # 5. Cross-project: residual catch-all
-    if len(contexts) >= 4 or (len(members) >= 5 and len(sessions) / len(members) > 0.7):
+    if (len(contexts) >= _patterns_cfg.cross_project_contexts
+            or (len(members) >= 5 and len(sessions) / len(members) > 0.7)):
         return "cross_project"
 
     return "tool_cluster"
@@ -517,10 +525,10 @@ def compute_distances(
 
 async def detect_patterns(
     learnings: list[Learning],
-    min_cluster_size: int = 5,
-    min_samples: int = 3,
-    min_confidence: float = 0.3,
-    tag_noise_percentile: float = 10,
+    min_cluster_size: int = _patterns_cfg.min_cluster_size,
+    min_samples: int = _patterns_cfg.min_samples,
+    min_confidence: float = _patterns_cfg.min_confidence,
+    tag_noise_percentile: float = _patterns_cfg.tag_noise_percentile,
     classifier: PatternClassifier | None = None,
 ) -> list[DetectedPattern]:
     """Run the full pattern detection pipeline.

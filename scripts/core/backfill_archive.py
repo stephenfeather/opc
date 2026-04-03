@@ -18,6 +18,15 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+# Add repository root to path
+_repo_root = str(Path(__file__).parent.parent.parent)
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
+
+from scripts.core.config import get_config as _get_config  # noqa: E402
+
+_archival_cfg = _get_config().archival
+
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
 
 # Load env (same as daemon)
@@ -81,7 +90,7 @@ def archive_jsonl(jsonl_path: Path, bucket: str, dry_run: bool = False):
         # Compress
         result = subprocess.run(
             ["zstd", "-q", "--rm", str(jsonl_path)],
-            capture_output=True, timeout=300,
+            capture_output=True, timeout=_archival_cfg.compress_timeout,
         )
         if result.returncode != 0:
             print(f"  zstd failed: {result.stderr.decode()}")
@@ -90,14 +99,14 @@ def archive_jsonl(jsonl_path: Path, bucket: str, dry_run: bool = False):
         # Upload
         result = subprocess.run(
             ["aws", "s3", "cp", str(zst_path), s3_key, "--quiet"],
-            capture_output=True, timeout=120,
+            capture_output=True, timeout=_archival_cfg.upload_timeout,
         )
         if result.returncode != 0:
             print(f"  S3 upload failed: {result.stderr.decode()}")
             # Restore original
             subprocess.run(
                 ["zstd", "-d", "-q", "--rm", str(zst_path)],
-                capture_output=True, timeout=300,
+                capture_output=True, timeout=_archival_cfg.compress_timeout,
             )
             return False
 
@@ -115,7 +124,7 @@ def archive_jsonl(jsonl_path: Path, bucket: str, dry_run: bool = False):
         if zst_path.exists() and not jsonl_path.exists():
             subprocess.run(
                 ["zstd", "-d", "-q", "--rm", str(zst_path)],
-                capture_output=True, timeout=300,
+                capture_output=True, timeout=_archival_cfg.compress_timeout,
             )
         return False
     except Exception as e:
@@ -138,7 +147,7 @@ def main():
 
     from datetime import datetime, timedelta
 
-    cutoff = datetime.now() - timedelta(minutes=10)
+    cutoff = datetime.now() - timedelta(minutes=_archival_cfg.skip_recent_minutes)
     all_jsonls = sorted(jsonl_dir.glob("*/*.jsonl"), key=lambda x: x.stat().st_mtime)
     jsonls = [
         f for f in all_jsonls

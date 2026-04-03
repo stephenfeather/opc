@@ -245,6 +245,156 @@ async def get_dedup_stats(conn: Any) -> dict:
     }
 
 
+async def get_embedding_coverage(conn: Any) -> dict:
+    """Report what % of active learnings have valid embeddings (all-time)."""
+    row = await conn.fetchrow(
+        """
+        SELECT
+            COUNT(*) FILTER (WHERE embedding IS NOT NULL) AS with_embedding,
+            COUNT(*) FILTER (WHERE embedding IS NULL) AS without_embedding,
+            COUNT(*) AS total
+        FROM archival_memory
+        WHERE superseded_by IS NULL
+        """
+    )
+    total = row["total"]
+    return {
+        "with_embedding": row["with_embedding"],
+        "without_embedding": row["without_embedding"],
+        "coverage_pct": round(100.0 * row["with_embedding"] / total, 1) if total else 0.0,
+    }
+
+
+async def get_feedback_velocity(conn: Any) -> dict:
+    """Report feedback rate per week over the last 4 weeks (all-time table)."""
+    table_exists = await conn.fetchval(
+        "SELECT to_regclass('public.memory_feedback') IS NOT NULL"
+    )
+    if not table_exists:
+        return {"weeks": [], "avg_per_week": 0.0}
+
+    rows = await conn.fetch(
+        """
+        SELECT
+            date_trunc('week', created_at)::date AS week_start,
+            COUNT(*) AS feedback_count,
+            COUNT(*) FILTER (WHERE helpful) AS helpful_count,
+            COUNT(*) FILTER (WHERE NOT helpful) AS not_helpful_count
+        FROM memory_feedback
+        WHERE created_at >= NOW() - INTERVAL '4 weeks'
+        GROUP BY week_start
+        ORDER BY week_start
+        """
+    )
+    weeks = [
+        {
+            "week": str(r["week_start"]),
+            "total": r["feedback_count"],
+            "helpful": r["helpful_count"],
+            "not_helpful": r["not_helpful_count"],
+        }
+        for r in rows
+    ]
+    total = sum(w["total"] for w in weeks)
+    n_weeks = max(len(weeks), 1)
+    return {
+        "weeks": weeks,
+        "avg_per_week": round(total / n_weeks, 1),
+    }
+
+
+async def get_supersession_candidates(conn: Any) -> dict:
+    """Identify learnings that are candidates for supersession/cleanup.
+
+    Criteria: active, never recalled, low confidence, older than 30 days.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT
+            COUNT(*) AS candidate_count,
+            COUNT(*) FILTER (
+                WHERE metadata->>'confidence' = 'low'
+            ) AS low_confidence,
+            COUNT(*) FILTER (
+                WHERE metadata->>'confidence' = 'medium'
+            ) AS medium_confidence,
+            COUNT(*) FILTER (
+                WHERE metadata->>'confidence' = 'high'
+            ) AS high_confidence
+        FROM archival_memory
+        WHERE superseded_by IS NULL
+          AND (recall_count = 0 OR last_recalled IS NULL)
+          AND created_at < NOW() - INTERVAL '30 days'
+        """
+    )
+    return {
+        "total_candidates": row["candidate_count"],
+        "by_confidence": {
+            "low": row["low_confidence"],
+            "medium": row["medium_confidence"],
+            "high": row["high_confidence"],
+        },
+        "criteria": "active, never recalled, older than 30 days",
+    }
+
+
+async def get_recall_frequency(conn: Any) -> dict:
+    """Report recall usage across sessions (all-time).
+
+    Uses recall_count on archival_memory to infer how recall is distributed.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT
+            COUNT(*) FILTER (WHERE recall_count > 0) AS recalled_learnings,
+            COUNT(*) AS total_active,
+            COALESCE(SUM(recall_count), 0) AS total_recalls,
+            COALESCE(AVG(recall_count) FILTER (WHERE recall_count > 0), 0) AS avg_recalls_when_used,
+            COALESCE(MAX(recall_count), 0) AS max_recalls
+        FROM archival_memory
+        WHERE superseded_by IS NULL
+        """
+    )
+    total = row["total_active"]
+    recalled = row["recalled_learnings"]
+    return {
+        "recalled_learnings": recalled,
+        "total_active": total,
+        "recall_rate_pct": round(100.0 * recalled / total, 1) if total else 0.0,
+        "total_recall_events": int(row["total_recalls"]),
+        "avg_recalls_per_recalled_learning": round(float(row["avg_recalls_when_used"]), 1),
+        "max_recalls_single_learning": int(row["max_recalls"]),
+    }
+
+
+async def get_type_recall_correlation(conn: Any) -> dict:
+    """Compare learning_type distribution: stored vs. actually recalled."""
+    rows = await conn.fetch(
+        """
+        SELECT
+            COALESCE(metadata->>'learning_type', 'unset') AS learning_type,
+            COUNT(*) AS total,
+            COUNT(*) FILTER (WHERE recall_count > 0) AS recalled,
+            COALESCE(SUM(recall_count), 0) AS total_recalls
+        FROM archival_memory
+        WHERE superseded_by IS NULL
+        GROUP BY learning_type
+        ORDER BY total DESC
+        """
+    )
+    result = {}
+    for r in rows:
+        total = r["total"]
+        recalled = r["recalled"]
+        result[r["learning_type"]] = {
+            "stored": total,
+            "recalled": recalled,
+            "recall_rate_pct": round(100.0 * recalled / total, 1) if total else 0.0,
+            "total_recall_events": int(r["total_recalls"]),
+        }
+    return result
+
+
 async def get_extraction_stats(conn: Any) -> dict:
     """Count sessions by extraction status (all-time)."""
     row = await conn.fetchrow(
@@ -397,12 +547,17 @@ async def collect_all_metrics(
         confidence = await get_confidence_distribution(conn, start, end)
         classification = await get_classification_distribution(conn, start, end)
         dedup = await get_dedup_stats(conn)  # always all-time
+        embedding_cov = await get_embedding_coverage(conn)  # always all-time
         extraction = await get_extraction_stats(conn)  # always all-time
         stale = await get_stale_learnings(conn, start, end)
         tags = await get_top_tags(conn)  # always all-time
         superseded = await get_superseded_stats(conn)  # always all-time
         temporal = await get_temporal_stats(conn)  # always all-time
         feedback = await get_feedback_stats(conn)  # always all-time
+        feedback_vel = await get_feedback_velocity(conn)  # always all-time
+        supersession_cand = await get_supersession_candidates(conn)  # always all-time
+        recall_freq = await get_recall_frequency(conn)  # always all-time
+        type_recall = await get_type_recall_correlation(conn)  # always all-time
 
     period = None
     if start or end:
@@ -431,12 +586,17 @@ async def collect_all_metrics(
         "confidence_distribution": confidence,
         "classification_distribution": classification,
         "dedup_stats_alltime": dedup,
+        "embedding_coverage_alltime": embedding_cov,
         "extraction_stats_alltime": extraction,
         "stale_learnings": stale,
         "top_tags_alltime": tags,
         "superseded_alltime": superseded,
         "temporal_alltime": temporal,
         "feedback_alltime": feedback,
+        "feedback_velocity": feedback_vel,
+        "supersession_candidates": supersession_cand,
+        "recall_frequency": recall_freq,
+        "type_recall_correlation": type_recall,
         "version": _get_version(),
     }
 
@@ -479,10 +639,73 @@ def format_human(metrics: dict) -> str:
         lines.append(f"  {lt:28s}  {data['count']:4d}  ({data['pct']:.1f}%)")
     lines.append("")
 
+    # --- System Health ---
+    lines.append("═══ System Health ═══")
+    lines.append("")
+
+    emb = metrics.get("embedding_coverage_alltime", {})
+    lines.append(f"Embedding Coverage:  {emb.get('coverage_pct', 0):.1f}% "
+                 f"({emb.get('with_embedding', 0)} with, "
+                 f"{emb.get('without_embedding', 0)} without)")
+
     d = metrics["dedup_stats_alltime"]
-    lines.append(f"Dedup (all-time):  {d['hash_coverage_pct']:.1f}% hash coverage "
+    lines.append(f"Dedup Hash Coverage: {d['hash_coverage_pct']:.1f}% "
                  f"({d['learnings_with_content_hash']} with, "
                  f"{d['learnings_without_content_hash']} without)")
+
+    fb = metrics.get("feedback_alltime", {})
+    total_fb = fb.get("total_feedback", 0)
+    if total_fb > 0:
+        lines.append(
+            f"Feedback (all-time): {fb['helpful']} helpful, {fb['not_helpful']} not helpful "
+            f"out of {total_fb} ({fb['helpfulness_rate_pct']:.1f}% helpful), "
+            f"{fb['unique_learnings_rated']} unique learnings rated"
+        )
+    else:
+        lines.append("Feedback (all-time): No feedback recorded yet")
+
+    fv = metrics.get("feedback_velocity", {})
+    lines.append(f"Feedback Velocity:   {fv.get('avg_per_week', 0):.1f}/week (last 4 weeks)")
+
+    sc = metrics.get("supersession_candidates", {})
+    lines.append(f"Supersession Candidates: {sc.get('total_candidates', 0)} "
+                 f"(never recalled, >30d old)")
+    by_conf = sc.get("by_confidence", {})
+    if any(by_conf.values()):
+        lines.append(f"  low: {by_conf.get('low', 0)}, "
+                     f"medium: {by_conf.get('medium', 0)}, "
+                     f"high: {by_conf.get('high', 0)}")
+    lines.append("")
+
+    # --- Recall Quality ---
+    lines.append("═══ Recall Quality ═══")
+    lines.append("")
+
+    rf = metrics.get("recall_frequency", {})
+    lines.append(f"Recall Rate:  {rf.get('recalled_learnings', 0)}/{rf.get('total_active', 0)} "
+                 f"ever recalled ({rf.get('recall_rate_pct', 0):.1f}%)")
+    lines.append(f"  Total recall events: {rf.get('total_recall_events', 0)}, "
+                 f"avg per recalled: {rf.get('avg_recalls_per_recalled_learning', 0):.1f}, "
+                 f"max: {rf.get('max_recalls_single_learning', 0)}")
+
+    s = metrics["stale_learnings"]
+    lines.append(f"Stale:  {s['never_recalled']}/{s['total_active']} never recalled "
+                 f"({s['never_recalled_pct']:.1f}%)")
+
+    trc = metrics.get("type_recall_correlation", {})
+    if trc:
+        lines.append("")
+        lines.append("Type vs Recall:")
+        lines.append(f"  {'Type':28s}  {'Stored':>6s}  {'Recalled':>8s}  {'Rate':>6s}  {'Events':>6s}")
+        for lt, data in trc.items():
+            lines.append(
+                f"  {lt:28s}  {data['stored']:6d}  {data['recalled']:8d}  "
+                f"{data['recall_rate_pct']:5.1f}%  {data['total_recall_events']:6d}"
+            )
+    lines.append("")
+
+    # --- Storage & Extraction ---
+    lines.append("═══ Storage & Extraction ═══")
     lines.append("")
 
     e = metrics["extraction_stats_alltime"]
@@ -493,9 +716,9 @@ def format_human(metrics: dict) -> str:
     lines.append(f"  Learnings/Extraction:  {lpe:.2f}")
     lines.append("")
 
-    s = metrics["stale_learnings"]
-    lines.append(f"Stale:  {s['never_recalled']}/{s['total_active']} never recalled "
-                 f"({s['never_recalled_pct']:.1f}%)")
+    sup = metrics["superseded_alltime"]
+    lines.append(f"Superseded (all-time):  {sup['superseded_count']}/{sup['total_learnings']} "
+                 f"({sup['superseded_pct']:.1f}%)")
     lines.append("")
 
     lines.append("Top Tags (all-time):")
@@ -503,27 +726,10 @@ def format_human(metrics: dict) -> str:
         lines.append(f"  {tag_data['tag']:20s}  {tag_data['count']:4d}")
     lines.append("")
 
-    sup = metrics["superseded_alltime"]
-    lines.append(f"Superseded (all-time):  {sup['superseded_count']}/{sup['total_learnings']} "
-                 f"({sup['superseded_pct']:.1f}%)")
-    lines.append("")
-
     tmp = metrics["temporal_alltime"]
     lines.append(f"Temporal (all-time):  oldest {tmp['oldest_learning']}")
     lines.append(f"           newest {tmp['newest_learning']}")
     lines.append(f"           last 7d: {tmp['last_7_days']},  last 30d: {tmp['last_30_days']}")
-    lines.append("")
-
-    fb = metrics.get("feedback_alltime", {})
-    total_fb = fb.get("total_feedback", 0)
-    if total_fb > 0:
-        lines.append(
-            f"Feedback (all-time):  {fb['helpful']} helpful, {fb['not_helpful']} not helpful "
-            f"out of {total_fb} ({fb['helpfulness_rate_pct']:.1f}% helpful), "
-            f"{fb['unique_learnings_rated']} unique learnings rated"
-        )
-    else:
-        lines.append("Feedback (all-time):  No feedback recorded yet")
 
     return "\n".join(lines)
 

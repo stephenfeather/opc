@@ -78,9 +78,10 @@ LEARNING_TYPES = [
 # Valid confidence levels
 CONFIDENCE_LEVELS = ["high", "medium", "low"]
 
-# Semantic deduplication threshold (0.92 = 92% cosine similarity).
-# Global cross-session check — catches near-duplicates from ANY session.
-DEDUP_THRESHOLD = 0.92
+# Loaded from opc.toml [dedup] threshold. See config.py for precedence chain.
+from scripts.core.config import get_config as _get_config
+
+DEDUP_THRESHOLD = _get_config().dedup.threshold
 
 
 async def store_learning_v2(

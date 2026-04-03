@@ -66,9 +66,10 @@ def _patches(mock_memory_service, mock_embedder):
     )
 
 
-def test_dedup_threshold_is_092():
-    """Threshold should be 0.92 per the enhancement spec."""
-    assert DEDUP_THRESHOLD == 0.92
+def test_dedup_threshold_from_config():
+    """Threshold should match opc.toml [dedup] threshold (default 0.85)."""
+    from scripts.core.config import get_config
+    assert DEDUP_THRESHOLD == get_config().dedup.threshold
 
 
 @pytest.mark.asyncio
@@ -158,13 +159,13 @@ async def test_global_dedup_rejects_at_exact_threshold(
 async def test_global_dedup_allows_just_below_threshold(
     mock_memory_service, mock_embedder
 ):
-    """Similarity just below 0.92 should be stored."""
+    """Similarity just below threshold should be stored."""
     mock_memory_service.search_vector_global.return_value = [
         {
             "id": "near-miss-uuid",
             "session_id": "other-session",
             "content": "Almost a match",
-            "similarity": 0.9199,
+            "similarity": DEDUP_THRESHOLD - 0.001,
         }
     ]
 

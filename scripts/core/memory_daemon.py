@@ -90,12 +90,15 @@ def _normalize_project(path_str: str) -> str | None:
         return name or None
     return p.name or None
 
-# Global config
-POLL_INTERVAL = 60  # seconds
-STALE_THRESHOLD = 900  # 15 minutes in seconds
-MAX_CONCURRENT_EXTRACTIONS = 4
-MAX_RETRIES = 5
-EXTRACTION_TIMEOUT = 1800  # 30 minutes - kill stuck extraction subprocesses
+# Config from opc.toml [daemon]
+from scripts.core.config import get_config as _get_config
+_daemon_cfg = _get_config().daemon
+
+POLL_INTERVAL = _daemon_cfg.poll_interval
+STALE_THRESHOLD = _daemon_cfg.stale_threshold
+MAX_CONCURRENT_EXTRACTIONS = _daemon_cfg.max_concurrent_extractions
+MAX_RETRIES = _daemon_cfg.max_retries
+EXTRACTION_TIMEOUT = _daemon_cfg.extraction_timeout
 PID_FILE = Path.home() / ".claude" / "memory-daemon.pid"
 LOG_FILE = Path.home() / ".claude" / "memory-daemon.log"
 
@@ -105,9 +108,7 @@ pending_queue: list[tuple[str, str, str | None]] = []  # [(session_id, project, 
 
 # Pattern detection state (module-level for daemon process)
 # Interval configurable via PATTERN_DETECTION_INTERVAL_HOURS env var
-_PATTERN_DETECTION_INTERVAL = int(
-    os.environ.get("PATTERN_DETECTION_INTERVAL_HOURS", "6")
-) * 3600
+_PATTERN_DETECTION_INTERVAL = _daemon_cfg.pattern_detection_interval_hours * 3600
 _pattern_proc: subprocess.Popen | None = None
 _last_pattern_run: float = 0
 
@@ -536,9 +537,9 @@ Store each learning using store_learning.py with appropriate type and tags."""
         proc = subprocess.Popen(
             [
                 "claude", "-p",
-                "--model", "sonnet",
+                "--model", _daemon_cfg.extraction_model,
                 "--dangerously-skip-permissions",
-                "--max-turns", "15",
+                "--max-turns", str(_daemon_cfg.extraction_max_turns),
                 "--append-system-prompt", agent_prompt,
                 f"Extract learnings from session {session_id}. JSONL path: {jsonl_path}"
             ],

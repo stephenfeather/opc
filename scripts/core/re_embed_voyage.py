@@ -48,7 +48,9 @@ from scripts.core.db.postgres_pool import close_pool, get_connection  # noqa: E4
 
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
-BATCH_SIZE = 64
+from scripts.core.config import get_config as _get_config
+
+BATCH_SIZE = _get_config().embedding.re_embed_batch_size
 TARGET_MODEL = "voyage-code-3"
 
 

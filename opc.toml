@@ -1,0 +1,154 @@
+# OPC Configuration
+# ─────────────────
+# Opinionated Persistent Context — memory system for Claude Code.
+#
+# This file is loaded automatically from:
+#   1. Path in OPC_CONFIG env var (highest priority)
+#   2. ./opc.toml (project root)
+#   3. ~/.config/opc/config.toml (user global)
+#
+# Any value omitted here falls back to the built-in default.
+# Environment variables override config file values (see each section).
+
+
+[dedup]
+# Cosine similarity threshold for semantic deduplication.
+# Learnings above this similarity to an existing learning are rejected.
+# Range: 0.0–1.0. Based on density analysis: 0.85+ is same-fact rewording.
+threshold = 0.85
+
+
+[daemon]
+# How often the daemon checks for new sessions (seconds).
+poll_interval = 60
+
+# Sessions must be this old before extraction qualifies (seconds).
+stale_threshold = 900
+
+# Max simultaneous Claude extraction subprocesses.
+max_concurrent_extractions = 4
+
+# DB connection retry count.
+max_retries = 5
+
+# Kill extraction subprocess after this many seconds.
+extraction_timeout = 1800
+
+# Hours between pattern detection runs.
+# Env override: PATTERN_DETECTION_INTERVAL_HOURS
+pattern_detection_interval_hours = 6
+
+# Claude model used for extraction subprocesses.
+extraction_model = "sonnet"
+
+# Max turns per extraction subprocess.
+extraction_max_turns = 15
+
+
+[reranker]
+# Contextual signal weights (should sum to ~0.35).
+project_weight = 0.15
+recency_weight = 0.05
+confidence_weight = 0.05
+recall_weight = 0.05
+type_affinity_weight = 0.05
+tag_overlap_weight = 0.05
+pattern_weight = 0.05
+
+# Exponential decay half-life for recency scoring (days).
+recency_half_life_days = 45
+
+# Recall count normalizer: recall_count of 2^N scores as 1.0.
+recall_log2_normalizer = 4
+
+# Scale-up factor for hybrid_rrf raw scores in calibration.
+rrf_scale_factor = 60
+
+
+[patterns]
+# HDBSCAN clustering parameters.
+min_cluster_size = 5
+min_samples = 3
+
+# Minimum confidence for a detected pattern to be stored.
+min_confidence = 0.3
+
+# Bottom Nth percentile of tag IDF treated as noise.
+tag_noise_percentile = 10
+
+# Minimum IDF-weighted edge for tag co-occurrence graph.
+min_cooccurrence = 1.0
+
+# Minimum connected component size for tag clusters.
+min_component_size = 5
+
+# Jaccard overlap threshold for merging embedding + tag clusters.
+overlap_threshold = 0.3
+
+# Split tag clusters larger than this.
+max_cluster_size = 20
+
+# Classification heuristic thresholds.
+anti_pattern_threshold = 0.6
+problem_solution_threshold = 0.4
+expertise_threshold = 0.6
+tool_cluster_threshold = 0.7
+cross_project_days = 30
+cross_project_contexts = 4
+cross_project_sessions = 3
+
+
+[recall]
+# Default number of results returned.
+default_k = 5
+
+# RRF constant (higher = more weight to lower-ranked results).
+rrf_k = 60
+
+# Max IDF terms added during query expansion.
+max_expansion_terms = 5
+
+# Recall-count boost multiplier in hybrid RRF query.
+recall_boost_multiplier = 0.002
+
+# BM25 normalization divisor for SQLite scores.
+bm25_normalization_divisor = 25.0
+
+
+[embedding]
+# Default Ollama model for local embeddings.
+# Env override: OLLAMA_EMBED_MODEL
+ollama_model = "nomic-embed-text"
+
+# Default Ollama server URL.
+# Env override: OLLAMA_HOST
+ollama_host = "http://localhost:11434"
+
+# Batch size for re-embedding operations.
+re_embed_batch_size = 64
+
+
+[query_expansion]
+# Hours before the on-disk IDF cache is rebuilt.
+idf_max_age_hours = 24
+
+# If doc count drifts more than this fraction, force IDF rebuild.
+idf_drift_threshold = 0.10
+
+
+[archival]
+# Subprocess timeouts for backup operations (seconds).
+compress_timeout = 300
+upload_timeout = 300
+
+# Files modified within this many minutes are skipped from archival.
+skip_recent_minutes = 10
+
+
+[database]
+# Max asyncpg connection pool size.
+# Env override: AGENTICA_MAX_POOL_SIZE
+max_pool_size = 10
+
+# Max archival facts included when building LLM context string.
+max_archival_context = 10

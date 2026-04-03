@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from scripts.core.config import get_config as _get_config
+
 logger = logging.getLogger(__name__)
 
 # Shared stopwords — merges recall_backends meta_words with standard English
@@ -39,8 +41,9 @@ STOPWORDS: frozenset[str] = frozenset({
 
 _ALNUM_RE = re.compile(r"[^a-zA-Z0-9]")
 _IDF_CACHE_PATH = Path.home() / ".claude" / "cache" / "idf_index.json"
-_IDF_MAX_AGE_HOURS = 24
-_IDF_DRIFT_THRESHOLD = 0.10  # rebuild if doc count drifts >10%
+_qe_cfg = _get_config().query_expansion
+_IDF_MAX_AGE_HOURS = _qe_cfg.idf_max_age_hours
+_IDF_DRIFT_THRESHOLD = _qe_cfg.idf_drift_threshold
 
 
 def _tokenize(text: str) -> list[str]:

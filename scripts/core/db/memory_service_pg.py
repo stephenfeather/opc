@@ -1,6 +1,9 @@
 """Memory Service with PostgreSQL + pgvector backend.
 
-Async rewrite of memory_service.py with:
+Async I/O layer that delegates query building and formatting to pure
+functions in memory_service_queries.py.
+
+Architecture:
 - Core Memory: Key-value blocks per session/agent
 - Archival Memory: Long-term storage with FTS + vector search
 - Recall Memory: Cross-source query combining all sources
@@ -13,13 +16,8 @@ Usage:
     memory = MemoryServicePG(session_id="abc123")
     await memory.connect()
 
-    # Core memory
     await memory.set_core("persona", "You are a helpful assistant")
-
-    # Archival memory
     await memory.store("User prefers Python")
-
-    # Recall (cross-source query)
     result = await memory.recall("What language?")
 
     await memory.close()
@@ -33,15 +31,30 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Protocol
-from uuid import uuid4
+from typing import TYPE_CHECKING, Any, Protocol
 
 import asyncpg
-import numpy as np
 
+if TYPE_CHECKING:
+    from .memory_block import Block
+
+from .memory_service_queries import (
+    build_hybrid_search_sql,
+    build_text_search_sql,
+    build_vector_search_sql,
+    filter_core_by_query,
+    format_context_string,
+    format_recall_text,
+    format_rows,
+    generate_memory_id,
+    pad_embedding,
+)
 from .postgres_pool import get_connection, get_pool, get_transaction, init_pgvector
 
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+faulthandler.enable(
+    file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"),
+    all_threads=True,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,14 +72,6 @@ class EmbeddingProvider(Protocol):
         ...
 
 
-def generate_memory_id() -> str:
-    """Generate a UUID for memory ID.
-
-    Returns a proper UUID string for PostgreSQL UUID column.
-    """
-    return str(uuid4())
-
-
 @dataclass
 class ArchivalFact:
     """A fact stored in archival memory."""
@@ -75,20 +80,13 @@ class ArchivalFact:
     content: str
     metadata: dict[str, Any]
     created_at: datetime
-    similarity: float | None = None  # For vector search results
+    similarity: float | None = None
 
 
 class MemoryServicePG:
     """Async memory service with PostgreSQL + pgvector backend.
 
-    Scoping model (R-Flow):
-    - session_id: Claude Code session
-    - agent_id: Optional agent within session
-
-    Architecture:
-    - Core Memory: Key-value blocks (fast reads, concurrent writes)
-    - Archival Memory: Long-term with FTS + vector search
-    - Recall Memory: Query interface combining all sources
+    Thin I/O wrapper — pure logic lives in memory_service_queries.py.
     """
 
     def __init__(
@@ -96,12 +94,6 @@ class MemoryServicePG:
         session_id: str = "default",
         agent_id: str | None = None,
     ):
-        """Initialize memory service.
-
-        Args:
-            session_id: Session identifier for isolation
-            agent_id: Optional agent identifier for agent-specific memory
-        """
         self.session_id = session_id
         self.agent_id = agent_id
         self._pool: asyncpg.Pool | None = None
@@ -112,153 +104,90 @@ class MemoryServicePG:
 
     async def close(self) -> None:
         """Release connection (pool stays open for other services)."""
-        # Pool is shared, don't close it here
         pass
 
     # ==================== Core Memory ====================
 
     async def set_core(self, key: str, value: str) -> None:
-        """Set a core memory block.
-
-        Args:
-            key: Block key (e.g., "persona", "task", "context")
-            value: Block content
-        """
+        """Set a core memory block (DELETE + INSERT for NULL agent_id compat)."""
         async with get_transaction() as conn:
-            # Use DELETE + INSERT to handle NULL agent_id properly
-            # PostgreSQL's ON CONFLICT doesn't work well with NULL values
-            # Transaction wrapper ensures atomicity on concurrent writes
             await conn.execute(
                 """
                 DELETE FROM core_memory
                 WHERE session_id = $1 AND agent_id IS NOT DISTINCT FROM $2 AND key = $3
-            """,
-                self.session_id,
-                self.agent_id,
-                key,
+                """,
+                self.session_id, self.agent_id, key,
             )
             await conn.execute(
                 """
                 INSERT INTO core_memory (session_id, agent_id, key, value, updated_at)
                 VALUES ($1, $2, $3, $4, NOW())
-            """,
-                self.session_id,
-                self.agent_id,
-                key,
-                value,
+                """,
+                self.session_id, self.agent_id, key, value,
             )
 
     async def get_core(self, key: str) -> str | None:
-        """Get a core memory block.
-
-        Args:
-            key: Block key
-
-        Returns:
-            Block content or None if not found
-        """
+        """Get a core memory block value."""
         async with get_connection() as conn:
             row = await conn.fetchrow(
                 """
                 SELECT value FROM core_memory
                 WHERE session_id = $1 AND agent_id IS NOT DISTINCT FROM $2 AND key = $3
-            """,
-                self.session_id,
-                self.agent_id,
-                key,
+                """,
+                self.session_id, self.agent_id, key,
             )
             return row["value"] if row else None
 
     async def list_core_keys(self) -> list[str]:
-        """List all core memory block keys.
-
-        Returns:
-            List of keys
-        """
+        """List all core memory block keys."""
         async with get_connection() as conn:
             rows = await conn.fetch(
                 """
                 SELECT key FROM core_memory
                 WHERE session_id = $1 AND agent_id IS NOT DISTINCT FROM $2
                 ORDER BY key
-            """,
-                self.session_id,
-                self.agent_id,
+                """,
+                self.session_id, self.agent_id,
             )
             return [row["key"] for row in rows]
 
     async def delete_core(self, key: str) -> None:
-        """Delete a core memory block.
-
-        Args:
-            key: Block key to delete
-        """
+        """Delete a core memory block."""
         async with get_connection() as conn:
             await conn.execute(
                 """
                 DELETE FROM core_memory
                 WHERE session_id = $1 AND agent_id IS NOT DISTINCT FROM $2 AND key = $3
-            """,
-                self.session_id,
-                self.agent_id,
-                key,
+                """,
+                self.session_id, self.agent_id, key,
             )
 
     async def get_all_core(self) -> dict[str, str]:
-        """Get all core memory blocks.
-
-        Returns:
-            Dict of key -> value
-        """
+        """Get all core memory blocks as key→value dict."""
         async with get_connection() as conn:
             rows = await conn.fetch(
                 """
                 SELECT key, value FROM core_memory
                 WHERE session_id = $1 AND agent_id IS NOT DISTINCT FROM $2
                 ORDER BY key
-            """,
-                self.session_id,
-                self.agent_id,
+                """,
+                self.session_id, self.agent_id,
             )
             return {row["key"]: row["value"] for row in rows}
 
     # ==================== Block-Based Core Memory ====================
 
     async def set_block(self, block: Block) -> None:
-        """Set a Block in core memory.
-
-        Stores the block's value under its label, with limit in metadata.
-        This provides Letta-compatible block storage in core memory.
-
-        Args:
-            block: Block instance to store
-
-        Note:
-            Import Block lazily to avoid circular imports.
-        """
-
-        # Store as JSON with limit and metadata preserved
-        block_data = json.dumps(
-            {
-                "value": block.value,
-                "limit": block.limit,
-                "metadata": block.metadata,
-            }
-        )
+        """Set a Block in core memory (Letta-compatible)."""
+        block_data = json.dumps({
+            "value": block.value,
+            "limit": block.limit,
+            "metadata": block.metadata,
+        })
         await self.set_core(block.label, block_data)
 
     async def get_block(self, label: str) -> Block | None:
-        """Get a Block from core memory.
-
-        Retrieves block data stored via set_block() and reconstructs
-        the Block instance with preserved limit and metadata.
-
-        Args:
-            label: Block label to retrieve
-
-        Returns:
-            Block instance or None if not found
-        """
+        """Get a Block from core memory."""
         from .memory_block import Block
 
         raw = await self.get_core(label)
@@ -266,7 +195,6 @@ class MemoryServicePG:
             return None
 
         try:
-            # Parse JSON block data
             data = json.loads(raw)
             return Block(
                 label=label,
@@ -275,19 +203,14 @@ class MemoryServicePG:
                 metadata=data.get("metadata", {}),
             )
         except (json.JSONDecodeError, TypeError):
-            # Fall back to treating raw value as plain string (backward compat)
             return Block(label=label, value=raw)
 
     async def get_all_blocks(self) -> dict[str, Block]:
-        """Get all Blocks from core memory.
-
-        Returns:
-            Dict mapping label to Block instance
-        """
+        """Get all Blocks from core memory."""
         from .memory_block import Block
 
         all_core = await self.get_all_core()
-        blocks = {}
+        blocks: dict[str, Block] = {}
 
         for label, raw in all_core.items():
             try:
@@ -300,10 +223,8 @@ class MemoryServicePG:
                         metadata=data.get("metadata", {}),
                     )
                 else:
-                    # Plain string value
                     blocks[label] = Block(label=label, value=raw)
             except (json.JSONDecodeError, TypeError):
-                # Plain string value
                 blocks[label] = Block(label=label, value=raw)
 
         return blocks
@@ -323,34 +244,17 @@ class MemoryServicePG:
     ) -> str:
         """Store a fact in archival memory.
 
-        Args:
-            content: Fact content
-            metadata: Optional metadata dict
-            embedding: Optional pre-computed embedding (normalized to 1024 dims)
-            tags: Optional list of tags for categorization
-            content_hash: SHA-256 hash for deduplication
-            host_id: Machine identifier for multi-system support
-            supersedes: UUID of an older learning this one replaces.
-                When set, the old row's superseded_by is updated atomically
-                within the same transaction as the INSERT.
-            project: Optional project name for recall relevance
-
-        Returns:
-            Memory ID (or empty string if deduplicated)
+        Returns memory ID (or empty string if deduplicated).
         """
         memory_id = generate_memory_id()
 
-        # Normalize embedding to 1024 dims if provided
-        # Treat empty list as no embedding
         padded_embedding = None
         if embedding is not None and len(embedding) > 0:
-            padded_embedding = self._pad_embedding(embedding)
+            padded_embedding = pad_embedding(embedding)
 
         async with get_transaction() as conn:
             if padded_embedding is not None:
-                # Register vector type for this connection
                 await init_pgvector(conn)
-
                 result = await conn.execute(
                     """
                     INSERT INTO archival_memory
@@ -360,16 +264,10 @@ class MemoryServicePG:
                     ON CONFLICT (content_hash)
                         WHERE content_hash IS NOT NULL
                         DO NOTHING
-                """,
-                    memory_id,
-                    self.session_id,
-                    self.agent_id,
-                    content,
-                    json.dumps(metadata or {}),
-                    padded_embedding,
-                    content_hash,
-                    host_id,
-                    project,
+                    """,
+                    memory_id, self.session_id, self.agent_id, content,
+                    json.dumps(metadata or {}), padded_embedding,
+                    content_hash, host_id, project,
                 )
             else:
                 result = await conn.execute(
@@ -381,73 +279,42 @@ class MemoryServicePG:
                     ON CONFLICT (content_hash)
                         WHERE content_hash IS NOT NULL
                         DO NOTHING
-                """,
-                    memory_id,
-                    self.session_id,
-                    self.agent_id,
-                    content,
-                    json.dumps(metadata or {}),
-                    content_hash,
-                    host_id,
-                    project,
+                    """,
+                    memory_id, self.session_id, self.agent_id, content,
+                    json.dumps(metadata or {}), content_hash, host_id, project,
                 )
 
-            # Check if insert actually happened (dedup may have skipped)
             if result == "INSERT 0 0":
                 return ""
 
-            # Store tags if provided (deduplicated via set)
             if tags:
-                unique_tags = set(tags)
-                for tag in unique_tags:
+                for tag in set(tags):
                     await conn.execute(
                         """
                         INSERT INTO memory_tags (memory_id, tag, session_id)
                         VALUES ($1, $2, $3)
                         ON CONFLICT (memory_id, tag) DO NOTHING
                         """,
-                        memory_id,
-                        tag,
-                        self.session_id,
+                        memory_id, tag, self.session_id,
                     )
 
-            # Mark the old learning as superseded (same transaction)
             if supersedes:
                 try:
                     await conn.execute(
                         """
                         UPDATE archival_memory
-                        SET superseded_by = $1::uuid,
-                            superseded_at = NOW()
-                        WHERE id = $2::uuid
-                          AND superseded_by IS NULL
+                        SET superseded_by = $1::uuid, superseded_at = NOW()
+                        WHERE id = $2::uuid AND superseded_by IS NULL
                         """,
-                        memory_id,
-                        supersedes,
+                        memory_id, supersedes,
                     )
                 except Exception:
-                    # Column may not exist yet; don't break the insert
                     logger.debug(
                         "Supersede UPDATE failed for %s -> %s",
                         supersedes, memory_id, exc_info=True,
                     )
 
         return memory_id
-
-    def _pad_embedding(self, embedding: list[float], target_dim: int = 1024) -> list[float]:
-        """Pad or truncate embedding to target dimension.
-
-        Args:
-            embedding: Original embedding
-            target_dim: Target dimension (default 1024 to match bge-large-en-v1.5)
-
-        Returns:
-            Padded/truncated embedding as list
-        """
-        vec = np.array(embedding)
-        if len(vec) >= target_dim:
-            return vec[:target_dim].tolist()
-        return np.pad(vec, (0, target_dim - len(vec)), mode="constant").tolist()
 
     async def search_text(
         self,
@@ -456,68 +323,14 @@ class MemoryServicePG:
         start_date: datetime | None = None,
         end_date: datetime | None = None,
     ) -> list[dict[str, Any]]:
-        """Search archival memory with full-text search.
-
-        Args:
-            query: Search query
-            limit: Max results to return
-            start_date: Optional start of date range (inclusive)
-            end_date: Optional end of date range (inclusive)
-
-        Returns:
-            List of matching facts with ranking
-        """
+        """Search archival memory with full-text search."""
+        sql, params = build_text_search_sql(
+            self.session_id, self.agent_id, query, limit,
+            start_date=start_date, end_date=end_date,
+        )
         async with get_connection() as conn:
-            # Build query dynamically based on date filters
-            conditions = [
-                "session_id = $1",
-                "agent_id IS NOT DISTINCT FROM $2",
-                "to_tsvector('english', content) @@ plainto_tsquery('english', $3)",
-            ]
-            params: list[Any] = [self.session_id, self.agent_id, query]
-            param_idx = 4
-
-            if start_date is not None:
-                conditions.append(f"created_at >= ${param_idx}")
-                params.append(start_date)
-                param_idx += 1
-
-            if end_date is not None:
-                conditions.append(f"created_at <= ${param_idx}")
-                params.append(end_date)
-                param_idx += 1
-
-            params.append(limit)
-
-            where_clause = " AND ".join(conditions)
-            sql = f"""
-                SELECT
-                    id,
-                    content,
-                    metadata,
-                    created_at,
-                    ts_rank(
-                        to_tsvector('english', content),
-                        plainto_tsquery('english', $3)
-                    ) as rank
-                FROM archival_memory
-                WHERE {where_clause}
-                ORDER BY rank DESC
-                LIMIT ${param_idx}
-            """
-
             rows = await conn.fetch(sql, *params)
-
-            return [
-                {
-                    "id": row["id"],
-                    "content": row["content"],
-                    "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
-                    "created_at": row["created_at"],
-                    "rank": row["rank"],
-                }
-                for row in rows
-            ]
+            return format_rows(rows, extra_fields=["rank"])
 
     async def search_vector(
         self,
@@ -526,75 +339,19 @@ class MemoryServicePG:
         start_date: datetime | None = None,
         end_date: datetime | None = None,
     ) -> list[dict[str, Any]]:
-        """Search archival memory with vector similarity.
-
-        Args:
-            query_embedding: Query embedding (normalized to 1024 dims)
-            limit: Max results to return
-            start_date: Optional start of date range (inclusive)
-            end_date: Optional end of date range (inclusive)
-
-        Returns:
-            List of matching facts with cosine similarity score
-        """
-        padded_query = self._pad_embedding(query_embedding)
-
+        """Search archival memory with vector similarity."""
+        padded_query = pad_embedding(query_embedding)
+        sql, params = build_vector_search_sql(
+            self.session_id, self.agent_id, padded_query, limit,
+            start_date=start_date, end_date=end_date,
+        )
         async with get_connection() as conn:
             await init_pgvector(conn)
-
-            # Build query dynamically based on date filters
-            conditions = [
-                "session_id = $1",
-                "agent_id IS NOT DISTINCT FROM $2",
-                "embedding IS NOT NULL",
-            ]
-            params: list[Any] = [self.session_id, self.agent_id, padded_query]
-            param_idx = 4
-
-            if start_date is not None:
-                conditions.append(f"created_at >= ${param_idx}")
-                params.append(start_date)
-                param_idx += 1
-
-            if end_date is not None:
-                conditions.append(f"created_at <= ${param_idx}")
-                params.append(end_date)
-                param_idx += 1
-
-            params.append(limit)
-
-            where_clause = " AND ".join(conditions)
-            sql = f"""
-                SELECT
-                    id,
-                    content,
-                    metadata,
-                    created_at,
-                    1 - (embedding <=> $3::vector) as similarity
-                FROM archival_memory
-                WHERE {where_clause}
-                ORDER BY embedding <=> $3::vector
-                LIMIT ${param_idx}
-            """
-
             rows = await conn.fetch(sql, *params)
-
-            return [
-                {
-                    "id": row["id"],
-                    "content": row["content"],
-                    "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
-                    "created_at": row["created_at"],
-                    "similarity": row["similarity"],
-                }
-                for row in rows
-            ]
+            return format_rows(rows, extra_fields=["similarity"])
 
     async def search(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
-        """Search archival memory with FTS (backward compatible).
-
-        Alias for search_text() to match original API.
-        """
+        """Search archival memory with FTS (backward compatible alias)."""
         return await self.search_text(query, limit)
 
     async def search_vector_with_threshold(
@@ -603,28 +360,13 @@ class MemoryServicePG:
         threshold: float = 0.0,
         limit: int = 10,
     ) -> list[dict[str, Any]]:
-        """Search archival memory with vector similarity and threshold filter.
-
-        Args:
-            query_embedding: Query embedding (will be padded to 4096)
-            threshold: Minimum similarity threshold (0.0 to 1.0)
-            limit: Max results to return
-
-        Returns:
-            List of matching facts with cosine similarity score >= threshold
-        """
-        padded_query = self._pad_embedding(query_embedding)
-
+        """Search archival memory with vector similarity and threshold filter."""
+        padded_query = pad_embedding(query_embedding)
         async with get_connection() as conn:
             await init_pgvector(conn)
-
             rows = await conn.fetch(
                 """
-                SELECT
-                    id,
-                    content,
-                    metadata,
-                    created_at,
+                SELECT id, content, metadata, created_at,
                     1 - (embedding <=> $3::vector) as similarity
                 FROM archival_memory
                 WHERE session_id = $1
@@ -633,24 +375,10 @@ class MemoryServicePG:
                 AND (1 - (embedding <=> $3::vector)) >= $4
                 ORDER BY embedding <=> $3::vector
                 LIMIT $5
-            """,
-                self.session_id,
-                self.agent_id,
-                padded_query,
-                threshold,
-                limit,
+                """,
+                self.session_id, self.agent_id, padded_query, threshold, limit,
             )
-
-            return [
-                {
-                    "id": row["id"],
-                    "content": row["content"],
-                    "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
-                    "created_at": row["created_at"],
-                    "similarity": row["similarity"],
-                }
-                for row in rows
-            ]
+            return format_rows(rows, extra_fields=["similarity"])
 
     async def search_vector_with_filter(
         self,
@@ -658,29 +386,13 @@ class MemoryServicePG:
         metadata_filter: dict[str, Any],
         limit: int = 10,
     ) -> list[dict[str, Any]]:
-        """Search archival memory with vector similarity and metadata filter.
-
-        Args:
-            query_embedding: Query embedding (will be padded to 4096)
-            metadata_filter: Dict of key-value pairs to filter by (exact match)
-            limit: Max results to return
-
-        Returns:
-            List of matching facts filtered by metadata with cosine similarity score
-        """
-        padded_query = self._pad_embedding(query_embedding)
-
+        """Search archival memory with vector similarity and metadata filter."""
+        padded_query = pad_embedding(query_embedding)
         async with get_connection() as conn:
             await init_pgvector(conn)
-
-            # Build JSONB containment query for metadata filter
             rows = await conn.fetch(
                 """
-                SELECT
-                    id,
-                    content,
-                    metadata,
-                    created_at,
+                SELECT id, content, metadata, created_at,
                     1 - (embedding <=> $3::vector) as similarity
                 FROM archival_memory
                 WHERE session_id = $1
@@ -689,24 +401,11 @@ class MemoryServicePG:
                 AND metadata @> $4::jsonb
                 ORDER BY embedding <=> $3::vector
                 LIMIT $5
-            """,
-                self.session_id,
-                self.agent_id,
-                padded_query,
-                json.dumps(metadata_filter),
-                limit,
+                """,
+                self.session_id, self.agent_id, padded_query,
+                json.dumps(metadata_filter), limit,
             )
-
-            return [
-                {
-                    "id": row["id"],
-                    "content": row["content"],
-                    "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
-                    "created_at": row["created_at"],
-                    "similarity": row["similarity"],
-                }
-                for row in rows
-            ]
+            return format_rows(rows, extra_fields=["similarity"])
 
     async def search_vector_global(
         self,
@@ -714,55 +413,25 @@ class MemoryServicePG:
         threshold: float = 0.92,
         limit: int = 5,
     ) -> list[dict[str, Any]]:
-        """Search archival memory globally (all sessions) with similarity threshold.
-
-        Used for deduplication at store time — finds near-duplicates across
-        all sessions, not just the current one.
-
-        Args:
-            query_embedding: Query embedding vector
-            threshold: Minimum cosine similarity (0.0 to 1.0)
-            limit: Max results to return
-
-        Returns:
-            List of matching facts with cosine similarity score >= threshold
-        """
-        padded_query = self._pad_embedding(query_embedding)
-
+        """Search archival memory globally (all sessions) with similarity threshold."""
+        padded_query = pad_embedding(query_embedding)
         async with get_connection() as conn:
             await init_pgvector(conn)
-
             rows = await conn.fetch(
                 """
-                SELECT
-                    id,
-                    session_id,
-                    content,
-                    metadata,
-                    created_at,
+                SELECT id, session_id, content, metadata, created_at,
                     1 - (embedding <=> $1::vector) as similarity
                 FROM archival_memory
                 WHERE embedding IS NOT NULL
                 AND (1 - (embedding <=> $1::vector)) >= $2
                 ORDER BY embedding <=> $1::vector
                 LIMIT $3
-            """,
-                padded_query,
-                threshold,
-                limit,
+                """,
+                padded_query, threshold, limit,
             )
-
-            return [
-                {
-                    "id": row["id"],
-                    "session_id": row["session_id"],
-                    "content": row["content"],
-                    "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
-                    "created_at": row["created_at"],
-                    "similarity": row["similarity"],
-                }
-                for row in rows
-            ]
+            return format_rows(
+                rows, extra_fields=["session_id", "similarity"]
+            )
 
     async def search_hybrid(
         self,
@@ -774,103 +443,20 @@ class MemoryServicePG:
         start_date: datetime | None = None,
         end_date: datetime | None = None,
     ) -> list[dict[str, Any]]:
-        """Hybrid search combining full-text search and vector similarity.
-
-        Uses a weighted combination of FTS rank and vector similarity.
-
-        Args:
-            text_query: Text query for FTS
-            query_embedding: Query embedding for vector search
-            limit: Max results to return
-            text_weight: Weight for text search score (default 0.3)
-            vector_weight: Weight for vector similarity (default 0.7)
-            start_date: Optional start of date range (inclusive)
-            end_date: Optional end of date range (inclusive)
-
-        Returns:
-            List of matching facts with combined score
-        """
-        padded_query = self._pad_embedding(query_embedding)
-
+        """Hybrid search combining full-text search and vector similarity."""
+        padded_query = pad_embedding(query_embedding)
+        sql, params = build_hybrid_search_sql(
+            self.session_id, self.agent_id, text_query, padded_query, limit,
+            text_weight=text_weight, vector_weight=vector_weight,
+            start_date=start_date, end_date=end_date,
+        )
         async with get_connection() as conn:
             await init_pgvector(conn)
-
-            # Build query dynamically based on date filters
-            conditions = [
-                "session_id = $1",
-                "agent_id IS NOT DISTINCT FROM $2",
-                "(to_tsvector('english', content) @@ plainto_tsquery('english', $3) OR embedding IS NOT NULL)",
-            ]
-            # Base params: session_id, agent_id, text_query, embedding, text_weight, vector_weight
-            params: list[Any] = [
-                self.session_id,
-                self.agent_id,
-                text_query,
-                padded_query,
-                text_weight,
-                vector_weight,
-            ]
-            param_idx = 7
-
-            if start_date is not None:
-                conditions.append(f"created_at >= ${param_idx}")
-                params.append(start_date)
-                param_idx += 1
-
-            if end_date is not None:
-                conditions.append(f"created_at <= ${param_idx}")
-                params.append(end_date)
-                param_idx += 1
-
-            params.append(limit)
-
-            where_clause = " AND ".join(conditions)
-            sql = f"""
-                SELECT
-                    id,
-                    content,
-                    metadata,
-                    created_at,
-                    ts_rank(
-                        to_tsvector('english', content),
-                        plainto_tsquery('english', $3)
-                    ) as text_rank,
-                    CASE
-                        WHEN embedding IS NOT NULL
-                        THEN 1 - (embedding <=> $4::vector)
-                        ELSE 0
-                    END as similarity,
-                    (
-                        $5 * COALESCE(ts_rank(
-                            to_tsvector('english', content),
-                            plainto_tsquery('english', $3)
-                        ), 0) +
-                        $6 * CASE
-                            WHEN embedding IS NOT NULL
-                            THEN 1 - (embedding <=> $4::vector)
-                            ELSE 0
-                        END
-                    ) as combined_score
-                FROM archival_memory
-                WHERE {where_clause}
-                ORDER BY combined_score DESC
-                LIMIT ${param_idx}
-            """
-
             rows = await conn.fetch(sql, *params)
-
-            return [
-                {
-                    "id": row["id"],
-                    "content": row["content"],
-                    "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
-                    "created_at": row["created_at"],
-                    "text_rank": row["text_rank"],
-                    "similarity": row["similarity"],
-                    "combined_score": row["combined_score"],
-                }
-                for row in rows
-            ]
+            return format_rows(
+                rows,
+                extra_fields=["text_rank", "similarity", "combined_score"],
+            )
 
     async def search_hybrid_rrf(
         self,
@@ -879,36 +465,14 @@ class MemoryServicePG:
         limit: int = 10,
         k: int = 60,
     ) -> list[dict[str, Any]]:
-        """Hybrid search using Reciprocal Rank Fusion.
-
-        RRF combines rankings from FTS and vector search using:
-        score = 1/(k + rank_fts) + 1/(k + rank_vector)
-
-        This approach is more robust than weighted combination because:
-        - It's rank-based, not score-based (solves normalization issues)
-        - Less sensitive to weight tuning
-        - Works well when one modality has no results
-
-        Args:
-            text_query: Text query for FTS
-            query_embedding: Query embedding for vector search
-            limit: Max results to return
-            k: RRF constant (default 60, higher = more weight to lower ranks)
-
-        Returns:
-            List of matching facts with RRF score
-        """
-        padded_query = self._pad_embedding(query_embedding)
-
+        """Hybrid search using Reciprocal Rank Fusion."""
+        padded_query = pad_embedding(query_embedding)
         async with get_connection() as conn:
             await init_pgvector(conn)
-
-            # RRF query using CTEs for separate rankings
             rows = await conn.fetch(
                 """
                 WITH fts_ranked AS (
-                    SELECT
-                        id,
+                    SELECT id,
                         ROW_NUMBER() OVER (
                             ORDER BY ts_rank(
                                 to_tsvector('english', content),
@@ -921,8 +485,7 @@ class MemoryServicePG:
                     AND to_tsvector('english', content) @@ plainto_tsquery('english', $3)
                 ),
                 vector_ranked AS (
-                    SELECT
-                        id,
+                    SELECT id,
                         ROW_NUMBER() OVER (ORDER BY embedding <=> $4::vector) as vec_rank
                     FROM archival_memory
                     WHERE session_id = $1
@@ -937,35 +500,18 @@ class MemoryServicePG:
                     FROM fts_ranked f
                     FULL OUTER JOIN vector_ranked v ON f.id = v.id
                 )
-                SELECT
-                    a.id,
-                    a.content,
-                    a.metadata,
-                    a.created_at,
-                    c.rrf_score
+                SELECT a.id, a.content, a.metadata, a.created_at, c.rrf_score
                 FROM combined c
                 JOIN archival_memory a ON a.id = c.id
                 ORDER BY c.rrf_score DESC
                 LIMIT $6
-            """,
-                self.session_id,
-                self.agent_id,
-                text_query,
-                padded_query,
-                k,
-                limit,
+                """,
+                self.session_id, self.agent_id, text_query,
+                padded_query, k, limit,
             )
-
-            return [
-                {
-                    "id": row["id"],
-                    "content": row["content"],
-                    "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
-                    "created_at": row["created_at"],
-                    "rrf_score": float(row["rrf_score"]),
-                }
-                for row in rows
-            ]
+            return format_rows(
+                rows, extra_fields=["rrf_score"], float_fields=["rrf_score"]
+            )
 
     async def store_with_embedding(
         self,
@@ -973,54 +519,27 @@ class MemoryServicePG:
         metadata: dict[str, Any] | None = None,
         embedder: EmbeddingProvider | None = None,
     ) -> str:
-        """Store a fact with auto-generated embedding.
-
-        Args:
-            content: Fact content
-            metadata: Optional metadata dict
-            embedder: Optional embedding provider (if None, stores without embedding)
-
-        Returns:
-            Memory ID
-        """
+        """Store a fact with auto-generated embedding."""
         embedding = None
-
         if embedder is not None:
             embedding = await embedder.embed(content)
-
         return await self.store(content, metadata, embedding)
 
     async def delete_archival(self, memory_id: str) -> None:
-        """Delete a fact from archival memory.
-
-        Args:
-            memory_id: Memory ID to delete
-
-        Note:
-            Tags are automatically deleted via CASCADE.
-        """
+        """Delete a fact from archival memory (tags cascade)."""
         async with get_connection() as conn:
             await conn.execute(
                 """
                 DELETE FROM archival_memory
                 WHERE id = $1 AND session_id = $2 AND agent_id IS NOT DISTINCT FROM $3
-            """,
-                memory_id,
-                self.session_id,
-                self.agent_id,
+                """,
+                memory_id, self.session_id, self.agent_id,
             )
 
     # ==================== Tag Operations ====================
 
     async def get_tags(self, memory_id: str) -> list[str]:
-        """Get all tags for a memory ID.
-
-        Args:
-            memory_id: Memory ID to get tags for
-
-        Returns:
-            List of tag strings
-        """
+        """Get all tags for a memory ID."""
         async with get_connection() as conn:
             rows = await conn.fetch(
                 """
@@ -1028,18 +547,12 @@ class MemoryServicePG:
                 WHERE memory_id = $1 AND session_id = $2
                 ORDER BY tag
                 """,
-                memory_id,
-                self.session_id,
+                memory_id, self.session_id,
             )
             return [row["tag"] for row in rows]
 
     async def add_tag(self, memory_id: str, tag: str) -> None:
-        """Add a tag to an existing memory.
-
-        Args:
-            memory_id: Memory ID to tag
-            tag: Tag to add
-        """
+        """Add a tag to an existing memory."""
         async with get_connection() as conn:
             await conn.execute(
                 """
@@ -1047,35 +560,22 @@ class MemoryServicePG:
                 VALUES ($1, $2, $3)
                 ON CONFLICT (memory_id, tag) DO NOTHING
                 """,
-                memory_id,
-                tag,
-                self.session_id,
+                memory_id, tag, self.session_id,
             )
 
     async def remove_tag(self, memory_id: str, tag: str) -> None:
-        """Remove a tag from a memory.
-
-        Args:
-            memory_id: Memory ID to untag
-            tag: Tag to remove
-        """
+        """Remove a tag from a memory."""
         async with get_connection() as conn:
             await conn.execute(
                 """
                 DELETE FROM memory_tags
                 WHERE memory_id = $1 AND tag = $2 AND session_id = $3
                 """,
-                memory_id,
-                tag,
-                self.session_id,
+                memory_id, tag, self.session_id,
             )
 
     async def get_all_session_tags(self) -> list[str]:
-        """Get all unique tags used in this session.
-
-        Returns:
-            List of unique tag strings
-        """
+        """Get all unique tags used in this session."""
         async with get_connection() as conn:
             rows = await conn.fetch(
                 """
@@ -1094,27 +594,12 @@ class MemoryServicePG:
         tag_match_mode: str = "any",
         limit: int = 10,
     ) -> list[dict[str, Any]]:
-        """Search archival memory with optional tag filtering.
-
-        Args:
-            query: FTS query string
-            tags: Optional list of tags to filter by
-            tag_match_mode: "any" for OR matching, "all" for AND matching
-            limit: Maximum results to return
-
-        Returns:
-            List of matching facts with scores
-        """
+        """Search archival memory with optional tag filtering."""
         async with get_connection() as conn:
-            # If no tags specified, return all FTS matches
             if not tags:
                 rows = await conn.fetch(
                     """
-                    SELECT
-                        a.id,
-                        a.content,
-                        a.metadata,
-                        a.created_at,
+                    SELECT a.id, a.content, a.metadata, a.created_at,
                         ts_rank(
                             to_tsvector('english', a.content),
                             plainto_tsquery('english', $3)
@@ -1122,24 +607,17 @@ class MemoryServicePG:
                     FROM archival_memory a
                     WHERE a.session_id = $1
                     AND a.agent_id IS NOT DISTINCT FROM $2
-                    AND to_tsvector('english', a.content) @@ plainto_tsquery('english', $3)
+                    AND to_tsvector('english', a.content)
+                        @@ plainto_tsquery('english', $3)
                     ORDER BY score DESC
                     LIMIT $4
                     """,
-                    self.session_id,
-                    self.agent_id,
-                    query,
-                    limit,
+                    self.session_id, self.agent_id, query, limit,
                 )
             elif tag_match_mode == "all":
-                # Must have ALL specified tags
                 rows = await conn.fetch(
                     """
-                    SELECT
-                        a.id,
-                        a.content,
-                        a.metadata,
-                        a.created_at,
+                    SELECT a.id, a.content, a.metadata, a.created_at,
                         ts_rank(
                             to_tsvector('english', a.content),
                             plainto_tsquery('english', $3)
@@ -1147,7 +625,8 @@ class MemoryServicePG:
                     FROM archival_memory a
                     WHERE a.session_id = $1
                     AND a.agent_id IS NOT DISTINCT FROM $2
-                    AND to_tsvector('english', a.content) @@ plainto_tsquery('english', $3)
+                    AND to_tsvector('english', a.content)
+                        @@ plainto_tsquery('english', $3)
                     AND a.id IN (
                         SELECT memory_id FROM memory_tags
                         WHERE session_id = $1 AND tag = ANY($4)
@@ -1157,22 +636,13 @@ class MemoryServicePG:
                     ORDER BY score DESC
                     LIMIT $6
                     """,
-                    self.session_id,
-                    self.agent_id,
-                    query,
-                    tags,
-                    len(tags),
-                    limit,
+                    self.session_id, self.agent_id, query,
+                    tags, len(tags), limit,
                 )
             else:
-                # "any" mode: must have ANY of specified tags (OR)
                 rows = await conn.fetch(
                     """
-                    SELECT
-                        a.id,
-                        a.content,
-                        a.metadata,
-                        a.created_at,
+                    SELECT a.id, a.content, a.metadata, a.created_at,
                         ts_rank(
                             to_tsvector('english', a.content),
                             plainto_tsquery('english', $3)
@@ -1180,7 +650,8 @@ class MemoryServicePG:
                     FROM archival_memory a
                     WHERE a.session_id = $1
                     AND a.agent_id IS NOT DISTINCT FROM $2
-                    AND to_tsvector('english', a.content) @@ plainto_tsquery('english', $3)
+                    AND to_tsvector('english', a.content)
+                        @@ plainto_tsquery('english', $3)
                     AND a.id IN (
                         SELECT memory_id FROM memory_tags
                         WHERE session_id = $1 AND tag = ANY($4)
@@ -1188,11 +659,7 @@ class MemoryServicePG:
                     ORDER BY score DESC
                     LIMIT $5
                     """,
-                    self.session_id,
-                    self.agent_id,
-                    query,
-                    tags,
-                    limit,
+                    self.session_id, self.agent_id, query, tags, limit,
                 )
 
             return [
@@ -1216,59 +683,20 @@ class MemoryServicePG:
         start_date: datetime | None = None,
         end_date: datetime | None = None,
     ) -> str:
-        """Recall information from all memory sources.
-
-        Args:
-            query: Natural language query
-            include_core: Whether to include core memory
-            limit: Max archival results
-            start_date: Optional start of date range (inclusive)
-            end_date: Optional end of date range (inclusive)
-
-        Returns:
-            Combined recall result as string
-        """
-        parts = []
-
-        # Check core memory first (key match)
+        """Recall information from all memory sources."""
+        core_matches: dict[str, str] = {}
         if include_core:
             core = await self.get_all_core()
-            for key, value in core.items():
-                if query.lower() in key.lower() or key.lower() in query.lower():
-                    parts.append(f"[Core/{key}]: {value}")
+            core_matches = filter_core_by_query(core, query)
 
-        # Search archival memory with date filtering
         archival_results = await self.search_text(
             query, limit=limit, start_date=start_date, end_date=end_date
         )
-        for result in archival_results:
-            parts.append(f"[Archival]: {result['content']}")
-
-        if not parts:
-            return "No relevant memories found."
-
-        return "\n".join(parts)
+        return format_recall_text(core_matches, archival_results)
 
     async def to_context(self, max_archival: int = 10) -> str:
-        """Generate context string for prompt injection.
-
-        Args:
-            max_archival: Max recent archival facts to include
-
-        Returns:
-            Formatted context string
-        """
-        lines = ["## Core Memory"]
-
+        """Generate context string for prompt injection."""
         core = await self.get_all_core()
-        if core:
-            for key, value in core.items():
-                lines.append(f"**{key}:** {value}")
-        else:
-            lines.append("(empty)")
-
-        lines.append("")
-        lines.append("## Recent Archival Memory")
 
         async with get_connection() as conn:
             rows = await conn.fetch(
@@ -1277,16 +705,9 @@ class MemoryServicePG:
                 WHERE session_id = $1 AND agent_id IS NOT DISTINCT FROM $2
                 ORDER BY created_at DESC
                 LIMIT $3
-            """,
-                self.session_id,
-                self.agent_id,
-                max_archival,
+                """,
+                self.session_id, self.agent_id, max_archival,
             )
 
-            if rows:
-                for row in rows:
-                    lines.append(f"- {row['content']}")
-            else:
-                lines.append("(empty)")
-
-        return "\n".join(lines)
+        archival_contents = [row["content"] for row in rows]
+        return format_context_string(core, archival_contents)

@@ -52,10 +52,14 @@ from .memory_service_queries import (
 )
 from .postgres_pool import get_connection, get_pool, get_transaction, init_pgvector
 
-faulthandler.enable(
-    file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"),
-    all_threads=True,
-)
+_crash_log_file = None
+try:
+    _crash_log_dir = os.path.expanduser("~/.claude/logs")
+    os.makedirs(_crash_log_dir, exist_ok=True)
+    _crash_log_file = open(os.path.join(_crash_log_dir, "opc_crash.log"), "a")
+    faulthandler.enable(file=_crash_log_file, all_threads=True)
+except OSError:
+    faulthandler.enable(all_threads=True)  # falls back to stderr
 
 logger = logging.getLogger(__name__)
 
@@ -331,9 +335,9 @@ class MemoryServicePG:
                         """,
                         memory_id, supersedes,
                     )
-                except Exception:
+                except asyncpg.UndefinedColumnError:
                     logger.debug(
-                        "Supersede UPDATE failed for %s -> %s",
+                        "Supersede UPDATE failed (column missing) for %s -> %s",
                         supersedes, memory_id, exc_info=True,
                     )
 
@@ -709,16 +713,7 @@ class MemoryServicePG:
                     self.session_id, self.agent_id, query, tags, limit,
                 )
 
-            return [
-                {
-                    "id": str(row["id"]),
-                    "content": row["content"],
-                    "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
-                    "created_at": row["created_at"],
-                    "score": float(row["score"]),
-                }
-                for row in rows
-            ]
+            return format_rows(rows, extra_fields=["score"], float_fields=["score"])
 
     # ==================== Recall Memory ====================
 

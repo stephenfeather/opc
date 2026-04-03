@@ -4,8 +4,11 @@ Re-ranks recall results using contextual signals (project match, recency,
 confidence, type affinity, tag overlap, recall frequency) combined with
 calibrated retrieval scores.
 
-All signal and scoring functions are pure.  I/O helpers (save_centroids,
-load_centroids) are isolated in a clearly marked section at the bottom.
+Signal and scoring logic is pure when an explicit ``RerankerConfig`` is
+provided.  If ``config`` is omitted, some helpers lazily resolve defaults via
+``_default_config()``, which may consult config-file state on first use.
+Explicit I/O helpers (save_centroids, load_centroids) are isolated in a
+clearly marked section at the bottom.
 """
 
 from __future__ import annotations
@@ -88,7 +91,7 @@ def _default_config() -> RerankerConfig:
             recency_half_life_days=cfg.recency_half_life_days,
             recall_log2_normalizer=cfg.recall_log2_normalizer,
         )
-    except Exception:
+    except (ImportError, AttributeError, OSError, TypeError, ValueError):
         return RerankerConfig()
 
 
@@ -353,7 +356,8 @@ def rerank(
 ) -> list[dict]:
     """Re-rank recall results using contextual signals.
 
-    Pure function -- no I/O, no database calls, no network.
+    Pure when an explicit config is provided; otherwise lazily resolves
+    defaults via ``_default_config()``.  No database calls, no network.
 
     Parameters
     ----------
@@ -365,7 +369,9 @@ def rerank(
     Returns
     -------
     Top-k results sorted by final_score descending, each augmented
-    with ``final_score`` and ``rerank_details`` keys.
+    with ``final_score`` and ``rerank_details`` keys.  When
+    total_signal_weight is zero, final_score equals the calibrated
+    retrieval score and results are sorted accordingly.
     """
     if not results:
         return []
@@ -375,10 +381,20 @@ def rerank(
 
     total_signal_weight = config.total_signal_weight
     if total_signal_weight <= 0:
-        return [
-            {**r, "final_score": r.get("similarity", 0.0), "rerank_details": {}}
-            for r in results[:k]
+        total = len(results)
+        scored = [
+            {
+                **r,
+                "final_score": calibrate_score(
+                    r.get("similarity", 0.0), ctx.retrieval_mode,
+                    rank=i, total=total, config=config,
+                ),
+                "rerank_details": {},
+            }
+            for i, r in enumerate(results)
         ]
+        scored.sort(key=lambda r: r["final_score"], reverse=True)
+        return scored[:k]
 
     retrieval_weight = 1.0 - total_signal_weight
     total = len(results)

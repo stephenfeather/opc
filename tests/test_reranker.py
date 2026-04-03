@@ -424,9 +424,9 @@ class TestRerank:
         )
         ctx = RecallContext(retrieval_mode="vector")
         ranked = rerank(results, ctx, config=config, k=5)
-        # Should return in original order, not reranked
-        assert ranked[0]["id"] == "first"
-        assert ranked[1]["id"] == "second"
+        # Should sort by calibrated score (0.9 > 0.5 in vector mode)
+        assert ranked[0]["id"] == "second"
+        assert ranked[1]["id"] == "first"
         # Output shape should still include augmented keys
         assert "final_score" in ranked[0]
         assert "rerank_details" in ranked[0]

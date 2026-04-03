@@ -36,61 +36,19 @@ class RecallContext:
     now: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
-@dataclass(frozen=True)
-class RerankerConfig:
-    """Weights for each contextual signal (should sum to ~0.35).
-
-    Defaults match opc.toml [reranker] section.  Callers who want config-file
-    overrides can build a RerankerConfig from the parsed TOML and pass it in.
-    """
-
-    # Signal weights
-    project_weight: float = 0.15
-    recency_weight: float = 0.05
-    confidence_weight: float = 0.05
-    recall_weight: float = 0.05
-    type_affinity_weight: float = 0.05
-    tag_overlap_weight: float = 0.05
-    pattern_weight: float = 0.05
-
-    # Calibration / signal parameters
-    rrf_scale_factor: float = 60.0
-    recency_half_life_days: float = 45.0
-    recall_log2_normalizer: float = 4.0
-
-    @property
-    def total_signal_weight(self) -> float:
-        return (
-            self.project_weight
-            + self.recency_weight
-            + self.confidence_weight
-            + self.recall_weight
-            + self.type_affinity_weight
-            + self.tag_overlap_weight
-            + self.pattern_weight
-        )
+# Single source of truth for RerankerConfig lives in config/models.py.
+# Re-exported here for backward compatibility with existing callers.
+from scripts.core.config.models import RerankerConfig  # noqa: E402
 
 
 def _default_config() -> RerankerConfig:
-    """Lazily build a RerankerConfig from opc.toml, falling back to hardcoded defaults.
+    """Lazily load RerankerConfig from opc.toml, falling back to hardcoded defaults.
 
     This avoids import-time I/O while preserving backward compat with opc.toml overrides.
     """
     try:
         from scripts.core.config import get_config
-        cfg = get_config().reranker
-        return RerankerConfig(
-            project_weight=cfg.project_weight,
-            recency_weight=cfg.recency_weight,
-            confidence_weight=cfg.confidence_weight,
-            recall_weight=cfg.recall_weight,
-            type_affinity_weight=cfg.type_affinity_weight,
-            tag_overlap_weight=cfg.tag_overlap_weight,
-            pattern_weight=cfg.pattern_weight,
-            rrf_scale_factor=cfg.rrf_scale_factor,
-            recency_half_life_days=cfg.recency_half_life_days,
-            recall_log2_normalizer=cfg.recall_log2_normalizer,
-        )
+        return get_config().reranker
     except (ImportError, AttributeError, OSError, TypeError, ValueError):
         return RerankerConfig()
 
@@ -309,7 +267,7 @@ def compute_type_centroids(rows: list[dict]) -> dict[str, list[float]]:
 
     # Compute mean embedding per type
     return {
-        ltype: [sum(dims) / len(vectors) for dims in zip(*vectors)]
+        ltype: [sum(dims) / len(vectors) for dims in zip(*vectors, strict=True)]
         for ltype, vectors in groups.items()
         if vectors
     }

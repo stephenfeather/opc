@@ -175,7 +175,9 @@ def calibrate_confidence(content: str) -> dict:
 # Pure row-level calibration (no I/O)
 # ---------------------------------------------------------------------------
 
-Row = tuple[str, str | None, dict | None]
+from uuid import UUID
+
+Row = tuple[str | UUID, str | None, dict | None]
 
 
 def calibrate_rows(rows: Sequence[Row]) -> dict:
@@ -366,15 +368,21 @@ def backfill_calibration_sync(
                         (_confidence_patch(change), change["id"]),
                     )
 
-                # Mark unchanged rows as calibrated too
+                # Mark unchanged rows as calibrated too (without
+                # re-running calibrate_confidence — use set difference)
+                updated_ids = {
+                    change["id"] for change in batch_result["changes"]
+                }
+                error_ids = {
+                    str(mid)
+                    for mid, content, _ in batch
+                    if not content
+                }
                 unchanged_ids = [
                     str(mid)
-                    for mid, content, meta in batch
-                    if content
-                    and (meta or {}).get("confidence")
-                    == calibrate_confidence(content)["confidence"]
-                    and "confidence_score" in (meta or {})
-                    and "confidence_dimensions" in (meta or {})
+                    for mid, _, _ in batch
+                    if str(mid) not in updated_ids
+                    and str(mid) not in error_ids
                 ]
                 for uid in unchanged_ids:
                     cur.execute(

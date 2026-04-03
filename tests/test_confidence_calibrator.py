@@ -4,7 +4,7 @@ Validates that:
 1. Individual dimension scorers detect the right patterns
 2. calibrate_confidence() produces correct mappings
 3. Edge cases (empty content, missing fields) are handled
-4. Calibration thresholds produce reasonable distribution
+4. Calibration thresholds produce a reasonable distribution
 5. Pure row-calibration logic (calibrate_rows) works without DB
 6. Handler functions delegate correctly with mocked DB
 7. CLI dispatches to the right handler

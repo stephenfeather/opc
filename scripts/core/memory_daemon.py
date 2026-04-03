@@ -28,6 +28,8 @@ The session_start hook ensures this daemon is running.
 """
 
 import argparse
+import logging
+import logging.handlers
 import os
 import signal
 import sqlite3
@@ -113,6 +115,31 @@ _pattern_proc: subprocess.Popen | None = None
 _last_pattern_run: float = 0
 
 
+def _setup_logging() -> logging.Logger:
+    """Configure rotating logger for the daemon.
+
+    Uses TimedRotatingFileHandler to rotate the log every N days,
+    keeping a configurable number of backups. Rotated files are
+    named memory-daemon.log.YYYY-MM-DD.
+    """
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("memory-daemon")
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        handler = logging.handlers.TimedRotatingFileHandler(
+            LOG_FILE,
+            when="D",
+            interval=_daemon_cfg.log_rotation_days,
+            backupCount=_daemon_cfg.log_backup_count,
+        )
+        handler.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", "%Y-%m-%d %H:%M:%S"))
+        logger.addHandler(handler)
+    return logger
+
+
+_logger = _setup_logging()
+
+
 def _seed_last_pattern_run() -> float:
     """Read the most recent pattern detection timestamp from PostgreSQL.
 
@@ -135,13 +162,9 @@ def _seed_last_pattern_run() -> float:
 
 
 def log(msg: str):
-    """Write timestamped log message."""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{timestamp}] {msg}\n"
+    """Write timestamped log message via rotating file handler."""
     try:
-        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(LOG_FILE, "a") as f:
-            f.write(line)
+        _logger.info(msg)
     except Exception:
         pass  # Don't crash on log failures
 
@@ -779,6 +802,16 @@ def _count_session_learnings(session_id: str) -> int | None:
     return None
 
 
+def _count_session_rejections(session_id: str) -> int | None:
+    """Count rejected learnings for a session. Returns None on error."""
+    try:
+        from scripts.core.store_learning import get_rejection_count
+
+        return get_rejection_count(session_id)
+    except Exception:
+        return None
+
+
 def reap_completed_extractions():
     """Check for completed extraction processes and remove from active set."""
     completed = []
@@ -789,9 +822,11 @@ def reap_completed_extractions():
             elapsed = int(time.time() - _start)
             learnings_count = _count_session_learnings(session_id) if exit_code == 0 else None
             learnings_info = f", learnings={learnings_count}" if learnings_count is not None else ""
+            rejections_count = _count_session_rejections(session_id) if exit_code == 0 else None
+            rejections_info = f", rejections={rejections_count}" if rejections_count is not None else ""
             log(f"Extraction completed for {session_id} "
                 f"(pid={pid}, project={project}, "
-                f"exit={exit_code}, elapsed={elapsed}s{learnings_info})")
+                f"exit={exit_code}, elapsed={elapsed}s{learnings_info}{rejections_info})")
             if exit_code == 0:
                 mark_extracted(session_id)
                 _calibrate_session_confidence(session_id)

@@ -23,6 +23,8 @@ class DaemonConfig:
     pattern_detection_interval_hours: int = 6
     extraction_model: str = "sonnet"
     extraction_max_turns: int = 15
+    log_rotation_days: int = 7
+    log_backup_count: int = 4
 
 
 @dataclass(frozen=True)

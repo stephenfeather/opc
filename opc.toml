@@ -44,6 +44,13 @@ extraction_model = "sonnet"
 # Max turns per extraction subprocess.
 extraction_max_turns = 15
 
+# Rotate the daemon log file every N days.
+log_rotation_days = 7
+
+# Keep this many rotated log files before deleting the oldest.
+# Set to 0 to keep all rotated logs indefinitely.
+log_backup_count = 0
+
 
 [reranker]
 # Contextual signal weights (should sum to ~0.35).

@@ -43,6 +43,8 @@ class TestDaemonConfig:
         assert cfg.pattern_detection_interval_hours == 6
         assert cfg.extraction_model == "sonnet"
         assert cfg.extraction_max_turns == 15
+        assert cfg.log_rotation_days == 7
+        assert cfg.log_backup_count == 4
 
 
 class TestRerankerConfig:

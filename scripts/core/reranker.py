@@ -1,20 +1,21 @@
 """Contextual reranker for memory recall results.
 
-Pure Python post-processing module that re-ranks recall results using
-contextual signals (project match, recency, confidence, type affinity,
-tag overlap, recall frequency) combined with calibrated retrieval scores.
+Re-ranks recall results using contextual signals (project match, recency,
+confidence, type affinity, tag overlap, recall frequency) combined with
+calibrated retrieval scores.
 
-No I/O, no database calls -- all functions are pure.
+All signal and scoring functions are pure.  I/O helpers (save_centroids,
+load_centroids) are isolated in a clearly marked section at the bottom.
 """
 
 from __future__ import annotations
 
 import json
 import math
+from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
-
 
 # ---------------------------------------------------------------------------
 # Data Structures
@@ -32,22 +33,27 @@ class RecallContext:
     now: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
-# Defaults from opc.toml [reranker]
-from scripts.core.config import get_config as _get_config
-_reranker_cfg = _get_config().reranker
-
-
-@dataclass
+@dataclass(frozen=True)
 class RerankerConfig:
-    """Weights for each contextual signal (should sum to ~0.35)."""
+    """Weights for each contextual signal (should sum to ~0.35).
 
-    project_weight: float = _reranker_cfg.project_weight
-    recency_weight: float = _reranker_cfg.recency_weight
-    confidence_weight: float = _reranker_cfg.confidence_weight
-    recall_weight: float = _reranker_cfg.recall_weight
-    type_affinity_weight: float = _reranker_cfg.type_affinity_weight
-    tag_overlap_weight: float = _reranker_cfg.tag_overlap_weight
-    pattern_weight: float = _reranker_cfg.pattern_weight
+    Defaults match opc.toml [reranker] section.  Callers who want config-file
+    overrides can build a RerankerConfig from the parsed TOML and pass it in.
+    """
+
+    # Signal weights
+    project_weight: float = 0.15
+    recency_weight: float = 0.05
+    confidence_weight: float = 0.05
+    recall_weight: float = 0.05
+    type_affinity_weight: float = 0.05
+    tag_overlap_weight: float = 0.05
+    pattern_weight: float = 0.05
+
+    # Calibration / signal parameters
+    rrf_scale_factor: float = 60.0
+    recency_half_life_days: float = 45.0
+    recall_log2_normalizer: float = 4.0
 
     @property
     def total_signal_weight(self) -> float:
@@ -62,9 +68,34 @@ class RerankerConfig:
         )
 
 
+def _default_config() -> RerankerConfig:
+    """Lazily build a RerankerConfig from opc.toml, falling back to hardcoded defaults.
+
+    This avoids import-time I/O while preserving backward compat with opc.toml overrides.
+    """
+    try:
+        from scripts.core.config import get_config
+        cfg = get_config().reranker
+        return RerankerConfig(
+            project_weight=cfg.project_weight,
+            recency_weight=cfg.recency_weight,
+            confidence_weight=cfg.confidence_weight,
+            recall_weight=cfg.recall_weight,
+            type_affinity_weight=cfg.type_affinity_weight,
+            tag_overlap_weight=cfg.tag_overlap_weight,
+            pattern_weight=cfg.pattern_weight,
+            rrf_scale_factor=cfg.rrf_scale_factor,
+            recency_half_life_days=cfg.recency_half_life_days,
+            recall_log2_normalizer=cfg.recall_log2_normalizer,
+        )
+    except Exception:
+        return RerankerConfig()
+
+
 # ---------------------------------------------------------------------------
 # Score Calibration
 # ---------------------------------------------------------------------------
+
 
 def calibrate_score(
     raw_score: float,
@@ -72,6 +103,7 @@ def calibrate_score(
     *,
     rank: int,
     total: int,
+    config: RerankerConfig | None = None,
 ) -> float:
     """Normalize a raw retrieval score to [0, 1] based on retrieval mode.
 
@@ -81,17 +113,21 @@ def calibrate_score(
     mode:       Retrieval mode identifier.
     rank:       Zero-based rank of this result in the original list.
     total:      Total number of results.
+    config:     Optional config for tuning parameters (uses defaults if None).
     """
+    cfg = config if config is not None else _default_config()
+
     if mode == "vector":
         # Cosine similarity [-1, 1] -> [0, 1]
         calibrated = (raw_score + 1) / 2
     elif mode == "hybrid_rrf":
         # RRF scores ~0.01-0.03 -> scale up
-        calibrated = raw_score * _reranker_cfg.rrf_scale_factor
+        calibrated = raw_score * cfg.rrf_scale_factor
     elif mode in ("text", "sqlite"):
-        # BM25 unbounded -> squash with kappa=1.0
+        # BM25 unbounded -> squash with kappa=1.0; guard denominator
         kappa = 1.0
-        calibrated = raw_score / (raw_score + kappa)
+        denom = raw_score + kappa
+        calibrated = raw_score / denom if denom != 0.0 else 0.0
     else:
         # Unknown/None: rank-based fallback
         if total <= 0:
@@ -121,8 +157,13 @@ def project_match(result: dict, ctx: RecallContext) -> float:
     return 0.0
 
 
-def recency_score(result: dict, ctx: RecallContext) -> float:
-    """Exponential decay score: exp(-age_days / 45) over 90-day horizon."""
+def recency_score(
+    result: dict,
+    ctx: RecallContext,
+    *,
+    config: RerankerConfig | None = None,
+) -> float:
+    """Exponential decay score: exp(-age_days / half_life)."""
     created_at = result.get("created_at")
     if created_at is None:
         return 0.5
@@ -141,9 +182,11 @@ def recency_score(result: dict, ctx: RecallContext) -> float:
     if now.tzinfo is None:
         now = now.replace(tzinfo=UTC)
 
+    cfg = config if config is not None else _default_config()
     age = now - created_at
     age_days = max(0.0, age.total_seconds() / 86400)
-    return math.exp(-age_days / _reranker_cfg.recency_half_life_days)
+    half_life = cfg.recency_half_life_days if cfg.recency_half_life_days > 0.0 else 45.0
+    return math.exp(-age_days / half_life)
 
 
 def confidence_score(result: dict) -> float:
@@ -153,12 +196,18 @@ def confidence_score(result: dict) -> float:
     return mapping.get(conf, 0.5)
 
 
-def recall_score(result: dict) -> float:
+def recall_score(
+    result: dict,
+    *,
+    config: RerankerConfig | None = None,
+) -> float:
     """Score based on how often a learning has been recalled."""
     count = result.get("recall_count")
     if count is None or count <= 0:
         return 0.0
-    return min(1.0, math.log2(1 + count) / _reranker_cfg.recall_log2_normalizer)
+    cfg = config if config is not None else _default_config()
+    normalizer = cfg.recall_log2_normalizer if cfg.recall_log2_normalizer > 0.0 else 4.0
+    return min(1.0, math.log2(1 + count) / normalizer)
 
 
 def type_match(result: dict, ctx: RecallContext) -> float:
@@ -244,7 +293,8 @@ def compute_type_centroids(rows: list[dict]) -> dict[str, list[float]]:
     Returns:
         Dict mapping learning_type to centroid (mean embedding vector).
     """
-    groups: dict[str, list[list[float]]] = {}
+    # Group embeddings by type, filtering out None types and empty embeddings
+    groups: dict[str, list[list[float]]] = defaultdict(list)
     for row in rows:
         ltype = row.get("ltype")
         if ltype is None:
@@ -252,16 +302,14 @@ def compute_type_centroids(rows: list[dict]) -> dict[str, list[float]]:
         embedding = row.get("embedding")
         if embedding is None or (hasattr(embedding, "__len__") and len(embedding) == 0):
             continue
-        groups.setdefault(ltype, []).append(embedding)
+        groups[ltype].append(embedding)
 
-    centroids: dict[str, list[float]] = {}
-    for ltype, vectors in groups.items():
-        if not vectors:
-            continue
-        n = len(vectors)
-        centroid = [sum(dims) / n for dims in zip(*vectors)]
-        centroids[ltype] = centroid
-    return centroids
+    # Compute mean embedding per type
+    return {
+        ltype: [sum(dims) / len(vectors) for dims in zip(*vectors)]
+        for ltype, vectors in groups.items()
+        if vectors
+    }
 
 
 def infer_query_type(
@@ -291,24 +339,6 @@ def infer_query_type(
         return {lt: 1.0 / n for lt in centroids}
 
     return {lt: e / total for lt, e in exps.items()}
-
-
-def save_centroids(centroids: dict[str, list[float]], path: str | Path) -> None:
-    """Save centroids to a JSON file for caching."""
-    with open(path, "w") as f:
-        json.dump(centroids, f)
-
-
-def load_centroids(path: str | Path) -> dict[str, list[float]] | None:
-    """Load centroids from JSON file.  Returns None if missing or corrupt."""
-    p = Path(path)
-    if not p.exists():
-        return None
-    try:
-        with open(p) as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -341,11 +371,14 @@ def rerank(
         return []
 
     if config is None:
-        config = RerankerConfig()
+        config = _default_config()
 
     total_signal_weight = config.total_signal_weight
     if total_signal_weight <= 0:
-        return results[:k]
+        return [
+            {**r, "final_score": r.get("similarity", 0.0), "rerank_details": {}}
+            for r in results[:k]
+        ]
 
     retrieval_weight = 1.0 - total_signal_weight
     total = len(results)
@@ -354,13 +387,13 @@ def rerank(
     for rank, result in enumerate(results):
         # Calibrate raw retrieval score
         raw = result.get("similarity", 0.0)
-        cal = calibrate_score(raw, ctx.retrieval_mode, rank=rank, total=total)
+        cal = calibrate_score(raw, ctx.retrieval_mode, rank=rank, total=total, config=config)
 
         # Compute each signal
         sig_project = project_match(result, ctx)
-        sig_recency = recency_score(result, ctx)
+        sig_recency = recency_score(result, ctx, config=config)
         sig_confidence = confidence_score(result)
-        sig_recall = recall_score(result)
+        sig_recall = recall_score(result, config=config)
         sig_type = type_match(result, ctx)
         sig_tags = tag_overlap(result, ctx)
         sig_pattern = pattern_score(result, ctx)
@@ -394,3 +427,26 @@ def rerank(
 
     scored.sort(key=lambda r: r["final_score"], reverse=True)
     return scored[:k]
+
+
+# ---------------------------------------------------------------------------
+# I/O Handlers (side effects -- not pure functions)
+# ---------------------------------------------------------------------------
+
+
+def save_centroids(centroids: dict[str, list[float]], path: str | Path) -> None:
+    """Save centroids to a JSON file for caching."""
+    with open(path, "w") as f:
+        json.dump(centroids, f)
+
+
+def load_centroids(path: str | Path) -> dict[str, list[float]] | None:
+    """Load centroids from JSON file.  Returns None if missing or corrupt."""
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None

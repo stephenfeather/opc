@@ -37,7 +37,6 @@ from scripts.core.reranker import (  # noqa: E402
     type_match,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -131,6 +130,34 @@ class TestRecencyScore:
         result = _make_result()  # no created_at
         ctx = RecallContext()
         assert recency_score(result, ctx) == 0.5
+
+    def test_recency_string_timestamp(self):
+        """ISO format string timestamps should be parsed correctly."""
+        now = datetime(2026, 4, 1, 12, 0, 0, tzinfo=UTC)
+        result = _make_result()
+        result["created_at"] = "2026-03-31T12:00:00+00:00"
+        ctx = RecallContext(now=now)
+        score = recency_score(result, ctx)
+        # 1 day old => exp(-1/45)
+        assert abs(score - math.exp(-1 / 45)) < 0.01
+
+    def test_recency_invalid_string(self):
+        """Unparseable string timestamps should return 0.5 fallback."""
+        result = _make_result()
+        result["created_at"] = "not-a-date"
+        ctx = RecallContext()
+        assert recency_score(result, ctx) == 0.5
+
+    def test_recency_naive_datetime(self):
+        """Timezone-naive datetimes should get UTC assumed."""
+        now = datetime(2026, 4, 1, 12, 0, 0, tzinfo=UTC)
+        naive_dt = datetime(2026, 3, 31, 12, 0, 0)  # no tzinfo
+        result = _make_result()
+        result["created_at"] = naive_dt
+        ctx = RecallContext(now=now)
+        score = recency_score(result, ctx)
+        # 1 day old => exp(-1/45)
+        assert abs(score - math.exp(-1 / 45)) < 0.01
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +302,23 @@ class TestCalibration:
         score = calibrate_score(0.01, None, rank=0, total=1)
         assert score == 1.0
 
+    def test_calibrate_negative_score(self):
+        """Negative scores should be clamped to 0.0."""
+        # (-0.5 + 1) / 2 = 0.25 -- positive, not clamped
+        assert calibrate_score(-0.5, "vector", rank=0, total=5) == 0.25
+        # (-2.0 + 1) / 2 = -0.5 => clamped to 0.0
+        assert calibrate_score(-2.0, "vector", rank=0, total=5) == 0.0
+
+    def test_calibrate_text_negative_one_no_zerodiv(self):
+        """raw_score=-1.0 with text mode: denominator (-1+1)=0, should return 0.0."""
+        score = calibrate_score(-1.0, "text", rank=0, total=5)
+        assert score == 0.0
+
+    def test_calibrate_total_zero(self):
+        """total=0 with unknown mode should return 1.0 (edge case in rank fallback)."""
+        score = calibrate_score(0.5, None, rank=0, total=0)
+        assert score == 1.0
+
 
 # ---------------------------------------------------------------------------
 # Integration Tests: rerank
@@ -342,6 +386,51 @@ class TestRerank:
         assert len(ranked) == 1
         assert "final_score" in ranked[0]
 
+    def test_rerank_does_not_mutate_input(self):
+        """The original results list should be unchanged after rerank."""
+        results = [
+            _make_result(similarity=0.9),
+            _make_result(similarity=0.5),
+        ]
+        results[0]["id"] = "first"
+        results[1]["id"] = "second"
+        original_ids = [r["id"] for r in results]
+        original_keys = [set(r.keys()) for r in results]
+
+        ctx = RecallContext(retrieval_mode="vector")
+        rerank(results, ctx, k=5)
+
+        # Order unchanged
+        assert [r["id"] for r in results] == original_ids
+        # No extra keys added to originals
+        assert [set(r.keys()) for r in results] == original_keys
+
+    def test_rerank_zero_total_signal_weight(self):
+        """With zero total_signal_weight, returns results with consistent output shape."""
+        results = [
+            _make_result(similarity=0.5),
+            _make_result(similarity=0.9),
+        ]
+        results[0]["id"] = "first"
+        results[1]["id"] = "second"
+        config = RerankerConfig(
+            project_weight=0.0,
+            recency_weight=0.0,
+            confidence_weight=0.0,
+            recall_weight=0.0,
+            type_affinity_weight=0.0,
+            tag_overlap_weight=0.0,
+            pattern_weight=0.0,
+        )
+        ctx = RecallContext(retrieval_mode="vector")
+        ranked = rerank(results, ctx, config=config, k=5)
+        # Should return in original order, not reranked
+        assert ranked[0]["id"] == "first"
+        assert ranked[1]["id"] == "second"
+        # Output shape should still include augmented keys
+        assert "final_score" in ranked[0]
+        assert "rerank_details" in ranked[0]
+
 
 # ---------------------------------------------------------------------------
 # Phase 4: Cosine Similarity
@@ -401,6 +490,21 @@ class TestComputeCentroids:
         centroids = compute_type_centroids(rows)
         assert len(centroids) == 1
         assert "A" in centroids
+
+    def test_skips_empty_embeddings(self):
+        """Rows with empty embedding lists should be skipped."""
+        rows = [
+            {"ltype": "A", "embedding": []},
+            {"ltype": "A", "embedding": [1.0, 2.0]},
+            {"ltype": "B", "embedding": []},
+        ]
+        centroids = compute_type_centroids(rows)
+        # A should only use the non-empty embedding
+        assert "A" in centroids
+        assert abs(centroids["A"][0] - 1.0) < 1e-9
+        assert abs(centroids["A"][1] - 2.0) < 1e-9
+        # B should be absent (only had empty embedding)
+        assert "B" not in centroids
 
 
 # ---------------------------------------------------------------------------
@@ -536,3 +640,92 @@ class TestRerankWithPattern:
         config = RerankerConfig()
         assert config.pattern_weight == 0.05
         assert config.total_signal_weight > 0.35
+
+
+# ---------------------------------------------------------------------------
+# FP Compliance: Config defaults are hardcoded (no import-time I/O)
+# ---------------------------------------------------------------------------
+
+class TestRerankerConfigDefaults:
+    """RerankerConfig defaults should match opc.toml values without I/O at import."""
+
+    def test_default_project_weight(self):
+        config = RerankerConfig()
+        assert config.project_weight == 0.15
+
+    def test_default_recency_weight(self):
+        config = RerankerConfig()
+        assert config.recency_weight == 0.05
+
+    def test_config_is_frozen(self):
+        config = RerankerConfig()
+        with pytest.raises(AttributeError):
+            config.project_weight = 0.99
+
+    def test_default_total_signal_weight(self):
+        config = RerankerConfig()
+        expected = 0.15 + 0.05 + 0.05 + 0.05 + 0.05 + 0.05 + 0.05
+        assert abs(config.total_signal_weight - expected) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# FP Compliance: calibrate_score accepts config parameter (no module globals)
+# ---------------------------------------------------------------------------
+
+class TestCalibrateScoreWithConfig:
+    """calibrate_score should accept an optional config parameter for RRF scale."""
+
+    def test_calibrate_rrf_with_custom_config(self):
+        """RRF calibration should use config's rrf_scale_factor, not a global."""
+        config = RerankerConfig(rrf_scale_factor=100.0)
+        score = calibrate_score(0.01, "hybrid_rrf", rank=0, total=5, config=config)
+        # 0.01 * 100 = 1.0 (clamped)
+        assert score == 1.0
+
+    def test_calibrate_rrf_default_without_config(self):
+        """calibrate_score without config should still work with default scale."""
+        score = calibrate_score(0.01, "hybrid_rrf", rank=0, total=5)
+        assert abs(score - 0.6) < 0.001
+
+
+class TestRecencyScoreWithConfig:
+    """recency_score should accept config for half-life parameter."""
+
+    def test_recency_with_custom_half_life(self):
+        """recency_score should use config's half-life, not a module global."""
+        now = datetime(2026, 4, 1, 12, 0, 0, tzinfo=UTC)
+        result = _make_result(created_at=now - timedelta(days=10))
+        ctx = RecallContext(now=now)
+        config = RerankerConfig(recency_half_life_days=10.0)
+        score = recency_score(result, ctx, config=config)
+        # exp(-10 / 10) = exp(-1) ≈ 0.368
+        assert abs(score - math.exp(-1)) < 0.01
+
+    def test_recency_zero_half_life_falls_back(self):
+        """Zero half-life should fall back to default 45.0, not ZeroDivisionError."""
+        now = datetime(2026, 4, 1, 12, 0, 0, tzinfo=UTC)
+        result = _make_result(created_at=now - timedelta(days=10))
+        ctx = RecallContext(now=now)
+        config = RerankerConfig(recency_half_life_days=0.0)
+        score = recency_score(result, ctx, config=config)
+        assert abs(score - math.exp(-10 / 45)) < 0.01
+
+
+class TestRecallScoreWithConfig:
+    """recall_score should accept config for log2 normalizer."""
+
+    def test_recall_with_custom_normalizer(self):
+        """recall_score should use config's normalizer, not a module global."""
+        result = _make_result(recall_count=3)
+        config = RerankerConfig(recall_log2_normalizer=2.0)
+        # log2(4) / 2.0 = 2.0 / 2.0 = 1.0
+        score = recall_score(result, config=config)
+        assert abs(score - 1.0) < 0.01
+
+    def test_recall_zero_normalizer_falls_back(self):
+        """Zero normalizer should fall back to default 4.0, not ZeroDivisionError."""
+        result = _make_result(recall_count=3)
+        config = RerankerConfig(recall_log2_normalizer=0.0)
+        expected = min(1.0, math.log2(1 + 3) / 4.0)
+        score = recall_score(result, config=config)
+        assert abs(score - expected) < 0.01

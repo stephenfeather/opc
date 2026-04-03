@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import deque
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -193,13 +194,15 @@ def _accumulate_from_entries(entries: Iterable[dict]) -> dict:
     """Single-pass accumulation of all extracted data from entry stream.
 
     Processes each entry exactly once, discarding it after extraction.
+    Uses bounded storage: deque(maxlen=50) for commands, incremental last_git.
     Returns a raw accumulation dict (not a handoff — use _assemble_handoff).
     """
     read_files: list[str] = []
     edit_files: list[str] = []
     write_files: list[str] = []
     seen_reads: set[str] = set()
-    commands: list[dict] = []
+    recent_commands: deque[dict] = deque(maxlen=50)
+    last_git: dict | None = None
     tool_counts: dict[str, int] = {}
     first_ts = ""
     last_ts = ""
@@ -243,9 +246,10 @@ def _accumulate_from_entries(entries: Iterable[dict]) -> dict:
             if tool_name == "Bash":
                 command = tool_input.get("command", "")
                 if command:
-                    commands.append(
-                        {"command": command[:500], "timestamp": timestamp}
-                    )
+                    cmd_entry = {"command": command[:500], "timestamp": timestamp}
+                    recent_commands.append(cmd_entry)
+                    if "git" in command:
+                        last_git = cmd_entry
 
     created = [f for f in write_files if f not in seen_reads]
     modified = list(
@@ -256,7 +260,8 @@ def _accumulate_from_entries(entries: Iterable[dict]) -> dict:
         "read_files": read_files,
         "modified": modified,
         "created": created,
-        "commands": commands,
+        "recent_commands": list(recent_commands),
+        "last_git": last_git,
         "tool_counts": dict(sorted(tool_counts.items(), key=lambda x: -x[1])),
         "first_ts": first_ts,
         "last_ts": last_ts,
@@ -265,9 +270,14 @@ def _accumulate_from_entries(entries: Iterable[dict]) -> dict:
 
 def _assemble_handoff(acc: dict, session_id: str) -> dict:
     """Assemble a handoff dict from accumulation results."""
-    git_state = extract_git_state(acc["commands"])
+    git_state = None
+    if acc["last_git"]:
+        git_state = {
+            "last_command": acc["last_git"]["command"],
+            "timestamp": acc["last_git"]["timestamp"],
+        }
     date_str = _extract_date(acc["first_ts"])
-    recent_commands = [c["command"] for c in acc["commands"][-50:]]
+    recent_commands = [c["command"] for c in acc["recent_commands"]]
 
     return {
         "session": session_id,
@@ -303,14 +313,13 @@ def build_handoff_from_entries(
     return _assemble_handoff(acc, session_id)
 
 
-def build_handoff_from_state_events(
-    events: list[dict], session_id: str, project_dir: str
-) -> dict:
-    """Build handoff dict from parsed Phase 3 state events (pure function)."""
+def _accumulate_from_state_events(events: Iterable[dict]) -> dict:
+    """Single-pass accumulation from Phase 3 state events. Bounded storage."""
     read_files: list[str] = []
     edited_files: list[str] = []
     created_files: list[str] = []
-    commands: list[dict] = []
+    recent_commands: deque[dict] = deque(maxlen=50)
+    last_git: dict | None = None
     tool_counts: dict[str, int] = {}
     first_ts = ""
     last_ts = ""
@@ -335,28 +344,29 @@ def build_handoff_from_state_events(
 
         command = event.get("command", "")
         if tool == "Bash" and command:
-            commands.append({"command": command, "timestamp": ts})
-
-    git_state = extract_git_state(commands)
-    date_str = _extract_date(first_ts)
-    recent_commands = [c["command"] for c in commands[-50:]]
+            cmd_entry = {"command": command[:500], "timestamp": ts}
+            recent_commands.append(cmd_entry)
+            if "git" in command:
+                last_git = cmd_entry
 
     return {
-        "session": session_id,
-        "date": date_str,
-        "status": "complete",
-        "outcome": "auto-extracted",
-        "goal": "Auto-extracted session summary",
-        "files": {
-            "read": read_files,
-            "modified": edited_files,
-            "created": created_files,
-        },
-        "commands_run": recent_commands,
-        "git_state": git_state,
-        "tool_usage": dict(sorted(tool_counts.items(), key=lambda x: -x[1])),
-        "duration": {"first_timestamp": first_ts, "last_timestamp": last_ts},
+        "read_files": read_files,
+        "modified": edited_files,
+        "created": created_files,
+        "recent_commands": list(recent_commands),
+        "last_git": last_git,
+        "tool_counts": dict(sorted(tool_counts.items(), key=lambda x: -x[1])),
+        "first_ts": first_ts,
+        "last_ts": last_ts,
     }
+
+
+def build_handoff_from_state_events(
+    events: Iterable[dict], session_id: str, project_dir: str
+) -> dict:
+    """Build handoff dict from Phase 3 state events (pure, streaming)."""
+    acc = _accumulate_from_state_events(events)
+    return _assemble_handoff(acc, session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -441,8 +451,8 @@ def generate_handoff(
     """
     if state_file and state_file.exists():
         with open(state_file) as f:
-            events = parse_state_events(f)
-        return build_handoff_from_state_events(events, session_id, project_dir)
+            acc = _accumulate_from_state_events(_iter_parsed_lines(f))
+        return _assemble_handoff(acc, session_id)
     elif jsonl_path and jsonl_path.exists():
         with open(jsonl_path) as f:
             acc = _accumulate_from_entries(_iter_parsed_lines(f))

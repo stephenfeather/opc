@@ -710,3 +710,54 @@ class TestBuildHandoffFromStateEvents:
         result = build_handoff_from_state_events([], "s-empty", "/project")
         assert result["session"] == "s-empty"
         assert result["files"] == {"read": [], "modified": [], "created": []}
+
+
+# ===========================================================================
+# _sanitize_session_id
+# ===========================================================================
+
+
+class TestSanitizeSessionId:
+    """Tests for session ID path traversal prevention."""
+
+    def test_valid_simple_id(self):
+        from scripts.core.generate_mini_handoff import _sanitize_session_id
+
+        assert _sanitize_session_id("s-abc123") == "s-abc123"
+
+    def test_valid_with_underscores(self):
+        from scripts.core.generate_mini_handoff import _sanitize_session_id
+
+        assert _sanitize_session_id("session_2025_01") == "session_2025_01"
+
+    def test_rejects_path_traversal(self):
+        import pytest
+
+        from scripts.core.generate_mini_handoff import _sanitize_session_id
+
+        with pytest.raises(ValueError, match="Invalid session_id"):
+            _sanitize_session_id("../../../etc/passwd")
+
+    def test_rejects_slashes(self):
+        import pytest
+
+        from scripts.core.generate_mini_handoff import _sanitize_session_id
+
+        with pytest.raises(ValueError, match="Invalid session_id"):
+            _sanitize_session_id("foo/bar")
+
+    def test_rejects_empty_string(self):
+        import pytest
+
+        from scripts.core.generate_mini_handoff import _sanitize_session_id
+
+        with pytest.raises(ValueError, match="Invalid session_id"):
+            _sanitize_session_id("")
+
+    def test_rejects_spaces(self):
+        import pytest
+
+        from scripts.core.generate_mini_handoff import _sanitize_session_id
+
+        with pytest.raises(ValueError, match="Invalid session_id"):
+            _sanitize_session_id("has spaces")

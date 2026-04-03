@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections import deque
 from collections.abc import Iterable
@@ -461,16 +462,29 @@ def generate_handoff(
         raise ValueError("No data source provided (need jsonl_path or state_file)")
 
 
+_SAFE_SESSION_ID = re.compile(r"^[a-zA-Z0-9_\-]+$")
+
+
+def _sanitize_session_id(session_id: str) -> str:
+    """Validate session_id contains only safe filename characters."""
+    if not session_id or not _SAFE_SESSION_ID.match(session_id):
+        raise ValueError(
+            f"Invalid session_id: must match [a-zA-Z0-9_-], got {session_id!r}"
+        )
+    return session_id
+
+
 def write_handoff(handoff: dict, output_dir: Path, session_id: str) -> Path:
     """Write handoff YAML to the auto-handoffs directory.
 
     Output path: <output_dir>/thoughts/shared/handoffs/auto/<session_id>.yaml
     Returns the written path.
     """
+    safe_id = _sanitize_session_id(session_id)
     handoff_dir = output_dir / "thoughts" / "shared" / "handoffs" / "auto"
     handoff_dir.mkdir(parents=True, exist_ok=True)
 
-    output_path = handoff_dir / f"{session_id}.yaml"
+    output_path = handoff_dir / f"{safe_id}.yaml"
     output_path.write_text(format_as_yaml(handoff))
     return output_path
 

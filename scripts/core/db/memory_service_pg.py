@@ -120,7 +120,7 @@ class MemoryServicePG:
                     "SELECT 1 FROM archival_memory WHERE superseded_by IS NULL LIMIT 1"
                 )
             MemoryServicePG._has_superseded_column = True
-        except Exception:
+        except (asyncpg.UndefinedColumnError, asyncpg.UndefinedTableError):
             logger.debug("superseded_by column not found, disabling active-row filter")
             MemoryServicePG._has_superseded_column = False
         return MemoryServicePG._has_superseded_column
@@ -637,10 +637,12 @@ class MemoryServicePG:
         limit: int = 10,
     ) -> list[dict[str, Any]]:
         """Search archival memory with optional tag filtering."""
+        has_col = await self._check_superseded_column()
+        active_filter = f"AND a.{ACTIVE_ROW_FILTER}" if has_col else ""
         async with get_connection() as conn:
             if not tags:
                 rows = await conn.fetch(
-                    """
+                    f"""
                     SELECT a.id, a.content, a.metadata, a.created_at,
                         ts_rank(
                             to_tsvector('english', a.content),
@@ -651,7 +653,7 @@ class MemoryServicePG:
                     AND a.agent_id IS NOT DISTINCT FROM $2
                     AND to_tsvector('english', a.content)
                         @@ plainto_tsquery('english', $3)
-                    AND a.superseded_by IS NULL
+                    {active_filter}
                     ORDER BY score DESC
                     LIMIT $4
                     """,
@@ -659,7 +661,7 @@ class MemoryServicePG:
                 )
             elif tag_match_mode == "all":
                 rows = await conn.fetch(
-                    """
+                    f"""
                     SELECT a.id, a.content, a.metadata, a.created_at,
                         ts_rank(
                             to_tsvector('english', a.content),
@@ -670,7 +672,7 @@ class MemoryServicePG:
                     AND a.agent_id IS NOT DISTINCT FROM $2
                     AND to_tsvector('english', a.content)
                         @@ plainto_tsquery('english', $3)
-                    AND a.superseded_by IS NULL
+                    {active_filter}
                     AND a.id IN (
                         SELECT memory_id FROM memory_tags
                         WHERE session_id = $1 AND tag = ANY($4)
@@ -685,7 +687,7 @@ class MemoryServicePG:
                 )
             else:
                 rows = await conn.fetch(
-                    """
+                    f"""
                     SELECT a.id, a.content, a.metadata, a.created_at,
                         ts_rank(
                             to_tsvector('english', a.content),
@@ -696,7 +698,7 @@ class MemoryServicePG:
                     AND a.agent_id IS NOT DISTINCT FROM $2
                     AND to_tsvector('english', a.content)
                         @@ plainto_tsquery('english', $3)
-                    AND a.superseded_by IS NULL
+                    {active_filter}
                     AND a.id IN (
                         SELECT memory_id FROM memory_tags
                         WHERE session_id = $1 AND tag = ANY($4)

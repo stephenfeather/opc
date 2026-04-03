@@ -38,7 +38,7 @@ class RerankerConfig:
     tag_overlap_weight: float = 0.05
     pattern_weight: float = 0.05
     recency_half_life_days: float = 45.0
-    recall_log2_normalizer: int = 4
+    recall_log2_normalizer: float = 4.0
     rrf_scale_factor: float = 60.0
 
     @property

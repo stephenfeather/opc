@@ -91,6 +91,76 @@ def _dedup_threshold() -> float:
 DEDUP_THRESHOLD = _dedup_threshold()
 
 
+def _pg_url() -> str | None:
+    """Return PostgreSQL connection URL from environment, or None."""
+    return os.environ.get("CONTINUOUS_CLAUDE_DB_URL") or os.environ.get("DATABASE_URL")
+
+
+def _ensure_extraction_stats_table(cur) -> None:
+    """Create extraction_stats table if it does not exist."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS extraction_stats (
+            session_id TEXT PRIMARY KEY,
+            rejections INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+
+
+def _increment_rejection_count(session_id: str) -> None:
+    """Increment the learning rejection counter for a session.
+
+    Upserts into extraction_stats so the daemon can query rejection
+    counts after extraction completes.  Non-fatal — failures are
+    logged and swallowed.
+    """
+    url = _pg_url()
+    if not url:
+        return
+    try:
+        import psycopg2
+
+        conn = psycopg2.connect(url)
+        cur = conn.cursor()
+        _ensure_extraction_stats_table(cur)
+        cur.execute(
+            """
+            INSERT INTO extraction_stats (session_id, rejections)
+            VALUES (%s, 1)
+            ON CONFLICT (session_id)
+            DO UPDATE SET rejections = extraction_stats.rejections + 1
+            """,
+            (session_id,),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.debug("Failed to increment rejection count: %s", e)
+
+
+def get_rejection_count(session_id: str) -> int:
+    """Return the number of rejected (skipped) learnings for a session.
+
+    Returns 0 if no rejections recorded or on error.
+    """
+    url = _pg_url()
+    if not url:
+        return 0
+    try:
+        import psycopg2
+
+        conn = psycopg2.connect(url)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT rejections FROM extraction_stats WHERE session_id = %s",
+            (session_id,),
+        )
+        row = cur.fetchone()
+        conn.close()
+        return row[0] if row else 0
+    except Exception:
+        return 0
+
+
 async def store_learning_v2(
     session_id: str,
     content: str,
@@ -188,6 +258,7 @@ async def store_learning_v2(
                         "existing_id=%s threshold=%.2f",
                         session_id, similarity, existing_id, threshold,
                     )
+                    _increment_rejection_count(session_id)
                     await memory.close()
                     return {
                         "success": True,
@@ -303,6 +374,7 @@ async def store_learning_v2(
 
         # content_hash dedup returns empty string
         if not memory_id:
+            _increment_rejection_count(session_id)
             return {
                 "success": True,
                 "skipped": True,

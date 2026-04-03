@@ -11,115 +11,132 @@ Usage:
     python extract_workflow_patterns.py --jsonl path/to/session.jsonl --output /tmp/workflows.json
 """
 
+from __future__ import annotations
+
 import argparse
 import faulthandler
 import json
 import os
 import sys
+from collections import Counter
 from pathlib import Path
 
-faulthandler.enable(
-    file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"),
-    all_threads=True,
-)
+# ---------------------------------------------------------------------------
+# Types
+# ---------------------------------------------------------------------------
+
+PatternStep = str | tuple[str, ...]
 
 
-def extract_tool_uses(jsonl_path: Path) -> list[dict]:
-    """Stream through JSONL and extract tool_use blocks with their results.
+# ---------------------------------------------------------------------------
+# Pure functions — input extraction
+# ---------------------------------------------------------------------------
 
-    Returns ordered list of dicts with:
-        tool_name, input, timestamp, line_num, tool_use_id,
-        result_content (str|None), is_error (bool)
-    """
-    tool_uses = []
-    # First pass: collect all tool_use entries
-    pending_ids: dict[str, int] = {}  # tool_use_id -> index in tool_uses
-
-    with open(jsonl_path) as f:
-        for line_num, line in enumerate(f, 1):
-            try:
-                data = json.loads(line.strip())
-            except json.JSONDecodeError:
-                continue
-
-            message = data.get("message", {})
-            content = message.get("content")
-            if not isinstance(content, list):
-                continue
-
-            if data.get("type") == "assistant":
-                for item in content:
-                    if not isinstance(item, dict):
-                        continue
-                    if item.get("type") != "tool_use":
-                        continue
-
-                    tool_name = item.get("name", "")
-                    tool_input = item.get("input", {})
-                    tool_id = item.get("id", "")
-
-                    entry = {
-                        "tool_name": tool_name,
-                        "input": _extract_input(tool_name, tool_input),
-                        "timestamp": data.get("timestamp"),
-                        "line_num": line_num,
-                        "tool_use_id": tool_id,
-                        "result_error": None,
-                    }
-                    pending_ids[tool_id] = len(tool_uses)
-                    tool_uses.append(entry)
-
-            elif data.get("type") == "user":
-                for item in content:
-                    if not isinstance(item, dict):
-                        continue
-                    if item.get("type") != "tool_result":
-                        continue
-
-                    tid = item.get("tool_use_id", "")
-                    if tid in pending_ids:
-                        idx = pending_ids[tid]
-                        tool_uses[idx]["result_error"] = (
-                            item.get("is_error", False)
-                        )
-
-    return tool_uses
+INPUT_EXTRACTORS: dict[str, tuple[str, ...]] = {
+    "Read": ("file_path",),
+    "Edit": ("file_path",),
+    "Write": ("file_path",),
+    "MultiEdit": ("file_path",),
+    "Bash": ("command",),
+    "Grep": ("pattern", "path"),
+    "Glob": ("pattern", "path"),
+    "Agent": ("subagent_type", "description"),
+}
 
 
 def _extract_input(tool_name: str, tool_input: dict) -> dict:
     """Extract the relevant fields from tool input based on tool type."""
-    if tool_name in ("Read", "Edit", "Write", "MultiEdit"):
-        return {"file_path": tool_input.get("file_path", "")}
-    elif tool_name == "Bash":
-        cmd = tool_input.get("command", "")
-        return {"command": cmd[:500]}
-    elif tool_name in ("Grep", "Glob"):
-        return {
-            "pattern": tool_input.get("pattern", ""),
-            "path": tool_input.get("path", ""),
-        }
-    elif tool_name == "Agent":
-        return {
-            "subagent_type": tool_input.get("subagent_type", ""),
-            "description": tool_input.get("description", ""),
-        }
-    else:
+    fields = INPUT_EXTRACTORS.get(tool_name)
+    if fields is None:
         return {}
+    extracted = {f: tool_input.get(f, "") for f in fields}
+    if tool_name == "Bash":
+        extracted["command"] = extracted["command"][:500]
+    return extracted
 
+
+# ---------------------------------------------------------------------------
+# Pure functions — pattern matching
+# ---------------------------------------------------------------------------
 
 # Pattern definitions: (name, sequence of tool names, min_length)
-WORKFLOW_PATTERNS = [
+WORKFLOW_PATTERNS: list[tuple[str, list[PatternStep], int]] = [
     ("test-edit-test", ["Bash", ("Edit", "Write"), "Bash"], 3),
     ("search-read-edit", [("Grep", "Glob"), "Read", ("Edit", "Write")], 3),
     ("read-edit", ["Read", ("Edit", "Write")], 2),
 ]
 
 
-def _matches_step(tool_name: str, step) -> bool:
+def _matches_step(tool_name: str, step: PatternStep) -> bool:
     """Check if a tool name matches a pattern step (string or tuple)."""
     if isinstance(step, tuple):
         return tool_name in step
     return tool_name == step
+
+
+def _match_pattern_at(
+    tool_uses: list[dict],
+    pat_steps: list[PatternStep],
+    start: int,
+) -> list[dict] | None:
+    """Try to match a pattern starting at position start.
+
+    Returns matched tool entries if the full pattern is found, None otherwise.
+    """
+    matched: list[dict] = []
+    step_idx = 0
+    j = start
+
+    while j < len(tool_uses) and step_idx < len(pat_steps):
+        if _matches_step(tool_uses[j]["tool_name"], pat_steps[step_idx]):
+            matched.append(tool_uses[j])
+            step_idx += 1
+        elif step_idx > 0:
+            return None
+        j += 1
+
+    if step_idx == len(pat_steps):
+        return matched
+    return None
+
+
+def _determine_success(matched: list[dict]) -> bool | None:
+    """Determine success from matched tool entries.
+
+    Checks last Bash result first, then last Edit/Write result.
+    Returns None if no result_error information available.
+    """
+    for m in reversed(matched):
+        if m["tool_name"] == "Bash" and m["result_error"] is not None:
+            return not m["result_error"]
+
+    for m in reversed(matched):
+        if m["tool_name"] in ("Edit", "Write") and m["result_error"] is not None:
+            return not m["result_error"]
+
+    return None
+
+
+def _collect_files(matched: list[dict]) -> list[str]:
+    """Extract unique file paths from matched tool entries."""
+    return list({
+        m["input"].get("file_path", "")
+        for m in matched
+        if m["input"].get("file_path")
+    })
+
+
+def _build_pattern_result(pat_name: str, matched: list[dict]) -> dict:
+    """Build a pattern result dict from matched tool entries."""
+    return {
+        "pattern_type": pat_name,
+        "tools": [
+            {"tool_name": m["tool_name"], "input": m["input"]}
+            for m in matched
+        ],
+        "files": _collect_files(matched),
+        "success": _determine_success(matched),
+    }
 
 
 def detect_workflow_sequences(tool_uses: list[dict]) -> list[dict]:
@@ -129,93 +146,55 @@ def detect_workflow_sequences(tool_uses: list[dict]) -> list[dict]:
         pattern_type, tools (list of tool entries), files (list),
         success (bool|None)
     """
-    patterns_found = []
+    patterns_found: list[dict] = []
 
     for pat_name, pat_steps, min_len in WORKFLOW_PATTERNS:
         i = 0
         while i < len(tool_uses):
-            # Try to match the pattern starting at position i
-            matched = []
-            step_idx = 0
-            j = i
-
-            while j < len(tool_uses) and step_idx < len(pat_steps):
-                if _matches_step(
-                    tool_uses[j]["tool_name"], pat_steps[step_idx]
-                ):
-                    matched.append(tool_uses[j])
-                    step_idx += 1
-                elif step_idx > 0:
-                    # Pattern broken, restart
-                    break
-                j += 1
-
-            if step_idx == len(pat_steps) and len(matched) >= min_len:
-                # Determine success: check last Bash, then Edit/Write
-                success = None
-                for m in reversed(matched):
-                    if m["tool_name"] == "Bash":
-                        if m["result_error"] is not None:
-                            success = not m["result_error"]
-                        break
-                if success is None:
-                    for m in reversed(matched):
-                        if m["tool_name"] in ("Edit", "Write"):
-                            if m["result_error"] is not None:
-                                success = not m["result_error"]
-                            break
-
-                files = list({
-                    m["input"].get("file_path", "")
-                    for m in matched
-                    if m["input"].get("file_path")
-                })
-
-                patterns_found.append({
-                    "pattern_type": pat_name,
-                    "tools": [
-                        {
-                            "tool_name": m["tool_name"],
-                            "input": m["input"],
-                        }
-                        for m in matched
-                    ],
-                    "files": files,
-                    "success": success,
-                })
-                i = j  # skip past matched sequence
+            matched = _match_pattern_at(tool_uses, pat_steps, i)
+            if matched is not None and len(matched) >= min_len:
+                patterns_found.append(
+                    _build_pattern_result(pat_name, matched)
+                )
+                i += len(matched)
             else:
                 i += 1
 
     return patterns_found
 
 
+# ---------------------------------------------------------------------------
+# Pure functions — summarization
+# ---------------------------------------------------------------------------
+
+
 def summarize_tool_usage(tool_uses: list[dict]) -> dict:
     """Summarize tool usage frequency and files touched."""
-    tool_counts: dict[str, int] = {}
-    files_by_tool: dict[str, set] = {}
-    commands: list[str] = []
+    tool_counts = dict(Counter(tu["tool_name"] for tu in tool_uses))
 
+    files_by_tool: dict[str, set[str]] = {}
     for tu in tool_uses:
-        name = tu["tool_name"]
-        tool_counts[name] = tool_counts.get(name, 0) + 1
-
         fp = tu["input"].get("file_path", "")
         if fp:
-            files_by_tool.setdefault(name, set()).add(fp)
+            files_by_tool.setdefault(tu["tool_name"], set()).add(fp)
 
-        cmd = tu["input"].get("command", "")
-        if cmd:
-            commands.append(cmd)
+    commands = {
+        tu["input"].get("command", "")
+        for tu in tool_uses
+        if tu["input"].get("command")
+    }
 
     return {
         "tool_counts": tool_counts,
-        "files_by_tool": {
-            k: sorted(v) for k, v in files_by_tool.items()
-        },
-        "unique_commands": len(set(commands)),
+        "files_by_tool": {k: sorted(v) for k, v in files_by_tool.items()},
+        "unique_commands": len(commands),
         "total_tool_calls": len(tool_uses),
     }
+
+
+# ---------------------------------------------------------------------------
+# Pure functions — formatting
+# ---------------------------------------------------------------------------
 
 
 def format_pattern_as_learning(pattern: dict) -> str:
@@ -227,26 +206,164 @@ def format_pattern_as_learning(pattern: dict) -> str:
 
     tool_seq = " -> ".join(t["tool_name"] for t in tools)
     file_list = ", ".join(os.path.basename(f) for f in files[:5])
-    status = "succeeded" if success else "failed" if success is False else "unknown"
+    status = (
+        "succeeded" if success
+        else "failed" if success is False
+        else "unknown"
+    )
 
     parts = [f"Workflow pattern ({pat_type}): {tool_seq}"]
     if file_list:
         parts.append(f"Files: {file_list}")
     parts.append(f"Outcome: {status}")
 
-    # Add command details for test-edit-test
     if pat_type == "test-edit-test":
         for t in tools:
-            if t["tool_name"] == "Bash":
-                cmd = t["input"].get("command", "")
-                if cmd:
-                    parts.append(f"Command: {cmd[:200]}")
-                    break
+            cmd = t["input"].get("command", "")
+            if t["tool_name"] == "Bash" and cmd:
+                parts.append(f"Command: {cmd[:200]}")
+                break
 
     return ". ".join(parts)
 
 
-def main():
+# ---------------------------------------------------------------------------
+# I/O — JSONL parsing
+# ---------------------------------------------------------------------------
+
+
+def _parse_tool_use_entry(
+    item: dict, data: dict, line_num: int,
+) -> dict | None:
+    """Parse a single tool_use content item into a tool entry dict."""
+    if not isinstance(item, dict) or item.get("type") != "tool_use":
+        return None
+    tool_name = item.get("name", "")
+    return {
+        "tool_name": tool_name,
+        "input": _extract_input(tool_name, item.get("input", {})),
+        "timestamp": data.get("timestamp"),
+        "line_num": line_num,
+        "tool_use_id": item.get("id", ""),
+        "result_error": None,
+    }
+
+
+def _parse_tool_result(item: dict) -> tuple[str, bool] | None:
+    """Parse a tool_result content item. Returns (tool_use_id, is_error)."""
+    if not isinstance(item, dict) or item.get("type") != "tool_result":
+        return None
+    return (item.get("tool_use_id", ""), item.get("is_error", False))
+
+
+def extract_tool_uses(jsonl_path: Path) -> list[dict]:
+    """Stream through JSONL and extract tool_use blocks with their results.
+
+    Returns ordered list of dicts with:
+        tool_name, input, timestamp, line_num, tool_use_id,
+        result_error (bool|None)
+    """
+    tool_uses: list[dict] = []
+    pending_ids: dict[str, int] = {}
+
+    with open(jsonl_path) as f:
+        for line_num, line in enumerate(f, 1):
+            try:
+                data = json.loads(line.strip())
+            except json.JSONDecodeError:
+                continue
+
+            content = data.get("message", {}).get("content")
+            if not isinstance(content, list):
+                continue
+
+            msg_type = data.get("type")
+
+            if msg_type == "assistant":
+                for item in content:
+                    entry = _parse_tool_use_entry(item, data, line_num)
+                    if entry is not None:
+                        pending_ids[entry["tool_use_id"]] = len(tool_uses)
+                        tool_uses.append(entry)
+
+            elif msg_type == "user":
+                for item in content:
+                    result = _parse_tool_result(item)
+                    if result is not None:
+                        tid, is_error = result
+                        if tid in pending_ids:
+                            tool_uses[pending_ids[tid]]["result_error"] = (
+                                is_error
+                            )
+
+    return tool_uses
+
+
+# ---------------------------------------------------------------------------
+# CLI handler
+# ---------------------------------------------------------------------------
+
+
+def _format_output(
+    patterns: list[dict],
+    tool_uses: list[dict],
+    fmt: str,
+    patterns_only: bool,
+) -> str:
+    """Format results for output."""
+    if patterns_only:
+        result = patterns
+    else:
+        result = {
+            "tool_uses": [
+                {
+                    "tool_name": t["tool_name"],
+                    "input": t["input"],
+                    "timestamp": t["timestamp"],
+                    "result_error": t["result_error"],
+                }
+                for t in tool_uses
+            ],
+            "patterns": patterns,
+            "summary": summarize_tool_usage(tool_uses),
+        }
+
+    if fmt == "json":
+        return json.dumps(result, indent=2)
+
+    if patterns_only:
+        lines = [format_pattern_as_learning(p) for p in patterns]
+        return "\n\n".join(lines) if lines else "No patterns detected."
+
+    return json.dumps(result, indent=2)
+
+
+def _write_output(
+    output: str,
+    output_path: str | None,
+    pattern_count: int,
+    tool_count: int,
+) -> None:
+    """Write output to file or stdout."""
+    if output_path:
+        Path(output_path).write_text(output)
+        print(
+            f"Wrote {pattern_count} patterns from "
+            f"{tool_count} tool uses to {output_path}",
+            file=sys.stderr,
+        )
+    else:
+        print(output)
+
+
+def main() -> None:
+    faulthandler.enable(
+        file=open(
+            os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"
+        ),
+        all_threads=True,
+    )
+
     parser = argparse.ArgumentParser(
         description="Extract workflow patterns from session JSONL"
     )
@@ -281,49 +398,14 @@ def main():
     tool_uses = extract_tool_uses(jsonl_path)
 
     if args.stats:
-        summary = summarize_tool_usage(tool_uses)
-        print(json.dumps(summary, indent=2))
+        print(json.dumps(summarize_tool_usage(tool_uses), indent=2))
         return
 
     patterns = detect_workflow_sequences(tool_uses)
-
-    if args.patterns_only:
-        result = patterns
-    else:
-        result = {
-            "tool_uses": [
-                {
-                    "tool_name": t["tool_name"],
-                    "input": t["input"],
-                    "timestamp": t["timestamp"],
-                    "result_error": t["result_error"],
-                }
-                for t in tool_uses
-            ],
-            "patterns": patterns,
-            "summary": summarize_tool_usage(tool_uses),
-        }
-
-    if args.format == "json":
-        output = json.dumps(result, indent=2)
-    else:
-        if args.patterns_only:
-            lines = []
-            for p in patterns:
-                lines.append(format_pattern_as_learning(p))
-            output = "\n\n".join(lines) if lines else "No patterns detected."
-        else:
-            output = json.dumps(result, indent=2)
-
-    if args.output:
-        Path(args.output).write_text(output)
-        print(
-            f"Wrote {len(patterns)} patterns from "
-            f"{len(tool_uses)} tool uses to {args.output}",
-            file=sys.stderr,
-        )
-    else:
-        print(output)
+    output = _format_output(
+        patterns, tool_uses, args.format, args.patterns_only
+    )
+    _write_output(output, args.output, len(patterns), len(tool_uses))
 
 
 if __name__ == "__main__":

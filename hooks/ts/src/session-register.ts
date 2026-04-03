@@ -12,7 +12,7 @@
 
 import { readFileSync } from 'fs';
 import { registerSession, getActiveSessions } from './shared/db-utils-pg.js';
-import { generateSessionId, writeSessionId, getProject } from './shared/session-id.js';
+import { writeSessionId, getProject } from './shared/session-id.js';
 import type { SessionStartInput, HookOutput } from './shared/types.js';
 
 /**
@@ -37,7 +37,7 @@ export function main(): void {
     return;
   }
 
-  const sessionId = generateSessionId();
+  const sessionId = input.session_id;
   const project = getProject();
   const projectName = project.split('/').pop() || 'unknown';
 

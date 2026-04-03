@@ -1,3 +1,4 @@
+//! @hook Stop @preserve
 import * as fs from 'fs';
 import * as path from 'path';
 import { spawn } from 'child_process';

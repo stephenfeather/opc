@@ -1,3 +1,4 @@
+//! @hook UserPromptSubmit @preserve
 /**
  * Memory Awareness Hook (UserPromptSubmit)
  *

@@ -267,6 +267,7 @@ function getProject() {
 }
 
 // src/session-register.ts
+//! @hook SessionStart @preserve
 function main() {
   if (process.env.CLAUDE_MEMORY_EXTRACTION) {
     console.log(JSON.stringify({ result: "continue" }));

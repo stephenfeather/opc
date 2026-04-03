@@ -1,3 +1,4 @@
+//! @hook PreToolUse:Edit @preserve
 /**
  * PreToolUse:Edit Hook - Check and claim files for conflict prevention.
  *

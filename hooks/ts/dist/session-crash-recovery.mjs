@@ -1,5 +1,7 @@
-// src/pre-compact-continuity.ts
-import * as fs2 from "fs";
+// src/session-crash-recovery.ts
+import { existsSync as existsSync3, writeFileSync, mkdirSync } from "fs";
+import { readFileSync as readFileSync3 } from "fs";
+import { execSync } from "child_process";
 import * as path from "path";
 
 // src/transcript-parser.ts
@@ -271,168 +273,294 @@ if (isMainModule) {
   console.log(generateAutoHandoff(summary, sessionName));
 }
 
-// src/pre-compact-continuity.ts
-//! @hook PreCompact @preserve
-function getMemoryPushContext() {
+// src/shared/db-utils-pg.ts
+import { spawnSync } from "child_process";
+
+// src/shared/opc-path.ts
+import { existsSync as existsSync2, readFileSync as readFileSync2 } from "fs";
+import { join } from "path";
+function getOpcDirFromConfig() {
   const homeDir = process.env.HOME || process.env.USERPROFILE || "";
-  const pushFile = path.join(homeDir, ".claude", "cache", "memory-push.json");
-  if (!fs2.existsSync(pushFile)) return "";
+  if (!homeDir) return null;
+  const configPath = join(homeDir, ".claude", "opc.json");
+  if (!existsSync2(configPath)) return null;
   try {
-    const stat = fs2.statSync(pushFile);
-    const ageMs = Date.now() - stat.mtimeMs;
-    if (ageMs > 2 * 60 * 60 * 1e3) return "";
-    const pushData = JSON.parse(fs2.readFileSync(pushFile, "utf-8"));
-    if (!pushData.results || pushData.results.length === 0) return "";
-    const currentProject = (process.env.CLAUDE_PROJECT_DIR || process.cwd()).replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? "";
-    if (pushData.project && currentProject && pushData.project !== currentProject) return "";
-    const pushLines = pushData.results.map((r, i) => {
-      const label = r.pattern_label ? `
-   \u21B3 Pattern: "${r.pattern_label}"` : "";
-      return `${i + 1}. [${r.learning_type}|${r.confidence}] ${r.content} (id: ${r.id.slice(0, 8)})${label}`;
-    }).join("\n");
-    return `
-PROACTIVE MEMORY (carried through compaction):
-${pushLines}`;
+    const content = readFileSync2(configPath, "utf-8");
+    const config = JSON.parse(content);
+    const opcDir = config.opc_dir;
+    if (opcDir && typeof opcDir === "string" && existsSync2(opcDir)) {
+      return opcDir;
+    }
   } catch {
-    return "";
+  }
+  return null;
+}
+function getOpcDir() {
+  const envOpcDir = process.env.CLAUDE_OPC_DIR;
+  if (envOpcDir && existsSync2(envOpcDir)) {
+    return envOpcDir;
+  }
+  const configOpcDir = getOpcDirFromConfig();
+  if (configOpcDir) {
+    return configOpcDir;
+  }
+  const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  const localOpc = join(projectDir, "opc");
+  if (existsSync2(localOpc)) {
+    return localOpc;
+  }
+  const homeDir = process.env.HOME || process.env.USERPROFILE || "";
+  if (homeDir) {
+    const globalClaude = join(homeDir, ".claude");
+    const globalScripts = join(globalClaude, "scripts", "core");
+    if (existsSync2(globalScripts)) {
+      return globalClaude;
+    }
+  }
+  return null;
+}
+function requireOpcDir() {
+  const opcDir = getOpcDir();
+  if (!opcDir) {
+    console.log(JSON.stringify({ result: "continue" }));
+    process.exit(0);
+  }
+  return opcDir;
+}
+
+// src/shared/db-utils-pg.ts
+function getPgConnectionString() {
+  return process.env.CONTINUOUS_CLAUDE_DB_URL || process.env.DATABASE_URL || process.env.OPC_POSTGRES_URL || "postgresql://claude:claude_dev@localhost:5432/continuous_claude";
+}
+function runPgQuery(pythonCode, args = []) {
+  const opcDir = requireOpcDir();
+  const wrappedCode = `
+import sys
+import os
+import asyncio
+import json
+
+# Add opc to path for imports
+sys.path.insert(0, '${opcDir}')
+os.chdir('${opcDir}')
+
+${pythonCode}
+`;
+  try {
+    const result = spawnSync("uv", ["run", "python", "-c", wrappedCode, ...args], {
+      encoding: "utf-8",
+      maxBuffer: 1024 * 1024,
+      timeout: 5e3,
+      // 5 second timeout - fail gracefully if DB unreachable
+      cwd: opcDir,
+      env: {
+        ...process.env,
+        CONTINUOUS_CLAUDE_DB_URL: getPgConnectionString()
+      }
+    });
+    return {
+      success: result.status === 0,
+      stdout: result.stdout?.trim() || "",
+      stderr: result.stderr || ""
+    };
+  } catch (err) {
+    return {
+      success: false,
+      stdout: "",
+      stderr: String(err)
+    };
   }
 }
+function getCrashedSessions(project) {
+  const pythonCode = `
+import asyncpg
+import os
+import json
+
+project = sys.argv[1]
+pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL', 'postgresql://claude:claude_dev@localhost:5432/continuous_claude')
+
+async def main():
+    conn = await asyncpg.connect(pg_url)
+    try:
+        rows = await conn.fetch('''
+            SELECT id, project, claude_session_id, transcript_path, pid, started_at, last_heartbeat
+            FROM sessions
+            WHERE project = $1
+              AND exited_at IS NULL
+            ORDER BY started_at DESC
+        ''', project)
+
+        sessions = []
+        for row in rows:
+            sessions.append({
+                'id': row['id'],
+                'project': row['project'],
+                'claude_session_id': row['claude_session_id'],
+                'transcript_path': row['transcript_path'],
+                'pid': row['pid'],
+                'started_at': row['started_at'].isoformat() if row['started_at'] else None,
+                'last_heartbeat': row['last_heartbeat'].isoformat() if row['last_heartbeat'] else None
+            })
+
+        print(json.dumps(sessions))
+    except Exception as e:
+        print(json.dumps([]))
+    finally:
+        await conn.close()
+
+asyncio.run(main())
+`;
+  const result = runPgQuery(pythonCode, [project]);
+  if (!result.success) {
+    return { success: false, sessions: [] };
+  }
+  try {
+    const sessions = JSON.parse(result.stdout || "[]");
+    return { success: true, sessions };
+  } catch {
+    return { success: false, sessions: [] };
+  }
+}
+function markSessionsAcknowledged(sessionIds) {
+  if (sessionIds.length === 0) return { success: true };
+  const pythonCode = `
+import asyncpg
+import os
+import json
+
+session_ids = json.loads(sys.argv[1])
+pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL', 'postgresql://claude:claude_dev@localhost:5432/continuous_claude')
+
+async def main():
+    conn = await asyncpg.connect(pg_url)
+    try:
+        await conn.execute('''
+            UPDATE sessions SET exited_at = NOW()
+            WHERE id = ANY($1::text[])
+        ''', session_ids)
+        print('ok')
+    finally:
+        await conn.close()
+
+asyncio.run(main())
+`;
+  const result = runPgQuery(pythonCode, [JSON.stringify(sessionIds)]);
+  return { success: result.success && result.stdout === "ok" };
+}
+
+// src/session-crash-recovery.ts
+//! @hook SessionStart @preserve
+function getSessionName(projectDir) {
+  try {
+    const handoffsDir = path.join(projectDir, "thoughts", "shared", "handoffs");
+    if (existsSync3(handoffsDir)) {
+      const result = execSync(
+        `ls -td "${handoffsDir}"/*/ 2>/dev/null | head -1 | xargs basename`,
+        { encoding: "utf-8", timeout: 5e3, stdio: ["pipe", "pipe", "pipe"] }
+      ).trim();
+      if (result) return result;
+    }
+  } catch {
+  }
+  try {
+    const result = execSync(
+      `basename "$(git worktree list --porcelain 2>/dev/null | head -1 | sed 's/^worktree //')" 2>/dev/null`,
+      { cwd: projectDir, encoding: "utf-8", timeout: 5e3, stdio: ["pipe", "pipe", "pipe"] }
+    ).trim();
+    if (result) return result;
+  } catch {
+  }
+  try {
+    const result = execSync("git branch --show-current 2>/dev/null", {
+      cwd: projectDir,
+      encoding: "utf-8",
+      timeout: 5e3,
+      stdio: ["pipe", "pipe", "pipe"]
+    }).trim();
+    if (result) return result;
+  } catch {
+  }
+  return path.basename(projectDir);
+}
+function createRecoveryHandoff(crashed, projectDir) {
+  if (!crashed.transcript_path || !existsSync3(crashed.transcript_path)) {
+    return null;
+  }
+  const summary = parseTranscript(crashed.transcript_path);
+  if (summary.recentToolCalls.length === 0 && summary.filesModified.length === 0) {
+    return null;
+  }
+  const sessionName = getSessionName(projectDir);
+  let handoffContent = generateAutoHandoff(summary, sessionName);
+  handoffContent = handoffContent.replace("outcome: PARTIAL_PLUS", "outcome: PARTIAL_MINUS").replace("status: partial", "status: crashed").replace(
+    'auto_compact: "Context limit reached, auto-compacted"',
+    'crash_recovery: "Previous session ended unexpectedly (CLI crash/hang)"'
+  );
+  const handoffDir = path.join(projectDir, "thoughts", "shared", "handoffs", sessionName);
+  mkdirSync(handoffDir, { recursive: true });
+  const now = /* @__PURE__ */ new Date();
+  const dateStr = now.toISOString().split("T")[0];
+  const timeStr = `${String(now.getHours()).padStart(2, "0")}-${String(now.getMinutes()).padStart(2, "0")}`;
+  const filename = `${dateStr}_${timeStr}_crash-recovery.yaml`;
+  const handoffPath = path.join(handoffDir, filename);
+  writeFileSync(handoffPath, handoffContent);
+  return `thoughts/shared/handoffs/${sessionName}/${filename}`;
+}
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function isSessionCrashed(session) {
+  if (session.pid) {
+    return !isProcessAlive(session.pid);
+  }
+  if (!session.last_heartbeat) return true;
+  const heartbeat = new Date(session.last_heartbeat).getTime();
+  const staleThreshold = 5 * 60 * 1e3;
+  return Date.now() - heartbeat > staleThreshold;
+}
 async function main() {
-  const input = JSON.parse(await readStdin());
+  const input = JSON.parse(readFileSync3(0, "utf-8"));
   const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
-  const ledgerDir = path.join(projectDir, "thoughts", "ledgers");
-  const ledgerFiles = fs2.readdirSync(ledgerDir).filter((f) => f.startsWith("CONTINUITY_CLAUDE-") && f.endsWith(".md"));
-  if (ledgerFiles.length === 0) {
-    const output = {
-      continue: true,
-      systemMessage: "[PreCompact] No ledger found. Create one? /continuity_ledger"
-    };
-    console.log(JSON.stringify(output));
+  if (input.type && input.type !== "startup") {
+    console.log("{}");
     return;
   }
-  const mostRecent = ledgerFiles.sort((a, b) => {
-    const statA = fs2.statSync(path.join(ledgerDir, a));
-    const statB = fs2.statSync(path.join(ledgerDir, b));
-    return statB.mtime.getTime() - statA.mtime.getTime();
-  })[0];
-  const ledgerPath = path.join(ledgerDir, mostRecent);
-  if (input.trigger === "auto") {
-    const sessionName = mostRecent.replace("CONTINUITY_CLAUDE-", "").replace(".md", "");
-    let handoffFile = "";
-    if (input.transcript_path && fs2.existsSync(input.transcript_path)) {
-      const summary = parseTranscript(input.transcript_path);
-      const handoffContent = generateAutoHandoff(summary, sessionName);
-      const handoffDir = path.join(projectDir, "thoughts", "shared", "handoffs", sessionName);
-      fs2.mkdirSync(handoffDir, { recursive: true });
-      const timestamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      handoffFile = `auto-handoff-${timestamp}.yaml`;
-      const handoffPath = path.join(handoffDir, handoffFile);
-      fs2.writeFileSync(handoffPath, handoffContent);
-      const briefSummary = generateAutoSummary(projectDir, input.session_id);
-      if (briefSummary) {
-        appendToLedger(ledgerPath, briefSummary);
-      }
-    } else {
-      const briefSummary = generateAutoSummary(projectDir, input.session_id);
-      if (briefSummary) {
-        appendToLedger(ledgerPath, briefSummary);
-      }
-    }
-    const message = handoffFile ? `[PreCompact:auto] Created YAML handoff: thoughts/shared/handoffs/${sessionName}/${handoffFile}` : `[PreCompact:auto] Session summary auto-appended to ${mostRecent}`;
-    const pushContext = getMemoryPushContext();
+  const result = getCrashedSessions(projectDir);
+  if (!result.success || result.sessions.length === 0) {
+    console.log("{}");
+    return;
+  }
+  const crashedSessions = result.sessions.filter(isSessionCrashed);
+  if (crashedSessions.length === 0) {
+    console.log("{}");
+    return;
+  }
+  const crashed = crashedSessions[0];
+  const handoffPath = createRecoveryHandoff(crashed, projectDir);
+  const crashedIds = crashedSessions.map((s) => s.id);
+  markSessionsAcknowledged(crashedIds);
+  if (handoffPath) {
+    const contextMsg = [
+      "Previous session ended unexpectedly (crash/hang).",
+      `Recovery handoff created: ${handoffPath}`,
+      `Resume with: /resume_handoff ${handoffPath}`
+    ].join("\n");
     const output = {
-      continue: true,
-      systemMessage: message + pushContext
+      systemMessage: `\u26A0\uFE0F Crash detected! Recovery handoff: ${handoffPath}`,
+      hookSpecificOutput: {
+        hookEventName: "SessionStart",
+        additionalContext: contextMsg
+      }
     };
     console.log(JSON.stringify(output));
   } else {
-    const pushContext = getMemoryPushContext();
-    const output = {
-      continue: true,
-      systemMessage: `[PreCompact] Consider updating ledger before compacting: /continuity_ledger
-Ledger: ${mostRecent}` + pushContext
-    };
-    console.log(JSON.stringify(output));
+    console.log("{}");
   }
 }
-function generateAutoSummary(projectDir, sessionId) {
-  const timestamp = (/* @__PURE__ */ new Date()).toISOString();
-  const lines = [];
-  const cacheDir = path.join(projectDir, ".claude", "tsc-cache", sessionId || "default");
-  const editedFilesPath = path.join(cacheDir, "edited-files.log");
-  let editedFiles = [];
-  if (fs2.existsSync(editedFilesPath)) {
-    const content = fs2.readFileSync(editedFilesPath, "utf-8");
-    editedFiles = [...new Set(
-      content.split("\n").filter((line) => line.trim()).map((line) => {
-        const parts = line.split(":");
-        return parts[1]?.replace(projectDir + "/", "") || "";
-      }).filter((f) => f)
-    )];
-  }
-  const gitClaudeDir = path.join(projectDir, ".git", "claude", "branches");
-  let buildAttempts = { passed: 0, failed: 0 };
-  if (fs2.existsSync(gitClaudeDir)) {
-    try {
-      const branches = fs2.readdirSync(gitClaudeDir);
-      for (const branch of branches) {
-        const attemptsFile = path.join(gitClaudeDir, branch, "attempts.jsonl");
-        if (fs2.existsSync(attemptsFile)) {
-          const content = fs2.readFileSync(attemptsFile, "utf-8");
-          content.split("\n").filter((l) => l.trim()).forEach((line) => {
-            try {
-              const attempt = JSON.parse(line);
-              if (attempt.type === "build_pass") buildAttempts.passed++;
-              if (attempt.type === "build_fail") buildAttempts.failed++;
-            } catch {
-            }
-          });
-        }
-      }
-    } catch {
-    }
-  }
-  if (editedFiles.length === 0 && buildAttempts.passed === 0 && buildAttempts.failed === 0) {
-    return null;
-  }
-  lines.push(`
-## Session Auto-Summary (${timestamp})`);
-  if (editedFiles.length > 0) {
-    lines.push(`- Files changed: ${editedFiles.slice(0, 10).join(", ")}${editedFiles.length > 10 ? ` (+${editedFiles.length - 10} more)` : ""}`);
-  }
-  if (buildAttempts.passed > 0 || buildAttempts.failed > 0) {
-    lines.push(`- Build/test: ${buildAttempts.passed} passed, ${buildAttempts.failed} failed`);
-  }
-  return lines.join("\n");
-}
-function appendToLedger(ledgerPath, summary) {
-  try {
-    let content = fs2.readFileSync(ledgerPath, "utf-8");
-    const stateMatch = content.match(/## State\n/);
-    if (stateMatch) {
-      const nowMatch = content.match(/(\n-\s*Now:)/);
-      if (nowMatch && nowMatch.index) {
-        content = content.slice(0, nowMatch.index) + summary + content.slice(nowMatch.index);
-      } else {
-        const nextSection = content.indexOf("\n## ", content.indexOf("## State") + 1);
-        if (nextSection > 0) {
-          content = content.slice(0, nextSection) + summary + "\n" + content.slice(nextSection);
-        } else {
-          content += summary;
-        }
-      }
-    } else {
-      content += summary;
-    }
-    fs2.writeFileSync(ledgerPath, content);
-  } catch (err) {
-  }
-}
-async function readStdin() {
-  return new Promise((resolve) => {
-    let data = "";
-    process.stdin.on("data", (chunk) => data += chunk);
-    process.stdin.on("end", () => resolve(data));
-  });
-}
-main().catch(console.error);
+main().catch(() => console.log("{}"));

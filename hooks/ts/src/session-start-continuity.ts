@@ -1,3 +1,4 @@
+//! @hook SessionStart @preserve
 import * as fs from 'fs';
 import * as path from 'path';
 import { execSync, spawn } from 'child_process';

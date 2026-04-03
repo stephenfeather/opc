@@ -1,3 +1,4 @@
+//! @hook none (shared library) @preserve
 /**
  * Shared TypeScript client for TLDR daemon.
  *

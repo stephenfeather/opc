@@ -1,3 +1,4 @@
+//! @hook none (shared library) @preserve
 /**
  * Transcript Parser Module
  *

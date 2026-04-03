@@ -47,6 +47,7 @@ function getOpcDir() {
 }
 
 // src/memory-awareness.ts
+//! @hook UserPromptSubmit @preserve
 function readStdin() {
   return readFileSync2(0, "utf-8");
 }
@@ -212,8 +213,9 @@ function checkMemoryRelevance(intent, projectDir) {
   const opcDir = getOpcDir();
   if (!opcDir) return null;
   const searchTerm = intent.replace(/[_\/]/g, " ").replace(/\b\w{1,2}\b/g, "").replace(/\s+/g, " ").trim();
-  const projectTag = projectDir ? projectDir.split("/").pop() || "" : "";
-  const tagArgs = projectTag ? ["--tags", projectTag] : [];
+  const projectTag = projectDir ? projectDir.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? "" : "";
+  const safeProjectTag = projectTag && !projectTag.startsWith("-") ? projectTag : "";
+  const tagArgs = safeProjectTag ? ["--tags", safeProjectTag] : [];
   const result = spawnSync("uv", [
     "run",
     "python",

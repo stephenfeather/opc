@@ -1,3 +1,4 @@
+//! @hook Stop @preserve
 /**
  * Session Clean Exit Hook (SessionEnd)
  *

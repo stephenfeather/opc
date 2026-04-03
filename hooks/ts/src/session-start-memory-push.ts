@@ -1,3 +1,4 @@
+//! @hook SessionStart @preserve
 /**
  * Session Start Memory Push Hook (SessionStart, type=startup)
  *

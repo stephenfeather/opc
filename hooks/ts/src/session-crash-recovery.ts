@@ -1,3 +1,4 @@
+//! @hook SessionStart @preserve
 /**
  * Session Crash Recovery Hook (SessionStart)
  *

@@ -48,6 +48,7 @@ function getOpcDir() {
 }
 
 // src/session-start-memory-push.ts
+//! @hook SessionStart @preserve
 function main() {
   let input;
   try {

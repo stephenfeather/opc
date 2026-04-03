@@ -1,3 +1,4 @@
+//! @hook PostToolUse:Write @preserve
 import * as fs from 'fs';
 import * as path from 'path';
 import { spawn, execSync } from 'child_process';

@@ -8,6 +8,7 @@ and generate IDs.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 from uuid import uuid4
@@ -55,7 +56,7 @@ def pad_embedding(embedding: list[float], target_dim: int = 1024) -> list[float]
 
 
 def format_archival_row(
-    row: dict[str, Any],
+    row: Mapping[str, Any],
     extra_fields: list[str] | None = None,
     float_fields: list[str] | None = None,
 ) -> dict[str, Any]:
@@ -90,7 +91,7 @@ def format_archival_row(
 
 
 def format_rows(
-    rows: list[dict[str, Any]],
+    rows: list[Mapping[str, Any]],
     extra_fields: list[str] | None = None,
     float_fields: list[str] | None = None,
 ) -> list[dict[str, Any]]:

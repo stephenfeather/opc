@@ -25,10 +25,8 @@ Usage:
 
 from __future__ import annotations
 
-import faulthandler
 import json
 import logging
-import os
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Protocol
@@ -52,14 +50,7 @@ from .memory_service_queries import (
 )
 from .postgres_pool import get_connection, get_pool, get_transaction, init_pgvector
 
-_crash_log_file = None
-try:
-    _crash_log_dir = os.path.expanduser("~/.claude/logs")
-    os.makedirs(_crash_log_dir, exist_ok=True)
-    _crash_log_file = open(os.path.join(_crash_log_dir, "opc_crash.log"), "a")
-    faulthandler.enable(file=_crash_log_file, all_threads=True)
-except OSError:
-    faulthandler.enable(all_threads=True)  # falls back to stderr
+# faulthandler is enabled by postgres_pool._enable_faulthandler() on import.
 
 logger = logging.getLogger(__name__)
 

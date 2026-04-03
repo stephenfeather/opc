@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from .memory_block import Block
 
 from .memory_service_queries import (
+    ACTIVE_ROW_FILTER,
     build_hybrid_search_sql,
     build_text_search_sql,
     build_vector_search_sql,
@@ -346,9 +347,11 @@ class MemoryServicePG:
         end_date: datetime | None = None,
     ) -> list[dict[str, Any]]:
         """Search archival memory with full-text search."""
+        has_col = await self._check_superseded_column()
         sql, params = build_text_search_sql(
             self.session_id, self.agent_id, query, limit,
             start_date=start_date, end_date=end_date,
+            include_active_filter=has_col,
         )
         async with get_connection() as conn:
             rows = await conn.fetch(sql, *params)
@@ -362,10 +365,12 @@ class MemoryServicePG:
         end_date: datetime | None = None,
     ) -> list[dict[str, Any]]:
         """Search archival memory with vector similarity."""
+        has_col = await self._check_superseded_column()
         padded_query = pad_embedding(query_embedding)
         sql, params = build_vector_search_sql(
             self.session_id, self.agent_id, padded_query, limit,
             start_date=start_date, end_date=end_date,
+            include_active_filter=has_col,
         )
         async with get_connection() as conn:
             await init_pgvector(conn)
@@ -383,18 +388,20 @@ class MemoryServicePG:
         limit: int = 10,
     ) -> list[dict[str, Any]]:
         """Search archival memory with vector similarity and threshold filter."""
+        has_col = await self._check_superseded_column()
+        active_filter = f"AND {ACTIVE_ROW_FILTER}" if has_col else ""
         padded_query = pad_embedding(query_embedding)
         async with get_connection() as conn:
             await init_pgvector(conn)
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT id, content, metadata, created_at,
                     1 - (embedding <=> $3::vector) as similarity
                 FROM archival_memory
                 WHERE session_id = $1
                 AND agent_id IS NOT DISTINCT FROM $2
                 AND embedding IS NOT NULL
-                AND superseded_by IS NULL
+                {active_filter}
                 AND (1 - (embedding <=> $3::vector)) >= $4
                 ORDER BY embedding <=> $3::vector
                 LIMIT $5
@@ -410,18 +417,20 @@ class MemoryServicePG:
         limit: int = 10,
     ) -> list[dict[str, Any]]:
         """Search archival memory with vector similarity and metadata filter."""
+        has_col = await self._check_superseded_column()
+        active_filter = f"AND {ACTIVE_ROW_FILTER}" if has_col else ""
         padded_query = pad_embedding(query_embedding)
         async with get_connection() as conn:
             await init_pgvector(conn)
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT id, content, metadata, created_at,
                     1 - (embedding <=> $3::vector) as similarity
                 FROM archival_memory
                 WHERE session_id = $1
                 AND agent_id IS NOT DISTINCT FROM $2
                 AND embedding IS NOT NULL
-                AND superseded_by IS NULL
+                {active_filter}
                 AND metadata @> $4::jsonb
                 ORDER BY embedding <=> $3::vector
                 LIMIT $5
@@ -438,16 +447,18 @@ class MemoryServicePG:
         limit: int = 5,
     ) -> list[dict[str, Any]]:
         """Search archival memory globally (all sessions) with similarity threshold."""
+        has_col = await self._check_superseded_column()
+        active_filter = f"AND {ACTIVE_ROW_FILTER}" if has_col else ""
         padded_query = pad_embedding(query_embedding)
         async with get_connection() as conn:
             await init_pgvector(conn)
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT id, session_id, content, metadata, created_at,
                     1 - (embedding <=> $1::vector) as similarity
                 FROM archival_memory
                 WHERE embedding IS NOT NULL
-                AND superseded_by IS NULL
+                {active_filter}
                 AND (1 - (embedding <=> $1::vector)) >= $2
                 ORDER BY embedding <=> $1::vector
                 LIMIT $3
@@ -469,11 +480,13 @@ class MemoryServicePG:
         end_date: datetime | None = None,
     ) -> list[dict[str, Any]]:
         """Hybrid search combining full-text search and vector similarity."""
+        has_col = await self._check_superseded_column()
         padded_query = pad_embedding(query_embedding)
         sql, params = build_hybrid_search_sql(
             self.session_id, self.agent_id, text_query, padded_query, limit,
             text_weight=text_weight, vector_weight=vector_weight,
             start_date=start_date, end_date=end_date,
+            include_active_filter=has_col,
         )
         async with get_connection() as conn:
             await init_pgvector(conn)
@@ -491,11 +504,13 @@ class MemoryServicePG:
         k: int = 60,
     ) -> list[dict[str, Any]]:
         """Hybrid search using Reciprocal Rank Fusion."""
+        has_col = await self._check_superseded_column()
+        active_filter = f"AND {ACTIVE_ROW_FILTER}" if has_col else ""
         padded_query = pad_embedding(query_embedding)
         async with get_connection() as conn:
             await init_pgvector(conn)
             rows = await conn.fetch(
-                """
+                f"""
                 WITH fts_ranked AS (
                     SELECT id,
                         ROW_NUMBER() OVER (
@@ -508,7 +523,7 @@ class MemoryServicePG:
                     WHERE session_id = $1
                     AND agent_id IS NOT DISTINCT FROM $2
                     AND to_tsvector('english', content) @@ plainto_tsquery('english', $3)
-                    AND superseded_by IS NULL
+                    {active_filter}
                 ),
                 vector_ranked AS (
                     SELECT id,
@@ -517,7 +532,7 @@ class MemoryServicePG:
                     WHERE session_id = $1
                     AND agent_id IS NOT DISTINCT FROM $2
                     AND embedding IS NOT NULL
-                    AND superseded_by IS NULL
+                    {active_filter}
                 ),
                 combined AS (
                     SELECT
@@ -727,13 +742,15 @@ class MemoryServicePG:
     async def to_context(self, max_archival: int = 10) -> str:
         """Generate context string for prompt injection."""
         core = await self.get_all_core()
+        has_col = await self._check_superseded_column()
+        active_filter = f"AND {ACTIVE_ROW_FILTER}" if has_col else ""
 
         async with get_connection() as conn:
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT content FROM archival_memory
                 WHERE session_id = $1 AND agent_id IS NOT DISTINCT FROM $2
-                AND superseded_by IS NULL
+                {active_filter}
                 ORDER BY created_at DESC
                 LIMIT $3
                 """,

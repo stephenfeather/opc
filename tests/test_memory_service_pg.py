@@ -131,6 +131,105 @@ class TestCheckSupersededColumn:
         assert result is True
 
 
+class TestSupersededColumnWiring:
+    """Tests that search methods wire _check_superseded_column into query builders."""
+
+    async def test_search_text_passes_active_filter_false_when_no_column(self):
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        MemoryServicePG._has_superseded_column = None
+        conn = AsyncMock()
+        conn.fetchval = AsyncMock(side_effect=Exception("no column"))
+        conn.fetch = AsyncMock(return_value=[])
+        svc = MemoryServicePG(session_id="s1")
+
+        with patch(
+            "scripts.core.db.memory_service_pg.get_connection",
+            return_value=FakeConnection(conn),
+        ), patch(
+            "scripts.core.db.memory_service_pg.build_text_search_sql",
+            wraps=__import__(
+                "scripts.core.db.memory_service_queries", fromlist=["build_text_search_sql"]
+            ).build_text_search_sql,
+        ) as mock_builder:
+            await svc.search_text("test")
+
+        _, kwargs = mock_builder.call_args
+        assert kwargs.get("include_active_filter") is False
+
+    async def test_search_text_passes_active_filter_true_when_column_exists(self):
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        MemoryServicePG._has_superseded_column = None
+        check_conn = AsyncMock()
+        check_conn.fetchval = AsyncMock(return_value=1)
+        search_conn = AsyncMock()
+        search_conn.fetch = AsyncMock(return_value=[])
+        call_count = [0]
+
+        def conn_factory():
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return FakeConnection(check_conn)
+            return FakeConnection(search_conn)
+
+        svc = MemoryServicePG(session_id="s1")
+
+        with patch(
+            "scripts.core.db.memory_service_pg.get_connection",
+            side_effect=conn_factory,
+        ), patch(
+            "scripts.core.db.memory_service_pg.build_text_search_sql",
+            wraps=__import__(
+                "scripts.core.db.memory_service_queries", fromlist=["build_text_search_sql"]
+            ).build_text_search_sql,
+        ) as mock_builder:
+            await svc.search_text("test")
+
+        _, kwargs = mock_builder.call_args
+        assert kwargs.get("include_active_filter") is True
+
+    async def test_search_vector_global_omits_filter_when_no_column(self):
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        MemoryServicePG._has_superseded_column = False  # pre-cached
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[])
+        svc = MemoryServicePG(session_id="s1")
+
+        with patch(
+            "scripts.core.db.memory_service_pg.get_connection",
+            return_value=FakeConnection(conn),
+        ), patch(
+            "scripts.core.db.memory_service_pg.init_pgvector",
+            AsyncMock(),
+        ):
+            await svc.search_vector_global([0.1] * 1024)
+
+        sql = conn.fetch.call_args[0][0]
+        assert "superseded_by" not in sql
+
+    async def test_search_vector_global_includes_filter_when_column_exists(self):
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        MemoryServicePG._has_superseded_column = True  # pre-cached
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[])
+        svc = MemoryServicePG(session_id="s1")
+
+        with patch(
+            "scripts.core.db.memory_service_pg.get_connection",
+            return_value=FakeConnection(conn),
+        ), patch(
+            "scripts.core.db.memory_service_pg.init_pgvector",
+            AsyncMock(),
+        ):
+            await svc.search_vector_global([0.1] * 1024)
+
+        sql = conn.fetch.call_args[0][0]
+        assert "superseded_by IS NULL" in sql
+
+
 # ==================== Core Memory ====================
 
 

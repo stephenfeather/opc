@@ -552,6 +552,64 @@ class TestExtractToolUses:
         result = extract_tool_uses(jsonl_path)
         assert result == []
 
+    def test_top_level_list_skipped(self, tmp_path: Path) -> None:
+        """JSON array at top level should be skipped."""
+        jsonl_path = tmp_path / "session.jsonl"
+        with open(jsonl_path, "w") as f:
+            f.write("[1, 2, 3]\n")
+        result = extract_tool_uses(jsonl_path)
+        assert result == []
+
+    def test_non_dict_message_skipped(self, tmp_path: Path) -> None:
+        """Non-dict message field should be skipped."""
+        jsonl_path = tmp_path / "session.jsonl"
+        _write_jsonl(
+            [{"type": "assistant", "message": "oops"}],
+            jsonl_path,
+        )
+        result = extract_tool_uses(jsonl_path)
+        assert result == []
+
+    def test_non_dict_input_skipped(self, tmp_path: Path) -> None:
+        """tool_use with non-dict input should be skipped."""
+        jsonl_path = tmp_path / "session.jsonl"
+        _write_jsonl(
+            [{
+                "type": "assistant",
+                "message": {
+                    "content": [{
+                        "type": "tool_use",
+                        "name": "Read",
+                        "input": "oops",
+                        "id": "tu_1",
+                    }]
+                },
+            }],
+            jsonl_path,
+        )
+        result = extract_tool_uses(jsonl_path)
+        assert result == []
+
+    def test_empty_tool_use_id_not_tracked(self, tmp_path: Path) -> None:
+        """tool_use entries without an ID should not be indexed."""
+        jsonl_path = tmp_path / "session.jsonl"
+        _write_jsonl(
+            [{
+                "type": "assistant",
+                "message": {
+                    "content": [{
+                        "type": "tool_use",
+                        "name": "Read",
+                        "input": {"file_path": "/a.py"},
+                        "id": "",
+                    }]
+                },
+            }],
+            jsonl_path,
+        )
+        result = extract_tool_uses(jsonl_path)
+        assert result == []
+
 
 # ===========================================================================
 # _match_pattern_at (extracted helper)
@@ -666,6 +724,15 @@ class TestDetermineSuccess:
     def test_empty_matched(self) -> None:
         assert _determine_success([]) is None
 
+    def test_last_bash_none_returns_none(self) -> None:
+        """Last Bash with result_error=None should return None, not earlier result."""
+        matched = [
+            _make_tool_use("Bash", {}, result_error=True),
+            _make_tool_use("Edit", {}, result_error=False),
+            _make_tool_use("Bash", {}, result_error=None),
+        ]
+        assert _determine_success(matched) is None
+
 
 # ===========================================================================
 # _collect_files (extracted helper)
@@ -688,6 +755,15 @@ class TestCollectFiles:
 
     def test_empty_matched(self) -> None:
         assert _collect_files([]) == []
+
+    def test_preserves_encounter_order(self) -> None:
+        """Files should be in first-seen order, not hash order."""
+        matched = [
+            _make_tool_use("Read", {"file_path": "/z.py"}),
+            _make_tool_use("Edit", {"file_path": "/a.py"}),
+            _make_tool_use("Read", {"file_path": "/z.py"}),
+        ]
+        assert _collect_files(matched) == ["/z.py", "/a.py"]
 
 
 # ===========================================================================
@@ -738,6 +814,15 @@ class TestParseToolUseEntry:
 
     def test_non_dict_returns_none(self) -> None:
         assert _parse_tool_use_entry("not a dict", {}, 1) is None
+
+    def test_non_dict_input_returns_none(self) -> None:
+        item = {
+            "type": "tool_use",
+            "name": "Read",
+            "input": "not a dict",
+            "id": "tu_1",
+        }
+        assert _parse_tool_use_entry(item, {}, 1) is None
 
 
 class TestParseToolResult:

@@ -108,27 +108,36 @@ def _match_pattern_at(
 def _determine_success(matched: list[dict]) -> bool | None:
     """Determine success from matched tool entries.
 
-    Checks last Bash result first, then last Edit/Write result.
-    Returns None if no result_error information available.
+    Finds the last Bash entry; if present, returns its status (or None
+    if result_error is unknown). Falls back to last Edit/Write.
+    Returns None if no applicable tool found.
     """
-    for m in reversed(matched):
-        if m["tool_name"] == "Bash" and m["result_error"] is not None:
-            return not m["result_error"]
+    last_bash = next(
+        (m for m in reversed(matched) if m["tool_name"] == "Bash"),
+        None,
+    )
+    if last_bash is not None:
+        error = last_bash["result_error"]
+        return None if error is None else not error
 
-    for m in reversed(matched):
-        if m["tool_name"] in ("Edit", "Write") and m["result_error"] is not None:
-            return not m["result_error"]
+    last_edit = next(
+        (m for m in reversed(matched) if m["tool_name"] in ("Edit", "Write")),
+        None,
+    )
+    if last_edit is not None:
+        error = last_edit["result_error"]
+        return None if error is None else not error
 
     return None
 
 
 def _collect_files(matched: list[dict]) -> list[str]:
-    """Extract unique file paths from matched tool entries."""
-    return list({
+    """Extract unique file paths from matched entries, preserving order."""
+    return list(dict.fromkeys(
         m["input"].get("file_path", "")
         for m in matched
         if m["input"].get("file_path")
-    })
+    ))
 
 
 def _build_pattern_result(pat_name: str, matched: list[dict]) -> dict:
@@ -258,9 +267,12 @@ def _parse_tool_use_entry(
     if not isinstance(item, dict) or item.get("type") != "tool_use":
         return None
     tool_name = item.get("name", "")
+    tool_input = item.get("input", {})
+    if not isinstance(tool_input, dict):
+        return None
     return {
         "tool_name": tool_name,
-        "input": _extract_input(tool_name, item.get("input", {})),
+        "input": _extract_input(tool_name, tool_input),
         "timestamp": data.get("timestamp"),
         "line_num": line_num,
         "tool_use_id": item.get("id", ""),
@@ -292,7 +304,14 @@ def extract_tool_uses(jsonl_path: Path) -> list[dict]:
             except json.JSONDecodeError:
                 continue
 
-            content = data.get("message", {}).get("content")
+            if not isinstance(data, dict):
+                continue
+
+            message = data.get("message", {})
+            if not isinstance(message, dict):
+                continue
+
+            content = message.get("content")
             if not isinstance(content, list):
                 continue
 
@@ -301,7 +320,7 @@ def extract_tool_uses(jsonl_path: Path) -> list[dict]:
             if msg_type == "assistant":
                 for item in content:
                     entry = _parse_tool_use_entry(item, data, line_num)
-                    if entry is not None:
+                    if entry is not None and entry["tool_use_id"]:
                         pending_ids[entry["tool_use_id"]] = len(tool_uses)
                         tool_uses.append(entry)
 
@@ -310,7 +329,7 @@ def extract_tool_uses(jsonl_path: Path) -> list[dict]:
                     result = _parse_tool_result(item)
                     if result is not None:
                         tid, is_error = result
-                        if tid in pending_ids:
+                        if tid and tid in pending_ids:
                             tool_uses[pending_ids[tid]]["result_error"] = (
                                 is_error
                             )
@@ -418,6 +437,9 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    if args.format == "text" and not args.patterns_only:
+        parser.error("--format text requires --patterns-only")
 
     jsonl_path = Path(args.jsonl)
     if not jsonl_path.exists():

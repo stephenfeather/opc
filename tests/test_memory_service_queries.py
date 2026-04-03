@@ -271,7 +271,7 @@ class TestBuildHybridSearchSql:
 
     def test_basic_hybrid_search(self):
         embedding = [0.1] * 1024
-        sql, params = build_hybrid_search_sql(
+        sql, _params = build_hybrid_search_sql(
             session_id="s1",
             agent_id=None,
             text_query="test",
@@ -284,7 +284,7 @@ class TestBuildHybridSearchSql:
 
     def test_custom_weights(self):
         embedding = [0.1] * 1024
-        sql, params = build_hybrid_search_sql(
+        _sql, params = build_hybrid_search_sql(
             session_id="s1",
             agent_id=None,
             text_query="test",

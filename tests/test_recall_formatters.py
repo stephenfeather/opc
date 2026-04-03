@@ -203,13 +203,25 @@ class TestFormatResultLine:
         )
         header, content = _format_result_line(1, result)
         assert header == "1. [0.900] Session: sess-1 (2026-01-15T10:30)"
-        assert "A learning" in content
+        assert content == "   A learning"
+
+    def test_default_content_indent_is_3_spaces(self):
+        result = _make_result(content="test", similarity=0.5)
+        _, content = _format_result_line(1, result)
+        assert content.startswith("   ")  # 3 spaces
+
+    def test_custom_content_indent(self):
+        result = _make_result(content="test", similarity=0.5)
+        _, content = _format_result_line(1, result, content_indent="     ")
+        assert content == "     test"
 
     def test_with_indent(self):
         result = _make_result(content="test", similarity=0.5, session_id="s1")
-        header, content = _format_result_line(3, result, indent="  ")
+        header, content = _format_result_line(
+            3, result, indent="  ", content_indent="     "
+        )
         assert header.startswith("  3.")
-        assert content.startswith("  ")
+        assert content == "     test"
 
     def test_long_content_truncated(self):
         long_content = "x" * 400
@@ -453,6 +465,54 @@ class TestFormatHumanOutput:
         assert "  1." in output
         assert "  2." in output
         assert "  3." in output
+
+    def test_golden_flat_output(self):
+        """Pin exact flat output format to prevent regressions."""
+        results = [_make_result(
+            content="Hook errors come from path issues",
+            similarity=0.85,
+            final_score=0.92,
+            session_id="debug-hooks",
+            created_at="2026-02-10T09:15:00",
+        )]
+        output = format_human_output(results)
+        expected_lines = [
+            "Found 1 matching learnings:",
+            "",
+            "1. [0.920] Session: debug-hooks (2026-02-10T09:15)",
+            "   Hook errors come from path issues",
+            "",
+        ]
+        assert output == "\n".join(expected_lines)
+
+    def test_golden_structured_output(self):
+        """Pin exact structured output format to prevent regressions."""
+        results = [
+            _make_result(
+                learning_type="ERROR_FIX", content="Fix A",
+                similarity=0.9, final_score=0.95,
+                session_id="s1", created_at="2026-01-01T00:00:00",
+            ),
+            _make_result(
+                learning_type="WORKING_SOLUTION", content="Sol B",
+                similarity=0.8, final_score=0.85,
+                session_id="s2", created_at="2026-01-02T00:00:00",
+            ),
+        ]
+        output = format_human_output(results, structured=True)
+        expected_lines = [
+            "Found 2 matching learnings in 2 types:",
+            "",
+            "## ERROR_FIX (1)",
+            "  1. [0.950] Session: s1 (2026-01-01T00:00)",
+            "     Fix A",
+            "",
+            "## WORKING_SOLUTION (1)",
+            "  2. [0.850] Session: s2 (2026-01-02T00:00)",
+            "     Sol B",
+            "",
+        ]
+        assert output == "\n".join(expected_lines)
 
 
 # ---------------------------------------------------------------------------

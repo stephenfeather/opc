@@ -128,9 +128,15 @@ def format_json_full_output(results: list[dict[str, Any]]) -> str:
 
 
 def _format_result_line(
-    index: int, result: dict[str, Any], indent: str = ""
+    index: int, result: dict[str, Any], indent: str = "", content_indent: str = "   "
 ) -> tuple[str, str]:
     """Format a single result as a numbered score/session line and content line.
+
+    Args:
+        index: 1-based result number
+        result: Result dict from search/rerank pipeline
+        indent: Prefix for the header line (e.g. "  " for structured)
+        content_indent: Prefix for the content line (independent of indent)
 
     Returns:
         Tuple of (header_line, content_line)
@@ -140,7 +146,7 @@ def _format_result_line(
     created_str = _format_created_at_human(result["created_at"])
     content_preview = format_result_preview(result["content"], max_length=300)
     header = f"{indent}{index}. [{score:.3f}] Session: {session_id} ({created_str})"
-    content = f"{indent}{'   ' if not indent else '     '}{content_preview}"
+    content = f"{content_indent}{content_preview}"
     return header, content
 
 
@@ -167,7 +173,9 @@ def format_human_output(results: list[dict[str, Any]], structured: bool = False)
         for type_name, type_results in grouped.items():
             lines.append(f"## {type_name} ({len(type_results)})")
             for result in type_results:
-                header, content = _format_result_line(idx, result, indent="  ")
+                header, content = _format_result_line(
+                    idx, result, indent="  ", content_indent="     "
+                )
                 lines.append(header)
                 lines.append(content)
                 idx += 1

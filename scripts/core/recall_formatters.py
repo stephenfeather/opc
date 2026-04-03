@@ -61,7 +61,10 @@ def _extract_learning_type(result: dict[str, Any]) -> str:
 
 def _extract_score(result: dict[str, Any]) -> float:
     """Extract the display score from a result, preferring final_score over similarity."""
-    return result.get("final_score", result["similarity"])
+    score = result.get("final_score")
+    if score is None:
+        score = result["similarity"]
+    return float(score)
 
 
 def _build_json_result(result: dict[str, Any]) -> dict[str, Any]:

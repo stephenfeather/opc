@@ -202,6 +202,15 @@ class TestExtractScore:
         result = _make_result(similarity=0.7)
         assert _extract_score(result) == 0.7
 
+    def test_none_final_score_falls_back_to_similarity(self):
+        result = _make_result(similarity=0.6)
+        result["final_score"] = None
+        assert _extract_score(result) == 0.6
+
+    def test_returns_float(self):
+        result = _make_result(similarity=1)
+        assert isinstance(_extract_score(result), float)
+
 
 # ---------------------------------------------------------------------------
 # _format_result_line

@@ -33,16 +33,18 @@ from pathlib import Path
 
 
 def parse_jsonl_entries(lines: Iterable[str]) -> list[dict]:
-    """Parse JSONL lines into a list of entry dicts, skipping malformed lines."""
+    """Parse JSONL lines into a list of entry dicts, skipping non-dict/malformed lines."""
     entries: list[dict] = []
     for line in lines:
         line = line.strip()
         if not line:
             continue
         try:
-            entries.append(json.loads(line))
+            parsed = json.loads(line)
         except (json.JSONDecodeError, ValueError):
             continue
+        if isinstance(parsed, dict):
+            entries.append(parsed)
     return entries
 
 
@@ -52,15 +54,17 @@ def parse_state_events(lines: Iterable[str]) -> list[dict]:
 
 
 def _iter_parsed_lines(lines: Iterable[str]) -> Iterable[dict]:
-    """Yield parsed JSON dicts from lines, skipping malformed ones. Lazy."""
+    """Yield parsed JSON dicts from lines, skipping non-dict/malformed ones. Lazy."""
     for line in lines:
         line = line.strip()
         if not line:
             continue
         try:
-            yield json.loads(line)
+            parsed = json.loads(line)
         except (json.JSONDecodeError, ValueError):
             continue
+        if isinstance(parsed, dict):
+            yield parsed
 
 
 # ---------------------------------------------------------------------------

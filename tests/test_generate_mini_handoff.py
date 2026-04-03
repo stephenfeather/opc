@@ -125,6 +125,19 @@ class TestParseJsonlEntries:
             "2025-01-15T10:02:00Z",
         ]
 
+    def test_skips_non_dict_json_values(self):
+        lines = [
+            json.dumps([1, 2, 3]),          # valid JSON array
+            json.dumps("just a string"),     # valid JSON string
+            json.dumps(42),                  # valid JSON number
+            json.dumps(None),                # valid JSON null
+            json.dumps(True),                # valid JSON bool
+            json.dumps(_user_entry()),       # valid JSON dict — kept
+        ]
+        result = parse_jsonl_entries(lines)
+        assert len(result) == 1
+        assert result[0]["type"] == "user"
+
     def test_handles_empty_lines(self):
         lines = ["", json.dumps(_user_entry()), "", ""]
         result = parse_jsonl_entries(lines)

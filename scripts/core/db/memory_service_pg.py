@@ -89,6 +89,9 @@ class MemoryServicePG:
     Thin I/O wrapper — pure logic lives in memory_service_queries.py.
     """
 
+    # Module-level cache: None = not checked, True/False = result
+    _has_superseded_column: bool | None = None
+
     def __init__(
         self,
         session_id: str = "default",
@@ -101,6 +104,25 @@ class MemoryServicePG:
     async def connect(self) -> None:
         """Initialize connection pool."""
         self._pool = await get_pool()
+
+    async def _check_superseded_column(self) -> bool:
+        """Check if the superseded_by column exists (schema migration compat).
+
+        Caches the result at the class level so the check runs at most once
+        per process lifetime.
+        """
+        if MemoryServicePG._has_superseded_column is not None:
+            return MemoryServicePG._has_superseded_column
+        try:
+            async with get_connection() as conn:
+                await conn.fetchval(
+                    "SELECT 1 FROM archival_memory WHERE superseded_by IS NULL LIMIT 1"
+                )
+            MemoryServicePG._has_superseded_column = True
+        except Exception:
+            logger.debug("superseded_by column not found, disabling active-row filter")
+            MemoryServicePG._has_superseded_column = False
+        return MemoryServicePG._has_superseded_column
 
     async def close(self) -> None:
         """Release connection (pool stays open for other services)."""
@@ -711,6 +733,7 @@ class MemoryServicePG:
                 """
                 SELECT content FROM archival_memory
                 WHERE session_id = $1 AND agent_id IS NOT DISTINCT FROM $2
+                AND superseded_by IS NULL
                 ORDER BY created_at DESC
                 LIMIT $3
                 """,

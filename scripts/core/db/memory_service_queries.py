@@ -14,6 +14,12 @@ from uuid import uuid4
 
 import numpy as np
 
+# Active-row predicate: excludes superseded learnings from search results.
+# The superseded_by column may not exist on pre-migration databases.
+# Callers should set include_active_filter=False when schema detection
+# indicates the column is absent.
+ACTIVE_ROW_FILTER = "superseded_by IS NULL"
+
 # ==================== ID Generation ====================
 
 
@@ -149,6 +155,7 @@ def build_text_search_sql(
     limit: int,
     start_date: datetime | None = None,
     end_date: datetime | None = None,
+    include_active_filter: bool = True,
 ) -> tuple[str, list[Any]]:
     """Build SQL for full-text search on archival memory.
 
@@ -159,6 +166,8 @@ def build_text_search_sql(
         limit: Max results.
         start_date: Optional start date filter.
         end_date: Optional end date filter.
+        include_active_filter: Whether to add superseded_by IS NULL filter.
+            Set False when the column doesn't exist (pre-migration).
 
     Returns:
         Tuple of (sql_string, params_list).
@@ -167,8 +176,9 @@ def build_text_search_sql(
         "session_id = $1",
         "agent_id IS NOT DISTINCT FROM $2",
         "to_tsvector('english', content) @@ plainto_tsquery('english', $3)",
-        "superseded_by IS NULL",
     ]
+    if include_active_filter:
+        conditions.append(ACTIVE_ROW_FILTER)
     params: list[Any] = [session_id, agent_id, query]
 
     date_conds, date_params, next_idx = build_date_conditions(
@@ -201,6 +211,7 @@ def build_vector_search_sql(
     limit: int,
     start_date: datetime | None = None,
     end_date: datetime | None = None,
+    include_active_filter: bool = True,
 ) -> tuple[str, list[Any]]:
     """Build SQL for vector similarity search on archival memory.
 
@@ -211,6 +222,7 @@ def build_vector_search_sql(
         limit: Max results.
         start_date: Optional start date filter.
         end_date: Optional end date filter.
+        include_active_filter: Whether to add superseded_by IS NULL filter.
 
     Returns:
         Tuple of (sql_string, params_list).
@@ -219,8 +231,9 @@ def build_vector_search_sql(
         "session_id = $1",
         "agent_id IS NOT DISTINCT FROM $2",
         "embedding IS NOT NULL",
-        "superseded_by IS NULL",
     ]
+    if include_active_filter:
+        conditions.append(ACTIVE_ROW_FILTER)
     params: list[Any] = [session_id, agent_id, query_embedding]
 
     date_conds, date_params, next_idx = build_date_conditions(
@@ -253,6 +266,7 @@ def build_hybrid_search_sql(
     vector_weight: float = 0.7,
     start_date: datetime | None = None,
     end_date: datetime | None = None,
+    include_active_filter: bool = True,
 ) -> tuple[str, list[Any]]:
     """Build SQL for hybrid (text + vector) search.
 
@@ -266,6 +280,7 @@ def build_hybrid_search_sql(
         vector_weight: Weight for vector similarity.
         start_date: Optional start date filter.
         end_date: Optional end date filter.
+        include_active_filter: Whether to add superseded_by IS NULL filter.
 
     Returns:
         Tuple of (sql_string, params_list).
@@ -277,8 +292,9 @@ def build_hybrid_search_sql(
             "(to_tsvector('english', content) @@ plainto_tsquery('english', $3)"
             " OR embedding IS NOT NULL)"
         ),
-        "superseded_by IS NULL",
     ]
+    if include_active_filter:
+        conditions.append(ACTIVE_ROW_FILTER)
     params: list[Any] = [
         session_id, agent_id, text_query, query_embedding,
         text_weight, vector_weight,

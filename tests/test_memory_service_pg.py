@@ -61,6 +61,79 @@ class TestMemoryServicePGInit:
 # ==================== Core Memory ====================
 
 
+class TestCheckSupersededColumn:
+    """Tests for schema migration compatibility check."""
+
+    async def test_returns_true_when_column_exists(self):
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        MemoryServicePG._has_superseded_column = None  # reset cache
+        conn = AsyncMock()
+        conn.fetchval = AsyncMock(return_value=1)
+        svc = MemoryServicePG(session_id="s1")
+
+        with patch(
+            "scripts.core.db.memory_service_pg.get_connection",
+            return_value=FakeConnection(conn),
+        ):
+            result = await svc._check_superseded_column()
+
+        assert result is True
+        assert MemoryServicePG._has_superseded_column is True
+
+    async def test_returns_false_when_column_missing(self):
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        MemoryServicePG._has_superseded_column = None  # reset cache
+        conn = AsyncMock()
+        conn.fetchval = AsyncMock(side_effect=Exception("column does not exist"))
+        svc = MemoryServicePG(session_id="s1")
+
+        with patch(
+            "scripts.core.db.memory_service_pg.get_connection",
+            return_value=FakeConnection(conn),
+        ):
+            result = await svc._check_superseded_column()
+
+        assert result is False
+        assert MemoryServicePG._has_superseded_column is False
+
+    async def test_uses_cached_result_on_subsequent_calls(self):
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        MemoryServicePG._has_superseded_column = True  # pre-cached
+        svc = MemoryServicePG(session_id="s1")
+
+        with patch(
+            "scripts.core.db.memory_service_pg.get_connection",
+        ) as mock_conn:
+            result = await svc._check_superseded_column()
+
+        assert result is True
+        mock_conn.assert_not_called()  # no DB hit when cached
+
+    async def test_cache_reset_allows_recheck(self):
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        MemoryServicePG._has_superseded_column = False  # was false
+        MemoryServicePG._has_superseded_column = None  # reset
+
+        conn = AsyncMock()
+        conn.fetchval = AsyncMock(return_value=1)
+        svc = MemoryServicePG(session_id="s1")
+
+        with patch(
+            "scripts.core.db.memory_service_pg.get_connection",
+            return_value=FakeConnection(conn),
+        ):
+            result = await svc._check_superseded_column()
+
+        assert result is True
+
+
+# ==================== Core Memory ====================
+
+
 class TestCoreMemory:
     """Tests for core memory CRUD operations."""
 

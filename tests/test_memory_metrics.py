@@ -272,9 +272,12 @@ class TestCollectMetrics:
         expected_keys = {
             "generated_at", "period", "totals", "per_session",
             "confidence_distribution", "classification_distribution",
-            "dedup_stats_alltime", "extraction_stats_alltime", "stale_learnings",
+            "dedup_stats_alltime", "embedding_coverage_alltime",
+            "extraction_stats_alltime", "stale_learnings",
             "top_tags_alltime", "superseded_alltime", "temporal_alltime",
-            "feedback_alltime", "version",
+            "feedback_alltime", "feedback_velocity",
+            "supersession_candidates", "recall_frequency",
+            "type_recall_correlation", "version",
         }
         assert set(metrics.keys()) == expected_keys
 

@@ -32,17 +32,22 @@ class RecallContext:
     now: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
+# Defaults from opc.toml [reranker]
+from scripts.core.config import get_config as _get_config
+_reranker_cfg = _get_config().reranker
+
+
 @dataclass
 class RerankerConfig:
     """Weights for each contextual signal (should sum to ~0.35)."""
 
-    project_weight: float = 0.15
-    recency_weight: float = 0.05
-    confidence_weight: float = 0.05
-    recall_weight: float = 0.05
-    type_affinity_weight: float = 0.05
-    tag_overlap_weight: float = 0.05
-    pattern_weight: float = 0.05
+    project_weight: float = _reranker_cfg.project_weight
+    recency_weight: float = _reranker_cfg.recency_weight
+    confidence_weight: float = _reranker_cfg.confidence_weight
+    recall_weight: float = _reranker_cfg.recall_weight
+    type_affinity_weight: float = _reranker_cfg.type_affinity_weight
+    tag_overlap_weight: float = _reranker_cfg.tag_overlap_weight
+    pattern_weight: float = _reranker_cfg.pattern_weight
 
     @property
     def total_signal_weight(self) -> float:
@@ -82,7 +87,7 @@ def calibrate_score(
         calibrated = (raw_score + 1) / 2
     elif mode == "hybrid_rrf":
         # RRF scores ~0.01-0.03 -> scale up
-        calibrated = raw_score * 60
+        calibrated = raw_score * _reranker_cfg.rrf_scale_factor
     elif mode in ("text", "sqlite"):
         # BM25 unbounded -> squash with kappa=1.0
         kappa = 1.0
@@ -138,7 +143,7 @@ def recency_score(result: dict, ctx: RecallContext) -> float:
 
     age = now - created_at
     age_days = max(0.0, age.total_seconds() / 86400)
-    return math.exp(-age_days / 45)
+    return math.exp(-age_days / _reranker_cfg.recency_half_life_days)
 
 
 def confidence_score(result: dict) -> float:
@@ -153,7 +158,7 @@ def recall_score(result: dict) -> float:
     count = result.get("recall_count")
     if count is None or count <= 0:
         return 0.0
-    return min(1.0, math.log2(1 + count) / 4)
+    return min(1.0, math.log2(1 + count) / _reranker_cfg.recall_log2_normalizer)
 
 
 def type_match(result: dict, ctx: RecallContext) -> float:

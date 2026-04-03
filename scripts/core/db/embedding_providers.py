@@ -443,9 +443,6 @@ class OllamaEmbeddingProvider(EmbeddingProvider):
     - OLLAMA_EMBED_MODEL: Model name (default: nomic-embed-text)
     """
 
-    DEFAULT_MODEL = "nomic-embed-text"
-    DEFAULT_HOST = "http://localhost:11434"
-
     MODELS = {
         "nomic-embed-text": 768,
         "nomic-embed-text-v1.5": 768,
@@ -461,8 +458,12 @@ class OllamaEmbeddingProvider(EmbeddingProvider):
         host: str | None = None,
         verify_tls: bool = True,
     ):
-        self.model = model or os.getenv("OLLAMA_EMBED_MODEL", self.DEFAULT_MODEL)
-        self.host = host or os.getenv("OLLAMA_HOST", self.DEFAULT_HOST)
+        # Defaults from opc.toml [embedding], resolved at instantiation time
+        from scripts.core.config import get_config
+        _emb_cfg = get_config().embedding
+
+        self.model = model or os.getenv("OLLAMA_EMBED_MODEL", _emb_cfg.ollama_model)
+        self.host = host or os.getenv("OLLAMA_HOST", _emb_cfg.ollama_host)
         self.verify_tls = verify_tls
         _validate_ollama_host(self.host)
         self._client = httpx.AsyncClient(timeout=30.0, verify=verify_tls)

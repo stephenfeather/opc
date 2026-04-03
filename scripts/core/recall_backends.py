@@ -17,10 +17,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from scripts.core.config import get_config as _get_config
+
 logger = logging.getLogger(__name__)
 
+_recall_cfg = _get_config().recall
 
-async def search_learnings_text_only_postgres(query: str, k: int = 5) -> list[dict[str, Any]]:
+
+async def search_learnings_text_only_postgres(
+    query: str, k: int = _recall_cfg.default_k,
+) -> list[dict[str, Any]]:
     """Fast text-only search for PostgreSQL using full-text search.
 
     Uses tsvector/tsquery with GIN index. Automatic stopword handling.
@@ -153,7 +159,9 @@ async def search_learnings_text_only_postgres(query: str, k: int = 5) -> list[di
     return results
 
 
-async def search_learnings_sqlite(query: str, k: int = 5) -> list[dict[str, Any]]:
+async def search_learnings_sqlite(
+    query: str, k: int = _recall_cfg.default_k,
+) -> list[dict[str, Any]]:
     """Search learnings using SQLite FTS5 (BM25 ranking).
 
     Cross-session search - finds learnings from ALL sessions.
@@ -206,7 +214,7 @@ async def search_learnings_sqlite(query: str, k: int = 5) -> list[dict[str, Any]
             # BM25 returns negative scores (lower = better)
             # Normalize to 0.0-1.0 range
             raw_rank = row["rank"] if row["rank"] else 0
-            normalized_score = min(1.0, max(0.0, -raw_rank / 25.0))
+            normalized_score = min(1.0, max(0.0, -raw_rank / _recall_cfg.bm25_normalization_divisor))
 
             metadata = {}
             if row["metadata_json"]:
@@ -231,12 +239,12 @@ async def search_learnings_sqlite(query: str, k: int = 5) -> list[dict[str, Any]
 
 async def search_learnings_hybrid_rrf(
     query: str,
-    k: int = 5,
+    k: int = _recall_cfg.default_k,
     provider: str = "local",
-    rrf_k: int = 60,
+    rrf_k: int = _recall_cfg.rrf_k,
     similarity_threshold: float = 0.0,
     expand: bool = True,
-    max_expansion_terms: int = 5,
+    max_expansion_terms: int = _recall_cfg.max_expansion_terms,
 ) -> list[dict[str, Any]]:
     """Hybrid RRF search combining text and vector rankings.
 
@@ -336,7 +344,7 @@ async def search_learnings_hybrid_rrf(
                 a.last_recalled,
                 c.rrf_score +
                     CASE WHEN COALESCE(a.recall_count, 0) = 0 THEN 0
-                    ELSE log(2.0, 1 + COALESCE(a.recall_count, 0)) * 0.002
+                    ELSE log(2.0, 1 + COALESCE(a.recall_count, 0)) * {_recall_cfg.recall_boost_multiplier}
                     END as boosted_score,
                 c.rrf_score as raw_rrf_score,
                 c.fts_rank,
@@ -440,7 +448,7 @@ async def search_learnings_hybrid_rrf(
 
 async def search_learnings_postgres(
     query: str,
-    k: int = 5,
+    k: int = _recall_cfg.default_k,
     provider: str = "local",
     text_fallback: bool = True,
     similarity_threshold: float = 0.0,

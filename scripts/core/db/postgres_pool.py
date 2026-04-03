@@ -183,8 +183,11 @@ def resolve_connection_url(
 
 def _get_pool_config() -> dict[str, int]:
     """Read pool config from environment and delegate to build_pool_config."""
+    from scripts.core.config import get_config
     return build_pool_config(
-        max_size_str=os.environ.get("AGENTICA_MAX_POOL_SIZE", "10"),
+        max_size_str=os.environ.get(
+            "AGENTICA_MAX_POOL_SIZE", str(get_config().database.max_pool_size)
+        ),
     )
 
 

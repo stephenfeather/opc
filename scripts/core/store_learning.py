@@ -78,10 +78,17 @@ LEARNING_TYPES = [
 # Valid confidence levels
 CONFIDENCE_LEVELS = ["high", "medium", "low"]
 
-# Loaded from opc.toml [dedup] threshold. See config.py for precedence chain.
 from scripts.core.config import get_config as _get_config
 
-DEDUP_THRESHOLD = _get_config().dedup.threshold
+
+def _dedup_threshold() -> float:
+    """Read live dedup threshold from config (not cached at import time)."""
+    return _get_config().dedup.threshold
+
+
+# Module-level alias for backward compatibility (tests, external consumers).
+# Internal dedup logic uses _dedup_threshold() for live reads.
+DEDUP_THRESHOLD = _dedup_threshold()
 
 
 async def store_learning_v2(
@@ -152,12 +159,13 @@ async def store_learning_v2(
             embedding_model = embedder._provider.model
 
         # Semantic dedup: search ALL sessions for near-duplicates.
-        # The old code used search_vector() which was session-scoped —
-        # duplicates from other sessions slipped through.
+        # Read threshold live (not the module-level snapshot) so config
+        # changes take effect without process restart.
+        threshold = _dedup_threshold()
         try:
             if hasattr(memory, "search_vector_global"):
                 existing = await memory.search_vector_global(
-                    embedding, threshold=DEDUP_THRESHOLD, limit=1
+                    embedding, threshold=threshold, limit=1
                 )
             else:
                 # Fallback for non-PG backends that lack global search.
@@ -168,7 +176,7 @@ async def store_learning_v2(
             if existing and len(existing) > 0:
                 top_match = existing[0]
                 similarity = top_match.get("similarity", 0)
-                if similarity >= DEDUP_THRESHOLD:
+                if similarity >= threshold:
                     existing_session = top_match.get("session_id", session_id)
                     existing_id = str(top_match.get("id", ""))
                     reason = (
@@ -179,7 +187,7 @@ async def store_learning_v2(
                         "Dedup rejected: session=%s similarity=%.3f "
                         "existing_id=%s threshold=%.2f content=%.80s",
                         session_id, similarity, existing_id,
-                        DEDUP_THRESHOLD, content,
+                        threshold, content,
                     )
                     await memory.close()
                     return {

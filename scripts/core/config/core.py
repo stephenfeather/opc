@@ -58,6 +58,7 @@ _RANGE_RULES: dict[tuple[str, str], tuple[float | None, float | None]] = {
     ("patterns", "min_cluster_size"): (2, None),
     ("patterns", "min_samples"): (1, None),
     ("patterns", "min_confidence"): (0.0, 1.0),
+    ("patterns", "tag_noise_percentile"): (0, 100),
     ("patterns", "overlap_threshold"): (0.0, 1.0),
     ("recall", "default_k"): (1, None),
     ("recall", "rrf_k"): (1, None),

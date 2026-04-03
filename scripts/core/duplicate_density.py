@@ -56,8 +56,12 @@ from scripts.core.db.postgres_pool import close_pool, get_connection  # noqa: E4
 async def fetch_embeddings(conn: Any) -> tuple[list[str], list[str], np.ndarray]:
     """Fetch all active learning IDs, content previews, and embeddings.
 
+    Groups by embedding dimension and uses only the dominant dimension group.
+    Mixed-provider corpora (e.g. 1024-dim BGE + 768-dim Ollama) are handled
+    by analyzing the largest group and reporting skipped counts.
+
     Returns:
-        (ids, previews, embedding_matrix) where embedding_matrix is (N, 1024)
+        (ids, previews, embedding_matrix) where embedding_matrix is (N, D)
     """
     rows = await conn.fetch(
         """
@@ -69,17 +73,34 @@ async def fetch_embeddings(conn: Any) -> tuple[list[str], list[str], np.ndarray]
         """
     )
 
-    ids: list[str] = []
-    previews: list[str] = []
-    vectors: list[list[float]] = []
-
+    # Parse and group by dimension
+    by_dim: dict[int, tuple[list[str], list[str], list[list[float]]]] = {}
     for row in rows:
         raw = row["embedding"]
-        # pgvector returns "[0.1,0.2,...]" string
         vec = [float(x) for x in raw.strip("[]").split(",")]
-        ids.append(row["id"])
-        previews.append(row["preview"])
-        vectors.append(vec)
+        dim = len(vec)
+        if dim not in by_dim:
+            by_dim[dim] = ([], [], [])
+        ids_list, prev_list, vec_list = by_dim[dim]
+        ids_list.append(row["id"])
+        prev_list.append(row["preview"])
+        vec_list.append(vec)
+
+    if not by_dim:
+        return [], [], np.array([], dtype=np.float32)
+
+    # Use the largest dimension group
+    dominant_dim = max(by_dim, key=lambda d: len(by_dim[d][0]))
+    ids, previews, vectors = by_dim[dominant_dim]
+
+    skipped = sum(len(v[0]) for d, v in by_dim.items() if d != dominant_dim)
+    if skipped > 0:
+        other_dims = {d: len(v[0]) for d, v in by_dim.items() if d != dominant_dim}
+        print(
+            f"Using {len(ids)} embeddings (dim={dominant_dim}), "
+            f"skipped {skipped} with different dimensions: {other_dims}",
+            file=sys.stderr,
+        )
 
     matrix = np.array(vectors, dtype=np.float32)
     return ids, previews, matrix

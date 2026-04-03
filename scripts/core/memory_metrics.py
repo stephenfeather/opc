@@ -371,8 +371,12 @@ async def get_recall_frequency(conn: Any) -> dict:
             WHERE superseded_by IS NULL
             """
         )
-    except Exception:
-        return dict(_RECALL_FREQ_UNAVAILABLE)
+    except Exception as e:
+        # Only degrade for schema-compatibility issues (missing column).
+        # asyncpg raises UndefinedColumnError; check by name to avoid import.
+        if "UndefinedColumn" in type(e).__name__ or "column" in str(e).lower():
+            return {**_RECALL_FREQ_UNAVAILABLE, "note": f"schema degraded: {e}"}
+        raise
     total = row["total_active"]
     recalled = row["recalled_learnings"]
     return {
@@ -404,8 +408,10 @@ async def get_type_recall_correlation(conn: Any) -> dict:
             ORDER BY total DESC
             """
         )
-    except Exception:
-        return {}
+    except Exception as e:
+        if "UndefinedColumn" in type(e).__name__ or "column" in str(e).lower():
+            return {}
+        raise
     result = {}
     for r in rows:
         total = r["total"]

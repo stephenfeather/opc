@@ -32,6 +32,7 @@ import logging
 import os
 import re
 from collections.abc import Sequence
+from uuid import UUID
 
 logger = logging.getLogger(__name__)
 
@@ -175,9 +176,7 @@ def calibrate_confidence(content: str) -> dict:
 # Pure row-level calibration (no I/O)
 # ---------------------------------------------------------------------------
 
-from uuid import UUID
-
-Row = tuple[str | UUID, str | None, dict | None]
+Row = tuple[str | UUID, str | None, str | dict | None]
 
 
 def _normalize_metadata(metadata: dict | str | None) -> dict:

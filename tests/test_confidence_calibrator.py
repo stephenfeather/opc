@@ -442,7 +442,7 @@ class TestBackfillHandler:
         rows = [
             ("id-1", "Always use `foo()`. Verified.", {"confidence": "low"}),
         ]
-        conn, cur = self._make_mock_conn(rows)
+        conn, _cur = self._make_mock_conn(rows)
         mock_connect.return_value = conn
 
         result = backfill_calibration_sync(dry_run=False, batch_size=10)

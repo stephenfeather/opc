@@ -220,6 +220,51 @@ class TestExtractFilesTouched:
         result = extract_files_touched(entries)
         assert result == {"read": [], "modified": [], "created": []}
 
+    def test_null_tool_input_skipped(self):
+        entries = [
+            {
+                "type": "assistant",
+                "timestamp": "2025-01-15T10:00:00Z",
+                "message": {
+                    "content": [
+                        {"type": "tool_use", "name": "Read", "input": None}
+                    ]
+                },
+            }
+        ]
+        result = extract_files_touched(entries)
+        assert result == {"read": [], "modified": [], "created": []}
+
+    def test_non_dict_tool_input_skipped(self):
+        entries = [
+            {
+                "type": "assistant",
+                "timestamp": "2025-01-15T10:00:00Z",
+                "message": {
+                    "content": [
+                        {"type": "tool_use", "name": "Read", "input": "string-input"}
+                    ]
+                },
+            }
+        ]
+        result = extract_files_touched(entries)
+        assert result == {"read": [], "modified": [], "created": []}
+
+    def test_null_tool_name_skipped(self):
+        entries = [
+            {
+                "type": "assistant",
+                "timestamp": "2025-01-15T10:00:00Z",
+                "message": {
+                    "content": [
+                        {"type": "tool_use", "name": None, "input": {"file_path": "a.py"}}
+                    ]
+                },
+            }
+        ]
+        result = extract_files_touched(entries)
+        assert result == {"read": [], "modified": [], "created": []}
+
     def test_empty_entries_returns_empty_categories(self):
         result = extract_files_touched([])
         assert result == {"read": [], "modified": [], "created": []}

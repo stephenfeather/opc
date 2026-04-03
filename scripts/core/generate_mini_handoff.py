@@ -84,7 +84,13 @@ def _iter_tool_blocks(entries: list[dict]):
         for block in content:
             if not isinstance(block, dict) or block.get("type") != "tool_use":
                 continue
-            yield block.get("name", "unknown"), block.get("input", {}), timestamp
+            name = block.get("name") or "unknown"
+            tool_input = block.get("input")
+            if not isinstance(name, str):
+                name = "unknown"
+            if not isinstance(tool_input, dict):
+                tool_input = {}
+            yield name, tool_input, timestamp
 
 
 def extract_files_touched(entries: list[dict]) -> dict[str, list[str]]:
@@ -231,8 +237,12 @@ def _accumulate_from_entries(entries: Iterable[dict]) -> dict:
             if not isinstance(block, dict) or block.get("type") != "tool_use":
                 continue
 
-            tool_name = block.get("name", "unknown")
-            tool_input = block.get("input", {})
+            tool_name = block.get("name") or "unknown"
+            if not isinstance(tool_name, str):
+                tool_name = "unknown"
+            tool_input = block.get("input")
+            if not isinstance(tool_input, dict):
+                tool_input = {}
             tool_counts[tool_name] = tool_counts.get(tool_name, 0) + 1
 
             file_path = tool_input.get("file_path", "")

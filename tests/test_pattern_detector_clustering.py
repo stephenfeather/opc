@@ -11,7 +11,6 @@ Validates the clustering sub-functions extracted from pattern_detector:
 from __future__ import annotations
 
 import uuid
-from collections import Counter
 from datetime import UTC, datetime
 
 import numpy as np
@@ -21,14 +20,8 @@ from scripts.core.pattern_detector import Learning
 from scripts.core.pattern_detector_clustering import (
     build_edge_weights,
     build_tag_adjacency,
-    cluster_by_embeddings,
-    cluster_by_tags,
     components_from_edges,
-    compute_tag_idf,
-    detect_noise_tags,
-    fuse_clusters,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers

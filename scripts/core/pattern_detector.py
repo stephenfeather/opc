@@ -14,11 +14,14 @@ This module provides classification, scoring, and the detection pipeline.
 
 from __future__ import annotations
 
+import logging
 import math
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+
+_logger = logging.getLogger(__name__)
 
 import numpy as np
 
@@ -189,7 +192,7 @@ def generate_label(members: list[Learning], pattern_type: str) -> str:
     if not members:
         return "Empty pattern"
 
-    all_tags: list[str] = [tag for m in members for tag in set(m.tags)]
+    all_tags: list[str] = [tag for m in members for tag in dict.fromkeys(m.tags)]
     top_tags = [tag for tag, _ in Counter(all_tags).most_common(3)]
     sessions = {m.session_id for m in members}
     tag_str = " + ".join(top_tags) if top_tags else "misc"
@@ -204,6 +207,8 @@ def generate_label(members: list[Learning], pattern_type: str) -> str:
 
 def compute_cohesion(members: list[Learning], centroid: np.ndarray) -> float:
     """Mean cosine similarity of members to centroid, clamped to [0, 1]."""
+    if not members:
+        return 0.0
     embeddings = np.array([m.embedding for m in members])
     centroid_norm = centroid / (np.linalg.norm(centroid) or 1.0)
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
@@ -398,5 +403,5 @@ async def _classify_with_fallback(
         try:
             return await classifier(members)
         except Exception:
-            pass
+            _logger.debug("Classifier failed, falling back to heuristic", exc_info=True)
     return classify_pattern_heuristic(members)

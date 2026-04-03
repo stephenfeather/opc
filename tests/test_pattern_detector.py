@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import sys
 import uuid
-from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -27,7 +26,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import asyncio
 
 from scripts.core.pattern_detector import (  # noqa: E402
-    DetectedPattern,
     Learning,
     classify_pattern_heuristic,
     cluster_by_embeddings,
@@ -45,7 +43,6 @@ from scripts.core.pattern_detector import (  # noqa: E402
     fuse_clusters,
     generate_label,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -647,6 +644,10 @@ class TestComputeCohesion:
         members = [_make_learning()]
         result = compute_cohesion(members, np.zeros(1024, dtype=np.float32))
         assert 0.0 <= result <= 1.0
+
+    def test_empty_members_returns_zero(self):
+        """Empty members list should return 0.0, not crash."""
+        assert compute_cohesion([], np.zeros(1024, dtype=np.float32)) == 0.0
 
 
 class TestComputeDiversity:

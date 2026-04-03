@@ -21,6 +21,7 @@ class DaemonConfig:
     max_retries: int = 5
     extraction_timeout: int = 1800
     pattern_detection_interval_hours: int = 6
+    harvest_grace_period: int = 300
     extraction_model: str = "sonnet"
     extraction_max_turns: int = 15
     log_rotation_days: int = 7

@@ -101,6 +101,7 @@ STALE_THRESHOLD = _daemon_cfg.stale_threshold
 MAX_CONCURRENT_EXTRACTIONS = _daemon_cfg.max_concurrent_extractions
 MAX_RETRIES = _daemon_cfg.max_retries
 EXTRACTION_TIMEOUT = _daemon_cfg.extraction_timeout
+HARVEST_GRACE_PERIOD = _daemon_cfg.harvest_grace_period
 PID_FILE = Path.home() / ".claude" / "memory-daemon.pid"
 LOG_FILE = Path.home() / ".claude" / "memory-daemon.log"
 
@@ -226,16 +227,24 @@ def pg_ensure_column():
 
 
 def pg_get_stale_sessions() -> list:
-    """Get sessions with stale heartbeat that need extraction."""
+    """Get sessions with stale heartbeat that need extraction.
+
+    Returns rows where either:
+      - exited_at IS NULL (daemon must mark and wait), or
+      - exited_at is older than harvest_grace_period (ready to harvest).
+    Sessions within the grace period are excluded by the DB clock.
+    """
     conn = pg_connect()
     cur = conn.cursor()
-    # Use DB clock for comparison to avoid local-vs-UTC timezone mismatch
+    # Use DB clock for all time comparisons to avoid local-vs-UTC mismatch
     cur.execute("""
-        SELECT id, project, transcript_path, pid FROM sessions
+        SELECT id, project, transcript_path, pid, exited_at FROM sessions
         WHERE last_heartbeat < NOW() - INTERVAL '%s seconds'
         AND extraction_status = 'pending'
         AND extraction_attempts < %s
-    """, (STALE_THRESHOLD, MAX_RETRIES))
+        AND (exited_at IS NULL
+             OR exited_at < NOW() - INTERVAL '%s seconds')
+    """, (STALE_THRESHOLD, MAX_RETRIES, HARVEST_GRACE_PERIOD))
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -315,6 +324,18 @@ def pg_mark_archived(session_id: str, archive_path: str):
     conn.close()
 
 
+def pg_mark_session_exited(session_id: str):
+    """Set exited_at for a session the daemon observed as dead (no clean exit)."""
+    conn = pg_connect()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE sessions SET exited_at = NOW()
+        WHERE id = %s AND exited_at IS NULL
+    """, (session_id,))
+    conn.commit()
+    conn.close()
+
+
 # Database operations - SQLite
 def get_sqlite_path() -> Path:
     """Get SQLite database path."""
@@ -359,18 +380,27 @@ def sqlite_ensure_table():
 
 
 def sqlite_get_stale_sessions() -> list:
-    """Get sessions with stale heartbeat that need extraction."""
+    """Get sessions with stale heartbeat that need extraction.
+
+    Returns rows where either:
+      - exited_at IS NULL (daemon must mark and wait), or
+      - exited_at is older than harvest_grace_period (ready to harvest).
+    Sessions within the grace period are excluded.
+    """
     db_path = get_sqlite_path()
     if not db_path.exists():
         return []
     conn = sqlite3.connect(db_path)
-    threshold = (datetime.now() - timedelta(seconds=STALE_THRESHOLD)).isoformat()
+    stale_threshold = (datetime.now() - timedelta(seconds=STALE_THRESHOLD)).isoformat()
+    grace_threshold = (datetime.now() - timedelta(seconds=HARVEST_GRACE_PERIOD)).isoformat()
     cursor = conn.execute("""
-        SELECT id, project, transcript_path, pid FROM sessions
+        SELECT id, project, transcript_path, pid, exited_at FROM sessions
         WHERE last_heartbeat < ?
         AND extraction_status = 'pending'
         AND COALESCE(extraction_attempts, 0) < ?
-    """, (threshold, MAX_RETRIES))
+        AND (exited_at IS NULL
+             OR exited_at < ?)
+    """, (stale_threshold, MAX_RETRIES, grace_threshold))
     rows = cursor.fetchall()
     conn.close()
     return rows
@@ -424,6 +454,18 @@ def sqlite_mark_extraction_failed(session_id: str):
             "UPDATE sessions SET extraction_status = 'failed' WHERE id = ?",
             (session_id,),
         )
+    conn.commit()
+    conn.close()
+
+
+def sqlite_mark_session_exited(session_id: str):
+    """Set exited_at for a session the daemon observed as dead (no clean exit)."""
+    db_path = get_sqlite_path()
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "UPDATE sessions SET exited_at = ? WHERE id = ? AND exited_at IS NULL",
+        (datetime.now().isoformat(), session_id),
+    )
     conn.commit()
     conn.close()
 
@@ -521,6 +563,14 @@ def mark_extraction_failed(session_id: str):
         pg_mark_extraction_failed(session_id)
     else:
         sqlite_mark_extraction_failed(session_id)
+
+
+def mark_session_exited(session_id: str):
+    """Record exited_at for a session whose PID the daemon observed as dead."""
+    if use_postgres():
+        pg_mark_session_exited(session_id)
+    else:
+        sqlite_mark_session_exited(session_id)
 
 
 def extract_memories(
@@ -979,18 +1029,27 @@ def daemon_loop():
             watchdog_stuck_extractions()
             process_pending_queue()
 
-            # Find new stale sessions
+            # Find stale sessions (SQL excludes those within grace period)
             stale = get_stale_sessions()
             if stale:
-                # Filter out sessions whose Claude process is still alive
+                # Filter: skip alive processes, mark newly-dead sessions
                 truly_stale = []
                 for row in stale:
                     session_id = row[0]
                     pid = row[3] if len(row) > 3 else None
+                    exited_at = row[4] if len(row) > 4 else None
                     if _is_process_alive(pid):
                         log(f"Skipping {session_id}: process {pid} "
                             f"still alive")
                         continue
+                    if exited_at is None:
+                        # First time daemon sees this session as dead;
+                        # record exited_at so grace period starts
+                        mark_session_exited(session_id)
+                        log(f"Skipping {session_id}: marked exited, "
+                            f"grace period {HARVEST_GRACE_PERIOD}s")
+                        continue
+                    # exited_at exists and past grace period (SQL filtered)
                     truly_stale.append(row)
 
                 if truly_stale:

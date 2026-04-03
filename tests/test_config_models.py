@@ -40,6 +40,7 @@ class TestDaemonConfig:
         assert cfg.max_concurrent_extractions == 4
         assert cfg.max_retries == 5
         assert cfg.extraction_timeout == 1800
+        assert cfg.harvest_grace_period == 300
         assert cfg.pattern_detection_interval_hours == 6
         assert cfg.extraction_model == "sonnet"
         assert cfg.extraction_max_turns == 15

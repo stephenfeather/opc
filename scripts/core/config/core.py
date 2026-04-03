@@ -50,6 +50,7 @@ _RANGE_RULES: dict[tuple[str, str], tuple[float | None, float | None]] = {
     ("daemon", "max_concurrent_extractions"): (1, None),
     ("daemon", "max_retries"): (0, None),
     ("daemon", "extraction_timeout"): (1, None),
+    ("daemon", "harvest_grace_period"): (0, None),
     ("daemon", "pattern_detection_interval_hours"): (1, None),
     ("daemon", "extraction_max_turns"): (1, None),
     ("reranker", "recency_half_life_days"): (0.1, None),

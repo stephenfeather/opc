@@ -6,9 +6,7 @@ Covers all public and private functions with AAA pattern.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
-
-import pytest
+from datetime import UTC, datetime
 
 from scripts.core.recall_formatters import (
     LEARNING_TYPE_ORDER,
@@ -25,7 +23,6 @@ from scripts.core.recall_formatters import (
     get_api_version,
     group_by_type,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -121,7 +118,7 @@ class TestFormatResultPreview:
 
 class TestFormatCreatedAt:
     def test_datetime_to_isoformat(self):
-        dt = datetime(2026, 1, 15, 10, 30, 0, tzinfo=timezone.utc)
+        dt = datetime(2026, 1, 15, 10, 30, 0, tzinfo=UTC)
         result = _format_created_at(dt)
         assert result == "2026-01-15T10:30:00+00:00"
 
@@ -179,6 +176,16 @@ class TestExtractLearningType:
     def test_none_metadata_defaults_to_unknown(self):
         result = _make_result()
         result["metadata"] = None
+        assert _extract_learning_type(result) == "UNKNOWN"
+
+    def test_empty_string_learning_type_defaults_to_unknown(self):
+        result = _make_result()
+        result["metadata"] = {"learning_type": ""}
+        assert _extract_learning_type(result) == "UNKNOWN"
+
+    def test_none_learning_type_defaults_to_unknown(self):
+        result = _make_result()
+        result["metadata"] = {"learning_type": None}
         assert _extract_learning_type(result) == "UNKNOWN"
 
 
@@ -301,7 +308,7 @@ class TestBuildJsonResult:
         assert result["id"] == ""
 
     def test_datetime_created_at_serialized(self):
-        dt = datetime(2026, 1, 15, 10, 30, 0, tzinfo=timezone.utc)
+        dt = datetime(2026, 1, 15, 10, 30, 0, tzinfo=UTC)
         raw = _make_result(created_at=dt)
         result = _build_json_result(raw)
         assert result["created_at"] == "2026-01-15T10:30:00+00:00"
@@ -416,6 +423,13 @@ class TestFormatJsonFullOutput:
         parsed = json.loads(output)
         assert "version" in parsed
 
+    def test_null_metadata_normalized_to_empty_dict(self):
+        raw = _make_result()
+        raw["metadata"] = None
+        output = format_json_full_output([raw])
+        parsed = json.loads(output)
+        assert parsed["results"][0]["metadata"] == {}
+
 
 # ---------------------------------------------------------------------------
 # format_human_output
@@ -505,15 +519,15 @@ class TestFormatHumanOutput:
         results = [_make_result(content="line1\nline2")]
         output = format_human_output(results)
         lines = output.split("\n")
-        content_lines = [l for l in lines if "line1" in l or "line2" in l]
-        assert all(l.startswith("   ") for l in content_lines)
+        content_lines = [line for line in lines if "line1" in line or "line2" in line]
+        assert all(line.startswith("   ") for line in content_lines)
 
     def test_multiline_content_indented_structured(self):
         results = [_make_result(content="line1\nline2", learning_type="ERROR_FIX")]
         output = format_human_output(results, structured=True)
         lines = output.split("\n")
-        content_lines = [l for l in lines if "line1" in l or "line2" in l]
-        assert all(l.startswith("     ") for l in content_lines)
+        content_lines = [line for line in lines if "line1" in line or "line2" in line]
+        assert all(line.startswith("     ") for line in content_lines)
 
     def test_golden_flat_output(self):
         """Pin exact flat output format to prevent regressions."""

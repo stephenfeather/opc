@@ -47,7 +47,7 @@ def _format_created_at(created_at: Any) -> str:
 
 
 def _format_created_at_human(created_at: Any) -> str:
-    """Convert created_at to short human-readable string (YYYY-MM-DD HH:MM)."""
+    """Convert created_at to short human-readable string (up to 16 chars)."""
     if isinstance(created_at, datetime):
         return created_at.strftime("%Y-%m-%d %H:%M")
     return str(created_at)[:16]
@@ -56,7 +56,7 @@ def _format_created_at_human(created_at: Any) -> str:
 def _extract_learning_type(result: dict[str, Any]) -> str:
     """Extract learning_type from a result dict, defaulting to UNKNOWN."""
     metadata = result.get("metadata") or {}
-    return metadata.get("learning_type", "UNKNOWN")
+    return metadata.get("learning_type") or "UNKNOWN"
 
 
 def _extract_score(result: dict[str, Any]) -> float:
@@ -118,7 +118,7 @@ def format_json_full_output(results: list[dict[str, Any]]) -> str:
     json_results = [
         {
             **_build_json_result(result),
-            "metadata": result.get("metadata", {}),
+            "metadata": result.get("metadata") or {},
             "recall_count": result.get("recall_count", 0),
             "pattern_strength": result.get("pattern_strength", 0.0),
             "pattern_tags": result.get("pattern_tags", []),

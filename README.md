@@ -1,5 +1,7 @@
 # OPC - Opinionated Persistent Context
 
+> **⚠️ Refactoring in Progress** — This project is currently undergoing a significant refactoring effort. Expect breaking changes, restructured modules, and evolving APIs until the refactor is complete.
+
 A memory and context persistence system for Claude Code, providing semantic recall, session handoffs, artifact indexing, and embedding-backed search across sessions.
 
 ## Origin

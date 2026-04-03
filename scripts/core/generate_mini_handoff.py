@@ -321,7 +321,7 @@ def _assemble_handoff(acc: dict, session_id: str) -> dict:
 
 
 def build_handoff_from_entries(
-    entries: list[dict], session_id: str, project_dir: str
+    entries: list[dict], session_id: str, _project_dir: str = ""
 ) -> dict:
     """Build handoff dict from parsed JSONL entries (pure function)."""
     acc = _accumulate_from_entries(entries)
@@ -354,8 +354,12 @@ def _accumulate_from_state_events(events: Iterable[dict]) -> dict:
             read_files.append(file_path)
         elif tool in ("Edit", "MultiEdit") and file_path and file_path not in edited_files:
             edited_files.append(file_path)
-        elif tool == "Write" and file_path and file_path not in created_files:
-            created_files.append(file_path)
+        elif tool == "Write" and file_path:
+            if file_path in read_files or file_path in edited_files:
+                if file_path not in edited_files:
+                    edited_files.append(file_path)
+            elif file_path not in created_files:
+                created_files.append(file_path)
 
         command = event.get("command", "")
         if tool == "Bash" and command:
@@ -377,7 +381,7 @@ def _accumulate_from_state_events(events: Iterable[dict]) -> dict:
 
 
 def build_handoff_from_state_events(
-    events: Iterable[dict], session_id: str, project_dir: str
+    events: Iterable[dict], session_id: str, _project_dir: str = ""
 ) -> dict:
     """Build handoff dict from Phase 3 state events (pure, streaming)."""
     acc = _accumulate_from_state_events(events)
@@ -483,7 +487,8 @@ def _sanitize_session_id(session_id: str) -> str:
     """Validate session_id contains only safe filename characters."""
     if not session_id or not _SAFE_SESSION_ID.match(session_id):
         raise ValueError(
-            f"Invalid session_id: must match [a-zA-Z0-9_-], got {session_id!r}"
+            f"Invalid session_id: must contain only letters, digits, '_' or '-'"
+            f" (pattern: ^[a-zA-Z0-9_-]+$), got {session_id!r}"
         )
     return session_id
 

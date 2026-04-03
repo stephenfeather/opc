@@ -653,18 +653,29 @@ class TestBuildHandoffFromEntries:
         assert "git push" in result["git_state"]["last_command"]
 
     def test_date_fallback_when_no_timestamps(self):
+        from unittest.mock import patch
+
         from scripts.core.generate_mini_handoff import build_handoff_from_entries
 
+        fixed = datetime(2025, 6, 15, tzinfo=UTC)
         entries = [{"type": "user", "message": {"content": "hi"}}]
-        result = build_handoff_from_entries(entries, "s-test", "/project")
-        # Should use current date as fallback
-        assert result["date"] == datetime.now(UTC).strftime("%Y-%m-%d")
+        with patch("scripts.core.generate_mini_handoff.datetime") as mock_dt:
+            mock_dt.now.return_value = fixed
+            mock_dt.fromisoformat = datetime.fromisoformat
+            result = build_handoff_from_entries(entries, "s-test")
+        assert result["date"] == "2025-06-15"
 
     def test_date_fallback_on_invalid_timestamp(self):
+        from unittest.mock import patch
+
         from scripts.core.generate_mini_handoff import _extract_date
 
-        result = _extract_date("not-a-date")
-        assert result == datetime.now(UTC).strftime("%Y-%m-%d")
+        fixed = datetime(2025, 6, 15, tzinfo=UTC)
+        with patch("scripts.core.generate_mini_handoff.datetime") as mock_dt:
+            mock_dt.now.return_value = fixed
+            mock_dt.fromisoformat.side_effect = ValueError("bad")
+            result = _extract_date("not-a-date")
+        assert result == "2025-06-15"
 
 
 # ===========================================================================
@@ -715,12 +726,24 @@ class TestBuildHandoffFromStateEvents:
         result = build_handoff_from_state_events(events, "s-test", "/project")
         assert "a.py" in result["files"]["modified"]
 
-    def test_write_files_tracked_as_created(self):
+    def test_write_without_prior_read_is_created(self):
         from scripts.core.generate_mini_handoff import build_handoff_from_state_events
 
         events = [_state_event("Write", file="new.py")]
         result = build_handoff_from_state_events(events, "s-test", "/project")
         assert "new.py" in result["files"]["created"]
+        assert "new.py" not in result["files"]["modified"]
+
+    def test_write_with_prior_read_is_modified(self):
+        from scripts.core.generate_mini_handoff import build_handoff_from_state_events
+
+        events = [
+            _state_event("Read", file="a.py"),
+            _state_event("Write", file="a.py"),
+        ]
+        result = build_handoff_from_state_events(events, "s-test", "/project")
+        assert "a.py" in result["files"]["modified"]
+        assert "a.py" not in result["files"]["created"]
 
     def test_bash_commands_extracted(self):
         from scripts.core.generate_mini_handoff import build_handoff_from_state_events

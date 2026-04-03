@@ -319,6 +319,19 @@ class TestDetectWorkflowSequences:
         re_pats = [p for p in patterns if p["pattern_type"] == "read-edit"]
         assert len(re_pats) == 1
 
+    def test_overlapping_patterns_prefer_longest(self) -> None:
+        """Grep->Read->Edit matches search-read-edit, not also read-edit."""
+        tool_uses = [
+            _make_tool_use("Grep", {"pattern": "foo"}),
+            _make_tool_use("Read", {"file_path": "/a.py"}),
+            _make_tool_use("Edit", {"file_path": "/a.py"}, result_error=False),
+        ]
+        patterns = detect_workflow_sequences(tool_uses)
+        types = [p["pattern_type"] for p in patterns]
+        assert "search-read-edit" in types
+        assert "read-edit" not in types
+        assert len(patterns) == 1
+
 
 # ===========================================================================
 # summarize_tool_usage
@@ -546,7 +559,7 @@ class TestExtractToolUses:
 
 
 class TestMatchPatternAt:
-    """Tests for _match_pattern_at: returns (matched, end_index) or None."""
+    """Tests for _match_pattern_at: returns (matched, first_idx, end_idx)."""
 
     def test_full_match(self) -> None:
         tool_uses = [
@@ -555,8 +568,9 @@ class TestMatchPatternAt:
         ]
         result = _match_pattern_at(tool_uses, ["Read", ("Edit", "Write")], 0)
         assert result is not None
-        matched, end_idx = result
+        matched, first_idx, end_idx = result
         assert len(matched) == 2
+        assert first_idx == 0
         assert end_idx == 2
 
     def test_no_match(self) -> None:
@@ -586,8 +600,9 @@ class TestMatchPatternAt:
             tool_uses, ["Read", ("Edit", "Write")], 1
         )
         assert result is not None
-        matched, end_idx = result
+        matched, first_idx, end_idx = result
         assert len(matched) == 2
+        assert first_idx == 1
         assert end_idx == 3
 
     def test_skipped_entries_included_in_end_index(self) -> None:
@@ -602,8 +617,9 @@ class TestMatchPatternAt:
             tool_uses, ["Read", ("Edit", "Write")], 0
         )
         assert result is not None
-        matched, end_idx = result
+        matched, first_idx, end_idx = result
         assert len(matched) == 2
+        assert first_idx == 2  # first actual match at index 2
         assert end_idx == 4  # past all 4 entries
 
     def test_empty_tool_uses(self) -> None:

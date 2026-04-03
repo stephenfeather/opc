@@ -78,18 +78,22 @@ def _match_pattern_at(
     tool_uses: list[dict],
     pat_steps: list[PatternStep],
     start: int,
-) -> tuple[list[dict], int] | None:
+) -> tuple[list[dict], int, int] | None:
     """Try to match a pattern starting at position start.
 
-    Returns (matched_entries, end_index) if the full pattern is found,
-    None otherwise. end_index is the position after the last consumed entry.
+    Returns (matched_entries, first_match_index, end_index) if the full
+    pattern is found, None otherwise. first_match_index is where the
+    first step matched; end_index is after the last consumed entry.
     """
     matched: list[dict] = []
     step_idx = 0
     j = start
+    first_match_idx = -1
 
     while j < len(tool_uses) and step_idx < len(pat_steps):
         if _matches_step(tool_uses[j]["tool_name"], pat_steps[step_idx]):
+            if step_idx == 0:
+                first_match_idx = j
             matched.append(tool_uses[j])
             step_idx += 1
         elif step_idx > 0:
@@ -97,7 +101,7 @@ def _match_pattern_at(
         j += 1
 
     if step_idx == len(pat_steps):
-        return (matched, j)
+        return (matched, first_match_idx, j)
     return None
 
 
@@ -140,24 +144,37 @@ def _build_pattern_result(pat_name: str, matched: list[dict]) -> dict:
     }
 
 
+def _spans_overlap(
+    consumed: list[tuple[int, int]], start: int, end: int,
+) -> bool:
+    """Check if [start, end) overlaps any consumed span."""
+    return any(s < end and start < e for s, e in consumed)
+
+
 def detect_workflow_sequences(tool_uses: list[dict]) -> list[dict]:
     """Identify common workflow patterns in the tool use sequence.
+
+    Patterns are matched longest-first (WORKFLOW_PATTERNS order matters).
+    A span consumed by a longer pattern suppresses shorter overlapping matches.
 
     Returns list of dicts:
         pattern_type, tools (list of tool entries), files (list),
         success (bool|None)
     """
     patterns_found: list[dict] = []
+    consumed_spans: list[tuple[int, int]] = []
 
     for pat_name, pat_steps, min_len in WORKFLOW_PATTERNS:
         i = 0
         while i < len(tool_uses):
             result = _match_pattern_at(tool_uses, pat_steps, i)
             if result is not None and len(result[0]) >= min_len:
-                matched, end_idx = result
-                patterns_found.append(
-                    _build_pattern_result(pat_name, matched)
-                )
+                matched, first_idx, end_idx = result
+                if not _spans_overlap(consumed_spans, first_idx, end_idx):
+                    patterns_found.append(
+                        _build_pattern_result(pat_name, matched)
+                    )
+                    consumed_spans.append((first_idx, end_idx))
                 i = end_idx
             else:
                 i += 1
@@ -359,12 +376,12 @@ def _write_output(
 
 
 def main() -> None:
-    faulthandler.enable(
-        file=open(
-            os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"
-        ),
-        all_threads=True,
-    )
+    try:
+        log_path = os.path.expanduser("~/.claude/logs/opc_crash.log")
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        faulthandler.enable(file=open(log_path, "a"), all_threads=True)
+    except OSError:
+        faulthandler.enable(all_threads=True)
 
     parser = argparse.ArgumentParser(
         description="Extract workflow patterns from session JSONL"

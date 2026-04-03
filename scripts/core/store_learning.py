@@ -185,9 +185,8 @@ async def store_learning_v2(
                     )
                     logger.info(
                         "Dedup rejected: session=%s similarity=%.3f "
-                        "existing_id=%s threshold=%.2f content=%.80s",
-                        session_id, similarity, existing_id,
-                        threshold, content,
+                        "existing_id=%s threshold=%.2f",
+                        session_id, similarity, existing_id, threshold,
                     )
                     await memory.close()
                     return {

@@ -304,9 +304,11 @@ async def get_feedback_velocity(conn: Any) -> dict:
 
 
 async def get_supersession_candidates(conn: Any) -> dict:
-    """Identify learnings that are candidates for supersession/cleanup.
+    """Report aged never-recalled learnings, broken down by confidence.
 
-    Criteria: active, never recalled, low confidence, older than 30 days.
+    Criteria: active, never recalled, older than 30 days.
+    Not a cleanup recommendation — high-confidence items may be valid long-tail knowledge.
+    Use the confidence breakdown to prioritize review.
     """
     row = await conn.fetchrow(
         """

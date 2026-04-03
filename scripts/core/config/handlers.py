@@ -72,12 +72,25 @@ def load_config_file(paths: list[Path]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def read_env_overrides() -> dict[str, Any]:
-    """Read known env vars and return as a nested dict matching TOML structure."""
+    """Read known env vars and return as a nested dict matching TOML structure.
+
+    Invalid values (e.g. non-numeric for int fields) are logged and skipped
+    rather than crashing config loading.
+    """
+    import logging
+    _logger = logging.getLogger(__name__)
+
     result: dict[str, Any] = {}
     for env_var, section, key, cast in _ENV_OVERRIDES:
         value = os.environ.get(env_var)
         if value is not None:
-            result.setdefault(section, {})[key] = cast(value)
+            try:
+                result.setdefault(section, {})[key] = cast(value)
+            except (ValueError, TypeError):
+                _logger.warning(
+                    "Config: env var %s=%r cannot be cast to %s — ignored",
+                    env_var, value, cast.__name__,
+                )
     return result
 
 

@@ -170,15 +170,23 @@ async def store_learning_v2(
                 similarity = top_match.get("similarity", 0)
                 if similarity >= DEDUP_THRESHOLD:
                     existing_session = top_match.get("session_id", session_id)
+                    existing_id = str(top_match.get("id", ""))
+                    reason = (
+                        f"duplicate (similarity: {similarity:.2f},"
+                        f" session: {existing_session})"
+                    )
+                    logger.info(
+                        "Dedup rejected: session=%s similarity=%.3f "
+                        "existing_id=%s threshold=%.2f content=%.80s",
+                        session_id, similarity, existing_id,
+                        DEDUP_THRESHOLD, content,
+                    )
                     await memory.close()
                     return {
                         "success": True,
                         "skipped": True,
-                        "reason": (
-                            f"duplicate (similarity: {similarity:.2f},"
-                            f" session: {existing_session})"
-                        ),
-                        "existing_id": str(top_match.get("id", "")),
+                        "reason": reason,
+                        "existing_id": existing_id,
                     }
         except Exception:
             # If search fails, proceed with storing (don't block on dedup errors)

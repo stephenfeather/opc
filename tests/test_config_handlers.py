@@ -85,6 +85,19 @@ class TestReadEnvOverrides:
         assert result["embedding"]["ollama_host"] == "http://gpu:11434"
         assert result["database"]["max_pool_size"] == 20
 
+    def test_invalid_int_var_skipped(self, monkeypatch, caplog):
+        monkeypatch.setenv("AGENTICA_MAX_POOL_SIZE", "abc")
+        result = read_env_overrides()
+        assert "database" not in result
+        assert "AGENTICA_MAX_POOL_SIZE" in caplog.text
+
+    def test_invalid_var_does_not_block_valid_vars(self, monkeypatch):
+        monkeypatch.setenv("AGENTICA_MAX_POOL_SIZE", "not_a_number")
+        monkeypatch.setenv("OLLAMA_HOST", "http://valid:1234")
+        result = read_env_overrides()
+        assert result["embedding"]["ollama_host"] == "http://valid:1234"
+        assert "database" not in result
+
 
 class TestGetConfig:
     def setup_method(self):

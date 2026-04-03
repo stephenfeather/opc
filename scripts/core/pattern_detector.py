@@ -7,24 +7,34 @@ Detects recurring patterns across sessions using:
 1. HDBSCAN clustering on L2-normalized BGE embeddings
 2. IDF-weighted tag co-occurrence graph
 3. Fusion of both signal types
+
+Clustering logic lives in pattern_detector_clustering.py.
+This module provides classification, scoring, and the detection pipeline.
 """
 
 from __future__ import annotations
 
+import logging
 import math
-from collections import Counter, defaultdict
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+_logger = logging.getLogger(__name__)
+
 import numpy as np
 
 from scripts.core.config import get_config as _get_config
+from scripts.core.pattern_detector_clustering import (
+    cluster_by_embeddings,
+    cluster_by_tags,
+    compute_tag_idf,
+    detect_noise_tags,
+    fuse_clusters,
+)
 
 _patterns_cfg = _get_config().patterns
-from scipy.sparse.csgraph import connected_components
-from scipy.sparse import csr_matrix
-from sklearn.cluster import HDBSCAN
 
 
 # ---------------------------------------------------------------------------
@@ -48,358 +58,109 @@ class Learning:
 @dataclass
 class DetectedPattern:
     """A cluster of related learnings forming a cross-session pattern."""
-    pattern_type: str       # 'tool_cluster', 'problem_solution', 'cross_project', 'expertise', 'anti_pattern'
+    pattern_type: str
     member_ids: list[str]
-    representative_id: str  # closest to centroid
-    tags: list[str]         # aggregated, deduplicated
+    representative_id: str
+    tags: list[str]
     session_count: int
-    confidence: float       # cluster quality metric [0, 1]
-    label: str              # human-readable summary
+    confidence: float
+    label: str
     metadata: dict = field(default_factory=dict)
-    distances: dict[str, float] = field(default_factory=dict)  # member_id -> distance to centroid
+    distances: dict[str, float] = field(default_factory=dict)
 
 
-# ---------------------------------------------------------------------------
-# Embedding-based clustering
-# ---------------------------------------------------------------------------
-
-def cluster_by_embeddings(
-    learnings: list[Learning],
-    min_cluster_size: int = _patterns_cfg.min_cluster_size,
-    min_samples: int = _patterns_cfg.min_samples,
-) -> list[list[int]]:
-    """Cluster learnings by embedding similarity using HDBSCAN.
-
-    L2-normalizes embeddings so Euclidean distance is proportional to
-    cosine distance. No dimensionality reduction -- at 2.2K points the
-    pairwise matrix is ~19 MB, trivial for numpy.
-
-    Returns list of clusters, each a list of indices into `learnings`.
-    Noise points (label -1) are excluded.
-    """
-    if len(learnings) < min_cluster_size:
-        return []
-
-    embeddings = np.array([l.embedding for l in learnings])
-
-    # L2-normalize: Euclidean on unit vectors == cosine distance
-    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    norms = np.where(norms == 0, 1, norms)  # avoid division by zero
-    normalized = embeddings / norms
-
-    clusterer = HDBSCAN(
-        min_cluster_size=min_cluster_size,
-        min_samples=min_samples,
-        metric="euclidean",
-    )
-    labels = clusterer.fit_predict(normalized)
-
-    # Group indices by cluster label, skip noise (-1)
-    clusters: dict[int, list[int]] = defaultdict(list)
-    for idx, label in enumerate(labels):
-        if label >= 0:
-            clusters[label].append(idx)
-
-    return list(clusters.values())
-
-
-# ---------------------------------------------------------------------------
-# Tag IDF and co-occurrence clustering
-# ---------------------------------------------------------------------------
-
-def compute_tag_idf(
-    all_tags: dict[str, list[str]],
-    total_docs: int,
-) -> dict[str, float]:
-    """Compute inverse document frequency for each tag.
-
-    IDF(tag) = log(total_docs / (1 + docs_with_tag))
-
-    High IDF = rare tag = more informative.
-    Low IDF = common tag = noise.
-    """
-    doc_freq: Counter[str] = Counter()
-    for tags in all_tags.values():
-        for tag in set(tags):  # unique tags per document
-            doc_freq[tag] += 1
-
-    return {
-        tag: math.log(total_docs / (1 + freq))
-        for tag, freq in doc_freq.items()
-    }
-
-
-def detect_noise_tags(
-    tag_idf: dict[str, float],
-    threshold_percentile: float = _patterns_cfg.tag_noise_percentile,
-) -> set[str]:
-    """Tags with IDF in the bottom percentile are noise.
-
-    Returns set of tag names to exclude from co-occurrence analysis.
-    """
-    if not tag_idf:
-        return set()
-
-    values = sorted(tag_idf.values())
-    threshold_idx = max(0, int(len(values) * threshold_percentile / 100))
-    threshold = values[threshold_idx]
-
-    return {tag for tag, idf in tag_idf.items() if idf <= threshold}
-
-
-def cluster_by_tags(
-    learnings: list[Learning],
-    min_cooccurrence: float = _patterns_cfg.min_cooccurrence,
-    min_component_size: int = _patterns_cfg.min_component_size,
-    exclude_tags: set[str] | None = None,
-    tag_idf: dict[str, float] | None = None,
-) -> list[list[int]]:
-    """Find clusters via IDF-weighted tag co-occurrence graph.
-
-    Builds a weighted graph where nodes are learnings, edges connect
-    learnings sharing tags, weights = sum of shared tags' IDF scores.
-    Uses connected components with min-weight threshold.
-
-    Large components (>20 members) are split by raising the edge-weight
-    threshold iteratively until they break apart.
-    """
-    if len(learnings) < min_component_size:
-        return []
-
-    exclude = exclude_tags or set()
-
-    # Build learning -> filtered tags mapping
-    learning_tags: list[set[str]] = []
-    for l in learnings:
-        filtered = {t for t in l.tags if t not in exclude}
-        learning_tags.append(filtered)
-
-    # Build tag -> learning indices inverted index
-    tag_to_indices: dict[str, list[int]] = defaultdict(list)
-    for idx, tags in enumerate(learning_tags):
-        for tag in tags:
-            tag_to_indices[tag].append(idx)
-
-    # Default IDF: 1.0 for all tags if not provided
-    idf = tag_idf or {}
-
-    # Build sparse adjacency matrix with IDF-weighted edges
-    n = len(learnings)
-    rows, cols, weights = [], [], []
-
-    for tag, indices in tag_to_indices.items():
-        if len(indices) < 2:
-            continue
-        w = idf.get(tag, 1.0)
-        for i in range(len(indices)):
-            for j in range(i + 1, len(indices)):
-                rows.append(indices[i])
-                cols.append(indices[j])
-                weights.append(w)
-
-    if not rows:
-        return []
-
-    # Aggregate duplicate edges (same pair may share multiple tags)
-    edge_weights: dict[tuple[int, int], float] = defaultdict(float)
-    for r, c, w in zip(rows, cols, weights):
-        key = (min(r, c), max(r, c))
-        edge_weights[key] += w
-
-    # Filter by minimum co-occurrence weight
-    filtered_rows, filtered_cols, filtered_weights = [], [], []
-    for (r, c), w in edge_weights.items():
-        if w >= min_cooccurrence:
-            filtered_rows.extend([r, c])
-            filtered_cols.extend([c, r])
-            filtered_weights.extend([w, w])
-
-    if not filtered_rows:
-        return []
-
-    graph = csr_matrix(
-        (filtered_weights, (filtered_rows, filtered_cols)),
-        shape=(n, n),
-    )
-
-    n_components, labels = connected_components(graph, directed=False)
-
-    # Group by component, filter by min size
-    components: dict[int, list[int]] = defaultdict(list)
-    for idx, label in enumerate(labels):
-        components[label].append(idx)
-
-    clusters = []
-    for members in components.values():
-        if len(members) < min_component_size:
-            continue
-        if len(members) <= _patterns_cfg.max_cluster_size:
-            clusters.append(members)
-        else:
-            # Split large components by raising threshold
-            split = _split_large_component(
-                members, edge_weights, min_component_size, min_cooccurrence
-            )
-            clusters.extend(split)
-
-    return clusters
-
-
-def _split_large_component(
-    members: list[int],
-    edge_weights: dict[tuple[int, int], float],
-    min_size: int,
-    base_threshold: float,
-) -> list[list[int]]:
-    """Split a large component by iteratively raising the edge-weight threshold."""
-    member_set = set(members)
-    threshold = base_threshold
-
-    for _ in range(10):  # max 10 iterations
-        threshold *= 1.5
-
-        rows, cols, weights = [], [], []
-        for (r, c), w in edge_weights.items():
-            if r in member_set and c in member_set and w >= threshold:
-                rows.extend([r, c])
-                cols.extend([c, r])
-                weights.extend([w, w])
-
-        if not rows:
-            # Threshold too high, return the original as-is
-            return [members]
-
-        idx_map = {m: i for i, m in enumerate(sorted(member_set))}
-        n = len(member_set)
-        mapped_rows = [idx_map[r] for r in rows]
-        mapped_cols = [idx_map[c] for c in cols]
-
-        graph = csr_matrix((weights, (mapped_rows, mapped_cols)), shape=(n, n))
-        _, labels = connected_components(graph, directed=False)
-
-        reverse_map = {i: m for m, i in idx_map.items()}
-        sub_components: dict[int, list[int]] = defaultdict(list)
-        for i, label in enumerate(labels):
-            sub_components[label].append(reverse_map[i])
-
-        valid = [m for m in sub_components.values() if len(m) >= min_size]
-        if len(valid) > 1:
-            return valid
-
-    return [members]
-
-
-# ---------------------------------------------------------------------------
-# Cluster fusion
-# ---------------------------------------------------------------------------
-
-def fuse_clusters(
-    embedding_clusters: list[list[int]],
-    tag_clusters: list[list[int]],
-    overlap_threshold: float = _patterns_cfg.overlap_threshold,
-) -> list[list[int]]:
-    """Merge embedding and tag clusters using Jaccard overlap.
-
-    Two clusters from different methods merge if they share > threshold
-    members. Tag clusters that don't overlap with any embedding cluster
-    are kept as-is.
-    """
-    if not embedding_clusters and not tag_clusters:
-        return []
-    if not tag_clusters:
-        return [list(c) for c in embedding_clusters]
-    if not embedding_clusters:
-        return [list(c) for c in tag_clusters]
-
-    # Convert to sets for overlap computation
-    emb_sets = [set(c) for c in embedding_clusters]
-    tag_sets = [set(c) for c in tag_clusters]
-
-    merged = [set(c) for c in embedding_clusters]
-    tag_used = [False] * len(tag_sets)
-
-    for ti, tag_set in enumerate(tag_sets):
-        best_overlap = 0.0
-        best_ei = -1
-
-        for ei, emb_set in enumerate(emb_sets):
-            intersection = len(tag_set & emb_set)
-            union = len(tag_set | emb_set)
-            if union == 0:
-                continue
-            jaccard = intersection / union
-            if jaccard > best_overlap:
-                best_overlap = jaccard
-                best_ei = ei
-
-        if best_overlap >= overlap_threshold and best_ei >= 0:
-            merged[best_ei] = merged[best_ei] | tag_set
-            tag_used[ti] = True
-
-    # Keep non-overlapping tag clusters
-    for ti, tag_set in enumerate(tag_sets):
-        if not tag_used[ti]:
-            merged.append(tag_set)
-
-    return [sorted(c) for c in merged]
+# Type alias for an async cluster classifier callback.
+PatternClassifier = Callable[[list[Learning]], Awaitable[str]]
 
 
 # ---------------------------------------------------------------------------
 # Pattern classification
 # ---------------------------------------------------------------------------
 
-def classify_pattern_heuristic(members: list[Learning], reference_time: datetime | None = None) -> str:
-    """Classify a cluster using heuristics. Priority order: specific -> broad.
+def classify_pattern_heuristic(
+    members: list[Learning],
+    reference_time: datetime | None = None,
+) -> str:
+    """Classify a cluster using heuristics. Priority order:
 
-    1. anti_pattern: >60% FAILED_APPROACH (keep as-is)
-    2. problem_solution: Both ERROR_FIX and WORKING_SOLUTION present AND combined >=40%
-    3. expertise: 60% in last 30d + >=60% one type + >=4 distinct contexts + >=3 sessions
-    4. tool_cluster: >=70% same learning_type + <=3 distinct contexts
-    5. cross_project: residual -- 4+ contexts OR (>=5 members AND session/member > 0.7)
+    1. anti_pattern: >60% FAILED_APPROACH
+    2. problem_solution: Both ERROR_FIX and WORKING_SOLUTION, combined >=40%
+    3. expertise: 60% recent + >=60% one type + >=4 contexts + >=3 sessions
+    4. tool_cluster: >=70% same type + <=3 contexts
+    5. cross_project: 4+ contexts OR (>=5 members AND session/member > 0.7)
     """
     if not members:
         return "tool_cluster"
 
     types = Counter(m.learning_type for m in members)
-    sessions = set(m.session_id for m in members)
-    contexts = set(m.context for m in members if m.context)
+    sessions = {m.session_id for m in members}
+    contexts = {m.context for m in members if m.context}
     total = sum(types.values())
+    max_type_count = max(types.values())
 
-    # 1. Anti-pattern: all or majority FAILED_APPROACH
+    if _is_anti_pattern(types, total):
+        return "anti_pattern"
+    if _is_problem_solution(types, total):
+        return "problem_solution"
+    if _is_expertise(members, max_type_count, total, contexts, sessions, reference_time):
+        return "expertise"
+    if _is_tool_cluster(max_type_count, total, contexts):
+        return "tool_cluster"
+    if _is_cross_project(members, contexts, sessions):
+        return "cross_project"
+    return "tool_cluster"
+
+
+def _is_anti_pattern(types: Counter, total: int) -> bool:
     if len(types) == 1 and "FAILED_APPROACH" in types:
-        return "anti_pattern"
-    if types.get("FAILED_APPROACH", 0) / total > _patterns_cfg.anti_pattern_threshold:
-        return "anti_pattern"
+        return True
+    return types.get("FAILED_APPROACH", 0) / total > _patterns_cfg.anti_pattern_threshold
 
-    # 2. Problem-solution: both ERROR_FIX and WORKING_SOLUTION present, combined >=40%
+
+def _is_problem_solution(types: Counter, total: int) -> bool:
     error_fix = types.get("ERROR_FIX", 0)
     working_sol = types.get("WORKING_SOLUTION", 0)
-    if error_fix > 0 and working_sol > 0 and (error_fix + working_sol) / total >= _patterns_cfg.problem_solution_threshold:
-        return "problem_solution"
+    return (
+        error_fix > 0
+        and working_sol > 0
+        and (error_fix + working_sol) / total >= _patterns_cfg.problem_solution_threshold
+    )
 
-    # 3. Expertise: temporally concentrated + type-homogeneous + context-diverse + multi-session
+
+def _is_expertise(
+    members: list[Learning],
+    max_type_count: int,
+    total: int,
+    contexts: set[str],
+    sessions: set[str],
+    reference_time: datetime | None,
+) -> bool:
     now = reference_time or datetime.now(UTC)
+    cutoff_seconds = _patterns_cfg.cross_project_days * 24 * 3600
     recent = [
         m for m in members
-        if (now - m.created_at).total_seconds() <= _patterns_cfg.cross_project_days * 24 * 3600
+        if (now - m.created_at).total_seconds() <= cutoff_seconds
     ]
-    max_type_count = max(types.values())
-    if (len(recent) >= len(members) * _patterns_cfg.expertise_threshold
-            and max_type_count / total >= _patterns_cfg.expertise_threshold
-            and len(contexts) >= _patterns_cfg.cross_project_contexts
-            and len(sessions) >= _patterns_cfg.cross_project_sessions):
-        return "expertise"
+    return (
+        len(recent) >= len(members) * _patterns_cfg.expertise_threshold
+        and max_type_count / total >= _patterns_cfg.expertise_threshold
+        and len(contexts) >= _patterns_cfg.cross_project_contexts
+        and len(sessions) >= _patterns_cfg.cross_project_sessions
+    )
 
-    # 4. Tool cluster: highly homogeneous type + narrow context
-    if max_type_count / total >= _patterns_cfg.tool_cluster_threshold and len(contexts) <= 3:
-        return "tool_cluster"
 
-    # 5. Cross-project: residual catch-all
-    if (len(contexts) >= _patterns_cfg.cross_project_contexts
-            or (len(members) >= 5 and len(sessions) / len(members) > 0.7)):
-        return "cross_project"
+def _is_tool_cluster(max_type_count: int, total: int, contexts: set[str]) -> bool:
+    return max_type_count / total >= _patterns_cfg.tool_cluster_threshold and len(contexts) <= 3
 
-    return "tool_cluster"
+
+def _is_cross_project(
+    members: list[Learning],
+    contexts: set[str],
+    sessions: set[str],
+) -> bool:
+    if len(contexts) >= _patterns_cfg.cross_project_contexts:
+        return True
+    return len(members) >= 5 and len(sessions) / len(members) > 0.7
 
 
 def _learning_to_dict(m: Learning) -> dict:
@@ -413,39 +174,29 @@ def _learning_to_dict(m: Learning) -> dict:
     }
 
 
-# Type alias for an async cluster classifier callback.
-PatternClassifier = Callable[[list[Learning]], Awaitable[str]]
-
-
 # ---------------------------------------------------------------------------
 # Label generation
 # ---------------------------------------------------------------------------
 
-def generate_label(members: list[Learning], pattern_type: str) -> str:
-    """Generate a human-readable label for a pattern.
+_TYPE_LABELS = {
+    "tool_cluster": "patterns",
+    "problem_solution": "problem-solution patterns",
+    "cross_project": "cross-project patterns",
+    "expertise": "emerging expertise",
+    "anti_pattern": "anti-patterns",
+}
 
-    Uses the most common tags and learning_type to build a description.
-    """
+
+def generate_label(members: list[Learning], pattern_type: str) -> str:
+    """Generate a human-readable label for a pattern."""
     if not members:
         return "Empty pattern"
 
-    # Collect all tags, find top 3
-    all_tags: list[str] = []
-    for m in members:
-        all_tags.extend(m.tags)
+    all_tags: list[str] = [tag for m in members for tag in dict.fromkeys(m.tags)]
     top_tags = [tag for tag, _ in Counter(all_tags).most_common(3)]
-
-    sessions = set(m.session_id for m in members)
+    sessions = {m.session_id for m in members}
     tag_str = " + ".join(top_tags) if top_tags else "misc"
-
-    type_labels = {
-        "tool_cluster": "patterns",
-        "problem_solution": "problem-solution patterns",
-        "cross_project": "cross-project patterns",
-        "expertise": "emerging expertise",
-        "anti_pattern": "anti-patterns",
-    }
-    type_label = type_labels.get(pattern_type, "patterns")
+    type_label = _TYPE_LABELS.get(pattern_type, "patterns")
 
     return f"{tag_str} {type_label} across {len(sessions)} sessions"
 
@@ -454,6 +205,42 @@ def generate_label(members: list[Learning], pattern_type: str) -> str:
 # Confidence scoring
 # ---------------------------------------------------------------------------
 
+def compute_cohesion(members: list[Learning], centroid: np.ndarray) -> float:
+    """Mean cosine similarity of members to centroid, clamped to [0, 1]."""
+    if not members:
+        return 0.0
+    embeddings = np.array([m.embedding for m in members])
+    centroid_norm = centroid / (np.linalg.norm(centroid) or 1.0)
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1, norms)
+    similarities = (embeddings / norms) @ centroid_norm
+    return float(max(0.0, min(1.0, np.mean(similarities))))
+
+
+def compute_diversity(members: list[Learning]) -> float:
+    """Distinct session ratio, capped at 1.0 (5 sessions = max)."""
+    if not members:
+        return 0.0
+    sessions = {m.session_id for m in members}
+    return min(1.0, len(sessions) / 5)
+
+
+def compute_temporal_span(members: list[Learning]) -> float:
+    """Temporal spread as fraction of 14 days, capped at 1.0."""
+    if len(members) < 2:
+        return 0.0
+    dates = [m.created_at for m in members]
+    span_days = (max(dates) - min(dates)).days
+    return min(1.0, span_days / 14)
+
+
+def compute_size_score(count: int) -> float:
+    """Logarithmic size score, capped at 1.0 (16 members = max)."""
+    if count <= 0:
+        return 0.0
+    return min(1.0, math.log2(max(1, count)) / 4)
+
+
 def compute_confidence(
     members: list[Learning],
     centroid: np.ndarray,
@@ -461,45 +248,21 @@ def compute_confidence(
     """Score cluster quality on [0, 1].
 
     confidence = 0.3 * cohesion + 0.3 * diversity + 0.2 * temporal_span + 0.2 * size_score
-
-    cohesion:      mean cosine similarity to centroid
-    diversity:     min(1.0, distinct_sessions / 5)
-    temporal_span: min(1.0, (last - first).days / 14)
-    size_score:    min(1.0, log2(cluster_size) / 4)
     """
     if not members:
         return 0.0
 
-    # Cohesion: mean cosine similarity to centroid
-    embeddings = np.array([m.embedding for m in members])
-    centroid_norm = centroid / (np.linalg.norm(centroid) or 1.0)
-    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    norms = np.where(norms == 0, 1, norms)
-    normalized = embeddings / norms
-    similarities = normalized @ centroid_norm
-    cohesion = float(np.mean(similarities))
-    # Clamp to [0, 1]
-    cohesion = max(0.0, min(1.0, cohesion))
+    cohesion = compute_cohesion(members, centroid)
+    diversity = compute_diversity(members)
+    temporal = compute_temporal_span(members)
+    size = compute_size_score(len(members))
 
-    # Diversity: distinct sessions
-    sessions = set(m.session_id for m in members)
-    diversity = min(1.0, len(sessions) / 5)
-
-    # Temporal span
-    dates = [m.created_at for m in members]
-    span_days = (max(dates) - min(dates)).days if len(dates) >= 2 else 0
-    temporal_span = min(1.0, span_days / 14)
-
-    # Size
-    size_score = min(1.0, math.log2(max(1, len(members))) / 4)
-
-    return 0.3 * cohesion + 0.3 * diversity + 0.2 * temporal_span + 0.2 * size_score
+    return 0.3 * cohesion + 0.3 * diversity + 0.2 * temporal + 0.2 * size
 
 
 def compute_centroid(members: list[Learning]) -> np.ndarray:
     """Compute mean embedding (centroid) for a set of learnings."""
-    embeddings = np.array([m.embedding for m in members])
-    return np.mean(embeddings, axis=0)
+    return np.mean(np.array([m.embedding for m in members]), axis=0)
 
 
 def compute_distances(
@@ -508,15 +271,19 @@ def compute_distances(
 ) -> dict[str, float]:
     """Compute cosine distance from each member to the centroid."""
     centroid_norm = centroid / (np.linalg.norm(centroid) or 1.0)
-    distances = {}
-    for m in members:
-        norm = np.linalg.norm(m.embedding)
-        if norm == 0:
-            distances[m.id] = 1.0
-        else:
-            sim = float((m.embedding / norm) @ centroid_norm)
-            distances[m.id] = 1.0 - max(0.0, min(1.0, sim))
-    return distances
+    return {
+        m.id: _cosine_distance(m.embedding, centroid_norm)
+        for m in members
+    }
+
+
+def _cosine_distance(embedding: np.ndarray, centroid_norm: np.ndarray) -> float:
+    """1 - cosine_similarity, clamped to [0, 1]."""
+    norm = np.linalg.norm(embedding)
+    if norm == 0:
+        return 1.0
+    sim = float((embedding / norm) @ centroid_norm)
+    return 1.0 - max(0.0, min(1.0, sim))
 
 
 # ---------------------------------------------------------------------------
@@ -538,20 +305,37 @@ async def detect_patterns(
     3. Fuse clusters
     4. Classify, label, and score each cluster
 
-    Args:
-        classifier: Optional async callback for LLM-based classification.
-            Falls back to classify_pattern_heuristic() on None or error.
-
     Returns list of DetectedPattern sorted by confidence descending.
     """
     if len(learnings) < min_cluster_size:
         return []
 
-    # Step 1: Embedding clustering
+    fused = _cluster_and_fuse(
+        learnings, min_cluster_size, min_samples, tag_noise_percentile,
+    )
+
+    patterns = []
+    for cluster_indices in fused:
+        pattern = await _analyze_cluster(
+            cluster_indices, learnings, classifier, min_confidence,
+        )
+        if pattern is not None:
+            patterns.append(pattern)
+
+    patterns.sort(key=lambda p: p.confidence, reverse=True)
+    return patterns
+
+
+def _cluster_and_fuse(
+    learnings: list[Learning],
+    min_cluster_size: int,
+    min_samples: int,
+    tag_noise_percentile: float,
+) -> list[list[int]]:
+    """Run embedding + tag clustering and fuse results."""
     emb_clusters = cluster_by_embeddings(learnings, min_cluster_size, min_samples)
 
-    # Step 2: Tag IDF + tag clustering
-    all_tags = {l.id: l.tags for l in learnings}
+    all_tags = {m.id: m.tags for m in learnings}
     tag_idf = compute_tag_idf(all_tags, len(learnings))
     noise_tags = detect_noise_tags(tag_idf, tag_noise_percentile) | {"perception"}
     tag_clusters = cluster_by_tags(
@@ -562,58 +346,62 @@ async def detect_patterns(
         tag_idf=tag_idf,
     )
 
-    # Step 3: Fuse
-    fused = fuse_clusters(emb_clusters, tag_clusters)
+    return fuse_clusters(emb_clusters, tag_clusters)
 
-    # Step 4: Analyze each cluster
-    patterns = []
-    for cluster_indices in fused:
-        members = [learnings[i] for i in cluster_indices]
-        centroid = compute_centroid(members)
-        confidence = compute_confidence(members, centroid)
 
-        if confidence < min_confidence:
-            continue
+async def _analyze_cluster(
+    cluster_indices: list[int],
+    learnings: list[Learning],
+    classifier: PatternClassifier | None,
+    min_confidence: float,
+) -> DetectedPattern | None:
+    """Classify, label, and score a single cluster."""
+    members = [learnings[i] for i in cluster_indices]
+    centroid = compute_centroid(members)
+    confidence = compute_confidence(members, centroid)
 
-        # Find representative (closest to centroid)
-        distances = compute_distances(members, centroid)
-        representative_id = min(distances, key=distances.get)
+    if confidence < min_confidence:
+        return None
 
-        if classifier is not None:
-            try:
-                pattern_type = await classifier(members)
-            except Exception:
-                pattern_type = classify_pattern_heuristic(members)
-        else:
-            pattern_type = classify_pattern_heuristic(members)
-        label = generate_label(members, pattern_type)
+    distances = compute_distances(members, centroid)
+    representative_id = min(distances, key=distances.get)
+    pattern_type = await _classify_with_fallback(members, classifier)
+    label = generate_label(members, pattern_type)
 
-        # Aggregate tags
-        tag_counter: Counter[str] = Counter()
-        for m in members:
-            tag_counter.update(m.tags)
-        aggregated_tags = [t for t, _ in tag_counter.most_common(20)]
+    tag_counter: Counter[str] = Counter()
+    for m in members:
+        tag_counter.update(set(m.tags))
 
-        sessions = set(m.session_id for m in members)
+    sessions = {m.session_id for m in members}
 
-        patterns.append(DetectedPattern(
-            pattern_type=pattern_type,
-            member_ids=[m.id for m in members],
-            representative_id=representative_id,
-            tags=aggregated_tags,
-            session_count=len(sessions),
-            confidence=confidence,
-            label=label,
-            metadata={
-                "size": len(members),
-                "cohesion": float(np.mean([1.0 - d for d in distances.values()])),
-                "temporal_span_days": (
-                    (max(m.created_at for m in members) - min(m.created_at for m in members)).days
-                    if len(members) >= 2 else 0
-                ),
-            },
-            distances=distances,
-        ))
+    return DetectedPattern(
+        pattern_type=pattern_type,
+        member_ids=[m.id for m in members],
+        representative_id=representative_id,
+        tags=[t for t, _ in tag_counter.most_common(20)],
+        session_count=len(sessions),
+        confidence=confidence,
+        label=label,
+        metadata={
+            "size": len(members),
+            "cohesion": float(np.mean([1.0 - d for d in distances.values()])),
+            "temporal_span_days": (
+                (max(m.created_at for m in members) - min(m.created_at for m in members)).days
+                if len(members) >= 2 else 0
+            ),
+        },
+        distances=distances,
+    )
 
-    patterns.sort(key=lambda p: p.confidence, reverse=True)
-    return patterns
+
+async def _classify_with_fallback(
+    members: list[Learning],
+    classifier: PatternClassifier | None,
+) -> str:
+    """Use classifier callback if provided, fall back to heuristic."""
+    if classifier is not None:
+        try:
+            return await classifier(members)
+        except Exception:
+            _logger.debug("Classifier failed, falling back to heuristic", exc_info=True)
+    return classify_pattern_heuristic(members)

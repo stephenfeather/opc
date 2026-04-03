@@ -295,6 +295,30 @@ class TestDetectWorkflowSequences:
         assert len(re_pats) == 1
         assert re_pats[0]["files"] == ["/tmp/same.py"]
 
+    def test_leading_unrelated_tools_no_duplicate(self) -> None:
+        """Pattern preceded by unrelated tools should be found exactly once."""
+        tool_uses = [
+            _make_tool_use("Agent", {"subagent_type": "scout"}),
+            _make_tool_use("Agent", {"subagent_type": "oracle"}),
+            _make_tool_use("Read", {"file_path": "/a.py"}),
+            _make_tool_use("Edit", {"file_path": "/a.py"}, result_error=False),
+        ]
+        patterns = detect_workflow_sequences(tool_uses)
+        re_pats = [p for p in patterns if p["pattern_type"] == "read-edit"]
+        assert len(re_pats) == 1
+
+    def test_many_leading_unrelated_no_duplication(self) -> None:
+        """Five leading Agents should still yield exactly one pattern."""
+        tool_uses = [
+            _make_tool_use("Agent", {}) for _ in range(5)
+        ] + [
+            _make_tool_use("Read", {"file_path": "/a.py"}),
+            _make_tool_use("Edit", {"file_path": "/a.py"}, result_error=False),
+        ]
+        patterns = detect_workflow_sequences(tool_uses)
+        re_pats = [p for p in patterns if p["pattern_type"] == "read-edit"]
+        assert len(re_pats) == 1
+
 
 # ===========================================================================
 # summarize_tool_usage
@@ -522,7 +546,7 @@ class TestExtractToolUses:
 
 
 class TestMatchPatternAt:
-    """Tests for _match_pattern_at: matches a pattern at a given position."""
+    """Tests for _match_pattern_at: returns (matched, end_index) or None."""
 
     def test_full_match(self) -> None:
         tool_uses = [
@@ -531,7 +555,9 @@ class TestMatchPatternAt:
         ]
         result = _match_pattern_at(tool_uses, ["Read", ("Edit", "Write")], 0)
         assert result is not None
-        assert len(result) == 2
+        matched, end_idx = result
+        assert len(matched) == 2
+        assert end_idx == 2
 
     def test_no_match(self) -> None:
         tool_uses = [_make_tool_use("Bash", {"command": "ls"})]
@@ -560,7 +586,25 @@ class TestMatchPatternAt:
             tool_uses, ["Read", ("Edit", "Write")], 1
         )
         assert result is not None
-        assert len(result) == 2
+        matched, end_idx = result
+        assert len(matched) == 2
+        assert end_idx == 3
+
+    def test_skipped_entries_included_in_end_index(self) -> None:
+        """end_index accounts for skipped non-matching entries."""
+        tool_uses = [
+            _make_tool_use("Agent", {}),
+            _make_tool_use("Agent", {}),
+            _make_tool_use("Read", {"file_path": "/a.py"}),
+            _make_tool_use("Edit", {"file_path": "/a.py"}),
+        ]
+        result = _match_pattern_at(
+            tool_uses, ["Read", ("Edit", "Write")], 0
+        )
+        assert result is not None
+        matched, end_idx = result
+        assert len(matched) == 2
+        assert end_idx == 4  # past all 4 entries
 
     def test_empty_tool_uses(self) -> None:
         result = _match_pattern_at([], ["Read"], 0)

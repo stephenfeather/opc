@@ -78,10 +78,11 @@ def _match_pattern_at(
     tool_uses: list[dict],
     pat_steps: list[PatternStep],
     start: int,
-) -> list[dict] | None:
+) -> tuple[list[dict], int] | None:
     """Try to match a pattern starting at position start.
 
-    Returns matched tool entries if the full pattern is found, None otherwise.
+    Returns (matched_entries, end_index) if the full pattern is found,
+    None otherwise. end_index is the position after the last consumed entry.
     """
     matched: list[dict] = []
     step_idx = 0
@@ -96,7 +97,7 @@ def _match_pattern_at(
         j += 1
 
     if step_idx == len(pat_steps):
-        return matched
+        return (matched, j)
     return None
 
 
@@ -151,12 +152,13 @@ def detect_workflow_sequences(tool_uses: list[dict]) -> list[dict]:
     for pat_name, pat_steps, min_len in WORKFLOW_PATTERNS:
         i = 0
         while i < len(tool_uses):
-            matched = _match_pattern_at(tool_uses, pat_steps, i)
-            if matched is not None and len(matched) >= min_len:
+            result = _match_pattern_at(tool_uses, pat_steps, i)
+            if result is not None and len(result[0]) >= min_len:
+                matched, end_idx = result
                 patterns_found.append(
                     _build_pattern_result(pat_name, matched)
                 )
-                i += len(matched)
+                i = end_idx
             else:
                 i += 1
 

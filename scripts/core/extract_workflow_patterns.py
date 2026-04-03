@@ -375,13 +375,23 @@ def _write_output(
         print(output)
 
 
-def main() -> None:
+_crash_log_handle = None  # kept alive for faulthandler
+
+
+def _enable_faulthandler() -> None:
+    """Enable faulthandler with crash log, falling back to stderr."""
+    global _crash_log_handle  # noqa: PLW0603
     try:
         log_path = os.path.expanduser("~/.claude/logs/opc_crash.log")
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        faulthandler.enable(file=open(log_path, "a"), all_threads=True)
+        _crash_log_handle = open(log_path, "a")  # noqa: SIM115
+        faulthandler.enable(file=_crash_log_handle, all_threads=True)
     except OSError:
         faulthandler.enable(all_threads=True)
+
+
+def main() -> None:
+    _enable_faulthandler()
 
     parser = argparse.ArgumentParser(
         description="Extract workflow patterns from session JSONL"

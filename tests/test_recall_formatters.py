@@ -176,6 +176,11 @@ class TestExtractLearningType:
         result = {"similarity": 0.5, "session_id": "s", "content": "c", "created_at": "d"}
         assert _extract_learning_type(result) == "UNKNOWN"
 
+    def test_none_metadata_defaults_to_unknown(self):
+        result = _make_result()
+        result["metadata"] = None
+        assert _extract_learning_type(result) == "UNKNOWN"
+
 
 # ---------------------------------------------------------------------------
 # _extract_score
@@ -222,6 +227,22 @@ class TestFormatResultLine:
         )
         assert header.startswith("  3.")
         assert content == "     test"
+
+    def test_multiline_content_all_lines_indented(self):
+        result = _make_result(content="line1\nline2\nline3", similarity=0.5)
+        _, content = _format_result_line(1, result)
+        lines = content.split("\n")
+        assert all(line.startswith("   ") for line in lines)
+        assert lines[0] == "   line1"
+        assert lines[1] == "   line2"
+        assert lines[2] == "   line3"
+
+    def test_multiline_content_custom_indent(self):
+        result = _make_result(content="a\nb", similarity=0.5)
+        _, content = _format_result_line(1, result, content_indent="     ")
+        lines = content.split("\n")
+        assert lines[0] == "     a"
+        assert lines[1] == "     b"
 
     def test_long_content_truncated(self):
         long_content = "x" * 400
@@ -341,6 +362,13 @@ class TestFormatJsonOutput:
         output = format_json_output(results)
         parsed = json.loads(output)  # Should not raise
         assert parsed["results"][0]["content"] == 'has "quotes" and \nnewlines'
+
+    def test_null_metadata_does_not_crash(self):
+        result = _make_result()
+        result["metadata"] = None
+        output = format_json_output([result])
+        parsed = json.loads(output)
+        assert parsed["results"][0]["learning_type"] == "UNKNOWN"
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +493,27 @@ class TestFormatHumanOutput:
         assert "  1." in output
         assert "  2." in output
         assert "  3." in output
+
+    def test_null_metadata_does_not_crash(self):
+        result = _make_result()
+        result["metadata"] = None
+        output = format_human_output([result])
+        assert "UNKNOWN" not in output  # human output doesn't show type in flat mode
+        assert "1 matching learnings" in output
+
+    def test_multiline_content_indented_flat(self):
+        results = [_make_result(content="line1\nline2")]
+        output = format_human_output(results)
+        lines = output.split("\n")
+        content_lines = [l for l in lines if "line1" in l or "line2" in l]
+        assert all(l.startswith("   ") for l in content_lines)
+
+    def test_multiline_content_indented_structured(self):
+        results = [_make_result(content="line1\nline2", learning_type="ERROR_FIX")]
+        output = format_human_output(results, structured=True)
+        lines = output.split("\n")
+        content_lines = [l for l in lines if "line1" in l or "line2" in l]
+        assert all(l.startswith("     ") for l in content_lines)
 
     def test_golden_flat_output(self):
         """Pin exact flat output format to prevent regressions."""

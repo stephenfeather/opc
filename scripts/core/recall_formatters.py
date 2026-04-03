@@ -55,7 +55,8 @@ def _format_created_at_human(created_at: Any) -> str:
 
 def _extract_learning_type(result: dict[str, Any]) -> str:
     """Extract learning_type from a result dict, defaulting to UNKNOWN."""
-    return result.get("metadata", {}).get("learning_type", "UNKNOWN")
+    metadata = result.get("metadata") or {}
+    return metadata.get("learning_type", "UNKNOWN")
 
 
 def _extract_score(result: dict[str, Any]) -> float:
@@ -146,7 +147,8 @@ def _format_result_line(
     created_str = _format_created_at_human(result["created_at"])
     content_preview = format_result_preview(result["content"], max_length=300)
     header = f"{indent}{index}. [{score:.3f}] Session: {session_id} ({created_str})"
-    content = f"{content_indent}{content_preview}"
+    indented_lines = (f"{content_indent}{line}" for line in content_preview.split("\n"))
+    content = "\n".join(indented_lines)
     return header, content
 
 

@@ -180,6 +180,21 @@ from uuid import UUID
 Row = tuple[str | UUID, str | None, dict | None]
 
 
+def _normalize_metadata(metadata: dict | str | None) -> dict:
+    """Normalize metadata from DB — may be dict, JSON string, or None."""
+    if not metadata:
+        return {}
+    if isinstance(metadata, dict):
+        return metadata
+    if isinstance(metadata, str):
+        try:
+            decoded = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+    return {}
+
+
 def calibrate_rows(rows: Sequence[Row]) -> dict:
     """Calibrate a batch of (id, content, metadata) rows.
 
@@ -199,7 +214,7 @@ def calibrate_rows(rows: Sequence[Row]) -> dict:
             continue
 
         result = calibrate_confidence(content)
-        meta = metadata or {}
+        meta = _normalize_metadata(metadata)
         old_confidence = meta.get("confidence")
         new_confidence = result["confidence"]
 
@@ -246,7 +261,9 @@ def _pg_connect():
         "DATABASE_URL"
     )
     if not db_url:
-        raise RuntimeError("No DATABASE_URL configured")
+        raise RuntimeError(
+            "No database URL configured; set CONTINUOUS_CLAUDE_DB_URL or DATABASE_URL"
+        )
     return psycopg2.connect(db_url)
 
 

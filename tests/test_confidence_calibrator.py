@@ -268,6 +268,16 @@ class TestCalibrateRows:
         result = calibrate_rows(rows)
         assert result["stats"]["errors"] == 1
 
+    def test_string_metadata(self):
+        """Handle metadata arriving as JSON string from psycopg2."""
+        import json
+        meta_str = json.dumps({"confidence": "low"})
+        rows = [("id-1", "Always use `foo()`. Verified with tests.", meta_str)]
+        result = calibrate_rows(rows)
+        assert result["stats"]["total"] == 1
+        # Should parse the string and detect confidence change
+        assert result["stats"]["updated"] == 1
+
     def test_none_metadata(self):
         rows = [("id-1", "Always use `foo()` instead. Verified.", None)]
         result = calibrate_rows(rows)

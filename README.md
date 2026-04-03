@@ -13,13 +13,13 @@ This project began as a fork of [Continuous-Claude-v3](https://github.com/parcad
 - **Semantic memory** - Store and recall learnings across sessions using embedding-backed search (Voyage, OpenAI, local, or Ollama)
 - **Session handoffs** - Generate YAML handoff documents so new sessions can resume where previous ones left off
 - **Artifact indexing** - Track and query files, plans, and other artifacts across the project
-- **Memory daemon** - Background process that extracts thinking blocks, workflow patterns, and generates mini-handoffs automatically
+- **Memory daemon** - Background process that extracts thinking blocks, workflow patterns, and generates mini-handoffs automatically, with date-based log rotation
 - **Multi-provider embeddings** - Pluggable embedding service supporting Voyage AI, OpenAI, local sentence-transformers, and Ollama
 - **Contextual reranking** - Adaptive reranker that reorders recall results using recency, tag relevance, type inference, and per-mode calibration
 - **Cross-session pattern detection** - Identifies recurring patterns across sessions (repeated errors, tool preferences, architectural decisions) and boosts them in recall
 - **Learning chains** - Learnings can supersede previous entries, keeping the knowledge base current without duplication
 - **Temporal decay tracking** - Tracks when learnings are recalled and decays stale entries that haven't been useful recently
-- **Semantic deduplication** - Prevents storing near-duplicate learnings using embedding similarity checks across sessions
+- **Semantic deduplication** - Prevents storing near-duplicate learnings using embedding similarity checks across sessions, with per-session rejection tracking
 - **Tag-based filtering** - Store and recall learnings with tags for precise filtering (`--tags`, `--tags-strict`)
 - **LLM learning classification** - Auto-classifies learnings by type using a tuned prompt with eval harness (84.3% accuracy), wired into pattern detection
 - **Project-scoped extraction** - Daemon passes project context through both LLM and workflow extraction paths, enabling project-match reranking
@@ -29,10 +29,13 @@ This project began as a fork of [Continuous-Claude-v3](https://github.com/parcad
 - **Memory metrics** - CLI health dashboard reporting totals, confidence distribution, extraction stats, tag usage, and temporal trends (`--human` or `--json`)
 - **TF-IDF query expansion** - Expands text queries with semantically related terms before hybrid RRF search using pseudo-relevance feedback over vector neighbors and corpus IDF scoring (`--no-expand` to disable)
 - **Rerank A/B benchmarking** - Golden-set bootstrap tool and sweep framework for tuning reranker weights with measurable accuracy metrics
+- **TOML-driven configuration** - All daemon, reranker, dedup, recall, embedding, and pattern settings configurable via `opc.toml` with type validation and env overrides
+- **Dedup rejection tracking** - Records rejected (near-duplicate) learnings in `learning_rejections` table with similarity scores, surfaced in daemon extraction logs
 
 ## Project Structure
 
 ```
+opc.toml                   Configuration (daemon, reranker, dedup, recall, etc.)
 scripts/core/              Core memory system
   recall_learnings.py        Semantic search over stored learnings
   store_learning.py          Persist learnings to PostgreSQL
@@ -50,6 +53,7 @@ scripts/core/              Core memory system
   extract_thinking_blocks.py Thinking block extraction from transcripts
   extract_workflow_patterns.py Workflow pattern extraction
   generate_mini_handoff.py   Automatic mini-handoff generation
+  config/                     TOML config loading, validation, models
   db/                        Database layer
     embedding_service.py       Multi-provider embedding abstraction
     memory_service_pg.py       PostgreSQL memory storage
@@ -105,6 +109,7 @@ The complete database schema is in [`docker/init-schema.sql`](docker/init-schema
 - **`archival_memory`** — Extra columns for embedding provenance (`embedding_model`), deduplication (`content_hash`), multi-host support (`host_id`), learning chains (`superseded_by`), temporal decay (`recall_count`, `last_recalled_at`), and project scoping (`project`)
 - **`memory_tags`** — Tag table for categorizing learnings with fast lookup
 - **`memory_feedback`** — Per-session learning usefulness feedback with upsert on (learning_id, session_id)
+- **`learning_rejections`** — Dedup rejection audit log with similarity scores, thresholds, and matched existing learning references
 - **`cross_session_patterns`** — Detected patterns across sessions (recurring errors, tool preferences, decisions)
 - **`continuity`** — Session state snapshots (continuity ledger system)
 - **`plans`** — Indexed implementation plans

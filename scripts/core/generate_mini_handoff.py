@@ -345,12 +345,12 @@ def generate_handoff(
     Prefers state_file (Phase 3, real-time) over jsonl_path (Phase 2, post-session).
     """
     if state_file and state_file.exists():
-        lines = state_file.read_text().splitlines()
-        events = parse_state_events(lines)
+        with open(state_file) as f:
+            events = parse_state_events(f)
         return build_handoff_from_state_events(events, session_id, project_dir)
     elif jsonl_path and jsonl_path.exists():
-        lines = jsonl_path.read_text().splitlines()
-        entries = parse_jsonl_entries(lines)
+        with open(jsonl_path) as f:
+            entries = parse_jsonl_entries(f)
         return build_handoff_from_entries(entries, session_id, project_dir)
     else:
         raise ValueError("No data source provided (need jsonl_path or state_file)")

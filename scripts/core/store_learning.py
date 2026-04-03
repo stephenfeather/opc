@@ -96,22 +96,46 @@ def _pg_url() -> str | None:
     return os.environ.get("CONTINUOUS_CLAUDE_DB_URL") or os.environ.get("DATABASE_URL")
 
 
-def _ensure_extraction_stats_table(cur) -> None:
-    """Create extraction_stats table if it does not exist."""
+def _ensure_learning_rejections_table(cur) -> None:
+    """Create learning_rejections table if it does not exist."""
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS extraction_stats (
-            session_id TEXT PRIMARY KEY,
-            rejections INTEGER NOT NULL DEFAULT 0
+        CREATE TABLE IF NOT EXISTS learning_rejections (
+            id SERIAL PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            similarity REAL,
+            threshold REAL,
+            existing_id TEXT,
+            existing_session TEXT,
+            project TEXT,
+            learning_type TEXT,
+            context TEXT,
+            tags TEXT[],
+            rejected_at TIMESTAMP NOT NULL DEFAULT NOW()
         )
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_learning_rejections_session
+        ON learning_rejections (session_id)
     """)
 
 
-def _increment_rejection_count(session_id: str) -> None:
-    """Increment the learning rejection counter for a session.
+def _record_rejection(
+    session_id: str,
+    *,
+    similarity: float | None = None,
+    threshold: float | None = None,
+    existing_id: str | None = None,
+    existing_session: str | None = None,
+    project: str | None = None,
+    learning_type: str | None = None,
+    context: str | None = None,
+    tags: list[str] | None = None,
+) -> None:
+    """Record a rejected learning with dedup details.
 
-    Upserts into extraction_stats so the daemon can query rejection
-    counts after extraction completes.  Non-fatal — failures are
-    logged and swallowed.
+    Inserts a row into learning_rejections so the daemon can query
+    rejection counts and details after extraction completes.
+    Non-fatal — failures are logged and swallowed.
     """
     url = _pg_url()
     if not url:
@@ -121,20 +145,30 @@ def _increment_rejection_count(session_id: str) -> None:
 
         conn = psycopg2.connect(url)
         cur = conn.cursor()
-        _ensure_extraction_stats_table(cur)
+        _ensure_learning_rejections_table(cur)
         cur.execute(
             """
-            INSERT INTO extraction_stats (session_id, rejections)
-            VALUES (%s, 1)
-            ON CONFLICT (session_id)
-            DO UPDATE SET rejections = extraction_stats.rejections + 1
+            INSERT INTO learning_rejections
+                (session_id, similarity, threshold, existing_id,
+                 existing_session, project, learning_type, context, tags)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
-            (session_id,),
+            (
+                session_id,
+                similarity,
+                threshold,
+                existing_id,
+                existing_session,
+                project,
+                learning_type,
+                context,
+                tags,
+            ),
         )
         conn.commit()
         conn.close()
     except Exception as e:
-        logger.debug("Failed to increment rejection count: %s", e)
+        logger.debug("Failed to record rejection: %s", e)
 
 
 def get_rejection_count(session_id: str) -> int:
@@ -151,7 +185,7 @@ def get_rejection_count(session_id: str) -> int:
         conn = psycopg2.connect(url)
         cur = conn.cursor()
         cur.execute(
-            "SELECT rejections FROM extraction_stats WHERE session_id = %s",
+            "SELECT COUNT(*) FROM learning_rejections WHERE session_id = %s",
             (session_id,),
         )
         row = cur.fetchone()
@@ -258,7 +292,17 @@ async def store_learning_v2(
                         "existing_id=%s threshold=%.2f",
                         session_id, similarity, existing_id, threshold,
                     )
-                    _increment_rejection_count(session_id)
+                    _record_rejection(
+                        session_id,
+                        similarity=similarity,
+                        threshold=threshold,
+                        existing_id=existing_id,
+                        existing_session=existing_session,
+                        project=project,
+                        learning_type=learning_type,
+                        context=context,
+                        tags=tags,
+                    )
                     await memory.close()
                     return {
                         "success": True,
@@ -374,7 +418,13 @@ async def store_learning_v2(
 
         # content_hash dedup returns empty string
         if not memory_id:
-            _increment_rejection_count(session_id)
+            _record_rejection(
+                session_id,
+                project=project,
+                learning_type=learning_type,
+                context=context,
+                tags=tags,
+            )
             return {
                 "success": True,
                 "skipped": True,

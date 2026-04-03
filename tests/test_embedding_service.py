@@ -504,6 +504,147 @@ class TestEmbeddingProviders:
         provider = OllamaEmbeddingProvider(host="https://remote.example.com:11434")
         assert provider.host == "https://remote.example.com:11434"
 
+    def test_ollama_rejects_spoofed_loopback(self):
+        """127.0.0.1.evil.example should NOT pass as loopback."""
+        from scripts.core.db.embedding_providers import OllamaEmbeddingProvider
+
+        with pytest.raises(ValueError, match="only allowed for loopback"):
+            OllamaEmbeddingProvider(host="http://127.0.0.1.evil.example:11434")
+
+    def test_ollama_allows_127_0_0_1(self):
+        from scripts.core.db.embedding_providers import OllamaEmbeddingProvider
+
+        provider = OllamaEmbeddingProvider(host="http://127.0.0.1:11434")
+        assert provider.host == "http://127.0.0.1:11434"
+
+    def test_ollama_has_aclose(self):
+        from scripts.core.db.embedding_providers import OllamaEmbeddingProvider
+
+        provider = OllamaEmbeddingProvider()
+        assert hasattr(provider, "aclose")
+
+    async def test_ollama_context_manager(self):
+        from scripts.core.db.embedding_providers import OllamaEmbeddingProvider
+
+        async with OllamaEmbeddingProvider() as provider:
+            assert provider.model == "nomic-embed-text"
+
+
+# ---------------------------------------------------------------------------
+# API response validation tests
+# ---------------------------------------------------------------------------
+
+
+class TestValidateEmbeddingResponse:
+    """Test _validate_embedding_response pure function."""
+
+    def test_valid_response(self):
+        from scripts.core.db.embedding_providers import _validate_embedding_response
+
+        data = {"data": [{"index": 0, "embedding": [0.1, 0.2]}]}
+        result = _validate_embedding_response(data, 1, "Test")
+        assert result == [[0.1, 0.2]]
+
+    def test_valid_multi_item_response(self):
+        from scripts.core.db.embedding_providers import _validate_embedding_response
+
+        data = {
+            "data": [
+                {"index": 1, "embedding": [0.3]},
+                {"index": 0, "embedding": [0.1]},
+            ]
+        }
+        result = _validate_embedding_response(data, 2, "Test")
+        assert result == [[0.1], [0.3]]  # sorted by index
+
+    def test_not_a_dict(self):
+        from scripts.core.db.embedding_providers import _validate_embedding_response
+        from scripts.core.db.embedding_service import EmbeddingError
+
+        with pytest.raises(EmbeddingError, match="missing 'data' key"):
+            _validate_embedding_response("not a dict", 1, "Test")
+
+    def test_missing_data_key(self):
+        from scripts.core.db.embedding_providers import _validate_embedding_response
+        from scripts.core.db.embedding_service import EmbeddingError
+
+        with pytest.raises(EmbeddingError, match="missing 'data' key"):
+            _validate_embedding_response({"results": []}, 1, "Test")
+
+    def test_wrong_count(self):
+        from scripts.core.db.embedding_providers import _validate_embedding_response
+        from scripts.core.db.embedding_service import EmbeddingError
+
+        data = {"data": [{"index": 0, "embedding": [0.1]}]}
+        with pytest.raises(EmbeddingError, match="returned 1 items, expected 2"):
+            _validate_embedding_response(data, 2, "Test")
+
+    def test_duplicate_index(self):
+        from scripts.core.db.embedding_providers import _validate_embedding_response
+        from scripts.core.db.embedding_service import EmbeddingError
+
+        data = {
+            "data": [
+                {"index": 0, "embedding": [0.1]},
+                {"index": 0, "embedding": [0.2]},
+            ]
+        }
+        with pytest.raises(EmbeddingError, match="duplicate index"):
+            _validate_embedding_response(data, 2, "Test")
+
+    def test_missing_embedding(self):
+        from scripts.core.db.embedding_providers import _validate_embedding_response
+        from scripts.core.db.embedding_service import EmbeddingError
+
+        data = {"data": [{"index": 0}]}
+        with pytest.raises(EmbeddingError, match="missing list 'embedding'"):
+            _validate_embedding_response(data, 1, "Test")
+
+    def test_non_integer_index(self):
+        from scripts.core.db.embedding_providers import _validate_embedding_response
+        from scripts.core.db.embedding_service import EmbeddingError
+
+        data = {"data": [{"index": "zero", "embedding": [0.1]}]}
+        with pytest.raises(EmbeddingError, match="missing integer 'index'"):
+            _validate_embedding_response(data, 1, "Test")
+
+
+# ---------------------------------------------------------------------------
+# Batch deduplication tests
+# ---------------------------------------------------------------------------
+
+
+class TestBatchDeduplication:
+    """Test that embed_batch deduplicates identical texts."""
+
+    async def test_duplicate_texts_sent_once(self):
+        """Duplicate texts should only be embedded once by the provider."""
+        from scripts.core.db.embedding_service import EmbeddingService
+
+        service = EmbeddingService(provider="mock", cache_enabled=True)
+        call_counts: list[int] = []
+        original_batch = service._provider.embed_batch
+
+        async def tracking_batch(texts, **kwargs):
+            call_counts.append(len(texts))
+            return await original_batch(texts, **kwargs)
+
+        service._provider.embed_batch = tracking_batch
+
+        results = await service.embed_batch(["hello", "hello", "world"])
+        assert len(results) == 3
+        assert results[0] == results[1]  # same text -> same embedding
+        assert call_counts == [2]  # only 2 unique texts sent
+
+    async def test_duplicate_texts_correct_order(self):
+        from scripts.core.db.embedding_service import EmbeddingService
+
+        service = EmbeddingService(provider="mock", cache_enabled=False)
+        results = await service.embed_batch(["a", "b", "a", "c", "b"])
+        assert len(results) == 5
+        assert results[0] == results[2]  # both "a"
+        assert results[1] == results[4]  # both "b"
+
 
 # ---------------------------------------------------------------------------
 # EmbeddingError tests

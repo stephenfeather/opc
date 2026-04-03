@@ -311,31 +311,36 @@ class EmbeddingService:
             return []
 
         results: list[list[float] | None] = [None] * len(texts)
-        texts_to_embed: list[tuple[int, str]] = []
+        # key -> (text, list of indices needing this embedding)
+        unique_texts: dict[str, tuple[str, list[int]]] = {}
 
         async with self._cache_lock:
             for i, text in enumerate(texts):
-                if self.cache_enabled:
-                    key = cache_key(text, **kwargs)
-                    if key in self._cache:
-                        results[i] = self._cache[key]
-                        continue
-                texts_to_embed.append((i, text))
+                key = cache_key(text, **kwargs)
+                if self.cache_enabled and key in self._cache:
+                    results[i] = self._cache[key]
+                    continue
+                if key in unique_texts:
+                    unique_texts[key][1].append(i)
+                else:
+                    unique_texts[key] = (text, [i])
 
-        if texts_to_embed:
-            indices, remaining_texts = zip(*texts_to_embed)
-            remaining_list = list(remaining_texts)
-            new_embeddings = await self._provider.embed_batch(remaining_list, **kwargs)
-            if len(new_embeddings) != len(remaining_list):
+        if unique_texts:
+            dedup_keys = list(unique_texts.keys())
+            dedup_texts = [unique_texts[k][0] for k in dedup_keys]
+            new_embeddings = await self._provider.embed_batch(dedup_texts, **kwargs)
+            if len(new_embeddings) != len(dedup_texts):
                 raise EmbeddingError(
                     f"Provider returned {len(new_embeddings)} embeddings "
-                    f"for {len(remaining_list)} texts"
+                    f"for {len(dedup_texts)} texts"
                 )
             async with self._cache_lock:
-                for idx, text, embedding in zip(indices, remaining_list, new_embeddings):
-                    results[idx] = embedding
+                for key, embedding in zip(dedup_keys, new_embeddings):
+                    _text, indices = unique_texts[key]
+                    for idx in indices:
+                        results[idx] = embedding
                     if self.cache_enabled:
-                        self._cache[cache_key(text, **kwargs)] = embedding
+                        self._cache[key] = embedding
 
         missing = [i for i, r in enumerate(results) if r is None]
         if missing:

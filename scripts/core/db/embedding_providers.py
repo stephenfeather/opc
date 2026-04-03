@@ -23,8 +23,19 @@ from scripts.core.db.embedding_service import EmbeddingError, EmbeddingProvider
 # Host validation
 # ---------------------------------------------------------------------------
 
-_LOOPBACK_PREFIXES = ("127.", "::1", "0.0.0.0")
 _LOOPBACK_HOSTNAMES = {"localhost"}
+
+
+def _is_loopback_address(hostname: str) -> bool:
+    """Check if hostname is a loopback address using proper IP parsing."""
+    import ipaddress
+
+    if hostname in _LOOPBACK_HOSTNAMES:
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
 
 
 def _validate_ollama_host(host: str) -> None:
@@ -45,15 +56,76 @@ def _validate_ollama_host(host: str) -> None:
             f"Ollama host must use http:// or https:// scheme, got: {host}"
         )
     hostname = (parsed.hostname or "").lower()
-    is_loopback = (
-        hostname in _LOOPBACK_HOSTNAMES
-        or any(hostname.startswith(p) for p in _LOOPBACK_PREFIXES)
-    )
-    if parsed.scheme == "http" and not is_loopback:
+    if parsed.scheme == "http" and not _is_loopback_address(hostname):
         raise ValueError(
             f"Ollama host over plain http:// is only allowed for loopback addresses. "
             f"Got: {host}. Use https:// for remote hosts."
         )
+
+
+# ---------------------------------------------------------------------------
+# API response validation
+# ---------------------------------------------------------------------------
+
+
+def _validate_embedding_response(
+    data: object, expected_count: int, provider_name: str
+) -> list[list[float]]:
+    """Validate and extract embeddings from an API response.
+
+    Checks that:
+    - data is a dict with a "data" key containing a list
+    - Each item has an integer "index" and a list "embedding"
+    - Indices cover exactly 0..expected_count-1 with no duplicates
+
+    Returns:
+        Embeddings sorted by index
+
+    Raises:
+        EmbeddingError: If response is malformed
+    """
+    if not isinstance(data, dict) or "data" not in data:
+        raise EmbeddingError(
+            f"{provider_name} response missing 'data' key or not a dict"
+        )
+    items = data["data"]
+    if not isinstance(items, list):
+        raise EmbeddingError(
+            f"{provider_name} response 'data' is not a list"
+        )
+    if len(items) != expected_count:
+        raise EmbeddingError(
+            f"{provider_name} returned {len(items)} items, expected {expected_count}"
+        )
+    seen_indices: set[int] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            raise EmbeddingError(
+                f"{provider_name} response item is not a dict"
+            )
+        idx = item.get("index")
+        if not isinstance(idx, int):
+            raise EmbeddingError(
+                f"{provider_name} response item missing integer 'index'"
+            )
+        if idx in seen_indices:
+            raise EmbeddingError(
+                f"{provider_name} response has duplicate index {idx}"
+            )
+        seen_indices.add(idx)
+        emb = item.get("embedding")
+        if not isinstance(emb, list):
+            raise EmbeddingError(
+                f"{provider_name} response item missing list 'embedding'"
+            )
+    expected_indices = set(range(expected_count))
+    if seen_indices != expected_indices:
+        raise EmbeddingError(
+            f"{provider_name} response indices {sorted(seen_indices)} "
+            f"do not match expected {sorted(expected_indices)}"
+        )
+    sorted_items = sorted(items, key=lambda x: x["index"])
+    return [item["embedding"] for item in sorted_items]
 
 
 # Module-level crash log file handle, kept open for faulthandler's lifetime.
@@ -137,8 +209,9 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
                 )
                 response.raise_for_status()
                 data = response.json()
-                sorted_data = sorted(data["data"], key=lambda x: x.get("index", 0))
-                return [item["embedding"] for item in sorted_data]
+                return _validate_embedding_response(data, len(texts), "OpenAI")
+            except EmbeddingError:
+                raise
             except Exception as e:
                 last_error = e
                 if attempt < self.max_retries - 1:
@@ -243,8 +316,9 @@ class VoyageEmbeddingProvider(EmbeddingProvider):
                 )
                 response.raise_for_status()
                 data = response.json()
-                sorted_data = sorted(data["data"], key=lambda x: x.get("index", 0))
-                return [item["embedding"] for item in sorted_data]
+                return _validate_embedding_response(data, len(texts), "Voyage")
+            except EmbeddingError:
+                raise
             except httpx.HTTPStatusError as e:
                 last_error = e
                 if attempt < self.max_retries - 1:
@@ -393,6 +467,15 @@ class OllamaEmbeddingProvider(EmbeddingProvider):
         _validate_ollama_host(self.host)
         self._client = httpx.AsyncClient(timeout=30.0, verify=verify_tls)
         self._dimension = self.MODELS.get(self.model, 768)
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    async def __aenter__(self) -> OllamaEmbeddingProvider:
+        return self
+
+    async def __aexit__(self, *args) -> None:
+        await self.aclose()
 
     async def embed(self, text: str, **kwargs) -> list[float]:
         url = f"{self.host.rstrip('/')}/api/embeddings"

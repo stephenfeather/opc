@@ -440,3 +440,85 @@ class TestFilterCoreByQuery:
         core = {"Persona": "assistant"}
         result = filter_core_by_query(core, "persona")
         assert "Persona" in result
+
+
+# ==================== Superseded row filtering ====================
+
+
+class TestSupersededFiltering:
+    """SQL builders must exclude superseded rows (superseded_by IS NULL)."""
+
+    def test_text_search_excludes_superseded(self):
+        from scripts.core.db.memory_service_queries import build_text_search_sql
+
+        sql, _ = build_text_search_sql(
+            session_id="s1", agent_id=None, query="test", limit=10,
+        )
+        assert "superseded_by IS NULL" in sql
+
+    def test_vector_search_excludes_superseded(self):
+        from scripts.core.db.memory_service_queries import build_vector_search_sql
+
+        sql, _ = build_vector_search_sql(
+            session_id="s1", agent_id=None,
+            query_embedding=[0.1] * 1024, limit=10,
+        )
+        assert "superseded_by IS NULL" in sql
+
+    def test_hybrid_search_excludes_superseded(self):
+        from scripts.core.db.memory_service_queries import build_hybrid_search_sql
+
+        sql, _ = build_hybrid_search_sql(
+            session_id="s1", agent_id=None,
+            text_query="test", query_embedding=[0.1] * 1024, limit=10,
+        )
+        assert "superseded_by IS NULL" in sql
+
+
+# ==================== format_archival_row metadata handling ====================
+
+
+class TestFormatArchivalRowMetadataTypes:
+    """format_archival_row must handle both string and already-decoded metadata."""
+
+    def test_string_metadata_decoded(self):
+        from scripts.core.db.memory_service_queries import format_archival_row
+
+        row = {
+            "id": "abc", "content": "t", "metadata": '{"k": "v"}',
+            "created_at": datetime(2024, 1, 1, tzinfo=UTC),
+        }
+        assert format_archival_row(row)["metadata"] == {"k": "v"}
+
+    def test_dict_metadata_passed_through(self):
+        from scripts.core.db.memory_service_queries import format_archival_row
+
+        row = {
+            "id": "abc", "content": "t", "metadata": {"k": "v"},
+            "created_at": datetime(2024, 1, 1, tzinfo=UTC),
+        }
+        assert format_archival_row(row)["metadata"] == {"k": "v"}
+
+    def test_none_metadata_returns_empty_dict(self):
+        from scripts.core.db.memory_service_queries import format_archival_row
+
+        row = {
+            "id": "abc", "content": "t", "metadata": None,
+            "created_at": datetime(2024, 1, 1, tzinfo=UTC),
+        }
+        assert format_archival_row(row)["metadata"] == {}
+
+    def test_id_coerced_to_string(self):
+        """UUIDs from asyncpg should be stringified."""
+        import uuid as uuid_mod
+
+        from scripts.core.db.memory_service_queries import format_archival_row
+
+        uid = uuid_mod.UUID("12345678-1234-5678-1234-567812345678")
+        row = {
+            "id": uid, "content": "t", "metadata": "{}",
+            "created_at": datetime(2024, 1, 1, tzinfo=UTC),
+        }
+        result = format_archival_row(row)
+        assert isinstance(result["id"], str)
+        assert result["id"] == "12345678-1234-5678-1234-567812345678"

@@ -64,10 +64,17 @@ def format_archival_row(
         Formatted result dict.
     """
     float_set = frozenset(float_fields or [])
+    raw_meta = row["metadata"]
+    if raw_meta is None:
+        metadata: dict[str, Any] = {}
+    elif isinstance(raw_meta, str):
+        metadata = json.loads(raw_meta)
+    else:
+        metadata = raw_meta
     result: dict[str, Any] = {
-        "id": row["id"],
+        "id": str(row["id"]),
         "content": row["content"],
-        "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
+        "metadata": metadata,
         "created_at": row["created_at"],
     }
     for field in extra_fields or []:
@@ -160,6 +167,7 @@ def build_text_search_sql(
         "session_id = $1",
         "agent_id IS NOT DISTINCT FROM $2",
         "to_tsvector('english', content) @@ plainto_tsquery('english', $3)",
+        "superseded_by IS NULL",
     ]
     params: list[Any] = [session_id, agent_id, query]
 
@@ -211,6 +219,7 @@ def build_vector_search_sql(
         "session_id = $1",
         "agent_id IS NOT DISTINCT FROM $2",
         "embedding IS NOT NULL",
+        "superseded_by IS NULL",
     ]
     params: list[Any] = [session_id, agent_id, query_embedding]
 
@@ -268,6 +277,7 @@ def build_hybrid_search_sql(
             "(to_tsvector('english', content) @@ plainto_tsquery('english', $3)"
             " OR embedding IS NOT NULL)"
         ),
+        "superseded_by IS NULL",
     ]
     params: list[Any] = [
         session_id, agent_id, text_query, query_embedding,

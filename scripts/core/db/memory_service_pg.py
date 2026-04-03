@@ -372,6 +372,7 @@ class MemoryServicePG:
                 WHERE session_id = $1
                 AND agent_id IS NOT DISTINCT FROM $2
                 AND embedding IS NOT NULL
+                AND superseded_by IS NULL
                 AND (1 - (embedding <=> $3::vector)) >= $4
                 ORDER BY embedding <=> $3::vector
                 LIMIT $5
@@ -398,6 +399,7 @@ class MemoryServicePG:
                 WHERE session_id = $1
                 AND agent_id IS NOT DISTINCT FROM $2
                 AND embedding IS NOT NULL
+                AND superseded_by IS NULL
                 AND metadata @> $4::jsonb
                 ORDER BY embedding <=> $3::vector
                 LIMIT $5
@@ -423,6 +425,7 @@ class MemoryServicePG:
                     1 - (embedding <=> $1::vector) as similarity
                 FROM archival_memory
                 WHERE embedding IS NOT NULL
+                AND superseded_by IS NULL
                 AND (1 - (embedding <=> $1::vector)) >= $2
                 ORDER BY embedding <=> $1::vector
                 LIMIT $3
@@ -483,6 +486,7 @@ class MemoryServicePG:
                     WHERE session_id = $1
                     AND agent_id IS NOT DISTINCT FROM $2
                     AND to_tsvector('english', content) @@ plainto_tsquery('english', $3)
+                    AND superseded_by IS NULL
                 ),
                 vector_ranked AS (
                     SELECT id,
@@ -491,6 +495,7 @@ class MemoryServicePG:
                     WHERE session_id = $1
                     AND agent_id IS NOT DISTINCT FROM $2
                     AND embedding IS NOT NULL
+                    AND superseded_by IS NULL
                 ),
                 combined AS (
                     SELECT
@@ -609,6 +614,7 @@ class MemoryServicePG:
                     AND a.agent_id IS NOT DISTINCT FROM $2
                     AND to_tsvector('english', a.content)
                         @@ plainto_tsquery('english', $3)
+                    AND a.superseded_by IS NULL
                     ORDER BY score DESC
                     LIMIT $4
                     """,
@@ -627,6 +633,7 @@ class MemoryServicePG:
                     AND a.agent_id IS NOT DISTINCT FROM $2
                     AND to_tsvector('english', a.content)
                         @@ plainto_tsquery('english', $3)
+                    AND a.superseded_by IS NULL
                     AND a.id IN (
                         SELECT memory_id FROM memory_tags
                         WHERE session_id = $1 AND tag = ANY($4)
@@ -652,6 +659,7 @@ class MemoryServicePG:
                     AND a.agent_id IS NOT DISTINCT FROM $2
                     AND to_tsvector('english', a.content)
                         @@ plainto_tsquery('english', $3)
+                    AND a.superseded_by IS NULL
                     AND a.id IN (
                         SELECT memory_id FROM memory_tags
                         WHERE session_id = $1 AND tag = ANY($4)

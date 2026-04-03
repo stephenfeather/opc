@@ -5,6 +5,7 @@
 --   - Embedding provenance and deduplication (archival_memory columns)
 --   - Session continuity snapshots (continuity table)
 --   - Implementation plan indexing (plans table)
+--   - Dedup rejection tracking (learning_rejections table)
 
 -- Enable required extensions
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -190,6 +191,24 @@ CREATE TABLE IF NOT EXISTS backfill_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_backfill_log_status ON backfill_log(status);
+
+-- Learning Rejections: Dedup rejection details for extraction diagnostics
+CREATE TABLE IF NOT EXISTS learning_rejections (
+    id SERIAL PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    similarity REAL,
+    threshold REAL,
+    existing_id TEXT,
+    existing_session TEXT,
+    project TEXT,
+    learning_type TEXT,
+    context TEXT,
+    tags TEXT[],
+    rejected_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_learning_rejections_session
+    ON learning_rejections (session_id);
 
 -- Plans: Indexed implementation plans for cross-session discovery
 CREATE TABLE IF NOT EXISTS plans (

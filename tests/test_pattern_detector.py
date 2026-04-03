@@ -33,9 +33,13 @@ from scripts.core.pattern_detector import (  # noqa: E402
     cluster_by_embeddings,
     cluster_by_tags,
     compute_centroid,
+    compute_cohesion,
     compute_confidence,
     compute_distances,
+    compute_diversity,
+    compute_size_score,
     compute_tag_idf,
+    compute_temporal_span,
     detect_noise_tags,
     detect_patterns,
     fuse_clusters,
@@ -549,6 +553,22 @@ class TestGenerateLabel:
         label = generate_label([], "tool_cluster")
         assert "Empty" in label
 
+    def test_duplicate_tags_not_inflated(self):
+        """Duplicate tags on one learning should not skew tag ranking."""
+        members = [
+            _make_learning(tags=["rare", "rare", "rare", "rare", "rare"]),
+            _make_learning(tags=["common", "rare"]),
+        ]
+        label_with_dupes = generate_label(members, "tool_cluster")
+        # "rare" appears in both learnings (count=2), "common" in one (count=1)
+        # Without dedup, "rare" would get count=6 - but ranking should be the same
+        members_deduped = [
+            _make_learning(tags=["rare"]),
+            _make_learning(tags=["common", "rare"]),
+        ]
+        label_without_dupes = generate_label(members_deduped, "tool_cluster")
+        assert label_with_dupes == label_without_dupes
+
 
 # ---------------------------------------------------------------------------
 # Confidence scoring tests
@@ -597,6 +617,91 @@ class TestComputeConfidence:
 
     def test_empty_members(self):
         assert compute_confidence([], np.zeros(1024)) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Confidence sub-component tests
+# ---------------------------------------------------------------------------
+
+class TestComputeCohesion:
+
+    def test_identical_embeddings_perfect_cohesion(self):
+        """All members identical to centroid -> cohesion = 1.0."""
+        emb = np.ones(1024, dtype=np.float32)
+        members = [_make_learning(embedding=emb.copy()) for _ in range(5)]
+        centroid = np.ones(1024, dtype=np.float32)
+        assert compute_cohesion(members, centroid) == pytest.approx(1.0, abs=0.01)
+
+    def test_orthogonal_embeddings_low_cohesion(self):
+        """Members orthogonal to centroid -> cohesion near 0."""
+        centroid = np.zeros(1024, dtype=np.float32)
+        centroid[0] = 1.0
+        emb = np.zeros(1024, dtype=np.float32)
+        emb[1] = 1.0
+        members = [_make_learning(embedding=emb.copy())]
+        result = compute_cohesion(members, centroid)
+        assert result < 0.1
+
+    def test_zero_norm_centroid_safe(self):
+        """Zero centroid should not crash."""
+        members = [_make_learning()]
+        result = compute_cohesion(members, np.zeros(1024, dtype=np.float32))
+        assert 0.0 <= result <= 1.0
+
+
+class TestComputeDiversity:
+
+    def test_many_sessions_high_diversity(self):
+        members = [_make_learning(session_id=f"s{i}") for i in range(5)]
+        assert compute_diversity(members) == pytest.approx(1.0)
+
+    def test_single_session_low_diversity(self):
+        members = [_make_learning(session_id="s1") for _ in range(5)]
+        assert compute_diversity(members) == pytest.approx(0.2)
+
+    def test_empty_returns_zero(self):
+        assert compute_diversity([]) == 0.0
+
+
+class TestComputeTemporalSpan:
+
+    def test_two_week_span(self):
+        members = [
+            _make_learning(created_at=datetime(2026, 1, 1, tzinfo=UTC)),
+            _make_learning(created_at=datetime(2026, 1, 15, tzinfo=UTC)),
+        ]
+        assert compute_temporal_span(members) == pytest.approx(1.0)
+
+    def test_same_day_zero_span(self):
+        members = [
+            _make_learning(created_at=datetime(2026, 1, 1, tzinfo=UTC)),
+            _make_learning(created_at=datetime(2026, 1, 1, tzinfo=UTC)),
+        ]
+        assert compute_temporal_span(members) == pytest.approx(0.0)
+
+    def test_single_member(self):
+        members = [_make_learning()]
+        assert compute_temporal_span(members) == 0.0
+
+    def test_empty_returns_zero(self):
+        assert compute_temporal_span([]) == 0.0
+
+
+class TestComputeSizeScore:
+
+    def test_16_members_max_score(self):
+        # log2(16) / 4 = 4/4 = 1.0
+        assert compute_size_score(16) == pytest.approx(1.0)
+
+    def test_single_member(self):
+        # log2(1) / 4 = 0/4 = 0.0
+        assert compute_size_score(1) == pytest.approx(0.0)
+
+    def test_zero_returns_zero(self):
+        assert compute_size_score(0) == 0.0
+
+    def test_large_clamped_to_one(self):
+        assert compute_size_score(1000) == pytest.approx(1.0)
 
 
 # ---------------------------------------------------------------------------

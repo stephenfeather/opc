@@ -162,9 +162,13 @@ def plot_density(
     similarities: np.ndarray,
     threshold_stats: list[dict],
     output_path: str,
-    current_threshold: float = 0.92,
+    current_threshold: float | None = None,
 ) -> None:
     """Generate a histogram of pairwise similarities with threshold annotations."""
+    if current_threshold is None:
+        from scripts.core.config import get_config
+        current_threshold = get_config().dedup.threshold
+
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -246,9 +250,13 @@ def format_summary(
     n_learnings: int,
     n_pairs: int,
     threshold_stats: list[dict],
-    current_threshold: float = 0.92,
+    current_threshold: float | None = None,
 ) -> str:
     """Format a text summary of the density analysis."""
+    if current_threshold is None:
+        from scripts.core.config import get_config
+        current_threshold = get_config().dedup.threshold
+
     lines = [
         "Near-Duplicate Density Report",
         f"Generated: {datetime.now(UTC).isoformat()}",

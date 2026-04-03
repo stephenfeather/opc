@@ -296,10 +296,10 @@ async def get_feedback_velocity(conn: Any) -> dict:
         for r in rows
     ]
     total = sum(w["total"] for w in weeks)
-    n_weeks = max(len(weeks), 1)
+    window_weeks = 4  # fixed window, not len(weeks) which omits zero-feedback weeks
     return {
         "weeks": weeks,
-        "avg_per_week": round(total / n_weeks, 1),
+        "avg_per_week": round(total / window_weeks, 1),
     }
 
 
@@ -340,23 +340,39 @@ async def get_supersession_candidates(conn: Any) -> dict:
     }
 
 
+_RECALL_FREQ_UNAVAILABLE = {
+    "recalled_learnings": 0,
+    "total_active": 0,
+    "recall_rate_pct": 0.0,
+    "total_recall_events": 0,
+    "avg_recalls_per_recalled_learning": 0.0,
+    "max_recalls_single_learning": 0,
+    "note": "recall_count column not available",
+}
+
+
 async def get_recall_frequency(conn: Any) -> dict:
     """Report recall usage across sessions (all-time).
 
-    Uses recall_count on archival_memory to infer how recall is distributed.
+    Uses recall_count on archival_memory. Degrades gracefully if the column
+    is missing on older schema versions.
     """
-    row = await conn.fetchrow(
-        """
-        SELECT
-            COUNT(*) FILTER (WHERE recall_count > 0) AS recalled_learnings,
-            COUNT(*) AS total_active,
-            COALESCE(SUM(recall_count), 0) AS total_recalls,
-            COALESCE(AVG(recall_count) FILTER (WHERE recall_count > 0), 0) AS avg_recalls_when_used,
-            COALESCE(MAX(recall_count), 0) AS max_recalls
-        FROM archival_memory
-        WHERE superseded_by IS NULL
-        """
-    )
+    try:
+        row = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE recall_count > 0) AS recalled_learnings,
+                COUNT(*) AS total_active,
+                COALESCE(SUM(recall_count), 0) AS total_recalls,
+                COALESCE(AVG(recall_count) FILTER (WHERE recall_count > 0), 0)
+                    AS avg_recalls_when_used,
+                COALESCE(MAX(recall_count), 0) AS max_recalls
+            FROM archival_memory
+            WHERE superseded_by IS NULL
+            """
+        )
+    except Exception:
+        return dict(_RECALL_FREQ_UNAVAILABLE)
     total = row["total_active"]
     recalled = row["recalled_learnings"]
     return {
@@ -370,20 +386,26 @@ async def get_recall_frequency(conn: Any) -> dict:
 
 
 async def get_type_recall_correlation(conn: Any) -> dict:
-    """Compare learning_type distribution: stored vs. actually recalled."""
-    rows = await conn.fetch(
-        """
-        SELECT
-            COALESCE(metadata->>'learning_type', 'unset') AS learning_type,
-            COUNT(*) AS total,
-            COUNT(*) FILTER (WHERE recall_count > 0) AS recalled,
-            COALESCE(SUM(recall_count), 0) AS total_recalls
-        FROM archival_memory
-        WHERE superseded_by IS NULL
-        GROUP BY learning_type
-        ORDER BY total DESC
-        """
-    )
+    """Compare learning_type distribution: stored vs. actually recalled.
+
+    Degrades gracefully if recall_count column is missing.
+    """
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT
+                COALESCE(metadata->>'learning_type', 'unset') AS learning_type,
+                COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE recall_count > 0) AS recalled,
+                COALESCE(SUM(recall_count), 0) AS total_recalls
+            FROM archival_memory
+            WHERE superseded_by IS NULL
+            GROUP BY learning_type
+            ORDER BY total DESC
+            """
+        )
+    except Exception:
+        return {}
     result = {}
     for r in rows:
         total = r["total"]

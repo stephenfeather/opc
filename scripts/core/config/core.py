@@ -41,6 +41,31 @@ class ConfigValidationError(ValueError):
     """Raised when config values fail type or range validation."""
 
 
+# Per-field range constraints: (section, key) -> (min, max) inclusive.
+# None means unbounded on that side.
+_RANGE_RULES: dict[tuple[str, str], tuple[float | None, float | None]] = {
+    ("dedup", "threshold"): (0.0, 1.0),
+    ("daemon", "poll_interval"): (1, None),
+    ("daemon", "stale_threshold"): (1, None),
+    ("daemon", "max_concurrent_extractions"): (1, None),
+    ("daemon", "max_retries"): (0, None),
+    ("daemon", "extraction_timeout"): (1, None),
+    ("daemon", "pattern_detection_interval_hours"): (1, None),
+    ("daemon", "extraction_max_turns"): (1, None),
+    ("reranker", "recency_half_life_days"): (0.1, None),
+    ("reranker", "recall_log2_normalizer"): (1, None),
+    ("reranker", "rrf_scale_factor"): (0.1, None),
+    ("patterns", "min_cluster_size"): (2, None),
+    ("patterns", "min_samples"): (1, None),
+    ("patterns", "min_confidence"): (0.0, 1.0),
+    ("patterns", "overlap_threshold"): (0.0, 1.0),
+    ("recall", "default_k"): (1, None),
+    ("recall", "rrf_k"): (1, None),
+    ("recall", "max_expansion_terms"): (0, None),
+    ("database", "max_pool_size"): (1, None),
+}
+
+
 def _validate_type(section: str, key: str, value: Any, expected_type: type) -> Any:
     """Validate and coerce a config value to the expected type.
 
@@ -54,6 +79,18 @@ def _validate_type(section: str, key: str, value: Any, expected_type: type) -> A
     raise ConfigValidationError(
         f"[{section}] {key}: expected {expected_type.__name__}, got {type(value).__name__} ({value!r})"
     )
+
+
+def _validate_range(section: str, key: str, value: Any) -> None:
+    """Check numeric value against range rules. Raises on violation."""
+    bounds = _RANGE_RULES.get((section, key))
+    if bounds is None:
+        return
+    lo, hi = bounds
+    if lo is not None and value < lo:
+        raise ConfigValidationError(f"[{section}] {key}: {value} is below minimum {lo}")
+    if hi is not None and value > hi:
+        raise ConfigValidationError(f"[{section}] {key}: {value} is above maximum {hi}")
 
 
 def build_section(cls: type, raw: dict[str, Any], *, section_name: str = "") -> Any:
@@ -79,7 +116,9 @@ def build_section(cls: type, raw: dict[str, Any], *, section_name: str = "") -> 
         type_map = {"float": float, "int": int, "str": str, "bool": bool}
         resolved_type = type_map.get(expected, expected) if isinstance(expected, str) else expected
         try:
-            validated[key] = _validate_type(section_name, key, value, resolved_type)
+            typed_value = _validate_type(section_name, key, value, resolved_type)
+            _validate_range(section_name, key, typed_value)
+            validated[key] = typed_value
         except ConfigValidationError as e:
             errors.append(str(e))
 

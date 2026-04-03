@@ -113,3 +113,29 @@ class TestBuildConfig:
         raw = {"daemon": {"poll_interval": "not_a_number"}}
         with pytest.raises(ConfigValidationError):
             build_config(raw)
+
+    def test_zero_poll_interval_rejected(self):
+        raw = {"daemon": {"poll_interval": 0}}
+        with pytest.raises(ConfigValidationError, match="below minimum"):
+            build_config(raw)
+
+    def test_zero_max_concurrent_rejected(self):
+        raw = {"daemon": {"max_concurrent_extractions": 0}}
+        with pytest.raises(ConfigValidationError, match="below minimum"):
+            build_config(raw)
+
+    def test_negative_timeout_rejected(self):
+        raw = {"daemon": {"extraction_timeout": -1}}
+        with pytest.raises(ConfigValidationError, match="below minimum"):
+            build_config(raw)
+
+    def test_threshold_above_one_rejected(self):
+        raw = {"dedup": {"threshold": 1.5}}
+        with pytest.raises(ConfigValidationError, match="above maximum"):
+            build_config(raw)
+
+    def test_threshold_at_boundaries_accepted(self):
+        cfg = build_config({"dedup": {"threshold": 0.0}})
+        assert cfg.dedup.threshold == 0.0
+        cfg = build_config({"dedup": {"threshold": 1.0}})
+        assert cfg.dedup.threshold == 1.0

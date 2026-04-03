@@ -113,6 +113,27 @@ _pattern_proc: subprocess.Popen | None = None
 _last_pattern_run: float = 0
 
 
+def _seed_last_pattern_run() -> float:
+    """Read the most recent pattern detection timestamp from PostgreSQL.
+
+    Returns a Unix timestamp so the daemon skips an immediate re-run
+    after restart if a recent detection already happened.
+    """
+    if not use_postgres():
+        return 0
+    try:
+        conn = pg_connect()
+        cur = conn.cursor()
+        cur.execute("SELECT MAX(created_at) FROM detected_patterns")
+        row = cur.fetchone()
+        conn.close()
+        if row and row[0]:
+            return row[0].timestamp()
+    except Exception:
+        pass
+    return 0
+
+
 def log(msg: str):
     """Write timestamped log message."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -897,6 +918,12 @@ def daemon_loop():
         f"max_concurrent={MAX_CONCURRENT_EXTRACTIONS})")
     ensure_schema()
     recover_stalled_extractions()
+
+    global _last_pattern_run
+    _last_pattern_run = _seed_last_pattern_run()
+    if _last_pattern_run:
+        log(f"Seeded last pattern run from DB: "
+            f"{datetime.fromtimestamp(_last_pattern_run).isoformat()}")
 
     while True:
         try:

@@ -10,26 +10,67 @@ Supports two data sources for Phase 3 readiness:
   - Hook-collected state file (Phase 3, when available)
 
 Usage:
-    python generate_mini_handoff.py --jsonl path/to/session.jsonl --session-id s-abc123 --project-dir /path/to/project
-    python generate_mini_handoff.py --jsonl path/to/session.jsonl --session-id s-abc123 --project-dir /path/to/project --format json
+    python generate_mini_handoff.py --jsonl path/to/session.jsonl \\
+        --session-id s-abc123 --project-dir /path/to/project
+    python generate_mini_handoff.py --jsonl path/to/session.jsonl \\
+        --session-id s-abc123 --project-dir /path/to/project --format json
 """
 
+from __future__ import annotations
+
 import argparse
-import faulthandler
 import json
-import os
 import sys
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 
-faulthandler.enable(
-    file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"),
-    all_threads=True,
-)
+# ---------------------------------------------------------------------------
+# Pure parsers: lines -> structured data
+# ---------------------------------------------------------------------------
 
 
-def extract_files_touched(jsonl_path: Path) -> dict[str, list[str]]:
-    """Scan JSONL for file operations and group by operation type.
+def parse_jsonl_entries(lines: Iterable[str]) -> list[dict]:
+    """Parse JSONL lines into a list of entry dicts, skipping malformed lines."""
+    entries: list[dict] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entries.append(json.loads(line))
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return entries
+
+
+def parse_state_events(lines: Iterable[str]) -> list[dict]:
+    """Parse Phase 3 state-file JSONL lines into event dicts."""
+    return parse_jsonl_entries(lines)
+
+
+# ---------------------------------------------------------------------------
+# Pure extractors: entries -> derived data
+# ---------------------------------------------------------------------------
+
+
+def _iter_tool_blocks(entries: list[dict]):
+    """Yield (tool_name, tool_input, timestamp) from assistant tool_use blocks."""
+    for entry in entries:
+        if entry.get("type") != "assistant":
+            continue
+        content = entry.get("message", {}).get("content", [])
+        if not isinstance(content, list):
+            continue
+        timestamp = entry.get("timestamp", "")
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            yield block.get("name", "unknown"), block.get("input", {}), timestamp
+
+
+def extract_files_touched(entries: list[dict]) -> dict[str, list[str]]:
+    """Extract file operations from parsed entries, grouped by operation type.
 
     Returns dict with keys: read, modified, created.
     'created' = files that appear in Write but not in any prior Read.
@@ -39,43 +80,22 @@ def extract_files_touched(jsonl_path: Path) -> dict[str, list[str]]:
     write_files: list[str] = []
     seen_reads: set[str] = set()
 
-    with open(jsonl_path) as f:
-        for line in f:
-            try:
-                entry = json.loads(line)
-            except (json.JSONDecodeError, ValueError):
-                continue
+    for tool_name, tool_input, _ in _iter_tool_blocks(entries):
+        file_path = tool_input.get("file_path", "")
+        if not file_path:
+            continue
 
-            if entry.get("type") != "assistant":
-                continue
+        if tool_name == "Read":
+            if file_path not in seen_reads:
+                read_files.append(file_path)
+                seen_reads.add(file_path)
+        elif tool_name in ("Edit", "MultiEdit"):
+            if file_path not in edit_files:
+                edit_files.append(file_path)
+        elif tool_name == "Write":
+            if file_path not in write_files:
+                write_files.append(file_path)
 
-            content = entry.get("message", {}).get("content", [])
-            if not isinstance(content, list):
-                continue
-
-            for block in content:
-                if not isinstance(block, dict) or block.get("type") != "tool_use":
-                    continue
-
-                tool_name = block.get("name", "")
-                tool_input = block.get("input", {})
-                file_path = tool_input.get("file_path", "")
-
-                if not file_path:
-                    continue
-
-                if tool_name == "Read":
-                    if file_path not in seen_reads:
-                        read_files.append(file_path)
-                        seen_reads.add(file_path)
-                elif tool_name in ("Edit", "MultiEdit"):
-                    if file_path not in edit_files:
-                        edit_files.append(file_path)
-                elif tool_name == "Write":
-                    if file_path not in write_files:
-                        write_files.append(file_path)
-
-    # Classify: Write to a file never Read before = created
     created = [f for f in write_files if f not in seen_reads]
     modified = list(dict.fromkeys(edit_files + [f for f in write_files if f in seen_reads]))
 
@@ -86,42 +106,16 @@ def extract_files_touched(jsonl_path: Path) -> dict[str, list[str]]:
     }
 
 
-def extract_commands_run(jsonl_path: Path) -> list[dict]:
-    """Scan JSONL for Bash tool_use blocks and extract commands.
+def extract_commands_run(entries: list[dict]) -> list[dict]:
+    """Extract Bash commands from parsed entries.
 
     Returns list of dicts with: command, timestamp.
     """
-    commands = []
-
-    with open(jsonl_path) as f:
-        for line in f:
-            try:
-                entry = json.loads(line)
-            except (json.JSONDecodeError, ValueError):
-                continue
-
-            if entry.get("type") != "assistant":
-                continue
-
-            timestamp = entry.get("timestamp", "")
-            content = entry.get("message", {}).get("content", [])
-            if not isinstance(content, list):
-                continue
-
-            for block in content:
-                if not isinstance(block, dict) or block.get("type") != "tool_use":
-                    continue
-                if block.get("name") != "Bash":
-                    continue
-
-                command = block.get("input", {}).get("command", "")
-                if command:
-                    commands.append({
-                        "command": command[:500],
-                        "timestamp": timestamp,
-                    })
-
-    return commands
+    return [
+        {"command": tool_input.get("command", "")[:500], "timestamp": timestamp}
+        for tool_name, tool_input, timestamp in _iter_tool_blocks(entries)
+        if tool_name == "Bash" and tool_input.get("command", "")
+    ]
 
 
 def extract_git_state(commands: list[dict]) -> dict | None:
@@ -142,74 +136,58 @@ def extract_git_state(commands: list[dict]) -> dict | None:
     return None
 
 
-def extract_timestamps(jsonl_path: Path) -> dict[str, str]:
-    """Extract first and last timestamps from JSONL."""
+def extract_timestamps(entries: list[dict]) -> dict[str, str]:
+    """Extract first and last timestamps from parsed entries."""
     first_ts = ""
     last_ts = ""
 
-    with open(jsonl_path) as f:
-        for line in f:
-            try:
-                entry = json.loads(line)
-            except (json.JSONDecodeError, ValueError):
-                continue
-
-            ts = entry.get("timestamp", "")
-            if ts:
-                if not first_ts:
-                    first_ts = ts
-                last_ts = ts
+    for entry in entries:
+        ts = entry.get("timestamp", "")
+        if ts:
+            if not first_ts:
+                first_ts = ts
+            last_ts = ts
 
     return {"first_timestamp": first_ts, "last_timestamp": last_ts}
 
 
-def extract_tool_counts(jsonl_path: Path) -> dict[str, int]:
-    """Count tool usage by tool name."""
+def extract_tool_counts(entries: list[dict]) -> dict[str, int]:
+    """Count tool usage by tool name from parsed entries."""
     counts: dict[str, int] = {}
 
-    with open(jsonl_path) as f:
-        for line in f:
-            try:
-                entry = json.loads(line)
-            except (json.JSONDecodeError, ValueError):
-                continue
-
-            if entry.get("type") != "assistant":
-                continue
-
-            content = entry.get("message", {}).get("content", [])
-            if not isinstance(content, list):
-                continue
-
-            for block in content:
-                if not isinstance(block, dict) or block.get("type") != "tool_use":
-                    continue
-                tool_name = block.get("name", "unknown")
-                counts[tool_name] = counts.get(tool_name, 0) + 1
+    for tool_name, _, _ in _iter_tool_blocks(entries):
+        counts[tool_name] = counts.get(tool_name, 0) + 1
 
     return dict(sorted(counts.items(), key=lambda x: -x[1]))
 
 
-def _handoff_from_jsonl(jsonl_path: Path, session_id: str, project_dir: str) -> dict:
-    """Build handoff dict from JSONL session transcript."""
-    files = extract_files_touched(jsonl_path)
-    commands = extract_commands_run(jsonl_path)
+def _extract_date(timestamp_str: str) -> str:
+    """Extract date string from ISO timestamp, falling back to today's date."""
+    if not timestamp_str:
+        return datetime.now(UTC).strftime("%Y-%m-%d")
+    try:
+        dt = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        return datetime.now(UTC).strftime("%Y-%m-%d")
+
+
+# ---------------------------------------------------------------------------
+# Pure assembly: extractors -> handoff dict
+# ---------------------------------------------------------------------------
+
+
+def build_handoff_from_entries(
+    entries: list[dict], session_id: str, project_dir: str
+) -> dict:
+    """Build handoff dict from parsed JSONL entries (pure function)."""
+    files = extract_files_touched(entries)
+    commands = extract_commands_run(entries)
     git_state = extract_git_state(commands)
-    timestamps = extract_timestamps(jsonl_path)
-    tool_usage = extract_tool_counts(jsonl_path)
+    timestamps = extract_timestamps(entries)
+    tool_usage = extract_tool_counts(entries)
+    date_str = _extract_date(timestamps["first_timestamp"])
 
-    # Extract date from first timestamp
-    date_str = ""
-    if timestamps["first_timestamp"]:
-        try:
-            dt = datetime.fromisoformat(timestamps["first_timestamp"].replace("Z", "+00:00"))
-            date_str = dt.strftime("%Y-%m-%d")
-        except (ValueError, TypeError):
-            date_str = datetime.now(UTC).strftime("%Y-%m-%d")
-    else:
-        date_str = datetime.now(UTC).strftime("%Y-%m-%d")
-
-    # Limit commands to last 50
     recent_commands = [c["command"] for c in commands[-50:]]
 
     return {
@@ -230,11 +208,10 @@ def _handoff_from_jsonl(jsonl_path: Path, session_id: str, project_dir: str) -> 
     }
 
 
-def _handoff_from_state_file(state_file: Path, session_id: str, project_dir: str) -> dict:
-    """Build handoff dict from hook-collected state file (Phase 3).
-
-    State file is JSONL with events: {timestamp, tool, file?, command?, exit_code?}
-    """
+def build_handoff_from_state_events(
+    events: list[dict], session_id: str, project_dir: str
+) -> dict:
+    """Build handoff dict from parsed Phase 3 state events (pure function)."""
     read_files: list[str] = []
     edited_files: list[str] = []
     created_files: list[str] = []
@@ -243,46 +220,30 @@ def _handoff_from_state_file(state_file: Path, session_id: str, project_dir: str
     first_ts = ""
     last_ts = ""
 
-    with open(state_file) as f:
-        for line in f:
-            try:
-                event = json.loads(line)
-            except (json.JSONDecodeError, ValueError):
-                continue
+    for event in events:
+        ts = event.get("timestamp", "")
+        if ts:
+            if not first_ts:
+                first_ts = ts
+            last_ts = ts
 
-            ts = event.get("timestamp", "")
-            if ts:
-                if not first_ts:
-                    first_ts = ts
-                last_ts = ts
+        tool = event.get("tool", "")
+        tool_counts[tool] = tool_counts.get(tool, 0) + 1
 
-            tool = event.get("tool", "")
-            tool_counts[tool] = tool_counts.get(tool, 0) + 1
+        file_path = event.get("file", "")
+        if tool == "Read" and file_path and file_path not in read_files:
+            read_files.append(file_path)
+        elif tool in ("Edit", "MultiEdit") and file_path and file_path not in edited_files:
+            edited_files.append(file_path)
+        elif tool == "Write" and file_path and file_path not in created_files:
+            created_files.append(file_path)
 
-            file_path = event.get("file", "")
-            if tool == "Read" and file_path and file_path not in read_files:
-                read_files.append(file_path)
-            elif tool in ("Edit", "MultiEdit") and file_path and file_path not in edited_files:
-                edited_files.append(file_path)
-            elif tool == "Write" and file_path and file_path not in created_files:
-                created_files.append(file_path)
-
-            command = event.get("command", "")
-            if tool == "Bash" and command:
-                commands.append({"command": command, "timestamp": ts})
+        command = event.get("command", "")
+        if tool == "Bash" and command:
+            commands.append({"command": command, "timestamp": ts})
 
     git_state = extract_git_state(commands)
-
-    date_str = ""
-    if first_ts:
-        try:
-            dt = datetime.fromisoformat(first_ts.replace("Z", "+00:00"))
-            date_str = dt.strftime("%Y-%m-%d")
-        except (ValueError, TypeError):
-            date_str = datetime.now(UTC).strftime("%Y-%m-%d")
-    else:
-        date_str = datetime.now(UTC).strftime("%Y-%m-%d")
-
+    date_str = _extract_date(first_ts)
     recent_commands = [c["command"] for c in commands[-50:]]
 
     return {
@@ -303,22 +264,9 @@ def _handoff_from_state_file(state_file: Path, session_id: str, project_dir: str
     }
 
 
-def generate_handoff(
-    session_id: str,
-    project_dir: str,
-    jsonl_path: Path | None = None,
-    state_file: Path | None = None,
-) -> dict:
-    """Generate a mini-handoff dict from available data source.
-
-    Prefers state_file (Phase 3, real-time) over jsonl_path (Phase 2, post-session).
-    """
-    if state_file and state_file.exists():
-        return _handoff_from_state_file(state_file, session_id, project_dir)
-    elif jsonl_path and jsonl_path.exists():
-        return _handoff_from_jsonl(jsonl_path, session_id, project_dir)
-    else:
-        raise ValueError("No data source provided (need jsonl_path or state_file)")
+# ---------------------------------------------------------------------------
+# Pure formatters
+# ---------------------------------------------------------------------------
 
 
 def _format_yaml_value(value, indent=0):
@@ -333,7 +281,7 @@ def _format_yaml_value(value, indent=0):
         return str(value)
     elif isinstance(value, str):
         if any(c in value for c in ":{}\n[]#&*!|>',\"@`") or value.startswith("- "):
-            escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+            escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
             return f'"{escaped}"'
         return value
     elif isinstance(value, list):
@@ -343,10 +291,9 @@ def _format_yaml_value(value, indent=0):
         for item in value:
             if isinstance(item, str):
                 formatted = _format_yaml_value(item)
-                lines.append(f"\n{prefix}- {formatted}")
             else:
                 formatted = _format_yaml_value(item, indent + 1)
-                lines.append(f"\n{prefix}- {formatted}")
+            lines.append(f"\n{prefix}- {formatted}")
         return "".join(lines)
     elif isinstance(value, dict):
         if not value:
@@ -354,10 +301,7 @@ def _format_yaml_value(value, indent=0):
         lines = []
         for k, v in value.items():
             formatted = _format_yaml_value(v, indent + 1)
-            if isinstance(v, (dict, list)) and v:
-                lines.append(f"\n{prefix}{k}: {formatted}")
-            else:
-                lines.append(f"\n{prefix}{k}: {formatted}")
+            lines.append(f"\n{prefix}{k}: {formatted}")
         return "".join(lines)
     return str(value)
 
@@ -365,14 +309,12 @@ def _format_yaml_value(value, indent=0):
 def format_as_yaml(handoff: dict) -> str:
     """Format handoff dict as YAML string without pyyaml dependency."""
     lines = ["---"]
-    # Frontmatter fields
     for key in ("session", "date", "status", "outcome"):
         val = handoff.get(key, "")
         lines.append(f"{key}: {_format_yaml_value(val)}")
     lines.append("---")
     lines.append("")
 
-    # Body fields
     for key in ("goal", "files", "commands_run", "git_state", "tool_usage", "duration"):
         val = handoff.get(key)
         if val is None:
@@ -385,6 +327,33 @@ def format_as_yaml(handoff: dict) -> str:
         lines.append("")
 
     return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# I/O boundary: file reading, writing, CLI
+# ---------------------------------------------------------------------------
+
+
+def generate_handoff(
+    session_id: str,
+    project_dir: str,
+    jsonl_path: Path | None = None,
+    state_file: Path | None = None,
+) -> dict:
+    """Generate a mini-handoff dict from available data source.
+
+    Prefers state_file (Phase 3, real-time) over jsonl_path (Phase 2, post-session).
+    """
+    if state_file and state_file.exists():
+        lines = state_file.read_text().splitlines()
+        events = parse_state_events(lines)
+        return build_handoff_from_state_events(events, session_id, project_dir)
+    elif jsonl_path and jsonl_path.exists():
+        lines = jsonl_path.read_text().splitlines()
+        entries = parse_jsonl_entries(lines)
+        return build_handoff_from_entries(entries, session_id, project_dir)
+    else:
+        raise ValueError("No data source provided (need jsonl_path or state_file)")
 
 
 def write_handoff(handoff: dict, output_dir: Path, session_id: str) -> Path:

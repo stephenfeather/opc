@@ -18,6 +18,7 @@ def get_api_version() -> str:
     """Return the OPC package version for API response envelopes."""
     try:
         from importlib.metadata import version
+
         return version("mcp-execution")
     except Exception:
         return "0.7.3"
@@ -45,13 +46,34 @@ def _format_created_at(created_at: Any) -> str:
     return str(created_at)
 
 
+def _format_created_at_human(created_at: Any) -> str:
+    """Convert created_at to short human-readable string (up to 16 chars)."""
+    if isinstance(created_at, datetime):
+        return created_at.strftime("%Y-%m-%d %H:%M")
+    return str(created_at)[:16]
+
+
+def _extract_learning_type(result: dict[str, Any]) -> str:
+    """Extract learning_type from a result dict, defaulting to UNKNOWN."""
+    metadata = result.get("metadata") or {}
+    return metadata.get("learning_type") or "UNKNOWN"
+
+
+def _extract_score(result: dict[str, Any]) -> float:
+    """Extract the display score from a result, preferring final_score over similarity."""
+    score = result.get("final_score")
+    if score is None:
+        score = result["similarity"]
+    return float(score)
+
+
 def _build_json_result(result: dict[str, Any]) -> dict[str, Any]:
     """Build a single JSON result dict from a raw result."""
-    json_result = {
+    json_result: dict[str, Any] = {
         "id": result.get("id", ""),
-        "score": result.get("final_score", result["similarity"]),
+        "score": _extract_score(result),
         "raw_score": result["similarity"],
-        "learning_type": result.get("metadata", {}).get("learning_type", "UNKNOWN"),
+        "learning_type": _extract_learning_type(result),
         "session_id": result["session_id"],
         "content": result["content"],
         "created_at": _format_created_at(result["created_at"]),
@@ -96,16 +118,41 @@ def format_json_full_output(results: list[dict[str, Any]]) -> str:
     Extends the standard JSON output with metadata, recall_count,
     pattern_strength, and pattern_tags needed by the reranker sweep.
     """
-    json_results = []
-    for result in results:
-        jr = _build_json_result(result)
-        metadata = result.get("metadata", {})
-        jr["metadata"] = metadata
-        jr["recall_count"] = result.get("recall_count", 0)
-        jr["pattern_strength"] = result.get("pattern_strength", 0.0)
-        jr["pattern_tags"] = result.get("pattern_tags", [])
-        json_results.append(jr)
+    json_results = [
+        {
+            **_build_json_result(result),
+            "metadata": result.get("metadata") or {},
+            "recall_count": result.get("recall_count", 0),
+            "pattern_strength": result.get("pattern_strength", 0.0),
+            "pattern_tags": result.get("pattern_tags", []),
+        }
+        for result in results
+    ]
     return json.dumps({"version": get_api_version(), "results": json_results})
+
+
+def _format_result_line(
+    index: int, result: dict[str, Any], indent: str = "", content_indent: str = "   "
+) -> tuple[str, str]:
+    """Format a single result as a numbered score/session line and content line.
+
+    Args:
+        index: 1-based result number
+        result: Result dict from search/rerank pipeline
+        indent: Prefix for the header line (e.g. "  " for structured)
+        content_indent: Prefix for the content line (independent of indent)
+
+    Returns:
+        Tuple of (header_line, content_line)
+    """
+    score = _extract_score(result)
+    session_id = result["session_id"]
+    created_str = _format_created_at_human(result["created_at"])
+    content_preview = format_result_preview(result["content"], max_length=300)
+    header = f"{indent}{index}. [{score:.3f}] Session: {session_id} ({created_str})"
+    indented_lines = (f"{content_indent}{line}" for line in content_preview.split("\n"))
+    content = "\n".join(indented_lines)
+    return header, content
 
 
 def format_human_output(results: list[dict[str, Any]], structured: bool = False) -> str:
@@ -131,39 +178,27 @@ def format_human_output(results: list[dict[str, Any]], structured: bool = False)
         for type_name, type_results in grouped.items():
             lines.append(f"## {type_name} ({len(type_results)})")
             for result in type_results:
-                score = result.get("final_score", result["similarity"])
-                content_preview = format_result_preview(result["content"], max_length=300)
-                session_id = result["session_id"]
-                created_at = result["created_at"]
-                if isinstance(created_at, datetime):
-                    created_str = created_at.strftime("%Y-%m-%d %H:%M")
-                else:
-                    created_str = str(created_at)[:16]
-                lines.append(f"  {idx}. [{score:.3f}] Session: {session_id} ({created_str})")
-                lines.append(f"     {content_preview}")
+                header, content = _format_result_line(
+                    idx, result, indent="  ", content_indent="     "
+                )
+                lines.append(header)
+                lines.append(content)
                 idx += 1
             lines.append("")
     else:
         lines.append(f"Found {len(results)} matching learnings:")
         lines.append("")
         for i, result in enumerate(results, 1):
-            score = result.get("final_score", result["similarity"])
-            content_preview = format_result_preview(result["content"], max_length=300)
-            session_id = result["session_id"]
-            created_at = result["created_at"]
-            if isinstance(created_at, datetime):
-                created_str = created_at.strftime("%Y-%m-%d %H:%M")
-            else:
-                created_str = str(created_at)[:16]
-            lines.append(f"{i}. [{score:.3f}] Session: {session_id} ({created_str})")
-            lines.append(f"   {content_preview}")
+            header, content = _format_result_line(i, result)
+            lines.append(header)
+            lines.append(content)
             lines.append("")
 
     return "\n".join(lines)
 
 
-# Canonical display order for learning types
-LEARNING_TYPE_ORDER = [
+# Canonical display order for learning types (immutable tuple)
+LEARNING_TYPE_ORDER: tuple[str, ...] = (
     "FAILED_APPROACH",
     "ERROR_FIX",
     "WORKING_SOLUTION",
@@ -171,7 +206,7 @@ LEARNING_TYPE_ORDER = [
     "CODEBASE_PATTERN",
     "USER_PREFERENCE",
     "OPEN_THREAD",
-]
+)
 
 
 def group_by_type(results: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -183,7 +218,7 @@ def group_by_type(results: list[dict[str, Any]]) -> dict[str, list[dict[str, Any
     """
     groups: dict[str, list[dict[str, Any]]] = {}
     for result in results:
-        lt = result.get("metadata", {}).get("learning_type", "UNKNOWN")
+        lt = _extract_learning_type(result)
         groups.setdefault(lt, []).append(result)
 
     # Reorder by canonical order

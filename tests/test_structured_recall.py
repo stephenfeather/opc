@@ -116,7 +116,7 @@ class TestGroupByType:
         """When all canonical types present, they appear in exact LEARNING_TYPE_ORDER."""
         results = [_make_result(learning_type=lt) for lt in reversed(LEARNING_TYPE_ORDER)]
         grouped = group_by_type(results)
-        assert list(grouped.keys()) == LEARNING_TYPE_ORDER
+        assert list(grouped.keys()) == list(LEARNING_TYPE_ORDER)
 
 
 # ---------------------------------------------------------------------------

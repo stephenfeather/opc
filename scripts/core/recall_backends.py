@@ -361,7 +361,7 @@ async def search_learnings_hybrid_rrf(
                 a.last_recalled,
                 c.rrf_score +
                     CASE WHEN COALESCE(a.recall_count, 0) = 0 THEN 0
-                    ELSE log(2.0, 1 + COALESCE(a.recall_count, 0)) * {_recall_cfg.recall_boost_multiplier}
+                    ELSE log(2.0, 1 + COALESCE(a.recall_count, 0)) * $5
                     END as boosted_score,
                 c.rrf_score as raw_rrf_score,
                 c.fts_rank,
@@ -396,7 +396,8 @@ async def search_learnings_hybrid_rrf(
     has_decay_columns = True
     async with pool.acquire() as conn:
         await init_pgvector(conn)
-        query_args = (text_query, str(query_embedding), rrf_k, k * 2)
+        boost = _recall_cfg.recall_boost_multiplier
+        query_args = (text_query, str(query_embedding), rrf_k, k * 2, boost)
 
         try:
             rows = await conn.fetch(_BOOSTED_SELECT, *query_args)
@@ -416,7 +417,7 @@ async def search_learnings_hybrid_rrf(
         if not rows and use_tsquery:
             logger.debug("Expanded tsquery returned no results, falling back to plainto_tsquery")
             plain_cte = _build_rrf_cte(chain_filter=True, use_tsquery=False)
-            plain_args = (query, str(query_embedding), rrf_k, k * 2)
+            plain_args = (query, str(query_embedding), rrf_k, k * 2, boost)
             try:
                 if has_decay_columns:
                     rows = await conn.fetch(plain_cte + _BOOSTED_TAIL, *plain_args)

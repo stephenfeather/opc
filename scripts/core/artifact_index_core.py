@@ -329,7 +329,7 @@ def generate_file_id(file_path: str) -> str:
     """Generate a deterministic 12-char hex ID from a file path."""
     import hashlib
 
-    return hashlib.md5(str(file_path).encode()).hexdigest()[:12]
+    return hashlib.sha256(str(file_path).encode()).hexdigest()[:12]
 
 
 def classify_file(file_path) -> str | None:
@@ -439,18 +439,14 @@ def parse_handoff_yaml_content(raw_content: str, file_path) -> dict:
     # Extract what_worked
     worked = data.get("worked", [])
     if isinstance(worked, list):
-        what_worked = "\n".join(
-            f"- {w}" if isinstance(w, str) else f"- {w}" for w in worked
-        )
+        what_worked = "\n".join(f"- {w}" for w in worked)
     else:
         what_worked = str(worked)
 
     # Extract what_failed
     failed = data.get("failed", [])
     if isinstance(failed, list):
-        what_failed = "\n".join(
-            f"- {f}" if isinstance(f, str) else f"- {f}" for f in failed
-        )
+        what_failed = "\n".join(f"- {f}" for f in failed)
     else:
         what_failed = str(failed)
 

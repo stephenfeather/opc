@@ -13,7 +13,7 @@ Structure (FP):
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     from .memory_protocol import MemoryBackend
@@ -98,7 +98,7 @@ async def create_memory_service(
     backend: BackendType = "sqlite",
     session_id: str = "default",
     agent_id: str | None = None,
-    **kwargs: Any,
+    db_path: str | None = None,
 ) -> MemoryBackend:
     """Create a memory service with the specified backend.
 
@@ -106,7 +106,7 @@ async def create_memory_service(
         backend: "sqlite" or "postgres"
         session_id: Session identifier for isolation
         agent_id: Optional agent identifier within session
-        **kwargs: Backend-specific options (e.g. db_path for SQLite)
+        db_path: File path for SQLite database (sqlite backend only)
 
     Returns:
         Connected MemoryBackend implementation.
@@ -122,7 +122,7 @@ async def create_memory_service(
 
     if backend == "sqlite":
         cls = _import_sqlite_backend()
-        service = cls(session_id=session_id, db_path=kwargs.get("db_path"))
+        service = cls(session_id=session_id, db_path=db_path)
     else:  # postgres
         cls = _import_postgres_backend()
         service = cls(session_id=session_id, agent_id=agent_id)

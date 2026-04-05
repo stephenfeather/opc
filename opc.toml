@@ -31,6 +31,10 @@ max_concurrent_extractions = 4
 # DB connection retry count.
 max_retries = 5
 
+# Seconds after exited_at before a session is eligible for extraction.
+# Must be > stale_threshold (900) so grace period is visible.
+harvest_grace_period = 1200
+
 # Kill extraction subprocess after this many seconds.
 extraction_timeout = 1800
 
@@ -39,6 +43,7 @@ extraction_timeout = 1800
 pattern_detection_interval_hours = 6
 
 # Claude model used for extraction subprocesses.
+# Allowed values: sonnet, haiku, opus
 extraction_model = "sonnet"
 
 # Max turns per extraction subprocess.
@@ -108,6 +113,9 @@ cross_project_sessions = 3
 [recall]
 # Default number of results returned.
 default_k = 5
+
+# Default limit for internal search methods (search_text, search_vector, etc.).
+default_search_limit = 10
 
 # RRF constant (higher = more weight to lower-ranked results).
 rrf_k = 60

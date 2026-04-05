@@ -29,6 +29,7 @@ from scripts.core.extract_workflow_patterns import (  # noqa: E402
     detect_workflow_sequences,
     extract_tool_uses,
     format_pattern_as_learning,
+    redact_input,
     summarize_tool_usage,
 )
 
@@ -535,6 +536,77 @@ class TestExtractToolUses:
         assert len(result) == 1
         assert result[0]["result_error"] is None
 
+
+# ===========================================================================
+# redact_input
+# ===========================================================================
+
+
+class TestRedactInput:
+    """Tests for redact_input: strips secrets from tool input dicts."""
+
+    def test_bearer_token_redacted(self) -> None:
+        inp = {"command": "curl -H 'Authorization: Bearer sk-abc123secret' http://api.example.com"}
+        result = redact_input(inp)
+        assert "sk-abc123secret" not in result["command"]
+        assert "[REDACTED]" in result["command"]
+
+    def test_api_key_env_assignment_redacted(self) -> None:
+        inp = {"command": "OPENAI_API_KEY=sk-proj-xyz123 python run.py"}
+        result = redact_input(inp)
+        assert "sk-proj-xyz123" not in result["command"]
+        assert "[REDACTED]" in result["command"]
+
+    def test_password_flag_redacted(self) -> None:
+        inp = {"command": "psql --password=SuperSecret123 -h localhost"}
+        result = redact_input(inp)
+        assert "SuperSecret123" not in result["command"]
+        assert "[REDACTED]" in result["command"]
+
+    def test_connection_string_password_redacted(self) -> None:
+        inp = {"command": "psql postgresql://user:s3cretPass@localhost:5432/db"}
+        result = redact_input(inp)
+        assert "s3cretPass" not in result["command"]
+        assert "[REDACTED]" in result["command"]
+
+    def test_no_secrets_unchanged(self) -> None:
+        inp = {"command": "pytest tests/ -x"}
+        result = redact_input(inp)
+        assert result["command"] == "pytest tests/ -x"
+
+    def test_file_path_unchanged(self) -> None:
+        inp = {"file_path": "/home/user/secret_project/auth.py"}
+        result = redact_input(inp)
+        assert result["file_path"] == "/home/user/secret_project/auth.py"
+
+    def test_does_not_mutate_original(self) -> None:
+        inp = {"command": "export TOKEN=abc123secret"}
+        original_cmd = inp["command"]
+        redact_input(inp)
+        assert inp["command"] == original_cmd
+
+    def test_multiple_secrets_all_redacted(self) -> None:
+        inp = {"command": "KEY1=secret1 KEY2=secret2 python app.py"}
+        result = redact_input(inp)
+        assert "secret1" not in result["command"]
+        assert "secret2" not in result["command"]
+
+    def test_export_var_redacted(self) -> None:
+        inp = {"command": "export VOYAGE_API_KEY=voy-abc123"}
+        result = redact_input(inp)
+        assert "voy-abc123" not in result["command"]
+        assert "[REDACTED]" in result["command"]
+
+    def test_empty_input_unchanged(self) -> None:
+        assert redact_input({}) == {}
+
+    def test_sk_prefix_token_redacted(self) -> None:
+        """Standalone sk-* tokens in any context are redacted."""
+        inp = {"command": "echo sk-live-4eC39HqLyjWDarjtT1zdp7dc"}
+        result = redact_input(inp)
+        assert "sk-live-4eC39HqLyjWDarjtT1zdp7dc" not in result["command"]
+        assert "[REDACTED]" in result["command"]
+
     def test_empty_file(self, tmp_path: Path) -> None:
         """Empty JSONL returns empty list."""
         jsonl_path = tmp_path / "empty.jsonl"
@@ -844,3 +916,102 @@ class TestParseToolResult:
         item = {"type": "tool_result"}
         result = _parse_tool_result(item)
         assert result == ("", False)
+
+
+# ===========================================================================
+# extract_tool_uses max_entries cap
+# ===========================================================================
+
+
+class TestExtractToolUsesMaxEntries:
+    """Tests for the max_entries parameter on extract_tool_uses."""
+
+    def test_cap_limits_returned_entries(self, tmp_path: Path) -> None:
+        """When max_entries is set, no more than that many entries are returned."""
+        jsonl_path = tmp_path / "session.jsonl"
+        lines = []
+        for i in range(10):
+            lines.append(
+                _make_assistant_tool_use("Read", {"file_path": f"/f{i}.py"}, f"t{i}")
+            )
+            lines.append(_make_user_tool_result(f"t{i}", is_error=False))
+        _write_jsonl(lines, jsonl_path)
+
+        result = extract_tool_uses(jsonl_path, max_entries=3)
+        assert len(result) == 3
+
+    def test_cap_still_correlates_results(self, tmp_path: Path) -> None:
+        """Entries at the cap boundary still get their result_error populated."""
+        jsonl_path = tmp_path / "session.jsonl"
+        lines = []
+        for i in range(5):
+            lines.append(
+                _make_assistant_tool_use("Bash", {"command": f"cmd{i}"}, f"t{i}")
+            )
+            lines.append(_make_user_tool_result(f"t{i}", is_error=(i == 2)))
+        _write_jsonl(lines, jsonl_path)
+
+        result = extract_tool_uses(jsonl_path, max_entries=3)
+        assert len(result) == 3
+        # All three should have result_error resolved (not None)
+        assert result[0]["result_error"] is False
+        assert result[1]["result_error"] is False
+        assert result[2]["result_error"] is True
+
+    def test_cap_none_returns_all(self, tmp_path: Path) -> None:
+        """max_entries=None (default) returns all entries."""
+        jsonl_path = tmp_path / "session.jsonl"
+        lines = []
+        for i in range(5):
+            lines.append(
+                _make_assistant_tool_use("Read", {"file_path": f"/f{i}.py"}, f"t{i}")
+            )
+            lines.append(_make_user_tool_result(f"t{i}"))
+        _write_jsonl(lines, jsonl_path)
+
+        result = extract_tool_uses(jsonl_path, max_entries=None)
+        assert len(result) == 5
+
+    def test_cap_larger_than_entries_returns_all(self, tmp_path: Path) -> None:
+        """max_entries larger than actual entries returns everything."""
+        jsonl_path = tmp_path / "session.jsonl"
+        lines = [
+            _make_assistant_tool_use("Read", {"file_path": "/a.py"}, "t1"),
+            _make_user_tool_result("t1"),
+        ]
+        _write_jsonl(lines, jsonl_path)
+
+        result = extract_tool_uses(jsonl_path, max_entries=100)
+        assert len(result) == 1
+
+    def test_cap_of_one(self, tmp_path: Path) -> None:
+        """Edge case: max_entries=1 returns exactly one entry with result."""
+        jsonl_path = tmp_path / "session.jsonl"
+        lines = [
+            _make_assistant_tool_use("Read", {"file_path": "/a.py"}, "t1"),
+            _make_user_tool_result("t1", is_error=False),
+            _make_assistant_tool_use("Edit", {"file_path": "/a.py"}, "t2"),
+            _make_user_tool_result("t2", is_error=False),
+        ]
+        _write_jsonl(lines, jsonl_path)
+
+        result = extract_tool_uses(jsonl_path, max_entries=1)
+        assert len(result) == 1
+        assert result[0]["tool_name"] == "Read"
+        assert result[0]["result_error"] is False
+
+    def test_cap_with_unresolved_results(self, tmp_path: Path) -> None:
+        """Entries without a matching result keep result_error=None."""
+        jsonl_path = tmp_path / "session.jsonl"
+        # Two tool uses, but only the first gets a result, then file ends
+        lines = [
+            _make_assistant_tool_use("Read", {"file_path": "/a.py"}, "t1"),
+            _make_assistant_tool_use("Edit", {"file_path": "/b.py"}, "t2"),
+            _make_user_tool_result("t1", is_error=False),
+        ]
+        _write_jsonl(lines, jsonl_path)
+
+        result = extract_tool_uses(jsonl_path, max_entries=2)
+        assert len(result) == 2
+        assert result[0]["result_error"] is False
+        assert result[1]["result_error"] is None

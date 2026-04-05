@@ -705,3 +705,79 @@ class TestTagOperations:
             result = await svc.get_all_session_tags()
 
         assert result == ["alpha", "beta", "gamma"]
+
+
+# ==================== Config Wiring ====================
+
+
+class TestConfigWiring:
+    """Tests that search defaults come from opc.toml config."""
+
+    def test_search_text_uses_config_default_limit(self):
+        """search_text default limit should come from recall config."""
+        import inspect
+
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        sig = inspect.signature(MemoryServicePG.search_text)
+        # Should not be hardcoded 10 — should come from config
+        from scripts.core.config import get_config
+
+        expected = get_config().recall.default_search_limit
+        assert sig.parameters["limit"].default == expected
+
+    def test_search_vector_uses_config_default_limit(self):
+        import inspect
+
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        sig = inspect.signature(MemoryServicePG.search_vector)
+        from scripts.core.config import get_config
+
+        expected = get_config().recall.default_search_limit
+        assert sig.parameters["limit"].default == expected
+
+    def test_search_uses_config_default_limit(self):
+        import inspect
+
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        sig = inspect.signature(MemoryServicePG.search)
+        from scripts.core.config import get_config
+
+        expected = get_config().recall.default_search_limit
+        assert sig.parameters["limit"].default == expected
+
+    def test_search_hybrid_rrf_uses_config_defaults(self):
+        import inspect
+
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        sig = inspect.signature(MemoryServicePG.search_hybrid_rrf)
+        from scripts.core.config import get_config
+
+        recall_cfg = get_config().recall
+        assert sig.parameters["limit"].default == recall_cfg.default_search_limit
+        assert sig.parameters["k"].default == recall_cfg.rrf_k
+
+    def test_search_with_tags_uses_config_default_limit(self):
+        import inspect
+
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        sig = inspect.signature(MemoryServicePG.search_with_tags)
+        from scripts.core.config import get_config
+
+        expected = get_config().recall.default_search_limit
+        assert sig.parameters["limit"].default == expected
+
+    def test_to_context_uses_config_max_archival(self):
+        import inspect
+
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        sig = inspect.signature(MemoryServicePG.to_context)
+        from scripts.core.config import get_config
+
+        expected = get_config().database.max_archival_context
+        assert sig.parameters["max_archival"].default == expected

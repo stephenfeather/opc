@@ -54,6 +54,12 @@ from .postgres_pool import get_connection, get_pool, get_transaction, init_pgvec
 
 logger = logging.getLogger(__name__)
 
+# Load config defaults for search methods.
+from scripts.core.config import get_config as _get_config
+
+_recall_cfg = _get_config().recall
+_db_cfg = _get_config().database
+
 
 class EmbeddingProvider(Protocol):
     """Protocol for embedding providers."""
@@ -337,7 +343,7 @@ class MemoryServicePG:
     async def search_text(
         self,
         query: str,
-        limit: int = 10,
+        limit: int = _recall_cfg.default_search_limit,
         start_date: datetime | None = None,
         end_date: datetime | None = None,
     ) -> list[dict[str, Any]]:
@@ -355,7 +361,7 @@ class MemoryServicePG:
     async def search_vector(
         self,
         query_embedding: list[float],
-        limit: int = 10,
+        limit: int = _recall_cfg.default_search_limit,
         start_date: datetime | None = None,
         end_date: datetime | None = None,
     ) -> list[dict[str, Any]]:
@@ -372,7 +378,7 @@ class MemoryServicePG:
             rows = await conn.fetch(sql, *params)
             return format_rows(rows, extra_fields=["similarity"])
 
-    async def search(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
+    async def search(self, query: str, limit: int = _recall_cfg.default_search_limit) -> list[dict[str, Any]]:
         """Search archival memory with FTS (backward compatible alias)."""
         return await self.search_text(query, limit)
 
@@ -495,8 +501,8 @@ class MemoryServicePG:
         self,
         text_query: str,
         query_embedding: list[float],
-        limit: int = 10,
-        k: int = 60,
+        limit: int = _recall_cfg.default_search_limit,
+        k: int = _recall_cfg.rrf_k,
     ) -> list[dict[str, Any]]:
         """Hybrid search using Reciprocal Rank Fusion."""
         has_col = await self._check_superseded_column()
@@ -629,7 +635,7 @@ class MemoryServicePG:
         query: str,
         tags: list[str] | None = None,
         tag_match_mode: str = "any",
-        limit: int = 10,
+        limit: int = _recall_cfg.default_search_limit,
     ) -> list[dict[str, Any]]:
         """Search archival memory with optional tag filtering."""
         has_col = await self._check_superseded_column()
@@ -727,7 +733,7 @@ class MemoryServicePG:
         )
         return format_recall_text(core_matches, archival_results)
 
-    async def to_context(self, max_archival: int = 10) -> str:
+    async def to_context(self, max_archival: int = _db_cfg.max_archival_context) -> str:
         """Generate context string for prompt injection."""
         core = await self.get_all_core()
         has_col = await self._check_superseded_column()

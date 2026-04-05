@@ -294,12 +294,20 @@ def _assemble_handoff(acc: dict, session_id: str) -> dict:
     date_str = _extract_date(acc["first_ts"])
     recent_commands = [c["command"] for c in acc["recent_commands"]]
 
+    # Derive done_this_session from modified/created for artifact_index compatibility
+    done_items = [f"Modified {f}" for f in acc["modified"]]
+    done_items.extend(f"Created {f}" for f in acc["created"])
+
     return {
         "session": session_id,
         "date": date_str,
         "status": "complete",
         "outcome": "auto-extracted",
         "goal": "Auto-extracted session summary",
+        "done_this_session": done_items,
+        "worked": [],
+        "failed": [],
+        "decisions": [],
         "files": {
             "read": acc["read_files"],
             "modified": acc["modified"],
@@ -439,7 +447,10 @@ def format_as_yaml(handoff: dict) -> str:
     lines.append("---")
     lines.append("")
 
-    for key in ("goal", "files", "commands_run", "git_state", "tool_usage", "duration"):
+    for key in (
+        "goal", "done_this_session", "worked", "failed", "decisions",
+        "files", "commands_run", "git_state", "tool_usage", "duration",
+    ):
         val = handoff.get(key)
         if val is None:
             continue

@@ -679,6 +679,80 @@ class TestBuildHandoffFromEntries:
 
 
 # ===========================================================================
+# Artifact-index compatibility fields
+# ===========================================================================
+
+
+class TestArtifactIndexFields:
+    """Verify handoffs include fields that artifact_index.py expects."""
+
+    def test_done_this_session_derived_from_modified_and_created(self):
+        from scripts.core.generate_mini_handoff import build_handoff_from_entries
+
+        entries = [
+            _assistant_entry("Read", {"file_path": "src/auth.py"}, "2025-01-15T10:00:00Z"),
+            _assistant_entry("Edit", {"file_path": "src/auth.py"}, "2025-01-15T10:01:00Z"),
+            _assistant_entry("Write", {"file_path": "src/new_module.py"}, "2025-01-15T10:02:00Z"),
+        ]
+        result = build_handoff_from_entries(entries, "s-test", "/project")
+
+        assert "done_this_session" in result
+        assert isinstance(result["done_this_session"], list)
+        assert any("src/auth.py" in item for item in result["done_this_session"])
+        assert any("src/new_module.py" in item for item in result["done_this_session"])
+
+    def test_done_this_session_empty_when_no_modifications(self):
+        from scripts.core.generate_mini_handoff import build_handoff_from_entries
+
+        entries = [
+            _assistant_entry("Read", {"file_path": "a.py"}, "2025-01-15T10:00:00Z"),
+        ]
+        result = build_handoff_from_entries(entries, "s-test", "/project")
+        assert result["done_this_session"] == []
+
+    def test_worked_and_failed_are_empty_lists(self):
+        from scripts.core.generate_mini_handoff import build_handoff_from_entries
+
+        result = build_handoff_from_entries([], "s-test", "/project")
+        assert result["worked"] == []
+        assert result["failed"] == []
+
+    def test_decisions_is_empty_list(self):
+        from scripts.core.generate_mini_handoff import build_handoff_from_entries
+
+        result = build_handoff_from_entries([], "s-test", "/project")
+        assert result["decisions"] == []
+
+    def test_yaml_output_includes_artifact_fields(self):
+        from scripts.core.generate_mini_handoff import build_handoff_from_entries, format_as_yaml
+
+        entries = [
+            _assistant_entry("Edit", {"file_path": "x.py"}, "2025-01-15T10:00:00Z"),
+        ]
+        result = build_handoff_from_entries(entries, "s-test", "/project")
+        yaml_output = format_as_yaml(result)
+        assert "done_this_session:" in yaml_output
+        assert "worked:" in yaml_output
+        assert "failed:" in yaml_output
+        assert "decisions:" in yaml_output
+
+    def test_state_events_also_include_artifact_fields(self):
+        from scripts.core.generate_mini_handoff import build_handoff_from_state_events
+
+        events = [
+            _state_event("Edit", file="a.py"),
+            _state_event("Write", file="b.py"),
+        ]
+        result = build_handoff_from_state_events(events, "s-test", "/project")
+        assert "done_this_session" in result
+        assert "worked" in result
+        assert "failed" in result
+        assert "decisions" in result
+        assert any("a.py" in item for item in result["done_this_session"])
+        assert any("b.py" in item for item in result["done_this_session"])
+
+
+# ===========================================================================
 # parse_state_events
 # ===========================================================================
 

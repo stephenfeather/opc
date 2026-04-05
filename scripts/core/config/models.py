@@ -76,6 +76,7 @@ class PatternsConfig:
 @dataclass(frozen=True)
 class RecallConfig:
     default_k: int = 5
+    default_search_limit: int = 10
     rrf_k: int = 60
     max_expansion_terms: int = 5
     recall_boost_multiplier: float = 0.002

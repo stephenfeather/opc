@@ -1,11 +1,16 @@
 """Tests for scripts/core/backfill_sessions.py - TDD+FP refactor."""
 
+import argparse
 import os
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from scripts.core.backfill_sessions import (
     _build_session_info,
+    _date_string,
+    _positive_int,
     _read_first_line,
     build_session_record,
     compute_fake_pid,
@@ -22,6 +27,42 @@ from scripts.core.backfill_sessions import (
     select_batch,
     sort_sessions_by_mtime,
 )
+
+# --- _positive_int ---
+
+
+class TestPositiveInt:
+    def test_valid(self):
+        assert _positive_int("5") == 5
+
+    def test_zero_raises(self):
+        with pytest.raises(argparse.ArgumentTypeError):
+            _positive_int("0")
+
+    def test_negative_raises(self):
+        with pytest.raises(argparse.ArgumentTypeError):
+            _positive_int("-1")
+
+    def test_non_int_raises(self):
+        with pytest.raises(ValueError):
+            _positive_int("abc")
+
+
+# --- _date_string ---
+
+
+class TestDateString:
+    def test_valid(self):
+        assert _date_string("2026-03-15") == "2026-03-15"
+
+    def test_invalid_format_raises(self):
+        with pytest.raises(argparse.ArgumentTypeError):
+            _date_string("03-15-2026")
+
+    def test_nonsense_raises(self):
+        with pytest.raises(argparse.ArgumentTypeError):
+            _date_string("not-a-date")
+
 
 # --- get_pg_url ---
 
@@ -451,7 +492,14 @@ class TestInsertSessions:
         sessions = self._sample_sessions()
         mock_conn = MagicMock()
         mock_cur = MagicMock()
-        mock_cur.rowcount = 1  # each INSERT actually inserts a row
+
+        def track_rowcount(sql, *args):
+            if sql.strip().startswith("INSERT"):
+                mock_cur.rowcount = 1
+            else:
+                mock_cur.rowcount = 0
+
+        mock_cur.execute.side_effect = track_rowcount
         mock_conn.cursor.return_value = mock_cur
         mock_pg.connect.return_value = mock_conn
 
@@ -469,7 +517,12 @@ class TestInsertSessions:
         sessions = self._sample_sessions()[:1]
         mock_conn = MagicMock()
         mock_cur = MagicMock()
-        mock_cur.rowcount = 0  # ON CONFLICT DO NOTHING — no row inserted
+
+        def track_rowcount(sql, *args):
+            # INSERT hits ON CONFLICT — no row inserted
+            mock_cur.rowcount = 0
+
+        mock_cur.execute.side_effect = track_rowcount
         mock_conn.cursor.return_value = mock_cur
         mock_pg.connect.return_value = mock_conn
 

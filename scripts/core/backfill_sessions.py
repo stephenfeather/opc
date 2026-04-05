@@ -93,7 +93,8 @@ def decode_project_path(dir_name: str) -> str:
 
 def is_subagent_file(path_str: str) -> bool:
     """Check if a JSONL path belongs to a subagent transcript."""
-    return "subagents" in path_str or Path(path_str).stem.startswith("agent-")
+    p = Path(path_str)
+    return "subagents" in p.parts or p.stem.startswith("agent-")
 
 
 def is_daemon_extraction_content(first_line: str) -> bool:
@@ -257,8 +258,9 @@ def insert_sessions(sessions: list[dict], dry_run: bool = False) -> int:
                     record["exited_at"],
                 ),
             )
+            row_inserted = cur.rowcount > 0
             cur.execute("RELEASE SAVEPOINT sp_insert")
-            if cur.rowcount > 0:
+            if row_inserted:
                 inserted += 1
         except Exception as e:
             cur.execute("ROLLBACK TO SAVEPOINT sp_insert")
@@ -297,16 +299,35 @@ def _bootstrap() -> None:
         load_dotenv(opc_env, override=True)
 
 
+def _positive_int(value: str) -> int:
+    """Argparse type for positive integers."""
+    n = int(value)
+    if n <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {value}")
+    return n
+
+
+def _date_string(value: str) -> str:
+    """Argparse type that validates YYYY-MM-DD format."""
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid date format: {value!r}, expected YYYY-MM-DD")
+    return value
+
+
 def main() -> int:
     """CLI entry point for backfill_sessions."""
     parser = argparse.ArgumentParser(description="Backfill unregistered sessions")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be inserted")
     parser.add_argument(
-        "--batch-size", type=int, default=10, help="Sessions to insert (default: 10)"
+        "--batch-size", type=_positive_int, default=10,
+        help="Sessions to insert (default: 10)",
     )
     parser.add_argument("--all", action="store_true", help="Insert all unregistered sessions")
     parser.add_argument(
-        "--after", type=str, default=None, help="Only after this date (YYYY-MM-DD)"
+        "--after", type=_date_string, default=None,
+        help="Only after this date (YYYY-MM-DD)",
     )
     args = parser.parse_args()
     _bootstrap()
@@ -319,11 +340,12 @@ def main() -> int:
 
     print(f"Found {len(sessions)} unregistered sessions")
 
+    batch = select_batch(sessions, batch_size=args.batch_size, select_all=args.all)
+
     if args.dry_run:
-        insert_sessions(sessions, dry_run=True)
+        insert_sessions(batch, dry_run=True)
         return 0
 
-    batch = select_batch(sessions, batch_size=args.batch_size, select_all=args.all)
     print(f"Inserting batch of {len(batch)} (of {len(sessions)} total)")
     inserted = insert_sessions(batch)
 

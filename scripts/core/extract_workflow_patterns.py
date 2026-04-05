@@ -17,6 +17,7 @@ import argparse
 import faulthandler
 import json
 import os
+import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -53,6 +54,50 @@ def _extract_input(tool_name: str, tool_input: dict) -> dict:
     if tool_name == "Bash":
         extracted["command"] = extracted["command"][:500]
     return extracted
+
+
+_REDACT_MARKER = "[REDACTED]"
+
+# Each entry: (compiled pattern, replacement template using \1 backrefs + marker).
+_REDACT_RULES: list[tuple[re.Pattern[str], str]] = [
+    # Bearer / Authorization tokens
+    (re.compile(r"(Bearer\s+)\S+", re.IGNORECASE), rf"\1{_REDACT_MARKER}"),
+    # Connection string passwords: ://user:PASSWORD@host
+    (re.compile(r"(://[^:]+:)[^@]+(@)"), rf"\1{_REDACT_MARKER}\2"),
+    # --password=VALUE, --token=VALUE, --secret=VALUE, --key=VALUE
+    (re.compile(r"(--(?:password|token|secret|key)=)\S+", re.IGNORECASE), rf"\1{_REDACT_MARKER}"),
+    # export VAR=VALUE or VAR=VALUE for sensitive env var names
+    (
+        re.compile(
+            r"((?:export\s+)?[A-Za-z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)[A-Za-z0-9_]*=)\S+",
+            re.IGNORECASE,
+        ),
+        rf"\1{_REDACT_MARKER}",
+    ),
+    # Standalone sk-* tokens (Stripe, OpenAI, etc.)
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"), _REDACT_MARKER),
+]
+
+
+def _redact_command(command: str) -> str:
+    """Apply redaction patterns to a command string."""
+    for pattern, replacement in _REDACT_RULES:
+        command = pattern.sub(replacement, command)
+    return command
+
+
+def redact_input(inp: dict) -> dict:
+    """Return a copy of a tool input dict with secrets redacted from commands.
+
+    Only the 'command' field is redacted; file paths and other fields pass
+    through unchanged.
+    """
+    if not inp:
+        return {}
+    result = dict(inp)
+    if "command" in result:
+        result["command"] = _redact_command(result["command"])
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -455,6 +500,11 @@ def main() -> None:
         default=None,
         help="Maximum tool entries to collect (default: unlimited)",
     )
+    parser.add_argument(
+        "--redact",
+        action="store_true",
+        help="Strip secrets (tokens, passwords, keys) from command strings",
+    )
 
     args = parser.parse_args()
 
@@ -467,6 +517,11 @@ def main() -> None:
         sys.exit(1)
 
     tool_uses = extract_tool_uses(jsonl_path, max_entries=args.max_entries)
+
+    if args.redact:
+        tool_uses = [
+            {**t, "input": redact_input(t["input"])} for t in tool_uses
+        ]
 
     if args.stats:
         print(json.dumps(summarize_tool_usage(tool_uses), indent=2))

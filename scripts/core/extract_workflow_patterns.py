@@ -287,18 +287,30 @@ def _parse_tool_result(item: dict) -> tuple[str, bool] | None:
     return (item.get("tool_use_id", ""), item.get("is_error", False))
 
 
-def extract_tool_uses(jsonl_path: Path) -> list[dict]:
+def extract_tool_uses(jsonl_path: Path, max_entries: int | None = None) -> list[dict]:
     """Stream through JSONL and extract tool_use blocks with their results.
 
     Returns ordered list of dicts with:
         tool_name, input, timestamp, line_num, tool_use_id,
         result_error (bool|None)
+
+    Args:
+        jsonl_path: Path to the JSONL file to parse.
+        max_entries: Cap on collected tool_use entries. When set, stops adding new
+            entries after the cap is reached but continues reading to correlate
+            tool_result responses for already-collected entries. Once all pending
+            results are resolved, reading stops early.
     """
     tool_uses: list[dict] = []
     pending_ids: dict[str, int] = {}
+    cap_reached = False
 
     with open(jsonl_path) as f:
         for line_num, line in enumerate(f, 1):
+            # Once cap is reached and all pending results are resolved, stop reading.
+            if cap_reached and not pending_ids:
+                break
+
             try:
                 data = json.loads(line.strip())
             except json.JSONDecodeError:
@@ -317,12 +329,15 @@ def extract_tool_uses(jsonl_path: Path) -> list[dict]:
 
             msg_type = data.get("type")
 
-            if msg_type == "assistant":
+            if msg_type == "assistant" and not cap_reached:
                 for item in content:
                     entry = _parse_tool_use_entry(item, data, line_num)
                     if entry is not None and entry["tool_use_id"]:
                         pending_ids[entry["tool_use_id"]] = len(tool_uses)
                         tool_uses.append(entry)
+                        if max_entries is not None and len(tool_uses) >= max_entries:
+                            cap_reached = True
+                            break
 
             elif msg_type == "user":
                 for item in content:
@@ -330,9 +345,8 @@ def extract_tool_uses(jsonl_path: Path) -> list[dict]:
                     if result is not None:
                         tid, is_error = result
                         if tid and tid in pending_ids:
-                            tool_uses[pending_ids[tid]]["result_error"] = (
-                                is_error
-                            )
+                            tool_uses[pending_ids[tid]]["result_error"] = is_error
+                            del pending_ids[tid]
 
     return tool_uses
 
@@ -435,6 +449,12 @@ def main() -> None:
         action="store_true",
         help="Show tool usage statistics only",
     )
+    parser.add_argument(
+        "--max-entries",
+        type=int,
+        default=None,
+        help="Maximum tool entries to collect (default: unlimited)",
+    )
 
     args = parser.parse_args()
 
@@ -446,7 +466,7 @@ def main() -> None:
         print(f"Error: File not found: {jsonl_path}", file=sys.stderr)
         sys.exit(1)
 
-    tool_uses = extract_tool_uses(jsonl_path)
+    tool_uses = extract_tool_uses(jsonl_path, max_entries=args.max_entries)
 
     if args.stats:
         print(json.dumps(summarize_tool_usage(tool_uses), indent=2))

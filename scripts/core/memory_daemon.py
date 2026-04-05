@@ -750,7 +750,7 @@ def _extract_and_store_workflows(
         return
 
     try:
-        tool_uses = extract_tool_uses(jsonl_path)
+        tool_uses = extract_tool_uses(jsonl_path, max_entries=50_000)
         patterns = detect_workflow_sequences(tool_uses)
         successful = [p for p in patterns if p.get("success") is True]
 

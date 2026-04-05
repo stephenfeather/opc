@@ -844,3 +844,102 @@ class TestParseToolResult:
         item = {"type": "tool_result"}
         result = _parse_tool_result(item)
         assert result == ("", False)
+
+
+# ===========================================================================
+# extract_tool_uses max_entries cap
+# ===========================================================================
+
+
+class TestExtractToolUsesMaxEntries:
+    """Tests for the max_entries parameter on extract_tool_uses."""
+
+    def test_cap_limits_returned_entries(self, tmp_path: Path) -> None:
+        """When max_entries is set, no more than that many entries are returned."""
+        jsonl_path = tmp_path / "session.jsonl"
+        lines = []
+        for i in range(10):
+            lines.append(
+                _make_assistant_tool_use("Read", {"file_path": f"/f{i}.py"}, f"t{i}")
+            )
+            lines.append(_make_user_tool_result(f"t{i}", is_error=False))
+        _write_jsonl(lines, jsonl_path)
+
+        result = extract_tool_uses(jsonl_path, max_entries=3)
+        assert len(result) == 3
+
+    def test_cap_still_correlates_results(self, tmp_path: Path) -> None:
+        """Entries at the cap boundary still get their result_error populated."""
+        jsonl_path = tmp_path / "session.jsonl"
+        lines = []
+        for i in range(5):
+            lines.append(
+                _make_assistant_tool_use("Bash", {"command": f"cmd{i}"}, f"t{i}")
+            )
+            lines.append(_make_user_tool_result(f"t{i}", is_error=(i == 2)))
+        _write_jsonl(lines, jsonl_path)
+
+        result = extract_tool_uses(jsonl_path, max_entries=3)
+        assert len(result) == 3
+        # All three should have result_error resolved (not None)
+        assert result[0]["result_error"] is False
+        assert result[1]["result_error"] is False
+        assert result[2]["result_error"] is True
+
+    def test_cap_none_returns_all(self, tmp_path: Path) -> None:
+        """max_entries=None (default) returns all entries."""
+        jsonl_path = tmp_path / "session.jsonl"
+        lines = []
+        for i in range(5):
+            lines.append(
+                _make_assistant_tool_use("Read", {"file_path": f"/f{i}.py"}, f"t{i}")
+            )
+            lines.append(_make_user_tool_result(f"t{i}"))
+        _write_jsonl(lines, jsonl_path)
+
+        result = extract_tool_uses(jsonl_path, max_entries=None)
+        assert len(result) == 5
+
+    def test_cap_larger_than_entries_returns_all(self, tmp_path: Path) -> None:
+        """max_entries larger than actual entries returns everything."""
+        jsonl_path = tmp_path / "session.jsonl"
+        lines = [
+            _make_assistant_tool_use("Read", {"file_path": "/a.py"}, "t1"),
+            _make_user_tool_result("t1"),
+        ]
+        _write_jsonl(lines, jsonl_path)
+
+        result = extract_tool_uses(jsonl_path, max_entries=100)
+        assert len(result) == 1
+
+    def test_cap_of_one(self, tmp_path: Path) -> None:
+        """Edge case: max_entries=1 returns exactly one entry with result."""
+        jsonl_path = tmp_path / "session.jsonl"
+        lines = [
+            _make_assistant_tool_use("Read", {"file_path": "/a.py"}, "t1"),
+            _make_user_tool_result("t1", is_error=False),
+            _make_assistant_tool_use("Edit", {"file_path": "/a.py"}, "t2"),
+            _make_user_tool_result("t2", is_error=False),
+        ]
+        _write_jsonl(lines, jsonl_path)
+
+        result = extract_tool_uses(jsonl_path, max_entries=1)
+        assert len(result) == 1
+        assert result[0]["tool_name"] == "Read"
+        assert result[0]["result_error"] is False
+
+    def test_cap_with_unresolved_results(self, tmp_path: Path) -> None:
+        """Entries without a matching result keep result_error=None."""
+        jsonl_path = tmp_path / "session.jsonl"
+        # Two tool uses, but only the first gets a result, then file ends
+        lines = [
+            _make_assistant_tool_use("Read", {"file_path": "/a.py"}, "t1"),
+            _make_assistant_tool_use("Edit", {"file_path": "/b.py"}, "t2"),
+            _make_user_tool_result("t1", is_error=False),
+        ]
+        _write_jsonl(lines, jsonl_path)
+
+        result = extract_tool_uses(jsonl_path, max_entries=2)
+        assert len(result) == 2
+        assert result[0]["result_error"] is False
+        assert result[1]["result_error"] is None

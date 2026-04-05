@@ -115,6 +115,9 @@ _PATTERN_DETECTION_INTERVAL = _daemon_cfg.pattern_detection_interval_hours * 360
 _pattern_proc: subprocess.Popen | None = None
 _last_pattern_run: float = 0
 
+# Allowlist of Claude models permitted for extraction subprocesses.
+_ALLOWED_EXTRACTION_MODELS = frozenset({"sonnet", "haiku", "opus"})
+
 
 def _setup_logging() -> logging.Logger:
     """Configure rotating logger for the daemon.
@@ -623,6 +626,13 @@ def extract_memories(
 Look for decisions, what worked, what failed, and patterns discovered.
 Store each learning using store_learning.py with appropriate type and tags."""
 
+        if _daemon_cfg.extraction_model not in _ALLOWED_EXTRACTION_MODELS:
+            log(
+                f"Invalid extraction_model '{_daemon_cfg.extraction_model}', "
+                f"must be one of {sorted(_ALLOWED_EXTRACTION_MODELS)}"
+            )
+            return False
+
         env = os.environ.copy()
         env["CLAUDE_MEMORY_EXTRACTION"] = "1"  # Prevent session-register from registering extraction sessions
         if project_dir:
@@ -633,6 +643,7 @@ Store each learning using store_learning.py with appropriate type and tags."""
                 "claude", "-p",
                 "--model", _daemon_cfg.extraction_model,
                 "--dangerously-skip-permissions",
+                "--allowedTools", "Bash,Read",
                 "--max-turns", str(_daemon_cfg.extraction_max_turns),
                 "--append-system-prompt", agent_prompt,
                 f"Extract learnings from session {session_id}. JSONL path: {jsonl_path}"

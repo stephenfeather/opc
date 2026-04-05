@@ -43,6 +43,7 @@ extraction_timeout = 1800
 pattern_detection_interval_hours = 6
 
 # Claude model used for extraction subprocesses.
+# Allowed values: sonnet, haiku, opus
 extraction_model = "sonnet"
 
 # Max turns per extraction subprocess.

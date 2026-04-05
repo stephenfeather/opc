@@ -35,7 +35,12 @@ from pathlib import Path
 
 def get_pg_url() -> str | None:
     """Resolve PostgreSQL URL from environment with fallback chain."""
-    return os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL") or None
+    return (
+        os.environ.get("CONTINUOUS_CLAUDE_DB_URL")
+        or os.environ.get("DATABASE_URL")
+        or os.environ.get("POSTGRES_URL")
+        or None
+    )
 
 
 def get_s3_bucket() -> str | None:
@@ -215,6 +220,14 @@ def _positive_int(value: str) -> int:
     return n
 
 
+def _nonneg_int(value: str) -> int:
+    """Argparse type for non-negative integers (0 means all)."""
+    n = int(value)
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"must be a non-negative integer, got {value}")
+    return n
+
+
 # ---------------------------------------------------------------------------
 # I/O functions
 # ---------------------------------------------------------------------------
@@ -261,6 +274,9 @@ def list_s3_keys(bucket: str) -> str:
         return result.stdout
     except subprocess.TimeoutExpired:
         _log("S3 list timed out")
+        return ""
+    except FileNotFoundError:
+        _log("ERROR: 'aws' CLI not found. Install AWS CLI to use S3 backfill.")
         return ""
 
 
@@ -483,7 +499,7 @@ def main() -> int:
     )
     parser.add_argument("--dry-run", action="store_true", help="Preview without extracting")
     parser.add_argument(
-        "--limit", type=_positive_int, default=0, help="Max sessions (0=all)"
+        "--limit", type=_nonneg_int, default=0, help="Max sessions (0=all)"
     )
     parser.add_argument("--project", type=str, default="", help="Filter by project substring")
     parser.add_argument(
@@ -559,6 +575,7 @@ def main() -> int:
         return 0
 
     # Load config
+    allowed_models = frozenset({"sonnet", "haiku", "opus"})
     try:
         from scripts.core.config import get_config
 
@@ -570,6 +587,10 @@ def main() -> int:
         model = "sonnet"
         max_turns = 15
         timeout = 300
+
+    if model not in allowed_models:
+        _log(f"ERROR: invalid extraction model '{model}', must be one of {sorted(allowed_models)}")
+        return 1
 
     agent_prompt = load_agent_prompt()
 
@@ -606,7 +627,6 @@ def main() -> int:
                     "session_id": s.get("session_id", "?"),
                     "project": s.get("project", "?"),
                 }
-                errors += 1
 
             status = result.get("status", "unknown")
             learned = result.get("learnings", 0)
@@ -621,12 +641,12 @@ def main() -> int:
             if status != "ok":
                 errors += 1
                 _log(
-                    f"[{i}/{len(batch)}] FAIL {s.get('session_id', '?')} "
+                    f"[{i}/{len(claimed_batch)}] FAIL {s.get('session_id', '?')} "
                     f"status={status} error={result.get('error', '')[:100]}"
                 )
             else:
                 _log(
-                    f"[{i}/{len(batch)}] OK {s.get('session_id', '?')} "
+                    f"[{i}/{len(claimed_batch)}] OK {s.get('session_id', '?')} "
                     f"learnings={learned} dupes={dupes}"
                 )
 

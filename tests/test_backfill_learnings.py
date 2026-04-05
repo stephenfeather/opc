@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from scripts.core.backfill_learnings import (
+    _nonneg_int,
     _positive_int,
     _process_one,
     build_extraction_cmd,
@@ -57,8 +58,24 @@ class TestPositiveInt:
             _positive_int("abc")
 
 
+class TestNonnegInt:
+    def test_zero(self):
+        assert _nonneg_int("0") == 0
+
+    def test_positive(self):
+        assert _nonneg_int("5") == 5
+
+    def test_negative_raises(self):
+        with pytest.raises(argparse.ArgumentTypeError):
+            _nonneg_int("-1")
+
+
 class TestGetPgUrl:
-    def test_database_url(self):
+    def test_continuous_claude_first(self):
+        with patch.dict("os.environ", {"CONTINUOUS_CLAUDE_DB_URL": "pg://cc"}, clear=True):
+            assert get_pg_url() == "pg://cc"
+
+    def test_database_url_fallback(self):
         with patch.dict("os.environ", {"DATABASE_URL": "pg://a"}, clear=True):
             assert get_pg_url() == "pg://a"
 
@@ -66,11 +83,13 @@ class TestGetPgUrl:
         with patch.dict("os.environ", {"POSTGRES_URL": "pg://b"}, clear=True):
             assert get_pg_url() == "pg://b"
 
-    def test_database_url_takes_precedence(self):
+    def test_continuous_claude_takes_precedence(self):
         with patch.dict(
-            "os.environ", {"DATABASE_URL": "pg://a", "POSTGRES_URL": "pg://b"}, clear=True
+            "os.environ",
+            {"CONTINUOUS_CLAUDE_DB_URL": "pg://cc", "DATABASE_URL": "pg://a"},
+            clear=True,
         ):
-            assert get_pg_url() == "pg://a"
+            assert get_pg_url() == "pg://cc"
 
     def test_missing_returns_none(self):
         with patch.dict("os.environ", {}, clear=True):
@@ -359,6 +378,13 @@ class TestListS3Keys:
     @patch("scripts.core.backfill_learnings.subprocess")
     def test_timeout_returns_empty(self, mock_sub):
         mock_sub.run.side_effect = subprocess.TimeoutExpired(cmd="aws", timeout=60)
+        mock_sub.TimeoutExpired = subprocess.TimeoutExpired
+        result = list_s3_keys("my-bucket")
+        assert result == ""
+
+    @patch("scripts.core.backfill_learnings.subprocess")
+    def test_missing_aws_cli(self, mock_sub):
+        mock_sub.run.side_effect = FileNotFoundError("aws")
         mock_sub.TimeoutExpired = subprocess.TimeoutExpired
         result = list_s3_keys("my-bucket")
         assert result == ""
@@ -780,7 +806,5 @@ class TestProcessOne:
         }
         _process_one(session, "prompt", "sonnet", 15, 300)
         # Verify project was passed as project_dir to run_extraction
-        _, kwargs = mock_run.call_args
-        # run_extraction is called positionally
         args = mock_run.call_args[0]
         assert args[6] == "-Users-myproj"  # project_dir argument

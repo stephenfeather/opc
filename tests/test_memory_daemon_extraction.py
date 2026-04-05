@@ -23,6 +23,13 @@ def _clean_active_extractions():
     active_extractions.clear()
 
 
+@pytest.fixture(autouse=True)
+def _silence_daemon_log():
+    """Prevent test calls from writing to the production daemon log."""
+    with patch("scripts.core.memory_daemon.log"):
+        yield
+
+
 @pytest.fixture()
 def tmp_jsonl(tmp_path: Path) -> Path:
     """Create a temporary JSONL file that extract_memories can find."""

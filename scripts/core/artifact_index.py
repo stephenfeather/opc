@@ -286,13 +286,9 @@ def db_execute(conn, sql: str, params: tuple = (), table_hint: str = ""):
 
 
 
-# --- Pure functions imported from artifact_index_core ---
-# _adapt_for_postgres, _convert_pg_upsert, parse_frontmatter, extract_sections,
-# extract_session_info, normalize_outcome, extract_files, _parse_simple_yaml,
-# OUTCOME_MAP are all imported at module top.
-
-
-# --- Remaining helper functions ---
+# --- Helpers imported from artifact_index_core ---
+# Module-level imports provide database adaptation, file classification,
+# and parse_*_content helpers; the remaining I/O wrappers are defined below.
 
 
 def parse_handoff(file_path: Path) -> dict:

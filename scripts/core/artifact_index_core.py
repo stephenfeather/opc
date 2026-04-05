@@ -517,7 +517,7 @@ def parse_plan_content(content: str, file_path) -> dict:
 
     phases = []
     for key in sections:
-        if key.startswith("phase"):
+        if re.match(r"^phase[_\-]?\d+", key):
             phases.append({"name": key, "content": sections[key][:500]})
 
     return {

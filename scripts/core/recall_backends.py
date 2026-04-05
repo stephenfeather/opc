@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,20 @@ from typing import Any
 from scripts.core.config import get_config as _get_config
 
 logger = logging.getLogger(__name__)
+
+
+def sanitize_tsquery_words(words: list[str]) -> list[str]:
+    """Strip tsquery metacharacters from words to prevent injection.
+
+    Removes: ! & | ( ) < > : *  and any non-alphanumeric characters.
+    Filters out words that become too short (<=2 chars) after sanitization.
+    """
+    result = []
+    for w in words:
+        clean = re.sub(r"[^a-zA-Z0-9]", "", w)
+        if len(clean) > 2:
+            result.append(clean)
+    return result
 
 _recall_cfg = _get_config().recall
 
@@ -49,9 +64,11 @@ async def search_learnings_text_only_postgres(
 
         # Build OR-based query: "session affinity terminal" -> 'session' | 'affinity' | 'terminal'
         # This matches documents containing ANY of the terms, ranked by how many match
-        words = [w for w in clean_query.split() if len(w) > 2]
+        # Sanitize to strip tsquery metacharacters (!, &, |, <->, etc.)
+        words = sanitize_tsquery_words(clean_query.split())
         if not words:
-            words = clean_query.split()[:1] or [query.split()[0]]
+            fallback = re.sub(r"[^a-zA-Z0-9]", "", query.split()[0]) if query.strip() else ""
+            words = [fallback] if fallback and len(fallback) > 2 else [fallback or "a"]
         or_query = ' | '.join(words)
 
         try:

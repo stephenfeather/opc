@@ -138,7 +138,7 @@ ${content}`;
     if (terminalPid && sessionName) {
       storeSessionAffinity(projectDir, terminalPid, sessionName);
     }
-    const indexScript = path.join(projectDir, "scripts", "artifact_index.py");
+    const indexScript = path.join(projectDir, "scripts", "core", "artifact_index.py");
     if (fs.existsSync(indexScript)) {
       const child = spawn("uv", ["run", "python", indexScript, "--file", fullPath], {
         cwd: projectDir,

@@ -181,12 +181,12 @@ def _build_session_info(
     project_path: str,
 ) -> dict:
     """Build a session info dict from a JSONL path and its decoded project."""
-    mtime = datetime.fromtimestamp(jsonl_path.stat().st_mtime)
+    st = jsonl_path.stat()
     return {
         "uuid": jsonl_path.stem,
         "project": project_path,
-        "mtime": mtime,
-        "size": jsonl_path.stat().st_size,
+        "mtime": datetime.fromtimestamp(st.st_mtime),
+        "size": st.st_size,
         "jsonl_path": str(jsonl_path),
     }
 
@@ -209,25 +209,26 @@ def find_unregistered_sessions(after_date: str | None = None) -> list[dict]:
     conn.close()
 
     # Collect candidate sessions from JSONL files
+    # Cheap checks (set membership, string match) before expensive ones (disk I/O)
     sessions = [
         _build_session_info(jsonl_path, decode_project_path(jsonl_path.parent.name))
         for jsonl_path in projects_dir.glob("*/*.jsonl")
-        if not is_subagent_file(str(jsonl_path))
+        if jsonl_path.stem not in registered_ids
+        and not is_subagent_file(str(jsonl_path))
         and not is_daemon_extraction_content(_read_first_line(jsonl_path))
-        and jsonl_path.stem not in registered_ids
     ]
 
     filtered = filter_sessions_by_date(sessions, after_date)
     return sort_sessions_by_mtime(filtered)
 
 
-def insert_sessions(sessions: list[dict], dry_run: bool = False) -> None:
-    """Insert session records into PostgreSQL."""
+def insert_sessions(sessions: list[dict], dry_run: bool = False) -> int:
+    """Insert session records into PostgreSQL. Returns count of successful inserts."""
     if dry_run:
         print(f"\nDry run: would insert {len(sessions)} sessions:\n")
         for s in sessions:
             print(format_dry_run_line(s))
-        return
+        return 0
 
     conn = psycopg2.connect(get_pg_url())
     cur = conn.cursor()
@@ -257,9 +258,11 @@ def insert_sessions(sessions: list[dict], dry_run: bool = False) -> None:
                 ),
             )
             cur.execute("RELEASE SAVEPOINT sp_insert")
-            inserted += 1
+            if cur.rowcount > 0:
+                inserted += 1
         except Exception as e:
             cur.execute("ROLLBACK TO SAVEPOINT sp_insert")
+            cur.execute("RELEASE SAVEPOINT sp_insert")
             print(f"  Error inserting {s['uuid']}: {e}")
 
     conn.commit()
@@ -268,16 +271,22 @@ def insert_sessions(sessions: list[dict], dry_run: bool = False) -> None:
         f"Inserted {inserted} sessions. Daemon will process them over the next "
         f"~{inserted // 4 + 1} minutes (4 concurrent extractions)."
     )
+    return inserted
+
+
+_faulthandler_log_file = None
 
 
 def _bootstrap() -> None:
     """Initialize faulthandler and load .env files. Called only from main()."""
+    global _faulthandler_log_file  # noqa: PLW0603
     from dotenv import load_dotenv
 
     log_path = os.path.expanduser("~/.claude/logs/opc_crash.log")
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    _faulthandler_log_file = open(log_path, "a")  # noqa: SIM115
     faulthandler.enable(
-        file=open(log_path, "a"),  # noqa: SIM115
+        file=_faulthandler_log_file,
         all_threads=True,
     )
     global_env = Path.home() / ".claude" / ".env"
@@ -290,7 +299,6 @@ def _bootstrap() -> None:
 
 def main() -> int:
     """CLI entry point for backfill_sessions."""
-    _bootstrap()
     parser = argparse.ArgumentParser(description="Backfill unregistered sessions")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be inserted")
     parser.add_argument(
@@ -301,6 +309,7 @@ def main() -> int:
         "--after", type=str, default=None, help="Only after this date (YYYY-MM-DD)"
     )
     args = parser.parse_args()
+    _bootstrap()
 
     sessions = find_unregistered_sessions(after_date=args.after)
 
@@ -316,9 +325,9 @@ def main() -> int:
 
     batch = select_batch(sessions, batch_size=args.batch_size, select_all=args.all)
     print(f"Inserting batch of {len(batch)} (of {len(sessions)} total)")
-    insert_sessions(batch)
+    inserted = insert_sessions(batch)
 
-    remaining = len(sessions) - len(batch)
+    remaining = len(sessions) - inserted
     if remaining > 0:
         print(f"\n{remaining} sessions remaining. Run again to insert the next batch.")
 

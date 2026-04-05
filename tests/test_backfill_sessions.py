@@ -4,8 +4,6 @@ import os
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from scripts.core.backfill_sessions import (
     _build_session_info,
     _read_first_line,
@@ -24,7 +22,6 @@ from scripts.core.backfill_sessions import (
     select_batch,
     sort_sessions_by_mtime,
 )
-
 
 # --- get_pg_url ---
 
@@ -70,12 +67,16 @@ class TestNaiveDecodePath:
 
 class TestDecodeProjectPathPure:
     def test_uses_resolver_result_when_found(self):
-        resolver = lambda candidate: candidate == "/Users/stephenfeather/Dev/foo"
+        def resolver(candidate: str) -> bool:
+            return candidate == "/Users/stephenfeather/Dev/foo"
+
         result = decode_project_path_pure("-Users-stephenfeather-Dev-foo", resolver)
         assert result == "/Users/stephenfeather/Dev/foo"
 
     def test_falls_back_to_naive_when_resolver_finds_nothing(self):
-        resolver = lambda candidate: False  # nothing exists
+        def resolver(candidate: str) -> bool:
+            return False
+
         result = decode_project_path_pure("-Users-stephenfeather-Dev-foo", resolver)
         assert result == "/Users/stephenfeather/Dev/foo"
 
@@ -289,10 +290,8 @@ class TestReadFirstLine:
 
     def test_returns_empty_on_permission_error(self, tmp_path):
         p = tmp_path / "noperm.jsonl"
-        p.write_text("data")
-        p.chmod(0o000)
-        result = _read_first_line(p)
-        p.chmod(0o644)  # cleanup
+        with patch("builtins.open", side_effect=PermissionError("access denied")):
+            result = _read_first_line(p)
         assert result == ""
 
 
@@ -357,10 +356,8 @@ class TestFindUnregisteredSessions:
         config_dir = tmp_path / ".claude"
         proj_dir = config_dir / "projects" / "Users-foo-bar"
         proj_dir.mkdir(parents=True)
-        # subagent path
-        sub_dir = proj_dir / "subagents"
-        sub_dir.mkdir()
-        (sub_dir / "agent-xyz.jsonl").write_text('{"type": "assistant"}\n')
+        # agent- prefix at glob-matched depth (*/*.jsonl)
+        (proj_dir / "agent-xyz.jsonl").write_text('{"type": "assistant"}\n')
 
         mock_conn = MagicMock()
         mock_cur = MagicMock()
@@ -439,29 +436,46 @@ class TestInsertSessions:
              "size": 2048, "jsonl_path": "/tmp/bbb.jsonl"},
         ]
 
-    def test_dry_run_does_not_connect(self, capsys):
+    def test_dry_run_does_not_connect_and_returns_zero(self, capsys):
         sessions = self._sample_sessions()
         with patch("scripts.core.backfill_sessions.psycopg2") as mock_pg:
-            insert_sessions(sessions, dry_run=True)
+            result = insert_sessions(sessions, dry_run=True)
             mock_pg.connect.assert_not_called()
+        assert result == 0
         output = capsys.readouterr().out
         assert "Dry run" in output
         assert "aaa" in output
 
     @patch("scripts.core.backfill_sessions.psycopg2")
-    def test_inserts_records_with_savepoints(self, mock_pg):
+    def test_inserts_records_and_returns_count(self, mock_pg):
         sessions = self._sample_sessions()
         mock_conn = MagicMock()
         mock_cur = MagicMock()
+        mock_cur.rowcount = 1  # each INSERT actually inserts a row
         mock_conn.cursor.return_value = mock_cur
         mock_pg.connect.return_value = mock_conn
 
-        insert_sessions(sessions)
+        result = insert_sessions(sessions)
 
+        assert result == 2
         # Each row: SAVEPOINT + INSERT + RELEASE = 3 calls per row
         assert mock_cur.execute.call_count == 6
         mock_conn.commit.assert_called_once()
         mock_conn.close.assert_called_once()
+
+    @patch("scripts.core.backfill_sessions.psycopg2")
+    def test_on_conflict_do_nothing_does_not_increment(self, mock_pg):
+        """When ON CONFLICT fires, rowcount=0 and inserted should not increment."""
+        sessions = self._sample_sessions()[:1]
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_cur.rowcount = 0  # ON CONFLICT DO NOTHING — no row inserted
+        mock_conn.cursor.return_value = mock_cur
+        mock_pg.connect.return_value = mock_conn
+
+        result = insert_sessions(sessions)
+
+        assert result == 0
 
     @patch("scripts.core.backfill_sessions.psycopg2")
     def test_inserts_transcript_path_and_exited_at(self, mock_pg):
@@ -511,8 +525,8 @@ class TestInsertSessions:
         assert "Error" in output
 
     @patch("scripts.core.backfill_sessions.psycopg2")
-    def test_rollback_to_savepoint_on_error(self, mock_pg):
-        """After a failed INSERT, ROLLBACK TO SAVEPOINT is called so the txn stays valid."""
+    def test_rollback_and_release_savepoint_on_error(self, mock_pg):
+        """After a failed INSERT, ROLLBACK TO + RELEASE SAVEPOINT are called."""
         sessions = [self._sample_sessions()[0]]  # just one session
         mock_conn = MagicMock()
         mock_cur = MagicMock()
@@ -532,12 +546,17 @@ class TestInsertSessions:
 
         insert_sessions(sessions)
 
-        # After error: ROLLBACK TO SAVEPOINT should be called
+        # After error: ROLLBACK TO SAVEPOINT + RELEASE SAVEPOINT
         rollback_calls = [
             c for c in mock_cur.execute.call_args_list
             if "ROLLBACK TO SAVEPOINT" in str(c)
         ]
+        release_after_rollback = [
+            c for c in mock_cur.execute.call_args_list
+            if "RELEASE SAVEPOINT" in str(c)
+        ]
         assert len(rollback_calls) == 1
+        assert len(release_after_rollback) == 1
 
 
 # --- main (mocked I/O) ---
@@ -569,9 +588,9 @@ class TestMain:
         assert kwargs.get("dry_run") is True or mock_insert.call_args[0][1] is True
 
     @patch("scripts.core.backfill_sessions._bootstrap")
-    @patch("scripts.core.backfill_sessions.insert_sessions")
+    @patch("scripts.core.backfill_sessions.insert_sessions", return_value=2)
     @patch("scripts.core.backfill_sessions.find_unregistered_sessions")
-    def test_batch_size_limits_insertion(self, mock_find, mock_insert, mock_boot):
+    def test_batch_size_limits_insertion(self, mock_find, mock_insert, mock_boot, capsys):
         mock_find.return_value = [
             {"uuid": f"s{i}", "project": "/foo", "mtime": datetime(2026, 1, i + 1),
              "size": 100, "jsonl_path": f"/tmp/s{i}.jsonl"}
@@ -580,11 +599,13 @@ class TestMain:
         with patch("sys.argv", ["backfill_sessions.py", "--batch-size", "2"]):
             result = main()
         assert result == 0
-        inserted = mock_insert.call_args[0][0]
-        assert len(inserted) == 2
+        batch_passed = mock_insert.call_args[0][0]
+        assert len(batch_passed) == 2
+        output = capsys.readouterr().out
+        assert "3 sessions remaining" in output
 
     @patch("scripts.core.backfill_sessions._bootstrap")
-    @patch("scripts.core.backfill_sessions.insert_sessions")
+    @patch("scripts.core.backfill_sessions.insert_sessions", return_value=5)
     @patch("scripts.core.backfill_sessions.find_unregistered_sessions")
     def test_all_flag_inserts_everything(self, mock_find, mock_insert, mock_boot):
         mock_find.return_value = [
@@ -595,5 +616,5 @@ class TestMain:
         with patch("sys.argv", ["backfill_sessions.py", "--all"]):
             result = main()
         assert result == 0
-        inserted = mock_insert.call_args[0][0]
-        assert len(inserted) == 5
+        batch_passed = mock_insert.call_args[0][0]
+        assert len(batch_passed) == 5

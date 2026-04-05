@@ -258,7 +258,7 @@ class TestMarkArchivedInDb:
     def test_handles_db_error_gracefully(self, mock_pg, capsys):
         mock_pg.connect.side_effect = Exception("connection refused")
         result = mark_archived_in_db("sess-1", "s3://b/path", "postgresql://bad")
-        assert result == 0
+        assert result is None
         output = capsys.readouterr().out
         assert "postgresql://" not in output
         assert "Exception" in output
@@ -302,6 +302,22 @@ class TestFindArchivableJsonls:
         paths = [f["path"].name for f in result]
         assert "real.jsonl" in paths
         assert "link.jsonl" not in paths
+
+    def test_skips_symlinked_project_directory(self, tmp_path):
+        proj_dir = tmp_path / "projects" / "proj"
+        proj_dir.mkdir(parents=True)
+        (proj_dir / "real.jsonl").write_text('{"test": true}\n')
+
+        external_dir = tmp_path / "external"
+        external_dir.mkdir()
+        (external_dir / "stolen.jsonl").write_text('{"test": true}\n')
+        evil_link = tmp_path / "projects" / "evil"
+        evil_link.symlink_to(external_dir, target_is_directory=True)
+
+        result = find_archivable_jsonls(tmp_path)
+        paths = [f["path"].name for f in result]
+        assert "real.jsonl" in paths
+        assert "stolen.jsonl" not in paths
 
     def test_sorted_by_mtime(self, tmp_path):
         import os
@@ -429,7 +445,7 @@ class TestArchiveJsonl:
     @patch("scripts.core.backfill_archive.mark_archived_in_db", return_value=0)
     @patch("scripts.core.backfill_archive.upload_to_s3")
     @patch("scripts.core.backfill_archive.compress_file")
-    def test_db_failure_is_best_effort_after_upload(
+    def test_db_noop_is_best_effort_after_upload(
         self, mock_compress, mock_upload, mock_mark, tmp_path, capsys
     ):
         p = self._make_jsonl(tmp_path)
@@ -441,7 +457,24 @@ class TestArchiveJsonl:
         result = archive_jsonl(p, "my-bucket", self._cfg(), "postgresql://test")
 
         assert result is True  # S3 upload succeeded, DB is best-effort
-        assert "Warning: DB mark failed" in capsys.readouterr().out
+        assert "No DB row updated" in capsys.readouterr().out  # not tracked or archived
+
+    @patch("scripts.core.backfill_archive.mark_archived_in_db", return_value=None)
+    @patch("scripts.core.backfill_archive.upload_to_s3")
+    @patch("scripts.core.backfill_archive.compress_file")
+    def test_db_error_warns_after_upload(
+        self, mock_compress, mock_upload, mock_mark, tmp_path, capsys
+    ):
+        p = self._make_jsonl(tmp_path)
+        zst = p.with_suffix(".jsonl.zst")
+        zst.write_bytes(b"compressed")
+        mock_compress.return_value = MagicMock(returncode=0)
+        mock_upload.return_value = MagicMock(returncode=0)
+
+        result = archive_jsonl(p, "my-bucket", self._cfg(), "postgresql://test")
+
+        assert result is True
+        assert "Warning: DB error" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------
@@ -451,12 +484,10 @@ class TestArchiveJsonl:
 
 class TestMain:
     @patch("scripts.core.backfill_archive._bootstrap")
-    def test_no_bucket_returns_1(self, mock_boot, capsys):
-        with patch.dict("os.environ", {}, clear=False):
-            import os
-            os.environ.pop("CLAUDE_SESSION_ARCHIVE_BUCKET", None)
-            with patch("sys.argv", ["backfill_archive.py"]):
-                result = main()
+    def test_no_bucket_returns_1(self, mock_boot, capsys, monkeypatch):
+        monkeypatch.delenv("CLAUDE_SESSION_ARCHIVE_BUCKET", raising=False)
+        with patch("sys.argv", ["backfill_archive.py"]):
+            result = main()
         assert result == 1
         assert "CLAUDE_SESSION_ARCHIVE_BUCKET" in capsys.readouterr().out
 

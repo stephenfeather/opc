@@ -126,7 +126,7 @@ def mark_archived_in_db(
         updated = cur.rowcount
         if updated > 0:
             cur.execute(
-                "UPDATE archival_memory SET metadata = metadata || "
+                "UPDATE archival_memory SET metadata = COALESCE(metadata, '{}'::jsonb) || "
                 "jsonb_build_object('archive_path', %s) "
                 "WHERE session_id = %s AND (metadata->>'archive_path') IS NULL",
                 (archive_path, session_id),
@@ -135,7 +135,7 @@ def mark_archived_in_db(
         return updated
     except Exception as e:
         print(f"  DB error: {type(e).__name__}")
-        return 0
+        return None
     finally:
         if conn:
             conn.close()
@@ -146,18 +146,23 @@ def find_archivable_jsonls(config_dir: Path) -> list[dict]:
     projects_dir = config_dir / "projects"
     if not projects_dir.exists():
         return []
-    return sorted(
-        [
-            {
-                "path": f,
-                "mtime": datetime.fromtimestamp(f.stat().st_mtime),
-                "size": f.stat().st_size,
-            }
-            for f in projects_dir.glob("*/*.jsonl")
-            if not f.is_symlink()
-        ],
-        key=lambda x: x["mtime"],
-    )
+    resolved_root = projects_dir.resolve()
+    archivable = []
+    for f in projects_dir.glob("*/*.jsonl"):
+        if f.is_symlink():
+            continue
+        try:
+            f.resolve().relative_to(resolved_root)
+        except ValueError:
+            continue
+        try:
+            st = f.stat()
+        except FileNotFoundError:
+            continue
+        archivable.append(
+            {"path": f, "mtime": datetime.fromtimestamp(st.st_mtime), "size": st.st_size}
+        )
+    return sorted(archivable, key=lambda x: x["mtime"])
 
 
 def _safe_restore(zst_path: Path, timeout: int) -> bool:
@@ -208,8 +213,10 @@ def archive_jsonl(
         # DB mark is best-effort after successful S3 upload (matches daemon behavior)
         if db_url:
             db_result = mark_archived_in_db(session_id, s3_key, db_url)
-            if not db_result:
-                print(f"  Warning: DB mark failed for {session_id} (S3 upload succeeded)")
+            if db_result is None:
+                print(f"  Warning: DB error for {session_id} (S3 upload succeeded)")
+            elif db_result == 0:
+                print(f"  Note: No DB row updated for {session_id} (not tracked or archived)")
 
         print(f"  Archived {session_id} -> {s3_key}")
         return True
@@ -298,4 +305,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main() or 0)
+    sys.exit(main())

@@ -92,7 +92,7 @@ def test_popen_args_contain_dangerously_skip_permissions(
 @patch("scripts.core.memory_daemon._is_extraction_blocked", return_value=False)
 @patch("scripts.core.memory_daemon.mark_extracted")
 def test_invalid_model_rejects_and_skips_popen(
-    _mark, _blocked, mock_popen, tmp_jsonl
+    mock_mark, _blocked, mock_popen, tmp_jsonl
 ):
     """An extraction_model not in the allowlist must return False without calling Popen."""
     from scripts.core.memory_daemon import _daemon_cfg, extract_memories
@@ -107,6 +107,7 @@ def test_invalid_model_rejects_and_skips_popen(
 
     assert result is False
     mock_popen.assert_not_called()
+    mock_mark.assert_called_once_with("sess-3")
 
 
 @pytest.mark.parametrize("model", ["sonnet", "haiku", "opus"])

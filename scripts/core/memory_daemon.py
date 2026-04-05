@@ -631,6 +631,7 @@ Store each learning using store_learning.py with appropriate type and tags."""
                 f"Invalid extraction_model '{_daemon_cfg.extraction_model}', "
                 f"must be one of {sorted(_ALLOWED_EXTRACTION_MODELS)}"
             )
+            mark_extracted(session_id)
             return False
 
         env = os.environ.copy()

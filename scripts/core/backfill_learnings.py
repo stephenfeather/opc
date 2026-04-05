@@ -61,7 +61,7 @@ def parse_s3_listing(
 
     sessions: list[dict] = []
     for line in stdout.strip().splitlines():
-        parts = line.split()
+        parts = line.split(maxsplit=3)
         if len(parts) < 4:
             continue
         key = parts[3]
@@ -109,34 +109,34 @@ def build_extraction_cmd(
     ]
 
 
+_ALLOW_ENV_EXACT = frozenset({
+    "PATH", "HOME", "USER", "LANG", "TERM", "SHELL", "TMPDIR",
+    "PYTHONPATH", "VIRTUAL_ENV",
+})
+
 _ALLOW_ENV_PREFIXES = (
-    "PATH",
-    "HOME",
-    "USER",
-    "LANG",
     "LC_",
-    "TERM",
-    "SHELL",
-    "TMPDIR",
     "XDG_",
     "CLAUDE_",
     "UV_",
-    "PYTHONPATH",
-    "VIRTUAL_ENV",
 )
+
+
+def _is_env_allowed(key: str) -> bool:
+    """Check if an env var key is on the extraction allowlist."""
+    if key in _ALLOW_ENV_EXACT:
+        return True
+    return any(key.startswith(prefix) for prefix in _ALLOW_ENV_PREFIXES)
 
 
 def build_extraction_env(project_dir: str | None) -> dict[str, str]:
     """Build allowlisted environment dict for extraction subprocess.
 
-    Only passes env vars matching known-safe prefixes. This prevents
-    leaking DB credentials, API keys, or tokens to the LLM process.
+    Only passes env vars matching known-safe exact names or prefixes.
+    This prevents leaking DB credentials, API keys, or tokens to the
+    LLM process.
     """
-    env = {
-        k: v
-        for k, v in os.environ.items()
-        if any(k.startswith(prefix) for prefix in _ALLOW_ENV_PREFIXES)
-    }
+    env = {k: v for k, v in os.environ.items() if _is_env_allowed(k)}
     env["CLAUDE_MEMORY_EXTRACTION"] = "1"
     if project_dir:
         env["CLAUDE_PROJECT_DIR"] = project_dir
@@ -259,8 +259,12 @@ def _bootstrap() -> None:
         load_dotenv(opc_env, override=True)
 
 
-def list_s3_keys(bucket: str) -> str:
-    """Run ``aws s3 ls`` and return raw stdout. Returns empty string on error."""
+def list_s3_keys(bucket: str) -> str | None:
+    """Run ``aws s3 ls`` and return raw stdout.
+
+    Returns ``None`` on error (distinguishable from an empty archive
+    which returns ``""``).
+    """
     try:
         result = subprocess.run(
             ["aws", "s3", "ls", f"s3://{bucket}/sessions/", "--recursive"],
@@ -270,14 +274,14 @@ def list_s3_keys(bucket: str) -> str:
         )
         if result.returncode != 0:
             _log(f"S3 list failed: {result.stderr}")
-            return ""
+            return None
         return result.stdout
     except subprocess.TimeoutExpired:
         _log("S3 list timed out")
-        return ""
+        return None
     except FileNotFoundError:
         _log("ERROR: 'aws' CLI not found. Install AWS CLI to use S3 backfill.")
-        return ""
+        return None
 
 
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -442,9 +446,15 @@ def run_extraction(
 
 
 def load_agent_prompt(agent_file: Path | None = None) -> str:
-    """Load memory-extractor agent body, stripping YAML frontmatter."""
+    """Load memory-extractor agent body, stripping YAML frontmatter.
+
+    Checks the repo-local ``agents/`` directory first, then falls back
+    to ``~/.claude/agents/``.
+    """
     if agent_file is None:
-        agent_file = Path.home() / ".claude" / "agents" / "memory-extractor.md"
+        repo_file = Path(__file__).parent.parent.parent / "agents" / "memory-extractor.md"
+        home_file = Path.home() / ".claude" / "agents" / "memory-extractor.md"
+        agent_file = repo_file if repo_file.exists() else home_file
     if not agent_file.exists():
         return "Extract learnings from this session. Store each with store_learning.py."
     content = agent_file.read_text()
@@ -534,6 +544,9 @@ def main() -> int:
 
     # List and parse S3 sessions
     raw_listing = list_s3_keys(bucket)
+    if raw_listing is None:
+        _log("ERROR: Failed to list S3 sessions")
+        return 1
     sessions = parse_s3_listing(raw_listing, bucket, args.project or None)
     _log(f"Found {len(sessions)} archived sessions")
 

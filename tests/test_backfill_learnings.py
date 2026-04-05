@@ -206,6 +206,8 @@ class TestBuildExtractionEnv:
                 "POSTGRES_URL": "pg://creds2",
                 "GITHUB_TOKEN": "tok",
                 "PGPASSWORD": "pass",
+                "LANGSMITH_API_KEY": "ls",
+                "USER_TOKEN": "ut",
                 "PATH": "/usr/bin",
                 "HOME": "/home/test",
                 "CLAUDE_CONFIG_DIR": "/tmp/claude",
@@ -221,7 +223,10 @@ class TestBuildExtractionEnv:
             assert "POSTGRES_URL" not in env
             assert "GITHUB_TOKEN" not in env
             assert "PGPASSWORD" not in env
-            # Safe keys included (in allowlist)
+            # Prefix-like names that aren't exact matches are excluded
+            assert "LANGSMITH_API_KEY" not in env
+            assert "USER_TOKEN" not in env
+            # Safe exact-match keys included
             assert env["PATH"] == "/usr/bin"
             assert env["HOME"] == "/home/test"
             assert env["CLAUDE_CONFIG_DIR"] == "/tmp/claude"
@@ -370,24 +375,24 @@ class TestListS3Keys:
         mock_sub.run.assert_called_once()
 
     @patch("scripts.core.backfill_learnings.subprocess")
-    def test_failure_returns_empty(self, mock_sub):
+    def test_failure_returns_none(self, mock_sub):
         mock_sub.run.return_value = MagicMock(returncode=1, stderr="access denied")
         result = list_s3_keys("my-bucket")
-        assert result == ""
+        assert result is None
 
     @patch("scripts.core.backfill_learnings.subprocess")
-    def test_timeout_returns_empty(self, mock_sub):
+    def test_timeout_returns_none(self, mock_sub):
         mock_sub.run.side_effect = subprocess.TimeoutExpired(cmd="aws", timeout=60)
         mock_sub.TimeoutExpired = subprocess.TimeoutExpired
         result = list_s3_keys("my-bucket")
-        assert result == ""
+        assert result is None
 
     @patch("scripts.core.backfill_learnings.subprocess")
-    def test_missing_aws_cli(self, mock_sub):
+    def test_missing_aws_cli_returns_none(self, mock_sub):
         mock_sub.run.side_effect = FileNotFoundError("aws")
         mock_sub.TimeoutExpired = subprocess.TimeoutExpired
         result = list_s3_keys("my-bucket")
-        assert result == ""
+        assert result is None
 
 
 class TestLookupSessionId:

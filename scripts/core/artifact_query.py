@@ -20,6 +20,7 @@ import faulthandler
 import hashlib
 import json
 import os
+import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -44,6 +45,31 @@ def _enable_faulthandler() -> None:
         faulthandler.enable(file=_faulthandler_file, all_threads=True)
     except OSError:
         pass  # Best-effort: crash logging is not critical
+
+
+# ---------------------------------------------------------------------------
+# Path safety (pure)
+# ---------------------------------------------------------------------------
+
+_SESSION_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+def _is_safe_path(file_path: Path, base: Path | None = None) -> bool:
+    """Check that resolved file_path is under the allowed base directory."""
+    base = (base or Path.cwd()).resolve()
+    try:
+        resolved = file_path.resolve()
+        return resolved == base or str(resolved).startswith(str(base) + os.sep)
+    except (OSError, ValueError):
+        return False
+
+
+def _safe_read_text(path: Path) -> str | None:
+    """Read text from path, returning None on I/O or encoding errors."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +439,10 @@ def search_dispatch(
 
 
 def handle_span_id_lookup(
-    conn: sqlite3.Connection, span_id: str, with_content: bool = False
+    conn: sqlite3.Connection,
+    span_id: str,
+    with_content: bool = False,
+    allowed_base: Path | None = None,
 ) -> dict | None:
     """Handle --by-span-id lookup mode.
 
@@ -421,6 +450,7 @@ def handle_span_id_lookup(
         conn: Database connection
         span_id: Braintrust root_span_id to look up
         with_content: Whether to include full file content
+        allowed_base: Root directory for path-traversal checks (defaults to cwd)
 
     Returns:
         Handoff dict or None if not found
@@ -432,8 +462,10 @@ def handle_span_id_lookup(
 
     if with_content and handoff.get("file_path"):
         file_path = Path(handoff["file_path"])
-        if file_path.exists():
-            handoff["content"] = file_path.read_text()
+        if file_path.exists() and _is_safe_path(file_path, base=allowed_base):
+            content = _safe_read_text(file_path)
+            if content is not None:
+                handoff["content"] = content
 
         session_name = handoff.get("session_name")
         if not session_name and handoff.get("file_path"):
@@ -443,15 +475,17 @@ def handle_span_id_lookup(
                 if idx + 1 < len(parts):
                     session_name = parts[idx + 1]
 
-        if session_name:
+        if session_name and _SESSION_NAME_RE.match(session_name):
             ledger_path = Path(f"CONTINUITY_CLAUDE-{session_name}.md")
-            if ledger_path.exists():
-                ledger = {
-                    "session_name": session_name,
-                    "file_path": str(ledger_path),
-                    "content": ledger_path.read_text(),
-                }
-                handoff["ledger"] = ledger
+            if ledger_path.exists() and _is_safe_path(ledger_path, base=allowed_base):
+                content = _safe_read_text(ledger_path)
+                if content is not None:
+                    ledger = {
+                        "session_name": session_name,
+                        "file_path": str(ledger_path),
+                        "content": content,
+                    }
+                    handoff["ledger"] = ledger
             else:
                 ledger = get_ledger_for_session(conn, session_name)
                 if ledger:
@@ -482,7 +516,7 @@ def save_query(
         now: Timestamp override for testability (defaults to datetime.now())
     """
     timestamp = now or datetime.now()
-    query_id = hashlib.md5(
+    query_id = hashlib.sha256(
         f"{question}{timestamp.isoformat()}".encode()
     ).hexdigest()[:12]
 

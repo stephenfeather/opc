@@ -2,6 +2,7 @@
 
 Tests cover:
 - Pure functions: escape_fts5_query, format_result_section, formatters, format_results
+- Path safety: _is_safe_path, _safe_read_text, _SESSION_NAME_RE
 - DB search functions: search_handoffs, search_plans, search_continuity, search_past_queries
 - DB lookup functions: get_handoff_by_span_id, get_ledger_for_session
 - Dispatch: search_dispatch
@@ -16,8 +17,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-
-_SCHEMA_PATH = Path(__file__).resolve().parent.parent / "scripts" / "core" / "artifact_schema.sql"
 
 from scripts.core.artifact_query import (
     STATUS_ICONS,
@@ -40,6 +39,8 @@ from scripts.core.artifact_query import (
     search_plans,
 )
 
+_SCHEMA_PATH = Path(__file__).resolve().parent.parent / "scripts" / "core" / "artifact_schema.sql"
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -50,10 +51,16 @@ from scripts.core.artifact_query import (
 def db_conn():
     """In-memory SQLite database using the production artifact schema."""
     conn = sqlite3.connect(":memory:")
-    schema_sql = _SCHEMA_PATH.read_text()
-    conn.executescript(schema_sql)
-    yield conn
-    conn.close()
+    try:
+        schema_sql = _SCHEMA_PATH.read_text()
+        conn.executescript(schema_sql)
+        yield conn
+    finally:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        conn.close()
 
 
 @pytest.fixture
@@ -602,7 +609,9 @@ class TestHandleSpanIdLookup:
         )
         populated_db.commit()
 
-        result = handle_span_id_lookup(populated_db, "span-abc123", with_content=True)
+        result = handle_span_id_lookup(
+            populated_db, "span-abc123", with_content=True, allowed_base=tmp_path,
+        )
         assert result is not None
         assert result["content"] == "handoff content here"
 
@@ -701,3 +710,64 @@ class TestMain:
 
         captured = capsys.readouterr()
         assert "Database not found" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Path safety tests
+# ---------------------------------------------------------------------------
+
+
+class TestPathSafety:
+    """Tests for _is_safe_path, _safe_read_text, _SESSION_NAME_RE."""
+
+    def test_safe_path_under_base(self, tmp_path):
+        from scripts.core.artifact_query import _is_safe_path
+
+        child = tmp_path / "thoughts" / "file.md"
+        child.parent.mkdir(parents=True, exist_ok=True)
+        child.touch()
+        assert _is_safe_path(child, base=tmp_path) is True
+
+    def test_unsafe_path_outside_base(self, tmp_path):
+        from scripts.core.artifact_query import _is_safe_path
+
+        outside = tmp_path.parent / "etc" / "passwd"
+        assert _is_safe_path(outside, base=tmp_path) is False
+
+    def test_traversal_path_blocked(self, tmp_path):
+        from scripts.core.artifact_query import _is_safe_path
+
+        traversal = tmp_path / "thoughts" / ".." / ".." / "etc" / "passwd"
+        assert _is_safe_path(traversal, base=tmp_path) is False
+
+    def test_base_itself_is_safe(self, tmp_path):
+        from scripts.core.artifact_query import _is_safe_path
+
+        assert _is_safe_path(tmp_path, base=tmp_path) is True
+
+    def test_session_name_regex_valid(self):
+        from scripts.core.artifact_query import _SESSION_NAME_RE
+
+        assert _SESSION_NAME_RE.match("my-session_123") is not None
+
+    def test_session_name_regex_traversal(self):
+        from scripts.core.artifact_query import _SESSION_NAME_RE
+
+        assert _SESSION_NAME_RE.match("../../etc/passwd") is None
+
+    def test_session_name_regex_spaces(self):
+        from scripts.core.artifact_query import _SESSION_NAME_RE
+
+        assert _SESSION_NAME_RE.match("name with spaces") is None
+
+    def test_safe_read_text_present(self, tmp_path):
+        from scripts.core.artifact_query import _safe_read_text
+
+        f = tmp_path / "test.txt"
+        f.write_text("hello", encoding="utf-8")
+        assert _safe_read_text(f) == "hello"
+
+    def test_safe_read_text_missing(self, tmp_path):
+        from scripts.core.artifact_query import _safe_read_text
+
+        assert _safe_read_text(tmp_path / "nonexistent.txt") is None

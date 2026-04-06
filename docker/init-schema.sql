@@ -113,6 +113,7 @@ CREATE INDEX IF NOT EXISTS idx_memory_tags_memory_id ON memory_tags(memory_id);
 CREATE TABLE IF NOT EXISTS handoffs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     session_name TEXT NOT NULL,
+    session_uuid TEXT,
     file_path TEXT UNIQUE NOT NULL,
     format TEXT DEFAULT 'yaml',
     session_id TEXT,
@@ -132,6 +133,7 @@ CREATE TABLE IF NOT EXISTS handoffs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_handoffs_session ON handoffs(session_name);
+CREATE INDEX IF NOT EXISTS idx_handoffs_session_uuid ON handoffs(session_uuid);
 CREATE INDEX IF NOT EXISTS idx_handoffs_session_id ON handoffs(session_id);
 CREATE INDEX IF NOT EXISTS idx_handoffs_root_span ON handoffs(root_span_id);
 CREATE INDEX IF NOT EXISTS idx_handoffs_created ON handoffs(created_at DESC);

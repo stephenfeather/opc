@@ -14,6 +14,7 @@
 CREATE TABLE IF NOT EXISTS handoffs (
     id TEXT PRIMARY KEY,
     session_name TEXT NOT NULL,
+    session_uuid TEXT,
     task_number INTEGER,
     file_path TEXT NOT NULL,
 

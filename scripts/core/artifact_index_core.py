@@ -287,10 +287,11 @@ def adapt_for_postgres(sql: str, params: tuple, table_hint: str) -> tuple:
     if "INTO handoffs" in sql or table_hint == "handoffs":
         sql = """
             INSERT INTO handoffs
-            (id, session_name, file_path, goal, what_worked, what_failed,
-             key_decisions, outcome, root_span_id, session_id)
-            VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            (id, session_name, session_uuid, file_path, goal, what_worked,
+             what_failed, key_decisions, outcome, root_span_id, session_id)
+            VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (file_path) DO UPDATE SET
+                session_uuid = COALESCE(EXCLUDED.session_uuid, handoffs.session_uuid),
                 goal = EXCLUDED.goal,
                 what_worked = EXCLUDED.what_worked,
                 what_failed = EXCLUDED.what_failed,
@@ -300,17 +301,18 @@ def adapt_for_postgres(sql: str, params: tuple, table_hint: str) -> tuple:
                 session_id = EXCLUDED.session_id,
                 indexed_at = NOW()
         """
-        if len(params) == 15:
+        if len(params) == 16:
             params = (
                 params[1],   # session_name
-                params[3],   # file_path
-                params[4],   # task_summary -> goal
-                params[5],   # what_worked
-                params[6],   # what_failed
-                params[7],   # key_decisions
-                params[9],   # outcome
-                params[10],  # root_span_id
-                params[12],  # session_id
+                params[2],   # session_uuid
+                params[4],   # file_path
+                params[5],   # task_summary -> goal
+                params[6],   # what_worked
+                params[7],   # what_failed
+                params[8],   # key_decisions
+                params[10],  # outcome
+                params[11],  # root_span_id
+                params[13],  # session_id
             )
         return sql, params
 
@@ -420,8 +422,9 @@ def parse_handoff_yaml_content(raw_content: str, file_path) -> dict:
     file_id = generate_file_id(str(file_path))
 
     session_name = frontmatter.get("session", "")
+    _, session_uuid = extract_session_info(file_path)
     if not session_name:
-        session_name, _ = extract_session_info(file_path)
+        session_name, session_uuid = extract_session_info(file_path)
 
     # Build task summary from done_this_session
     done_items = data.get("done_this_session", [])
@@ -480,7 +483,7 @@ def parse_handoff_yaml_content(raw_content: str, file_path) -> dict:
     return {
         "id": file_id,
         "session_name": session_name,
-        "session_uuid": None,
+        "session_uuid": session_uuid,
         "task_number": None,
         "file_path": str(file_path),
         "task_summary": task_summary,

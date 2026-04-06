@@ -338,28 +338,48 @@ class TestAdaptForPostgres:
         assert new_params == ("id1", "name1")
 
     def test_handoffs_table_rewrite(self):
-        # 15 params for handoffs insert
-        params = tuple(f"val{i}" for i in range(15))
+        # 16 params for handoffs insert (includes session_uuid)
+        params = tuple(f"val{i}" for i in range(16))
         sql = "INSERT INTO handoffs (col) VALUES (?)"
         new_sql, new_params = adapt_for_postgres(sql, params, "handoffs")
         assert "gen_random_uuid()" in new_sql
         assert "ON CONFLICT" in new_sql
-        assert len(new_params) == 9  # reordered to 9 params
+        assert len(new_params) == 10  # reordered to 10 params (added session_uuid)
 
     def test_handoffs_param_reorder(self):
         # Verify specific param positions are mapped correctly
-        params = tuple(f"p{i}" for i in range(15))
+        # SQLite column order (16 params):
+        #   0=id, 1=session_name, 2=session_uuid, 3=task_number, 4=file_path,
+        #   5=task_summary, 6=what_worked, 7=what_failed, 8=key_decisions,
+        #   9=files_modified, 10=outcome, 11=root_span_id, 12=turn_span_id,
+        #   13=session_id, 14=braintrust_session_id, 15=created_at
+        params = tuple(f"p{i}" for i in range(16))
         sql = "INSERT INTO handoffs (col) VALUES (?)"
         _, new_params = adapt_for_postgres(sql, params, "handoffs")
         assert new_params[0] == "p1"   # session_name
-        assert new_params[1] == "p3"   # file_path
-        assert new_params[2] == "p4"   # task_summary -> goal
-        assert new_params[3] == "p5"   # what_worked
-        assert new_params[4] == "p6"   # what_failed
-        assert new_params[5] == "p7"   # key_decisions
-        assert new_params[6] == "p9"   # outcome
-        assert new_params[7] == "p10"  # root_span_id
-        assert new_params[8] == "p12"  # session_id
+        assert new_params[1] == "p2"   # session_uuid
+        assert new_params[2] == "p4"   # file_path
+        assert new_params[3] == "p5"   # task_summary -> goal
+        assert new_params[4] == "p6"   # what_worked
+        assert new_params[5] == "p7"   # what_failed
+        assert new_params[6] == "p8"   # key_decisions
+        assert new_params[7] == "p10"  # outcome
+        assert new_params[8] == "p11"  # root_span_id
+        assert new_params[9] == "p13"  # session_id
+
+    def test_handoffs_session_uuid_in_sql(self):
+        """session_uuid column appears in the PG INSERT and ON CONFLICT UPDATE."""
+        params = tuple(f"val{i}" for i in range(16))
+        sql = "INSERT INTO handoffs (col) VALUES (?)"
+        new_sql, _ = adapt_for_postgres(sql, params, "handoffs")
+        assert "session_uuid" in new_sql
+
+    def test_handoffs_coalesce_preserves_existing_uuid(self):
+        """ON CONFLICT uses COALESCE so NULL incoming doesn't clobber existing."""
+        params = tuple(f"val{i}" for i in range(16))
+        sql = "INSERT INTO handoffs (col) VALUES (?)"
+        new_sql, _ = adapt_for_postgres(sql, params, "handoffs")
+        assert "COALESCE(EXCLUDED.session_uuid, handoffs.session_uuid)" in new_sql
 
     def test_insert_or_replace_converts(self):
         sql = "INSERT OR REPLACE INTO plans (id, name) VALUES (?, ?)"
@@ -616,6 +636,33 @@ class TestParseHandoffYamlContent:
         path = Path("thoughts/shared/handoffs/test/h.yaml")
         result = parse_handoff_yaml_content(content, path)
         assert result["outcome"] == "FAILED"
+
+    def test_uuid_in_yaml_path(self):
+        content = "---\nsession: auth-refactor\nstatus: SUCCEEDED\n---\ngoal: stuff"
+        path = Path("thoughts/shared/handoffs/auth-refactor-aabb1122/handoff.yaml")
+        result = parse_handoff_yaml_content(content, path)
+        assert result["session_uuid"] == "aabb1122"
+        assert result["session_name"] == "auth-refactor"
+
+    def test_uuid_from_path_when_no_frontmatter_session(self):
+        content = "---\nstatus: SUCCESS\n---\ngoal: stuff"
+        path = Path("thoughts/shared/handoffs/my-task-deadbeef/handoff.yaml")
+        result = parse_handoff_yaml_content(content, path)
+        assert result["session_uuid"] == "deadbeef"
+        assert result["session_name"] == "my-task"
+
+    def test_no_uuid_in_path_gives_none(self):
+        content = "---\nsession: plain-sess\nstatus: SUCCESS\n---\ngoal: stuff"
+        path = Path("thoughts/shared/handoffs/plain-sess/handoff.yaml")
+        result = parse_handoff_yaml_content(content, path)
+        assert result["session_uuid"] is None
+
+    def test_auto_handoff_session_uuid_is_none(self):
+        """Auto-generated handoffs use auto/<session_id>.yaml — no dir UUID."""
+        content = "---\nsession: auto-sess\nstatus: SUCCESS\n---\ngoal: stuff"
+        path = Path("thoughts/shared/handoffs/auto/abc123.yaml")
+        result = parse_handoff_yaml_content(content, path)
+        assert result["session_uuid"] is None
 
 
 # =============================================================================

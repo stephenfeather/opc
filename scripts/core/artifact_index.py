@@ -120,6 +120,10 @@ def init_sqlite(db_path: Path) -> sqlite3.Connection:
     schema_path = Path(__file__).parent / "artifact_schema.sql"
     if schema_path.exists():
         conn.executescript(schema_path.read_text())
+    # Idempotent migration for existing databases missing session_uuid
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(handoffs)").fetchall()}
+    if "session_uuid" not in cols:
+        conn.execute("ALTER TABLE handoffs ADD COLUMN session_uuid TEXT")
     return conn
 
 
@@ -143,6 +147,7 @@ def init_postgres():
         CREATE TABLE IF NOT EXISTS handoffs (
             id TEXT PRIMARY KEY,
             session_name TEXT,
+            session_uuid TEXT,
             task_number INTEGER,
             file_path TEXT,
             task_summary TEXT,
@@ -160,6 +165,14 @@ def init_postgres():
             indexed_at TIMESTAMP DEFAULT NOW(),
             goal TEXT
         )
+    """)
+
+    # Idempotent migration for existing databases missing session_uuid
+    cur.execute("""
+        ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS session_uuid TEXT
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_handoffs_session_uuid ON handoffs(session_uuid)
     """)
 
     # Create plans table if not exists
@@ -331,33 +344,7 @@ def index_handoffs(conn, base_path: Path = Path("thoughts/shared/handoffs")):
                 data = parse_handoff_yaml(handoff_file)
             else:
                 data = parse_handoff(handoff_file)
-            db_execute(
-                conn,
-                """
-                INSERT OR REPLACE INTO handoffs
-                (id, session_name, task_number, file_path, task_summary, what_worked,
-                 what_failed, key_decisions, files_modified, outcome,
-                 root_span_id, turn_span_id, session_id, braintrust_session_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-                (
-                    data["id"],
-                    data["session_name"],
-                    data["task_number"],
-                    data["file_path"],
-                    data["task_summary"],
-                    data["what_worked"],
-                    data["what_failed"],
-                    data["key_decisions"],
-                    data["files_modified"],
-                    data["outcome"],
-                    data["root_span_id"],
-                    data["turn_span_id"],
-                    data["session_id"],
-                    data["braintrust_session_id"],
-                    data["created_at"],
-                ),
-            )
+            _index_handoff(conn, data)
             count += 1
         except Exception as e:
             print(f"Error indexing {handoff_file}: {e}")
@@ -456,14 +443,15 @@ def _index_handoff(conn, data: dict) -> None:
         conn,
         """
         INSERT OR REPLACE INTO handoffs
-        (id, session_name, task_number, file_path, task_summary, what_worked,
-         what_failed, key_decisions, files_modified, outcome,
+        (id, session_name, session_uuid, task_number, file_path, task_summary,
+         what_worked, what_failed, key_decisions, files_modified, outcome,
          root_span_id, turn_span_id, session_id, braintrust_session_id, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """,
         (
             data["id"],
             data["session_name"],
+            data["session_uuid"],
             data["task_number"],
             data["file_path"],
             data["task_summary"],

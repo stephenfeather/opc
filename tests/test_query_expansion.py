@@ -214,6 +214,43 @@ class TestIDFIndex:
         assert "authentication" in index.word_df
         assert index.word_df["authentication"] == 1
 
+    async def test_build_idf_index_streams_without_buffering(self):
+        """Regression: build_idf_index must fold each row incrementally,
+        not buffer the entire corpus into a list first."""
+        consumed_count = 0
+
+        class StreamingCursor:
+            """Cursor that tracks consumption order."""
+
+            def __init__(self):
+                self._items = [
+                    {"content": f"document number {i} with unique content"} for i in range(100)
+                ]
+                self._idx = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                nonlocal consumed_count
+                if self._idx >= len(self._items):
+                    raise StopAsyncIteration
+                item = self._items[self._idx]
+                self._idx += 1
+                consumed_count += 1
+                return item
+
+        mock_pool, _ = _make_pool_and_conn(
+            cursor=MagicMock(return_value=StreamingCursor()),
+        )
+
+        with patch("scripts.core.db.postgres_pool.get_pool", return_value=mock_pool):
+            with patch("scripts.core.query_expansion.save_idf_index"):  # noqa: SIM117
+                index = await build_idf_index()
+
+        assert index.doc_count == 100
+        assert consumed_count == 100
+
     async def test_get_idf_index_caches(self, tmp_path: Path):
         """Second call uses cached index when fresh."""
         path = tmp_path / "idf.json"
@@ -469,6 +506,32 @@ class TestFormatTsquery:
 
         result = _format_tsquery([], [])
         assert result == ""
+
+
+class TestFoldDocument:
+    def test_folds_single_document(self):
+        from scripts.core.query_expansion import _fold_document
+
+        word_df, count = _fold_document({}, 0, "authentication tokens important")
+        assert count == 1
+        assert "authentication" in word_df
+        assert "tokens" in word_df
+
+    def test_folds_incrementally(self):
+        from scripts.core.query_expansion import _fold_document
+
+        word_df, count = _fold_document({}, 0, "authentication tokens")
+        word_df, count = _fold_document(word_df, count, "tokens expire")
+        assert count == 2
+        assert word_df["tokens"] == 2
+        assert word_df["authentication"] == 1
+
+    def test_deduplicates_within_document(self):
+        from scripts.core.query_expansion import _fold_document
+
+        word_df, count = _fold_document({}, 0, "tokens tokens tokens")
+        assert count == 1
+        assert word_df["tokens"] == 1
 
 
 class TestComputeWordDf:

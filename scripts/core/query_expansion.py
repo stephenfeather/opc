@@ -94,17 +94,29 @@ def _compute_neighbor_df(contents: Iterable[str]) -> dict[str, int]:
     return df
 
 
+def _fold_document(
+    word_df: dict[str, int], doc_count: int, text: str
+) -> tuple[dict[str, int], int]:
+    """Fold a single document into the word-DF accumulator.
+
+    Returns updated (word_df, doc_count). The caller's dict is mutated
+    for efficiency on large corpora, but the return value is canonical.
+    """
+    for w in set(_tokenize(text)):
+        word_df[w] = word_df.get(w, 0) + 1
+    return word_df, doc_count + 1
+
+
 def _compute_word_df(documents: Iterable[str]) -> tuple[dict[str, int], int]:
     """Compute corpus-wide word document frequency.
 
-    Returns (word_df dict, document count).
+    Returns (word_df dict, document count). Delegates to _fold_document
+    for each document.
     """
     word_df: dict[str, int] = {}
     doc_count = 0
     for text in documents:
-        doc_count += 1
-        for w in set(_tokenize(text)):
-            word_df[w] = word_df.get(w, 0) + 1
+        word_df, doc_count = _fold_document(word_df, doc_count, text)
     return word_df, doc_count
 
 
@@ -222,12 +234,14 @@ def load_idf_index(path: Path | None = None) -> IDFIndex | None:
 async def build_idf_index(path: Path | None = None) -> IDFIndex:
     """Build IDF index from all active learnings in the database.
 
-    Streams rows via cursor, delegates counting to _compute_word_df.
+    Streams rows via cursor, folding each document into the DF accumulator
+    without buffering the full corpus in memory.
     """
     from scripts.core.db.postgres_pool import get_pool
 
     pool = await get_pool()
-    documents: list[str] = []
+    word_df: dict[str, int] = {}
+    doc_count = 0
 
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -238,9 +252,7 @@ async def build_idf_index(path: Path | None = None) -> IDFIndex:
                 AND superseded_by IS NULL
                 """
             ):
-                documents.append(row["content"])
-
-    word_df, doc_count = _compute_word_df(documents)
+                word_df, doc_count = _fold_document(word_df, doc_count, row["content"])
 
     index = IDFIndex(
         word_df=word_df,

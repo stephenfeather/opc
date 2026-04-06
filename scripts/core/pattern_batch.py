@@ -61,18 +61,27 @@ def parse_learning_row(row: dict, *, expected_dim: int = EXPECTED_EMBEDDING_DIM)
 
     Pure function: no I/O, no mutation, deterministic for a given row.
     Rejects rows with missing timestamps or wrong-dimension embeddings.
+    Returns None (never raises) on malformed data.
     """
     raw = row["metadata"]
-    meta = raw if isinstance(raw, dict) else json.loads(raw or "{}")
+    try:
+        meta = raw if isinstance(raw, dict) else json.loads(raw or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(meta, dict):
+        return None
 
     emb = row["embedding"]
-    if isinstance(emb, str):
-        emb = np.fromstring(emb.strip("[]"), sep=",", dtype=np.float32)
-    elif isinstance(emb, (list, tuple)):
-        emb = np.array(emb, dtype=np.float32)
-    elif isinstance(emb, np.ndarray):
-        emb = emb.astype(np.float32)
-    else:
+    try:
+        if isinstance(emb, str):
+            emb = np.fromstring(emb.strip("[]"), sep=",", dtype=np.float32)
+        elif isinstance(emb, (list, tuple)):
+            emb = np.array(emb, dtype=np.float32)
+        elif isinstance(emb, np.ndarray):
+            emb = emb.astype(np.float32)
+        else:
+            return None
+    except (TypeError, ValueError):
         return None
 
     if len(emb) != expected_dim:
@@ -110,7 +119,7 @@ def merge_tags(
             merged = list(dict.fromkeys(lrn.tags + extra))
             result.append(replace(lrn, tags=merged))
         else:
-            result.append(replace(lrn))
+            result.append(replace(lrn, tags=list(lrn.tags)))
     return result
 
 
@@ -370,7 +379,7 @@ async def write_patterns(
 # ---------------------------------------------------------------------------
 
 
-async def get_last_run_report(pool) -> str | None:
+async def get_last_run_report(pool) -> str:
     """Generate a report from the most recent detection run."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow(

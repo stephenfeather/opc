@@ -210,6 +210,24 @@ class TestParseLearningRow:
         result = parse_learning_row(row)
         assert result is None
 
+    def test_returns_none_for_non_numeric_embedding_list(self):
+        row = _make_db_row()
+        row["embedding"] = ["not", "numbers"]
+        result = parse_learning_row(row)
+        assert result is None
+
+    def test_returns_none_for_scalar_metadata(self):
+        row = _make_db_row()
+        row["metadata"] = 42  # scalar, not dict or string
+        result = parse_learning_row(row)
+        assert result is None
+
+    def test_returns_none_for_malformed_json_metadata(self):
+        row = _make_db_row()
+        row["metadata"] = "{invalid json"
+        result = parse_learning_row(row)
+        assert result is None
+
     def test_uses_row_session_id_when_metadata_key_missing(self):
         row = _make_db_row()
         del row["metadata"]["session_id"]
@@ -304,6 +322,14 @@ class TestMergeTags:
     def test_handles_empty_learnings(self):
         result = merge_tags([], {"some-id": ["tag"]})
         assert result == []
+
+    def test_else_branch_isolates_tags_list(self):
+        """Even without DB tags, the returned tags list is a separate copy."""
+        learnings = [_make_learning(tags=["original"])]
+        result = merge_tags(learnings, {})
+
+        result[0].tags.append("mutated")
+        assert "mutated" not in learnings[0].tags
 
 
 # ---------------------------------------------------------------------------
@@ -745,6 +771,8 @@ class TestRunPatternDetection:
         assert "rejected" in result["error"].lower()
         assert result["rejected_count"] == 3
         # write_patterns should NOT have been called (no supersede)
+        assert conn.execute.call_count == 0
+        assert conn.fetchval.call_count == 0
         assert conn.executemany.call_count == 0
 
     @pytest.mark.asyncio
@@ -767,4 +795,6 @@ class TestRunPatternDetection:
         assert result["rejected_count"] == 2
         assert result["learnings_parsed"] == 5
         # write_patterns should NOT have been called
+        assert conn.execute.call_count == 0
+        assert conn.fetchval.call_count == 0
         assert conn.executemany.call_count == 0

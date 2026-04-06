@@ -301,19 +301,22 @@ def adapt_for_postgres(sql: str, params: tuple, table_hint: str) -> tuple:
                 session_id = EXCLUDED.session_id,
                 indexed_at = NOW()
         """
-        if len(params) == 16:
-            params = (
-                params[1],   # session_name
-                params[2],   # session_uuid
-                params[4],   # file_path
-                params[5],   # task_summary -> goal
-                params[6],   # what_worked
-                params[7],   # what_failed
-                params[8],   # key_decisions
-                params[10],  # outcome
-                params[11],  # root_span_id
-                params[13],  # session_id
+        if len(params) != 16:
+            raise ValueError(
+                f"Expected 16 handoff params for PostgreSQL adaptation, got {len(params)}"
             )
+        params = (
+            params[1],   # session_name
+            params[2],   # session_uuid
+            params[4],   # file_path
+            params[5],   # task_summary -> goal
+            params[6],   # what_worked
+            params[7],   # what_failed
+            params[8],   # key_decisions
+            params[10],  # outcome
+            params[11],  # root_span_id
+            params[13],  # session_id
+        )
         return sql, params
 
     if "INSERT OR REPLACE INTO" in sql:

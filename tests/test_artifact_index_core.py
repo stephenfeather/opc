@@ -381,6 +381,14 @@ class TestAdaptForPostgres:
         new_sql, _ = adapt_for_postgres(sql, params, "handoffs")
         assert "COALESCE(EXCLUDED.session_uuid, handoffs.session_uuid)" in new_sql
 
+    def test_handoffs_wrong_param_count_raises(self):
+        """Fail fast when handoff params tuple has unexpected length."""
+        import pytest
+        params = tuple(f"val{i}" for i in range(15))  # wrong count
+        sql = "INSERT INTO handoffs (col) VALUES (?)"
+        with pytest.raises(ValueError, match="Expected 16 handoff params"):
+            adapt_for_postgres(sql, params, "handoffs")
+
     def test_insert_or_replace_converts(self):
         sql = "INSERT OR REPLACE INTO plans (id, name) VALUES (?, ?)"
         new_sql, _ = adapt_for_postgres(sql, ("id1", "name1"), "plans")

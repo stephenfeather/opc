@@ -52,7 +52,8 @@ def db_conn():
     conn = sqlite3.connect(":memory:")
     schema_sql = _SCHEMA_PATH.read_text()
     conn.executescript(schema_sql)
-    return conn
+    yield conn
+    conn.close()
 
 
 @pytest.fixture
@@ -631,14 +632,19 @@ class TestHandleSpanIdLookup:
 class TestMain:
     """Tests for main() CLI entry point."""
 
+    @pytest.fixture(autouse=True)
+    def _patch_faulthandler(self):
+        """Prevent main() from writing to ~/.claude/logs during tests."""
+        with patch("scripts.core.artifact_query._enable_faulthandler"):
+            yield
+
     def test_no_args_prints_help(self, capsys):
         from scripts.core.artifact_query import main
 
         with patch("sys.argv", ["artifact_query.py"]):
             main()
         captured = capsys.readouterr()
-        # No query and no --by-span-id prints help
-        assert "Search the Context Graph" in captured.out or captured.out == ""
+        assert "Search the Context Graph" in captured.out
 
     def test_by_span_id_json_output(self, populated_db, capsys, tmp_path):
         from scripts.core.artifact_query import main

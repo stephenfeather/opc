@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -107,6 +108,19 @@ class TestTokenize:
         assert "world" in result
         assert "test" in result
 
+    def test_empty_string(self):
+        assert _tokenize("") == []
+
+    def test_only_stopwords(self):
+        assert _tokenize("the and or but") == []
+
+    def test_only_short_words(self):
+        assert _tokenize("a I am") == []
+
+    def test_returns_list_type(self):
+        result = _tokenize("hello world")
+        assert isinstance(result, list)
+
 
 # --- IDFIndex tests ---
 
@@ -129,6 +143,24 @@ class TestIDFIndex:
         unknown_idf = index.idf("unknown")
         known_idf = index.idf("known")
         assert unknown_idf > known_idf  # unknown gets max IDF
+
+    def test_idf_formula_correctness(self):
+        index = IDFIndex(
+            word_df={"term": 10},
+            doc_count=100,
+            built_at="2026-01-01T00:00:00",
+        )
+        expected = math.log(100 / (1 + 10))
+        assert index.idf("term") == pytest.approx(expected)
+
+    def test_idf_unknown_formula(self):
+        index = IDFIndex(
+            word_df={},
+            doc_count=100,
+            built_at="2026-01-01T00:00:00",
+        )
+        expected = math.log(101)
+        assert index.idf("unknown") == pytest.approx(expected)
 
     def test_save_load_roundtrip(self, tmp_path: Path):
         path = tmp_path / "idf_test.json"
@@ -155,6 +187,12 @@ class TestIDFIndex:
         path.write_text("not valid json {{{")
         result = load_idf_index(path)
         assert result is None
+
+    def test_save_creates_parent_dirs(self, tmp_path: Path):
+        path = tmp_path / "nested" / "deep" / "idf.json"
+        index = IDFIndex(word_df={"x": 1}, doc_count=1, built_at="t")
+        save_idf_index(index, path)
+        assert path.exists()
 
     async def test_build_idf_index(self):
         mock_rows = [
@@ -214,6 +252,339 @@ class TestIDFIndex:
         assert "fresh" in result.word_df
 
 
+# --- Pure function tests (extracted for FP compliance) ---
+
+
+class TestSanitizeQueryWords:
+    def test_basic_extraction(self):
+        from scripts.core.query_expansion import _sanitize_query_words
+
+        result = _sanitize_query_words("auth patterns")
+        assert "auth" in result
+        assert "patterns" in result
+
+    def test_strips_punctuation(self):
+        from scripts.core.query_expansion import _sanitize_query_words
+
+        result = _sanitize_query_words("hello! world?")
+        assert result == ["hello", "world"]
+
+    def test_filters_short_words(self):
+        from scripts.core.query_expansion import _sanitize_query_words
+
+        result = _sanitize_query_words("a I am big dog")
+        assert "big" in result
+        assert "dog" in result
+        assert "am" not in result
+
+    def test_lowercases(self):
+        from scripts.core.query_expansion import _sanitize_query_words
+
+        result = _sanitize_query_words("Auth PATTERNS")
+        assert result == ["auth", "patterns"]
+
+    def test_replaces_hyphens(self):
+        from scripts.core.query_expansion import _sanitize_query_words
+
+        result = _sanitize_query_words("multi-terminal")
+        assert "multi" in result
+        assert "terminal" in result
+
+    def test_empty_query_fallback(self):
+        from scripts.core.query_expansion import _sanitize_query_words
+
+        result = _sanitize_query_words("")
+        assert result == [""]
+
+    def test_only_short_words_fallback(self):
+        from scripts.core.query_expansion import _sanitize_query_words
+
+        result = _sanitize_query_words("a I")
+        assert isinstance(result, list)
+        assert len(result) >= 1
+
+
+class TestComputeNeighborDf:
+    def test_basic_counting(self):
+        from scripts.core.query_expansion import _compute_neighbor_df
+
+        contents = [
+            "authentication tokens are important",
+            "tokens expire after timeout",
+        ]
+        result = _compute_neighbor_df(contents)
+        assert result["tokens"] == 2
+        assert result["authentication"] == 1
+
+    def test_empty_contents(self):
+        from scripts.core.query_expansion import _compute_neighbor_df
+
+        result = _compute_neighbor_df([])
+        assert result == {}
+
+    def test_deduplicates_within_document(self):
+        from scripts.core.query_expansion import _compute_neighbor_df
+
+        contents = ["tokens tokens tokens"]
+        result = _compute_neighbor_df(contents)
+        assert result["tokens"] == 1  # unique per doc
+
+    def test_stopwords_excluded(self):
+        from scripts.core.query_expansion import _compute_neighbor_df
+
+        contents = ["the authentication with help"]
+        result = _compute_neighbor_df(contents)
+        assert "the" not in result
+        assert "with" not in result
+        assert "help" not in result
+        assert "authentication" in result
+
+
+class TestScoreExpansionCandidates:
+    def _make_idf(self) -> IDFIndex:
+        return IDFIndex(
+            word_df={"authentication": 5, "tokens": 8, "database": 50},
+            doc_count=200,
+            built_at="2026-01-01T00:00:00",
+        )
+
+    def test_scores_by_ndf_times_idf(self):
+        from scripts.core.query_expansion import _score_expansion_candidates
+
+        idf_index = self._make_idf()
+        neighbor_df = {"authentication": 3, "tokens": 2}
+        original_tokens: set[str] = set()
+
+        result = _score_expansion_candidates(
+            neighbor_df, idf_index, original_tokens, min_idf=0.0
+        )
+        result_dict = dict(result)
+        assert "authentication" in result_dict
+        assert "tokens" in result_dict
+
+    def test_excludes_original_tokens(self):
+        from scripts.core.query_expansion import _score_expansion_candidates
+
+        idf_index = self._make_idf()
+        neighbor_df = {"authentication": 3, "tokens": 2}
+        original_tokens = {"authentication"}
+
+        result = _score_expansion_candidates(
+            neighbor_df, idf_index, original_tokens, min_idf=0.0
+        )
+        terms = [t for t, _ in result]
+        assert "authentication" not in terms
+        assert "tokens" in terms
+
+    def test_excludes_stopwords(self):
+        from scripts.core.query_expansion import _score_expansion_candidates
+
+        idf_index = self._make_idf()
+        neighbor_df = {"the": 5, "authentication": 3}
+        original_tokens: set[str] = set()
+
+        result = _score_expansion_candidates(
+            neighbor_df, idf_index, original_tokens, min_idf=0.0
+        )
+        terms = [t for t, _ in result]
+        assert "the" not in terms
+
+    def test_excludes_short_terms(self):
+        from scripts.core.query_expansion import _score_expansion_candidates
+
+        idf_index = self._make_idf()
+        neighbor_df = {"ab": 5, "authentication": 3}
+        original_tokens: set[str] = set()
+
+        result = _score_expansion_candidates(
+            neighbor_df, idf_index, original_tokens, min_idf=0.0
+        )
+        terms = [t for t, _ in result]
+        assert "ab" not in terms
+
+    def test_min_idf_filter(self):
+        from scripts.core.query_expansion import _score_expansion_candidates
+
+        idf_index = IDFIndex(
+            word_df={"common": 190},  # IDF ~ log(200/191) ~ 0.046
+            doc_count=200,
+            built_at="2026-01-01T00:00:00",
+        )
+        neighbor_df = {"common": 5}
+        original_tokens: set[str] = set()
+
+        result = _score_expansion_candidates(
+            neighbor_df, idf_index, original_tokens, min_idf=1.0
+        )
+        assert len(result) == 0  # filtered by min_idf
+
+    def test_sorted_descending(self):
+        from scripts.core.query_expansion import _score_expansion_candidates
+
+        idf_index = self._make_idf()
+        neighbor_df = {"authentication": 10, "tokens": 1}
+        original_tokens: set[str] = set()
+
+        result = _score_expansion_candidates(
+            neighbor_df, idf_index, original_tokens, min_idf=0.0
+        )
+        scores = [s for _, s in result]
+        assert scores == sorted(scores, reverse=True)
+
+    def test_sanitizes_non_alnum(self):
+        from scripts.core.query_expansion import _score_expansion_candidates
+
+        idf_index = IDFIndex(word_df={}, doc_count=100, built_at="t")
+        neighbor_df = {"hello": 3}
+        original_tokens: set[str] = set()
+
+        result = _score_expansion_candidates(
+            neighbor_df, idf_index, original_tokens, min_idf=0.0
+        )
+        for term, _ in result:
+            assert term.isalnum()
+
+
+class TestFormatTsquery:
+    def test_basic_format(self):
+        from scripts.core.query_expansion import _format_tsquery
+
+        result = _format_tsquery(["auth", "patterns"], ["authentication", "workflow"])
+        assert result == "auth | patterns | authentication | workflow"
+
+    def test_no_expansion_terms(self):
+        from scripts.core.query_expansion import _format_tsquery
+
+        result = _format_tsquery(["auth", "patterns"], [])
+        assert result == "auth | patterns"
+
+    def test_single_original_term(self):
+        from scripts.core.query_expansion import _format_tsquery
+
+        result = _format_tsquery(["auth"], ["workflow"])
+        assert result == "auth | workflow"
+
+    def test_empty_lists_returns_empty_string(self):
+        from scripts.core.query_expansion import _format_tsquery
+
+        result = _format_tsquery([], [])
+        assert result == ""
+
+
+class TestComputeWordDf:
+    def test_basic_counting(self):
+        from scripts.core.query_expansion import _compute_word_df
+
+        documents = [
+            "authentication tokens important",
+            "tokens expire timeout",
+            "database connection pooling",
+        ]
+        word_df, doc_count = _compute_word_df(documents)
+        assert doc_count == 3
+        assert word_df["tokens"] == 2
+        assert word_df["authentication"] == 1
+
+    def test_empty_documents(self):
+        from scripts.core.query_expansion import _compute_word_df
+
+        word_df, doc_count = _compute_word_df([])
+        assert doc_count == 0
+        assert word_df == {}
+
+    def test_deduplicates_within_document(self):
+        from scripts.core.query_expansion import _compute_word_df
+
+        documents = ["tokens tokens tokens"]
+        word_df, doc_count = _compute_word_df(documents)
+        assert doc_count == 1
+        assert word_df["tokens"] == 1
+
+
+class TestIsCacheStale:
+    def test_fresh_cache_not_stale(self):
+        from datetime import UTC, datetime
+
+        from scripts.core.query_expansion import _is_cache_stale
+
+        cached = IDFIndex(
+            word_df={"test": 1},
+            doc_count=100,
+            built_at=datetime.now(UTC).isoformat(),
+        )
+        assert _is_cache_stale(
+            cached, max_age_hours=24, current_count=100, drift_threshold=0.1
+        ) is False
+
+    def test_old_cache_is_stale(self):
+        from scripts.core.query_expansion import _is_cache_stale
+
+        cached = IDFIndex(
+            word_df={"test": 1},
+            doc_count=100,
+            built_at="2020-01-01T00:00:00+00:00",
+        )
+        assert _is_cache_stale(
+            cached, max_age_hours=24, current_count=100, drift_threshold=0.1
+        ) is True
+
+    def test_high_drift_is_stale(self):
+        from datetime import UTC, datetime
+
+        from scripts.core.query_expansion import _is_cache_stale
+
+        cached = IDFIndex(
+            word_df={"test": 1},
+            doc_count=100,
+            built_at=datetime.now(UTC).isoformat(),
+        )
+        # 50% drift exceeds 10% threshold
+        assert _is_cache_stale(
+            cached, max_age_hours=24, current_count=150, drift_threshold=0.1
+        ) is True
+
+    def test_zero_doc_count_is_stale(self):
+        from datetime import UTC, datetime
+
+        from scripts.core.query_expansion import _is_cache_stale
+
+        cached = IDFIndex(
+            word_df={},
+            doc_count=0,
+            built_at=datetime.now(UTC).isoformat(),
+        )
+        assert _is_cache_stale(
+            cached, max_age_hours=24, current_count=10, drift_threshold=0.1
+        ) is True
+
+    def test_bad_timestamp_is_stale(self):
+        from scripts.core.query_expansion import _is_cache_stale
+
+        cached = IDFIndex(
+            word_df={"test": 1},
+            doc_count=100,
+            built_at="not-a-timestamp",
+        )
+        assert _is_cache_stale(
+            cached, max_age_hours=24, current_count=100, drift_threshold=0.1
+        ) is True
+
+    def test_within_drift_threshold(self):
+        from datetime import UTC, datetime
+
+        from scripts.core.query_expansion import _is_cache_stale
+
+        cached = IDFIndex(
+            word_df={"test": 1},
+            doc_count=100,
+            built_at=datetime.now(UTC).isoformat(),
+        )
+        # 5% drift is within 10% threshold
+        assert _is_cache_stale(
+            cached, max_age_hours=24, current_count=105, drift_threshold=0.1
+        ) is False
+
+
 # --- expand_query tests ---
 
 
@@ -250,7 +621,8 @@ class TestExpandQuery:
             patch("scripts.core.db.postgres_pool.init_pgvector", new_callable=AsyncMock),
             patch(
                 "scripts.core.query_expansion.get_idf_index",
-                new_callable=AsyncMock, return_value=idf_index,
+                new_callable=AsyncMock,
+                return_value=idf_index,
             ),
         ):
             result = await expand_query("auth patterns", [0.1] * 1024)
@@ -280,7 +652,8 @@ class TestExpandQuery:
             patch("scripts.core.db.postgres_pool.init_pgvector", new_callable=AsyncMock),
             patch(
                 "scripts.core.query_expansion.get_idf_index",
-                new_callable=AsyncMock, return_value=idf_index,
+                new_callable=AsyncMock,
+                return_value=idf_index,
             ),
         ):
             result = await expand_query("authentication setup", [0.1] * 1024)
@@ -305,7 +678,8 @@ class TestExpandQuery:
             patch("scripts.core.db.postgres_pool.init_pgvector", new_callable=AsyncMock),
             patch(
                 "scripts.core.query_expansion.get_idf_index",
-                new_callable=AsyncMock, return_value=idf_index,
+                new_callable=AsyncMock,
+                return_value=idf_index,
             ),
         ):
             result = await expand_query("auth test", [0.1] * 1024)
@@ -331,7 +705,8 @@ class TestExpandQuery:
             patch("scripts.core.db.postgres_pool.init_pgvector", new_callable=AsyncMock),
             patch(
                 "scripts.core.query_expansion.get_idf_index",
-                new_callable=AsyncMock, return_value=idf_index,
+                new_callable=AsyncMock,
+                return_value=idf_index,
             ),
         ):
             result = await expand_query(
@@ -383,7 +758,8 @@ class TestExpandQuery:
             patch("scripts.core.db.postgres_pool.init_pgvector", new_callable=AsyncMock),
             patch(
                 "scripts.core.query_expansion.get_idf_index",
-                new_callable=AsyncMock, return_value=idf_index,
+                new_callable=AsyncMock,
+                return_value=idf_index,
             ),
         ):
             result = await expand_query("auth", [0.1] * 1024)
@@ -487,7 +863,9 @@ class TestHybridRRFWithExpansion:
             await search_learnings_hybrid_rrf("auth patterns", k=5, expand=True)
 
         # The SQL should contain to_tsquery (not plainto_tsquery)
-        assert any("to_tsquery" in sql and "plainto_tsquery" not in sql for sql in captured_sql)
+        assert any(
+            "to_tsquery" in sql and "plainto_tsquery" not in sql for sql in captured_sql
+        )
 
     async def test_plainto_tsquery_when_not_expanded(self):
         """When no expansion, plainto_tsquery should be used."""

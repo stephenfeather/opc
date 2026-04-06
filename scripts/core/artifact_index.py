@@ -19,30 +19,62 @@ Examples:
 """
 
 import argparse
-import faulthandler
-import hashlib
-import json
 import os
 import re
 import sqlite3
+import sys
 from datetime import datetime
 from pathlib import Path
 
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
-
-# Load .env files for DATABASE_URL (cross-platform)
 try:
-    from dotenv import load_dotenv
-    # Global ~/.claude/.env
-    global_env = Path.home() / ".claude" / ".env"
-    if global_env.exists():
-        load_dotenv(global_env)
-    # Local opc/.env
-    opc_env = Path(__file__).parent.parent.parent / ".env"
-    if opc_env.exists():
-        load_dotenv(opc_env, override=True)
-except ImportError:
-    pass  # dotenv not required
+    from scripts.core.artifact_index_core import (
+        adapt_for_postgres as _adapt_for_postgres,
+    )
+    from scripts.core.artifact_index_core import (
+        classify_file,
+        parse_continuity_content,
+        parse_handoff_content,
+        parse_handoff_yaml_content,
+        parse_plan_content,
+    )
+except ModuleNotFoundError:
+    from artifact_index_core import (  # type: ignore[no-redef]
+        adapt_for_postgres as _adapt_for_postgres,
+    )
+    from artifact_index_core import (  # type: ignore[no-redef]
+        classify_file,
+        parse_continuity_content,
+        parse_handoff_content,
+        parse_handoff_yaml_content,
+        parse_plan_content,
+    )
+
+
+def _bootstrap() -> None:
+    """Initialize faulthandler and load .env files. Call from main() only."""
+    try:
+        import faulthandler
+
+        log_path = Path.home() / ".claude" / "logs" / "opc_crash.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        faulthandler.enable(
+            file=open(log_path, "a"),  # noqa: SIM115
+            all_threads=True,
+        )
+    except OSError:
+        pass  # Best-effort: crash logging not critical
+
+    try:
+        from dotenv import load_dotenv
+
+        global_env = Path.home() / ".claude" / ".env"
+        if global_env.exists():
+            load_dotenv(global_env)
+        opc_env = Path(__file__).parent.parent.parent / ".env"
+        if opc_env.exists():
+            load_dotenv(opc_env, override=True)
+    except ImportError:
+        pass
 
 
 # =============================================================================
@@ -205,7 +237,6 @@ class DatabaseConnection:
     def _convert_upsert(self, sql: str) -> str:
         """Convert SQLite INSERT OR REPLACE to PostgreSQL ON CONFLICT."""
         # Extract table name and columns
-        import re
         match = re.match(r"INSERT OR REPLACE INTO (\w+)\s*\(([^)]+)\)", sql, re.IGNORECASE)
         if not match:
             return sql
@@ -254,454 +285,32 @@ def db_execute(conn, sql: str, params: tuple = (), table_hint: str = ""):
         conn.execute(sql, params)
 
 
-def _adapt_for_postgres(sql: str, params: tuple, table_hint: str) -> tuple:
-    """Adapt SQL and params for PostgreSQL's existing schema."""
-    # Convert ? to %s
-    sql = sql.replace("?", "%s")
 
-    # Handle handoffs table - different schema in PostgreSQL
-    if "INTO handoffs" in sql or table_hint == "handoffs":
-        # PostgreSQL schema uses UUID id and different columns
-        # Map SQLite columns to PostgreSQL columns
-        sql = """
-            INSERT INTO handoffs
-            (id, session_name, file_path, goal, what_worked, what_failed,
-             key_decisions, outcome, root_span_id, session_id)
-            VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (file_path) DO UPDATE SET
-                goal = EXCLUDED.goal,
-                what_worked = EXCLUDED.what_worked,
-                what_failed = EXCLUDED.what_failed,
-                key_decisions = EXCLUDED.key_decisions,
-                outcome = EXCLUDED.outcome,
-                root_span_id = EXCLUDED.root_span_id,
-                session_id = EXCLUDED.session_id,
-                indexed_at = NOW()
-        """
-        # Reorder params: session_name, file_path, task_summary->goal, what_worked,
-        # what_failed, key_decisions, outcome, root_span_id, session_id
-        # Original order: id, session_name, task_number, file_path, task_summary,
-        #                 what_worked, what_failed, key_decisions, files_modified,
-        #                 outcome, root_span_id, turn_span_id, session_id,
-        #                 braintrust_session_id, created_at
-        if len(params) == 15:  # handoffs insert
-            params = (
-                params[1],   # session_name
-                params[3],   # file_path
-                params[4],   # task_summary -> goal
-                params[5],   # what_worked
-                params[6],   # what_failed
-                params[7],   # key_decisions
-                params[9],   # outcome
-                params[10],  # root_span_id
-                params[12],  # session_id
-            )
-        return sql, params
-
-    # Handle plans and continuity - just convert syntax
-    if "INSERT OR REPLACE INTO" in sql:
-        sql = _convert_pg_upsert(sql)
-
-    return sql, params
-
-
-def _convert_pg_upsert(sql: str) -> str:
-    """Convert SQLite INSERT OR REPLACE to PostgreSQL ON CONFLICT."""
-    # Use DOTALL to match across newlines
-    pattern = r"INSERT\s+OR\s+REPLACE\s+INTO\s+(\w+)\s*\(([^)]+)\)"
-    match = re.search(pattern, sql, re.IGNORECASE | re.DOTALL)
-    if not match:
-        return sql
-
-    columns = [c.strip() for c in match.group(2).split(",")]
-    non_pk_cols = [c for c in columns if c != "id"]
-    update_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in non_pk_cols)
-
-    # Replace with whitespace-tolerant pattern
-    sql = re.sub(r"INSERT\s+OR\s+REPLACE\s+INTO", "INSERT INTO", sql, flags=re.IGNORECASE)
-    sql = sql.rstrip().rstrip(";")
-    sql += f" ON CONFLICT (id) DO UPDATE SET {update_clause}"
-    return sql
-
-
-# --- Helper functions for reduced complexity ---
-
-def parse_frontmatter(content: str) -> tuple[dict, str]:
-    """Extract YAML frontmatter from markdown content.
-
-    Returns:
-        Tuple of (frontmatter_dict, remaining_content)
-    """
-    if not content.startswith("---"):
-        return {}, content
-
-    parts = content.split("---", 2)
-    if len(parts) < 3:
-        return {}, content
-
-    frontmatter = {}
-    for line in parts[1].strip().split("\n"):
-        if ":" in line:
-            key, value = line.split(":", 1)
-            frontmatter[key.strip()] = value.strip()
-
-    return frontmatter, parts[2]
-
-
-def extract_sections(content: str, level: int = 2) -> dict:
-    """Extract markdown sections at the specified heading level.
-
-    Args:
-        content: Markdown content to parse
-        level: Heading level (2 for ##, 3 for ###)
-
-    Returns:
-        Dict mapping normalized section names to content
-    """
-    if not content:
-        return {}
-
-    prefix = "#" * level + " "
-    next_level_prefix = "#" * (level - 1) + " " if level > 1 else None
-
-    sections = {}
-    current_section = None
-    current_content = []
-
-    for line in content.split("\n"):
-        if line.startswith(prefix):
-            if current_section:
-                sections[current_section] = "\n".join(current_content).strip()
-            current_section = line[len(prefix):].strip().lower().replace(" ", "_")
-            current_content = []
-        elif next_level_prefix and line.startswith(next_level_prefix):
-            # End section at higher-level heading
-            if current_section:
-                sections[current_section] = "\n".join(current_content).strip()
-            current_section = None
-            current_content = []
-        elif current_section:
-            current_content.append(line)
-
-    if current_section:
-        sections[current_section] = "\n".join(current_content).strip()
-
-    return sections
-
-
-def extract_session_info(file_path: Path) -> tuple[str, str | None]:
-    """Extract session name and optional UUID from handoff file path.
-
-    Supports paths like:
-    - thoughts/shared/handoffs/my-session/task-01.md
-    - thoughts/shared/handoffs/my-session-550e8400/task-01.md (with UUID suffix)
-
-    Returns:
-        Tuple of (session_name, session_uuid or None)
-    """
-    parts = file_path.parts
-
-    if "handoffs" not in parts:
-        return "", None
-
-    idx = parts.index("handoffs")
-    if idx + 1 >= len(parts):
-        return "", None
-
-    raw_name = parts[idx + 1]
-
-    # Check for UUID suffix: "auth-refactor-550e8400" -> "auth-refactor", "550e8400"
-    uuid_match = re.match(r"^(.+)-([0-9a-f]{8})$", raw_name, re.IGNORECASE)
-    if uuid_match:
-        return uuid_match.group(1), uuid_match.group(2).lower()
-
-    return raw_name, None
-
-
-# Dispatch table for outcome normalization
-OUTCOME_MAP = {
-    "SUCCESS": "SUCCEEDED",
-    "SUCCEEDED": "SUCCEEDED",
-    "PARTIAL": "PARTIAL_PLUS",
-    "PARTIAL_PLUS": "PARTIAL_PLUS",
-    "PARTIAL_MINUS": "PARTIAL_MINUS",
-    "FAILED": "FAILED",
-    "FAILURE": "FAILED",
-    "UNKNOWN": "UNKNOWN",
-}
-
-
-def normalize_outcome(status: str) -> str:
-    """Normalize status string to canonical outcome value.
-
-    Uses dispatch table for O(1) lookup instead of if/elif chains.
-    """
-    return OUTCOME_MAP.get(status.upper(), "UNKNOWN")
-
-
-# --- End helper functions ---
+# --- Helpers imported from artifact_index_core ---
+# Module-level imports provide database adaptation, file classification,
+# and parse_*_content helpers; the remaining I/O wrappers are defined below.
 
 
 def parse_handoff(file_path: Path) -> dict:
-    """Parse a handoff markdown file into structured data.
-
-    Uses helper functions for reduced complexity:
-    - parse_frontmatter(): Extract YAML frontmatter
-    - extract_sections(): Extract markdown sections
-    - extract_session_info(): Parse session from path
-    - normalize_outcome(): Map status to canonical outcome
-    """
+    """Parse a handoff markdown file into structured data."""
     raw_content = file_path.read_text()
-
-    # Use helper functions for parsing
-    frontmatter, content = parse_frontmatter(raw_content)
-
-    # Extract sections at both levels and merge (h3 overrides h2)
-    sections = extract_sections(content, level=2)
-    subsections = extract_sections(content, level=3)
-    sections.update(subsections)
-
-    # Generate ID from file path
-    file_id = hashlib.md5(str(file_path).encode()).hexdigest()[:12]
-
-    # Use helper for session info extraction
-    session_name, session_uuid = extract_session_info(file_path)
-
-    # Extract task number
-    task_match = re.search(r"task-(\d+)", file_path.stem)
-    task_number = int(task_match.group(1)) if task_match else None
-
-    # Use dispatch table for outcome normalization
-    status = frontmatter.get("status", "UNKNOWN")
-    outcome = normalize_outcome(status)
-
-    return {
-        "id": file_id,
-        "session_name": session_name,
-        "session_uuid": session_uuid,  # UUID suffix from directory name (if present)
-        "task_number": task_number,
-        "file_path": str(file_path),
-        "task_summary": sections.get("what_was_done", sections.get("summary", ""))[:500],
-        "what_worked": sections.get("what_worked", ""),
-        "what_failed": sections.get("what_failed", ""),
-        "key_decisions": sections.get("key_decisions", sections.get("decisions", "")),
-        "files_modified": json.dumps(extract_files(sections.get("files_modified", ""))),
-        "outcome": outcome,
-        # Braintrust trace links
-        "root_span_id": frontmatter.get("root_span_id", ""),
-        "turn_span_id": frontmatter.get("turn_span_id", ""),
-        "session_id": frontmatter.get("session_id", ""),
-        "braintrust_session_id": frontmatter.get("braintrust_session_id", ""),
-        "created_at": frontmatter.get("date", datetime.now().isoformat()),
-    }
-
-
-def _parse_simple_yaml(text: str) -> dict:
-    """Parse simple YAML without pyyaml dependency.
-
-    Handles the flat key-value and list structures used in handoff YAML files.
-    Does NOT handle arbitrary nested YAML - only the handoff format.
-    """
-    result = {}
-    current_key = None
-    current_list = None
-
-    for line in text.split("\n"):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-
-        # List item under a key
-        if stripped.startswith("- ") and current_key is not None:
-            item = stripped[2:].strip()
-            # Handle dict-style list items like "- task: ..."
-            if ": " in item and not item.startswith('"'):
-                # Could be "key: value" inside a list item
-                if current_list is None:
-                    current_list = []
-                if (
-                    isinstance(current_list, list)
-                    and len(current_list) > 0
-                    and isinstance(current_list[-1], dict)
-                ):
-                    # Check if this is a continuation of a dict item
-                    pass
-                k, v = item.split(": ", 1)
-                k = k.strip()
-                v = v.strip().strip('"')
-                if (
-                    current_list
-                    and isinstance(current_list[-1], dict)
-                    and k not in current_list[-1]
-                ):
-                    current_list[-1][k] = v
-                else:
-                    current_list.append({k: v})
-            else:
-                if current_list is None:
-                    current_list = []
-                # Strip quotes
-                item = item.strip('"').strip("'")
-                current_list.append(item)
-            result[current_key] = current_list
-            continue
-
-        # Indented key-value under a list item (e.g., "    files: [...]")
-        if (
-            line.startswith("    ")
-            and current_key
-            and current_list
-            and isinstance(current_list[-1], dict)
-        ):
-            if ": " in stripped:
-                k, v = stripped.split(": ", 1)
-                k = k.strip()
-                v = v.strip()
-                # Parse inline lists like [a, b, c]
-                if v.startswith("[") and v.endswith("]"):
-                    v = [x.strip().strip('"').strip("'") for x in v[1:-1].split(",") if x.strip()]
-                else:
-                    v = v.strip('"').strip("'")
-                current_list[-1][k] = v
-            continue
-
-        # Top-level key
-        if ":" in line and not line.startswith(" "):
-            # Save previous list
-            if current_key and current_list is not None:
-                result[current_key] = current_list
-
-            key, value = line.split(":", 1)
-            current_key = key.strip()
-            value = value.strip()
-            current_list = None
-
-            if value == "" or value == "[]":
-                current_list = []
-                result[current_key] = current_list
-            elif value.startswith("[") and value.endswith("]"):
-                result[current_key] = [
-                    x.strip().strip('"').strip("'")
-                    for x in value[1:-1].split(",")
-                    if x.strip()
-                ]
-                current_list = None
-                current_key = None
-            else:
-                result[current_key] = value.strip('"').strip("'")
-                current_list = None
-
+    result = parse_handoff_content(raw_content, file_path)
+    if not result["created_at"]:
+        result["created_at"] = datetime.now().isoformat()
     return result
 
 
+
+
 def parse_handoff_yaml(file_path: Path) -> dict:
-    """Parse a handoff YAML file into structured data.
-
-    Handles the YAML format used by auto-generated mini-handoffs.
-    """
+    """Parse a handoff YAML file into structured data."""
     raw_content = file_path.read_text()
-
-    # Separate frontmatter from body
-    frontmatter, body = parse_frontmatter(raw_content)
-
-    # Parse the YAML body
-    data = _parse_simple_yaml(body)
-
-    # Generate ID from file path
-    file_id = hashlib.md5(str(file_path).encode()).hexdigest()[:12]
-
-    # Extract session info from frontmatter or path
-    session_name = frontmatter.get("session", "")
-    if not session_name:
-        session_name, _ = extract_session_info(file_path)
-
-    # Build task summary from done_this_session
-    done_items = data.get("done_this_session", [])
-    if isinstance(done_items, list):
-        task_lines = []
-        for item in done_items:
-            if isinstance(item, dict):
-                task_lines.append(item.get("task", ""))
-            elif isinstance(item, str):
-                task_lines.append(item)
-        task_summary = "; ".join(t for t in task_lines if t)[:500]
-    else:
-        task_summary = str(done_items)[:500]
-
-    # Extract what_worked
-    worked = data.get("worked", [])
-    if isinstance(worked, list):
-        what_worked = "\n".join(f"- {w}" if isinstance(w, str) else f"- {w}" for w in worked)
-    else:
-        what_worked = str(worked)
-
-    # Extract what_failed
-    failed = data.get("failed", [])
-    if isinstance(failed, list):
-        what_failed = "\n".join(f"- {f}" if isinstance(f, str) else f"- {f}" for f in failed)
-    else:
-        what_failed = str(failed)
-
-    # Extract decisions
-    decisions = data.get("decisions", [])
-    if isinstance(decisions, list):
-        decision_lines = []
-        for d in decisions:
-            if isinstance(d, dict):
-                for k, v in d.items():
-                    decision_lines.append(f"- {k}: {v}")
-            elif isinstance(d, str):
-                decision_lines.append(f"- {d}")
-        key_decisions = "\n".join(decision_lines)
-    else:
-        key_decisions = str(decisions)
-
-    # Extract files modified
-    files_section = data.get("files", {})
-    all_files = []
-    if isinstance(files_section, dict):
-        for file_list in files_section.values():
-            if isinstance(file_list, list):
-                all_files.extend(file_list)
-    elif isinstance(files_section, list):
-        all_files = files_section
-
-    # Normalize outcome
-    status = frontmatter.get("status", data.get("outcome", "UNKNOWN"))
-    outcome = normalize_outcome(status)
-
-    return {
-        "id": file_id,
-        "session_name": session_name,
-        "session_uuid": None,
-        "task_number": None,
-        "file_path": str(file_path),
-        "task_summary": task_summary,
-        "what_worked": what_worked,
-        "what_failed": what_failed,
-        "key_decisions": key_decisions,
-        "files_modified": json.dumps(all_files),
-        "outcome": outcome,
-        "root_span_id": frontmatter.get("root_span_id", ""),
-        "turn_span_id": frontmatter.get("turn_span_id", ""),
-        "session_id": frontmatter.get("session_id", ""),
-        "braintrust_session_id": frontmatter.get("braintrust_session_id", ""),
-        "created_at": frontmatter.get("date", datetime.now().isoformat()),
-    }
+    result = parse_handoff_yaml_content(raw_content, file_path)
+    if not result["created_at"]:
+        result["created_at"] = datetime.now().isoformat()
+    return result
 
 
-def extract_files(content: str) -> list:
-    """Extract file paths from markdown content."""
-    files = []
-    for line in content.split("\n"):
-        # Match common patterns like "- `path/to/file.py`" or "- `path/to/file.py:123`"
-        # Group 1 captures path up to extension, Group 2 captures optional :line-range
-        matches = re.findall(r"`([^`]+\.[a-z]+)(:[^`]*)?`", line)
-        files.extend([m[0] for m in matches])  # Only take the path, not line range
-        # Match **File**: format
-        matches = re.findall(r"\*\*File\*\*:\s*`?([^\s`]+)`?", line)
-        files.extend(matches)
-    return files
 
 
 def index_handoffs(conn, base_path: Path = Path("thoughts/shared/handoffs")):
@@ -761,46 +370,7 @@ def index_handoffs(conn, base_path: Path = Path("thoughts/shared/handoffs")):
 def parse_plan(file_path: Path) -> dict:
     """Parse a plan markdown file into structured data."""
     content = file_path.read_text()
-
-    # Generate ID
-    file_id = hashlib.md5(str(file_path).encode()).hexdigest()[:12]
-
-    # Extract title from first H1
-    title_match = re.search(r"^# (.+)$", content, re.MULTILINE)
-    title = title_match.group(1) if title_match else file_path.stem
-
-    # Extract sections
-    sections = {}
-    current_section = None
-    current_content = []
-
-    for line in content.split("\n"):
-        if line.startswith("## "):
-            if current_section:
-                sections[current_section] = "\n".join(current_content).strip()
-            current_section = line[3:].strip().lower().replace(" ", "_")
-            current_content = []
-        elif current_section:
-            current_content.append(line)
-
-    if current_section:
-        sections[current_section] = "\n".join(current_content).strip()
-
-    # Extract phases
-    phases = []
-    for key in sections:
-        if key.startswith("phase_"):
-            phases.append({"name": key, "content": sections[key][:500]})
-
-    return {
-        "id": file_id,
-        "title": title,
-        "file_path": str(file_path),
-        "overview": sections.get("overview", "")[:1000],
-        "approach": sections.get("implementation_approach", sections.get("approach", ""))[:1000],
-        "phases": json.dumps(phases),
-        "constraints": sections.get("what_we're_not_doing", sections.get("constraints", "")),
-    }
+    return parse_plan_content(content, file_path)
 
 
 def index_plans(conn, base_path: Path = Path("thoughts/shared/plans")):
@@ -842,58 +412,7 @@ def index_plans(conn, base_path: Path = Path("thoughts/shared/plans")):
 def parse_continuity(file_path: Path) -> dict:
     """Parse a continuity ledger into structured data."""
     content = file_path.read_text()
-
-    # Generate ID
-    file_id = hashlib.md5(str(file_path).encode()).hexdigest()[:12]
-
-    # Extract session name from filename (CONTINUITY_CLAUDE-<session>.md)
-    session_match = re.search(r"CONTINUITY_CLAUDE-(.+)\.md", file_path.name)
-    session_name = session_match.group(1) if session_match else file_path.stem
-
-    # Extract sections
-    sections = {}
-    current_section = None
-    current_content = []
-
-    for line in content.split("\n"):
-        if line.startswith("## "):
-            if current_section:
-                sections[current_section] = "\n".join(current_content).strip()
-            current_section = line[3:].strip().lower().replace(" ", "_")
-            current_content = []
-        elif current_section:
-            current_content.append(line)
-
-    if current_section:
-        sections[current_section] = "\n".join(current_content).strip()
-
-    # Parse state section
-    state = sections.get("state", "")
-    state_done = []
-    state_now = ""
-    state_next = ""
-
-    for line in state.split("\n"):
-        if "[x]" in line.lower():
-            state_done.append(line.strip())
-        elif "[->]" in line or "now:" in line.lower():
-            state_now = line.strip()
-        elif "[ ]" in line or "next:" in line.lower():
-            state_next = line.strip()
-
-    return {
-        "id": file_id,
-        "session_name": session_name,
-        "goal": sections.get("goal", "")[:500],
-        "state_done": json.dumps(state_done),
-        "state_now": state_now,
-        "state_next": state_next,
-        "key_learnings": sections.get(
-            "key_learnings", sections.get("key_learnings_(this_session)", "")
-        ),
-        "key_decisions": sections.get("key_decisions", ""),
-        "snapshot_reason": "manual",
-    }
+    return parse_continuity_content(content, file_path)
 
 
 def index_continuity(conn, base_path: Path = Path(".")):
@@ -931,119 +450,119 @@ def index_continuity(conn, base_path: Path = Path(".")):
     return count
 
 
+def _index_handoff(conn, data: dict) -> None:
+    """Write handoff data to database."""
+    db_execute(
+        conn,
+        """
+        INSERT OR REPLACE INTO handoffs
+        (id, session_name, task_number, file_path, task_summary, what_worked,
+         what_failed, key_decisions, files_modified, outcome,
+         root_span_id, turn_span_id, session_id, braintrust_session_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """,
+        (
+            data["id"],
+            data["session_name"],
+            data["task_number"],
+            data["file_path"],
+            data["task_summary"],
+            data["what_worked"],
+            data["what_failed"],
+            data["key_decisions"],
+            data["files_modified"],
+            data["outcome"],
+            data["root_span_id"],
+            data["turn_span_id"],
+            data["session_id"],
+            data["braintrust_session_id"],
+            data["created_at"],
+        ),
+    )
+
+
+def _index_plan(conn, data: dict) -> None:
+    """Write plan data to database."""
+    db_execute(
+        conn,
+        """
+        INSERT OR REPLACE INTO plans
+        (id, title, file_path, overview, approach, phases, constraints)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """,
+        (
+            data["id"],
+            data["title"],
+            data["file_path"],
+            data["overview"],
+            data["approach"],
+            data["phases"],
+            data["constraints"],
+        ),
+    )
+
+
+def _index_continuity(conn, data: dict) -> None:
+    """Write continuity data to database."""
+    db_execute(
+        conn,
+        """
+        INSERT OR REPLACE INTO continuity
+        (id, session_name, goal, state_done, state_now, state_next,
+         key_learnings, key_decisions, snapshot_reason)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """,
+        (
+            data["id"],
+            data["session_name"],
+            data["goal"],
+            data["state_done"],
+            data["state_now"],
+            data["state_next"],
+            data["key_learnings"],
+            data["key_decisions"],
+            data["snapshot_reason"],
+        ),
+    )
+
+
+# Dispatch table for file type -> (parser, db_writer, label)
+_INDEX_DISPATCH = {
+    "handoff": (parse_handoff, _index_handoff, "handoff"),
+    "handoff_yaml": (parse_handoff_yaml, _index_handoff, "handoff"),
+    "plan": (parse_plan, _index_plan, "plan"),
+    "continuity": (parse_continuity, _index_continuity, "continuity"),
+}
+
+
 def index_single_file(conn, file_path: Path) -> bool:
     """Index a single file based on its location/type.
 
     Returns True if indexed successfully, False otherwise.
     """
     file_path = Path(file_path).resolve()
+    file_type = classify_file(file_path)
 
-    # Determine file type based on path
-    path_str = str(file_path)
-
-    if "handoffs" in path_str and file_path.suffix in (".md", ".yaml", ".yml"):
-        try:
-            if file_path.suffix in (".yaml", ".yml"):
-                data = parse_handoff_yaml(file_path)
-            else:
-                data = parse_handoff(file_path)
-            db_execute(
-                conn,
-                """
-                INSERT OR REPLACE INTO handoffs
-                (id, session_name, task_number, file_path, task_summary, what_worked,
-                 what_failed, key_decisions, files_modified, outcome,
-                 root_span_id, turn_span_id, session_id, braintrust_session_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-                (
-                    data["id"],
-                    data["session_name"],
-                    data["task_number"],
-                    data["file_path"],
-                    data["task_summary"],
-                    data["what_worked"],
-                    data["what_failed"],
-                    data["key_decisions"],
-                    data["files_modified"],
-                    data["outcome"],
-                    data["root_span_id"],
-                    data["turn_span_id"],
-                    data["session_id"],
-                    data["braintrust_session_id"],
-                    data["created_at"],
-                ),
-            )
-            conn.commit()
-            print(f"Indexed handoff: {file_path.name}")
-            return True
-        except Exception as e:
-            print(f"Error indexing handoff {file_path}: {e}")
-            return False
-
-    elif "plans" in path_str and file_path.suffix == ".md":
-        try:
-            data = parse_plan(file_path)
-            db_execute(
-                conn,
-                """
-                INSERT OR REPLACE INTO plans
-                (id, title, file_path, overview, approach, phases, constraints)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-                (
-                    data["id"],
-                    data["title"],
-                    data["file_path"],
-                    data["overview"],
-                    data["approach"],
-                    data["phases"],
-                    data["constraints"],
-                ),
-            )
-            conn.commit()
-            print(f"Indexed plan: {file_path.name}")
-            return True
-        except Exception as e:
-            print(f"Error indexing plan {file_path}: {e}")
-            return False
-
-    elif file_path.name.startswith("CONTINUITY_CLAUDE-"):
-        try:
-            data = parse_continuity(file_path)
-            db_execute(
-                conn,
-                """
-                INSERT OR REPLACE INTO continuity
-                (id, session_name, goal, state_done, state_now, state_next,
-                 key_learnings, key_decisions, snapshot_reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-                (
-                    data["id"],
-                    data["session_name"],
-                    data["goal"],
-                    data["state_done"],
-                    data["state_now"],
-                    data["state_next"],
-                    data["key_learnings"],
-                    data["key_decisions"],
-                    data["snapshot_reason"],
-                ),
-            )
-            conn.commit()
-            print(f"Indexed continuity: {file_path.name}")
-            return True
-        except Exception as e:
-            print(f"Error indexing continuity {file_path}: {e}")
-            return False
-
-    else:
+    if file_type is None:
         print(f"Unknown file type, skipping: {file_path}")
         return False
 
+    parser, writer, label = _INDEX_DISPATCH[file_type]
+    try:
+        data = parser(file_path)
+        writer(conn, data)
+        conn.commit()
+        print(f"Indexed {label}: {file_path.name}")
+        return True
+    except Exception as e:
+        print(f"Error indexing {label} {file_path}: {e}")
+        return False
 
-def main():
+
+def main() -> int:
+    """Entry point for artifact indexing CLI."""
+    _bootstrap()
+
     parser = argparse.ArgumentParser(description="Index context graph artifacts")
     parser.add_argument("--handoffs", action="store_true", help="Index handoffs")
     parser.add_argument("--plans", action="store_true", help="Index plans")
@@ -1081,7 +600,10 @@ def main():
     # Initialize connection
     if using_pg:
         conn = init_postgres()
-        print(f"Using database: {db_type} ({get_postgres_url()[:30]}...)")
+        pg_url = get_postgres_url() or ""
+        # Redact credentials from URL before printing
+        safe_url = re.sub(r"://[^@]+@", "://***@", pg_url)
+        print(f"Using database: {db_type} ({safe_url})")
     else:
         db_path = get_db_path(args.db)
         conn = init_sqlite(db_path)
@@ -1123,7 +645,8 @@ def main():
     conn.commit()
     conn.close()
     print("Done!")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

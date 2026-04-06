@@ -19,7 +19,7 @@ from scripts.core.artifact_mark import (
     format_recent_list,
     resolve_handoff_id,
     truncate_summary,
-)  # noqa: I001
+)
 
 # --- truncate_summary ---
 
@@ -48,6 +48,12 @@ class TestTruncateSummary:
     def test_empty_string_returns_placeholder(self):
         """Empty string returns placeholder."""
         assert truncate_summary("", 50) == "(no summary)"
+
+    def test_very_small_max_len(self):
+        """When max_len < 4, truncate without ellipsis."""
+        result = truncate_summary("hello world", 3)
+        assert result == "hel"
+        assert len(result) == 3
 
 
 # --- format_handoff_row ---
@@ -81,6 +87,7 @@ class TestFormatHandoffRow:
         row = ("abcdef123456789", "session-1", "task")
         result = format_handoff_row(row, max_summary_len=50)
         assert "abcdef123456" in result
+        assert "abcdef123456789" not in result
 
 
 # --- format_recent_list ---

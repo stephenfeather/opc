@@ -34,7 +34,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 faulthandler.enable(
-    file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"),  # noqa: SIM115
+    file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"),
     all_threads=True,
 )
 
@@ -61,6 +61,8 @@ def truncate_summary(text: str | None, max_len: int) -> str:
         return "(no summary)"
     if len(text) <= max_len:
         return text
+    if max_len < 4:
+        return text[:max_len]
     return text[: max_len - 3] + "..."
 
 
@@ -110,8 +112,8 @@ def format_error_not_found(handoff_id: str, db_type: str, recent_rows: list) -> 
     """Format the 'handoff not found' error message."""
     lines = [
         f"Error: Handoff not found: {handoff_id}",
-        f"\nDatabase: {db_type}",
-        "\nAvailable handoffs:",
+        f"Database: {db_type}",
+        "Available handoffs:",
     ]
     if recent_rows:
         lines.append(format_recent_list(recent_rows))
@@ -371,20 +373,20 @@ def main():
         args.handoff, args.latest, latest_id
     )
     if error:
-        print(error)
+        print(error, file=sys.stderr)
         return 1
 
     db_type = "PostgreSQL" if use_postgres() else "SQLite"
 
     handoff = get_handoff(handoff_id)
     if not handoff:
-        print(format_error_not_found(handoff_id, db_type, list_recent()))
+        print(format_error_not_found(handoff_id, db_type, list_recent()), file=sys.stderr)
         return 1
 
     # Use the full resolved ID from SELECT, not the user-supplied prefix
     resolved_id = handoff[0]
     if not update_outcome(resolved_id, args.outcome, args.notes):
-        print(f"Error: Failed to update handoff: {resolved_id}")
+        print(f"Error: Failed to update handoff: {resolved_id}", file=sys.stderr)
         return 1
 
     print(format_confirmation(handoff, args.outcome, args.notes, db_type))

@@ -210,6 +210,24 @@ class TestCheckDedupResult:
         result = check_dedup_result(existing=matches, threshold=0.85)
         assert result is not None
 
+    def test_default_session_used_when_missing(self) -> None:
+        """When match lacks session_id, default_session is used."""
+        matches = [{"similarity": 0.90, "id": "abc"}]
+        result = check_dedup_result(
+            existing=matches, threshold=0.85, default_session="fallback-sess"
+        )
+        assert result is not None
+        assert result["existing_session"] == "fallback-sess"
+
+    def test_match_session_preferred_over_default(self) -> None:
+        """When match has session_id, it takes priority over default."""
+        matches = [{"similarity": 0.90, "session_id": "from-match", "id": "abc"}]
+        result = check_dedup_result(
+            existing=matches, threshold=0.85, default_session="fallback"
+        )
+        assert result is not None
+        assert result["existing_session"] == "from-match"
+
     def test_uses_first_match_only(self) -> None:
         matches = [
             {"similarity": 0.90, "session_id": "s1", "id": "first"},

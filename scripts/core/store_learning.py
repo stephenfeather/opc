@@ -100,8 +100,12 @@ def _dedup_threshold() -> float:
 
 
 def _pg_url() -> str | None:
-    """Return PostgreSQL connection URL from environment, or None."""
-    return os.environ.get("DATABASE_URL") or os.environ.get("CONTINUOUS_CLAUDE_DB_URL") or None
+    """Return PostgreSQL connection URL from environment, or None.
+
+    Prefers CONTINUOUS_CLAUDE_DB_URL (canonical) over DATABASE_URL (fallback)
+    to match the resolution order used by postgres_pool.resolve_connection_url().
+    """
+    return os.environ.get("CONTINUOUS_CLAUDE_DB_URL") or os.environ.get("DATABASE_URL") or None
 
 
 def detect_backend(env: dict[str, str], fallback: str | None = None) -> str:
@@ -196,11 +200,16 @@ def check_dedup_result(
     *,
     existing: list[dict[str, Any]] | None,
     threshold: float,
+    default_session: str = "",
 ) -> dict[str, Any] | None:
     """Check whether search results indicate a duplicate.
 
     Pure function -- returns dedup info dict if the top match meets the
     threshold, or None if no duplicate found.
+
+    Args:
+        default_session: Fallback session_id when the match row lacks one
+            (e.g. session-scoped search_vector results).
     """
     if not existing:
         return None
@@ -209,7 +218,7 @@ def check_dedup_result(
     if similarity >= threshold:
         return {
             "similarity": similarity,
-            "existing_session": top_match.get("session_id", ""),
+            "existing_session": top_match.get("session_id", default_session),
             "existing_id": str(top_match.get("id", "")),
         }
     return None
@@ -515,7 +524,9 @@ async def store_learning_v2(
                 )
                 existing = await memory.search_vector(embedding, limit=1)
 
-            dedup = check_dedup_result(existing=existing, threshold=threshold)
+            dedup = check_dedup_result(
+                existing=existing, threshold=threshold, default_session=session_id
+            )
             if dedup is not None:
                 reason = (
                     f"duplicate (similarity: {dedup['similarity']:.2f},"

@@ -33,10 +33,10 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-faulthandler.enable(
-    file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"),
-    all_threads=True,
-)
+_crash_log_dir = Path.home() / ".claude" / "logs"
+_crash_log_dir.mkdir(parents=True, exist_ok=True)
+_crash_log_file = open(_crash_log_dir / "opc_crash.log", "a")  # noqa: SIM115
+faulthandler.enable(file=_crash_log_file, all_threads=True)
 
 # Load .env files for DATABASE_URL (cross-platform)
 # 1. Global ~/.claude/.env
@@ -205,25 +205,37 @@ def pg_get_latest_id() -> str | None:
 
 
 def pg_get_handoff(handoff_id: str) -> tuple | None:
-    """Get handoff by ID from PostgreSQL."""
+    """Get handoff by ID from PostgreSQL. Exact match first, then prefix."""
     conn = pg_connect()
     cur = conn.cursor()
+    # Try exact match first
+    cur.execute(
+        "SELECT id::text, session_name, goal FROM handoffs WHERE id::text = %s",
+        (handoff_id,),
+    )
+    row = cur.fetchone()
+    if row:
+        conn.close()
+        return row
+    # Fall back to prefix match, reject ambiguous
     cur.execute(
         "SELECT id::text, session_name, goal FROM handoffs WHERE id::text LIKE %s",
         (f"{handoff_id}%",),
     )
-    row = cur.fetchone()
+    rows = cur.fetchall()
     conn.close()
-    return row
+    if len(rows) == 1:
+        return rows[0]
+    return None
 
 
 def pg_update_outcome(handoff_id: str, outcome: str, notes: str) -> bool:
-    """Update handoff outcome in PostgreSQL."""
+    """Update handoff outcome in PostgreSQL (exact ID match only)."""
     conn = pg_connect()
     cur = conn.cursor()
     cur.execute(
-        "UPDATE handoffs SET outcome = %s, outcome_notes = %s WHERE id::text LIKE %s",
-        (outcome, notes, f"{handoff_id}%"),
+        "UPDATE handoffs SET outcome = %s, outcome_notes = %s WHERE id::text = %s",
+        (outcome, notes, handoff_id),
     )
     updated = cur.rowcount > 0
     conn.commit()
@@ -271,29 +283,40 @@ def sqlite_get_latest_id() -> str | None:
 
 
 def sqlite_get_handoff(handoff_id: str) -> tuple | None:
-    """Get handoff by ID from SQLite."""
+    """Get handoff by ID from SQLite. Exact match first, then prefix."""
     conn = sqlite_connect()
     if not conn:
         return None
+    # Try exact match first
     cursor = conn.execute(
-        "SELECT id, session_name, task_summary FROM handoffs"
-        " WHERE id = ? OR id LIKE ?",
-        (handoff_id, f"{handoff_id}%"),
+        "SELECT id, session_name, task_summary FROM handoffs WHERE id = ?",
+        (handoff_id,),
     )
     row = cursor.fetchone()
+    if row:
+        conn.close()
+        return row
+    # Fall back to prefix match, reject ambiguous
+    cursor = conn.execute(
+        "SELECT id, session_name, task_summary FROM handoffs WHERE id LIKE ?",
+        (f"{handoff_id}%",),
+    )
+    rows = cursor.fetchall()
     conn.close()
-    return row
+    if len(rows) == 1:
+        return rows[0]
+    return None
 
 
 def sqlite_update_outcome(handoff_id: str, outcome: str, notes: str) -> bool:
-    """Update handoff outcome in SQLite."""
+    """Update handoff outcome in SQLite (exact ID match only)."""
     conn = sqlite_connect()
     if not conn:
         return False
     cursor = conn.execute(
         "UPDATE handoffs SET outcome = ?, outcome_notes = ?, confidence = 'HIGH'"
-        " WHERE id = ? OR id LIKE ?",
-        (outcome, notes, handoff_id, f"{handoff_id}%"),
+        " WHERE id = ?",
+        (outcome, notes, handoff_id),
     )
     updated = cursor.rowcount > 0
     conn.commit()

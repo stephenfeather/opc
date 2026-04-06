@@ -20,18 +20,23 @@ Examples:
     uv run python scripts/core/artifact_mark.py --get-latest-id
 
     # Mark with additional notes
-    uv run python scripts/core/artifact_mark.py --latest --outcome PARTIAL_PLUS --notes "Almost done"
+    uv run python scripts/core/artifact_mark.py --latest --outcome PARTIAL_PLUS \\
+        --notes "Almost done"
 """
 
 import argparse
 import faulthandler
 import os
 import sqlite3
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+_crash_log_dir = Path.home() / ".claude" / "logs"
+_crash_log_dir.mkdir(parents=True, exist_ok=True)
+_crash_log_file = open(_crash_log_dir / "opc_crash.log", "a")  # noqa: SIM115
+faulthandler.enable(file=_crash_log_file, all_threads=True)
 
 # Load .env files for DATABASE_URL (cross-platform)
 # 1. Global ~/.claude/.env
@@ -43,6 +48,117 @@ if global_env.exists():
 opc_env = Path(__file__).parent.parent.parent / ".env"
 if opc_env.exists():
     load_dotenv(opc_env, override=True)
+
+VALID_OUTCOMES = ("SUCCEEDED", "PARTIAL_PLUS", "PARTIAL_MINUS", "FAILED")
+
+
+# --- Pure functions ---
+
+
+def truncate_summary(text: str | None, max_len: int) -> str:
+    """Truncate text with ellipsis, or return placeholder for empty/None."""
+    if not text:
+        return "(no summary)"
+    if len(text) <= max_len:
+        return text
+    if max_len < 4:
+        return text[:max_len]
+    return text[: max_len - 3] + "..."
+
+
+def format_handoff_row(row: tuple, max_summary_len: int = 50) -> str:
+    """Format a single handoff row for display: '  ID: session - summary'."""
+    return f"  {row[0][:12]}: {row[1]} - {truncate_summary(row[2], max_summary_len)}"
+
+
+def format_recent_list(rows: list, max_summary_len: int = 50) -> str:
+    """Format a list of handoff rows for display."""
+    if not rows:
+        return ""
+    return "\n".join(format_handoff_row(row, max_summary_len) for row in rows)
+
+
+def resolve_handoff_id(
+    handoff_id: str | None, use_latest: bool, latest_id: str | None
+) -> tuple[str | None, str | None]:
+    """Determine which handoff ID to use. Returns (id, error_message)."""
+    if handoff_id:
+        return (handoff_id, None)
+    if use_latest:
+        if latest_id:
+            return (latest_id, None)
+        return (None, "Error: No handoffs found in database")
+    return (None, "Either --handoff ID or --latest is required")
+
+
+def format_confirmation(
+    handoff: tuple, outcome: str, notes: str, db_type: str
+) -> str:
+    """Format the success confirmation message."""
+    lines = [
+        f"\u2713 Marked handoff as {outcome}",
+        f"  Database: {db_type}",
+        f"  ID: {handoff[0]}",
+        f"  Session: {handoff[1]}",
+    ]
+    if handoff[2]:
+        lines.append(f"  Summary: {truncate_summary(handoff[2], 80)}")
+    if notes:
+        lines.append(f"  Notes: {notes}")
+    return "\n".join(lines)
+
+
+def format_error_not_found(handoff_id: str, db_type: str, recent_rows: list) -> str:
+    """Format the 'handoff not found' error message."""
+    lines = [
+        f"Error: Handoff not found: {handoff_id}",
+        f"Database: {db_type}",
+        "Available handoffs:",
+    ]
+    if recent_rows:
+        lines.append(format_recent_list(recent_rows))
+    return "\n".join(lines)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build and return the argument parser (pure -- no side effects)."""
+    parser = argparse.ArgumentParser(
+        description="Mark handoff outcome (PostgreSQL or SQLite)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Mark specific handoff
+  %(prog)s --handoff abc123 --outcome SUCCEEDED
+
+  # Mark latest handoff
+  %(prog)s --latest --outcome SUCCEEDED
+
+  # Get latest handoff ID (for scripts)
+  %(prog)s --get-latest-id
+""",
+    )
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--handoff", help="Handoff ID to mark")
+    mode_group.add_argument(
+        "--latest", action="store_true", help="Mark the most recent handoff"
+    )
+    mode_group.add_argument(
+        "--get-latest-id",
+        action="store_true",
+        help="Print latest handoff ID and exit",
+    )
+    parser.add_argument(
+        "--outcome",
+        choices=list(VALID_OUTCOMES),
+        help="Outcome of the handoff",
+    )
+    parser.add_argument(
+        "--notes", default="", help="Optional notes about the outcome"
+    )
+    return parser
+
+
+# --- I/O: Configuration ---
 
 
 def get_postgres_url() -> str | None:
@@ -60,18 +176,21 @@ def use_postgres() -> bool:
     url = get_postgres_url()
     if not url:
         return False
-    # Try to import psycopg2, fall back to SQLite if not available
     try:
         import psycopg2  # noqa: F401
+
         return True
     except ImportError:
         return False
 
 
-# PostgreSQL operations
+# --- I/O: PostgreSQL operations ---
+
+
 def pg_connect():
     """Connect to PostgreSQL."""
     import psycopg2
+
     return psycopg2.connect(get_postgres_url())
 
 
@@ -86,25 +205,37 @@ def pg_get_latest_id() -> str | None:
 
 
 def pg_get_handoff(handoff_id: str) -> tuple | None:
-    """Get handoff by ID from PostgreSQL."""
+    """Get handoff by ID from PostgreSQL. Exact match first, then prefix."""
     conn = pg_connect()
     cur = conn.cursor()
+    # Try exact match first
     cur.execute(
-        "SELECT id::text, session_name, goal FROM handoffs WHERE id::text LIKE %s",
-        (f"{handoff_id}%",)
+        "SELECT id::text, session_name, goal FROM handoffs WHERE id::text = %s",
+        (handoff_id,),
     )
     row = cur.fetchone()
+    if row:
+        conn.close()
+        return row
+    # Fall back to prefix match, reject ambiguous
+    cur.execute(
+        "SELECT id::text, session_name, goal FROM handoffs WHERE id::text LIKE %s",
+        (f"{handoff_id}%",),
+    )
+    rows = cur.fetchall()
     conn.close()
-    return row
+    if len(rows) == 1:
+        return rows[0]
+    return None
 
 
 def pg_update_outcome(handoff_id: str, outcome: str, notes: str) -> bool:
-    """Update handoff outcome in PostgreSQL."""
+    """Update handoff outcome in PostgreSQL (exact ID match only)."""
     conn = pg_connect()
     cur = conn.cursor()
     cur.execute(
-        "UPDATE handoffs SET outcome = %s, outcome_notes = %s WHERE id::text LIKE %s",
-        (outcome, notes, f"{handoff_id}%")
+        "UPDATE handoffs SET outcome = %s, outcome_notes = %s WHERE id::text = %s",
+        (outcome, notes, handoff_id),
     )
     updated = cur.rowcount > 0
     conn.commit()
@@ -117,14 +248,17 @@ def pg_list_recent() -> list:
     conn = pg_connect()
     cur = conn.cursor()
     cur.execute(
-        "SELECT id::text, session_name, goal FROM handoffs ORDER BY indexed_at DESC LIMIT 10"
+        "SELECT id::text, session_name, goal FROM handoffs"
+        " ORDER BY indexed_at DESC LIMIT 10"
     )
     rows = cur.fetchall()
     conn.close()
     return rows
 
 
-# SQLite operations
+# --- I/O: SQLite operations ---
+
+
 def sqlite_connect():
     """Connect to SQLite."""
     db_path = get_sqlite_path()
@@ -140,34 +274,49 @@ def sqlite_get_latest_id() -> str | None:
     conn = sqlite_connect()
     if not conn:
         return None
-    cursor = conn.execute("SELECT id FROM handoffs ORDER BY indexed_at DESC LIMIT 1")
+    cursor = conn.execute(
+        "SELECT id FROM handoffs ORDER BY indexed_at DESC LIMIT 1"
+    )
     row = cursor.fetchone()
     conn.close()
     return row[0] if row else None
 
 
 def sqlite_get_handoff(handoff_id: str) -> tuple | None:
-    """Get handoff by ID from SQLite."""
+    """Get handoff by ID from SQLite. Exact match first, then prefix."""
     conn = sqlite_connect()
     if not conn:
         return None
+    # Try exact match first
     cursor = conn.execute(
-        "SELECT id, session_name, task_summary FROM handoffs WHERE id = ? OR id LIKE ?",
-        (handoff_id, f"{handoff_id}%")
+        "SELECT id, session_name, task_summary FROM handoffs WHERE id = ?",
+        (handoff_id,),
     )
     row = cursor.fetchone()
+    if row:
+        conn.close()
+        return row
+    # Fall back to prefix match, reject ambiguous
+    cursor = conn.execute(
+        "SELECT id, session_name, task_summary FROM handoffs WHERE id LIKE ?",
+        (f"{handoff_id}%",),
+    )
+    rows = cursor.fetchall()
     conn.close()
-    return row
+    if len(rows) == 1:
+        return rows[0]
+    return None
 
 
 def sqlite_update_outcome(handoff_id: str, outcome: str, notes: str) -> bool:
-    """Update handoff outcome in SQLite."""
+    """Update handoff outcome in SQLite (exact ID match only)."""
     conn = sqlite_connect()
     if not conn:
         return False
     cursor = conn.execute(
-        "UPDATE handoffs SET outcome = ?, outcome_notes = ?, confidence = 'HIGH' WHERE id = ? OR id LIKE ?",
-        (outcome, notes, handoff_id, f"{handoff_id}%")
+        "UPDATE handoffs SET outcome = ?, outcome_notes = ?, confidence = 'HIGH'"
+        " WHERE id = ?",
+        (outcome, notes, handoff_id),
     )
     updated = cursor.rowcount > 0
     conn.commit()
@@ -181,14 +330,17 @@ def sqlite_list_recent() -> list:
     if not conn:
         return []
     cursor = conn.execute(
-        "SELECT id, session_name, task_summary FROM handoffs ORDER BY indexed_at DESC LIMIT 10"
+        "SELECT id, session_name, task_summary FROM handoffs"
+        " ORDER BY indexed_at DESC LIMIT 10"
     )
     rows = cursor.fetchall()
     conn.close()
     return rows
 
 
-# Unified interface
+# --- I/O: Unified interface ---
+
+
 def get_latest_id() -> str | None:
     """Get latest handoff ID from database."""
     if use_postgres():
@@ -217,32 +369,12 @@ def list_recent() -> list:
     return sqlite_list_recent()
 
 
+# --- I/O: CLI entrypoint ---
+
+
 def main():
-    parser = argparse.ArgumentParser(
-        description="Mark handoff outcome (PostgreSQL or SQLite)",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Mark specific handoff
-  %(prog)s --handoff abc123 --outcome SUCCEEDED
-
-  # Mark latest handoff
-  %(prog)s --latest --outcome SUCCEEDED
-
-  # Get latest handoff ID (for scripts)
-  %(prog)s --get-latest-id
-""",
-    )
-    parser.add_argument("--handoff", help="Handoff ID to mark")
-    parser.add_argument("--latest", action="store_true", help="Mark the most recent handoff")
-    parser.add_argument("--get-latest-id", action="store_true", help="Print latest handoff ID and exit")
-    parser.add_argument(
-        "--outcome",
-        choices=["SUCCEEDED", "PARTIAL_PLUS", "PARTIAL_MINUS", "FAILED"],
-        help="Outcome of the handoff",
-    )
-    parser.add_argument("--notes", default="", help="Optional notes about the outcome")
-
+    """CLI entrypoint — thin I/O shell over pure functions."""
+    parser = build_arg_parser()
     args = parser.parse_args()
 
     # Mode: get-latest-id
@@ -251,54 +383,36 @@ Examples:
         if latest:
             print(latest)
             return 0
-        print("No handoffs found", file=__import__("sys").stderr)
+        print("No handoffs found", file=sys.stderr)
         return 1
 
     # Mode: mark handoff
     if not args.outcome:
         parser.error("--outcome is required unless using --get-latest-id")
 
-    # Determine which handoff to mark
-    if args.latest:
-        handoff_id = get_latest_id()
-        if not handoff_id:
-            print("Error: No handoffs found in database")
-            return 1
-    elif args.handoff:
-        handoff_id = args.handoff
-    else:
-        parser.error("Either --handoff ID or --latest is required")
+    # Resolve handoff ID (lazy: only query latest when --latest is set)
+    latest_id = get_latest_id() if args.latest else None
+    handoff_id, error = resolve_handoff_id(
+        args.handoff, args.latest, latest_id
+    )
+    if error:
+        print(error, file=sys.stderr)
+        return 1
 
-    # Check database availability
     db_type = "PostgreSQL" if use_postgres() else "SQLite"
 
-    # Check if handoff exists
     handoff = get_handoff(handoff_id)
     if not handoff:
-        print(f"Error: Handoff not found: {handoff_id}")
-        print(f"\nDatabase: {db_type}")
-        print("\nAvailable handoffs:")
-        for row in list_recent():
-            summary = row[2][:50] + "..." if row[2] and len(row[2]) > 50 else (row[2] or "(no summary)")
-            print(f"  {row[0][:12]}: {row[1]} - {summary}")
+        print(format_error_not_found(handoff_id, db_type, list_recent()), file=sys.stderr)
         return 1
 
-    # Update the handoff
-    if not update_outcome(handoff_id, args.outcome, args.notes):
-        print(f"Error: Failed to update handoff: {handoff_id}")
+    # Use the full resolved ID from SELECT, not the user-supplied prefix
+    resolved_id = handoff[0]
+    if not update_outcome(resolved_id, args.outcome, args.notes):
+        print(f"Error: Failed to update handoff: {resolved_id}", file=sys.stderr)
         return 1
 
-    # Show confirmation
-    print(f"✓ Marked handoff as {args.outcome}")
-    print(f"  Database: {db_type}")
-    print(f"  ID: {handoff[0]}")
-    print(f"  Session: {handoff[1]}")
-    if handoff[2]:
-        summary = handoff[2][:80] + "..." if len(handoff[2]) > 80 else handoff[2]
-        print(f"  Summary: {summary}")
-    if args.notes:
-        print(f"  Notes: {args.notes}")
-
+    print(format_confirmation(handoff, args.outcome, args.notes, db_type))
     return 0
 
 

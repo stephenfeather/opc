@@ -21,7 +21,7 @@ import os
 import sys
 import time
 import uuid
-from datetime import UTC, datetime
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -48,8 +48,169 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Database helpers
+# Pure functions
 # ---------------------------------------------------------------------------
+
+
+# Expected embedding dimension for BGE vectors
+EXPECTED_EMBEDDING_DIM = 1024
+
+
+def parse_learning_row(row: dict, *, expected_dim: int = EXPECTED_EMBEDDING_DIM) -> Learning | None:
+    """Parse a single database row into a Learning, or None if invalid.
+
+    Pure function: no I/O, no mutation, deterministic for a given row.
+    Rejects rows with missing timestamps or wrong-dimension embeddings.
+    Returns None (never raises) on malformed data.
+    """
+    raw = row["metadata"]
+    try:
+        meta = raw if isinstance(raw, dict) else json.loads(raw or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(meta, dict):
+        return None
+
+    emb = row["embedding"]
+    try:
+        if isinstance(emb, str):
+            emb = np.fromstring(emb.strip("[]"), sep=",", dtype=np.float32)
+        elif isinstance(emb, (list, tuple)):
+            emb = np.array(emb, dtype=np.float32)
+        elif isinstance(emb, np.ndarray):
+            emb = emb.astype(np.float32)
+        else:
+            return None
+    except (TypeError, ValueError):
+        return None
+
+    if len(emb) != expected_dim:
+        return None
+
+    if row["created_at"] is None:
+        return None
+
+    return Learning(
+        id=str(row["id"]),
+        content=row["content"] or "",
+        embedding=emb,
+        learning_type=meta.get("learning_type", "UNKNOWN"),
+        tags=meta.get("tags", []) or [],
+        session_id=meta.get("session_id", str(row["session_id"] or "")),
+        context=meta.get("context", ""),
+        created_at=row["created_at"],
+        confidence=meta.get("confidence", "medium"),
+    )
+
+
+def merge_tags(
+    learnings: list[Learning],
+    db_tags: dict[str, list[str]],
+) -> list[Learning]:
+    """Merge database tags into learnings without mutating originals.
+
+    Returns a new list of Learning instances with merged, deduplicated tags.
+    Uses dict.fromkeys for stable, insertion-order deduplication.
+    """
+    result = []
+    for lrn in learnings:
+        extra = db_tags.get(lrn.id, [])
+        if extra:
+            merged = list(dict.fromkeys(lrn.tags + extra))
+            result.append(replace(lrn, tags=merged))
+        else:
+            result.append(replace(lrn, tags=list(lrn.tags)))
+    return result
+
+
+def count_by_type(patterns: list[DetectedPattern]) -> dict[str, int]:
+    """Count patterns grouped by pattern_type."""
+    counts: dict[str, int] = {}
+    for p in patterns:
+        counts[p.pattern_type] = counts.get(p.pattern_type, 0) + 1
+    return counts
+
+
+def build_run_summary(
+    *,
+    run_id: str,
+    learnings_count: int,
+    patterns_count: int,
+    patterns_by_type: dict[str, int],
+    written: int,
+    duration: float,
+    dry_run: bool,
+) -> dict:
+    """Build the summary dict returned by run_pattern_detection."""
+    return {
+        "success": True,
+        "run_id": run_id,
+        "learnings_analyzed": learnings_count,
+        "patterns_detected": patterns_count,
+        "patterns_by_type": patterns_by_type,
+        "written": written,
+        "duration_seconds": duration,
+        "dry_run": dry_run,
+    }
+
+
+def format_report(
+    run_id,
+    created_at,
+    patterns: list[dict],
+) -> str:
+    """Format a report string from pattern rows."""
+    lines = [
+        "=" * 50,
+        "Pattern Detection Report",
+        f"Run: {run_id} | Date: {created_at}",
+        f"Patterns: {len(patterns)}",
+        "=" * 50,
+        "",
+    ]
+
+    by_type: dict[str, list] = {}
+    for p in patterns:
+        by_type.setdefault(p["pattern_type"], []).append(p)
+
+    for ptype, group in sorted(by_type.items()):
+        lines.append(f"{ptype.upper()} ({len(group)} detected)")
+        lines.append("-" * 40)
+        for i, p in enumerate(group, 1):
+            tags_str = ", ".join(p["tags"][:5]) if p["tags"] else "none"
+            lines.append(f"  {i}. \"{p['label']}\" (confidence: {p['confidence']:.2f})")
+            lines.append(
+                f"     {p['member_count']} learnings across {p['session_count']} sessions"
+            )
+            lines.append(f"     Tags: {tags_str}")
+            lines.append("")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def format_dry_run_output(patterns: list[DetectedPattern]) -> str:
+    """Format dry-run output for detected patterns."""
+    if not patterns:
+        return ""
+
+    lines = ["\n--- Dry Run Results ---"]
+    for i, p in enumerate(patterns, 1):
+        members = len(p.member_ids)
+        lines.append(f"\n{i}. [{p.pattern_type}] {p.label}")
+        lines.append(
+            f"   Confidence: {p.confidence:.2f} | Members: {members}"
+            f" | Sessions: {p.session_count}"
+        )
+        lines.append(f"   Tags: {', '.join(p.tags[:5])}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Database helpers (I/O handlers)
+# ---------------------------------------------------------------------------
+
 
 async def _get_pool():
     """Get asyncpg connection pool."""
@@ -78,16 +239,27 @@ async def _ensure_tables(pool) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Data loading
+# Data loading (I/O → pure function delegation)
 # ---------------------------------------------------------------------------
 
-async def load_learnings(pool) -> list[Learning]:
+
+async def load_learnings(
+    pool,
+    *,
+    expected_dim: int = EXPECTED_EMBEDDING_DIM,
+) -> tuple[list[Learning], int]:
     """Load all active learnings with embeddings from PostgreSQL.
 
     Filters:
     - superseded_by IS NULL (active only)
     - embedding IS NOT NULL
     - Excludes SYNTHESIZED_PATTERN to prevent feedback loops
+
+    Args:
+        pool: asyncpg connection pool.
+        expected_dim: Expected embedding dimension (default 1024).
+
+    Returns (learnings, rejected_count) so callers can detect parse failures.
     """
     query = """
         SELECT id, content, embedding, metadata, session_id, created_at
@@ -100,38 +272,12 @@ async def load_learnings(pool) -> list[Learning]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(query)
 
-    learnings = []
-    for row in rows:
-        raw = row["metadata"]
-        meta = raw if isinstance(raw, dict) else json.loads(raw or "{}")
-
-        # Parse embedding from pgvector format
-        emb = row["embedding"]
-        if isinstance(emb, str):
-            emb = np.fromstring(emb.strip("[]"), sep=",", dtype=np.float32)
-        elif isinstance(emb, (list, tuple)):
-            emb = np.array(emb, dtype=np.float32)
-        elif isinstance(emb, np.ndarray):
-            emb = emb.astype(np.float32)
-        else:
-            continue  # skip if we can't parse embedding
-
-        if len(emb) == 0:
-            continue
-
-        learnings.append(Learning(
-            id=str(row["id"]),
-            content=row["content"] or "",
-            embedding=emb,
-            learning_type=meta.get("learning_type", "UNKNOWN"),
-            tags=meta.get("tags", []) or [],
-            session_id=meta.get("session_id", str(row["session_id"] or "")),
-            context=meta.get("context", ""),
-            created_at=row["created_at"] or datetime.now(UTC),
-            confidence=meta.get("confidence", "medium"),
-        ))
-
-    return learnings
+    parsed = [parse_learning_row(row, expected_dim=expected_dim) for row in rows]
+    valid = [lrn for lrn in parsed if lrn is not None]
+    rejected = len(rows) - len(valid)
+    if rejected > 0:
+        logger.warning("Rejected %d/%d rows during parsing", rejected, len(rows))
+    return valid, rejected
 
 
 async def load_tags_for_learnings(
@@ -163,8 +309,9 @@ async def load_tags_for_learnings(
 
 
 # ---------------------------------------------------------------------------
-# Result writing
+# Result writing (I/O handler)
 # ---------------------------------------------------------------------------
+
 
 async def write_patterns(
     pool,
@@ -236,13 +383,13 @@ async def write_patterns(
 
 
 # ---------------------------------------------------------------------------
-# Reporting
+# Reporting (I/O → pure function delegation)
 # ---------------------------------------------------------------------------
 
-async def get_last_run_report(pool) -> str | None:
+
+async def get_last_run_report(pool) -> str:
     """Generate a report from the most recent detection run."""
     async with pool.acquire() as conn:
-        # Find the latest run_id
         row = await conn.fetchrow(
             """
             SELECT run_id, created_at, COUNT(*) as pattern_count
@@ -259,7 +406,6 @@ async def get_last_run_report(pool) -> str | None:
         run_id = row["run_id"]
         created_at = row["created_at"]
 
-        # Get patterns for this run
         patterns = await conn.fetch(
             """
             SELECT dp.*, COUNT(pm.memory_id) as member_count
@@ -272,37 +418,13 @@ async def get_last_run_report(pool) -> str | None:
             run_id,
         )
 
-    lines = [
-        "=" * 50,
-        "Pattern Detection Report",
-        f"Run: {run_id} | Date: {created_at}",
-        f"Patterns: {len(patterns)}",
-        "=" * 50,
-        "",
-    ]
-
-    # Group by type
-    by_type: dict[str, list] = {}
-    for p in patterns:
-        by_type.setdefault(p["pattern_type"], []).append(p)
-
-    for ptype, group in sorted(by_type.items()):
-        lines.append(f"{ptype.upper()} ({len(group)} detected)")
-        lines.append("-" * 40)
-        for i, p in enumerate(group, 1):
-            tags_str = ", ".join(p["tags"][:5]) if p["tags"] else "none"
-            lines.append(f"  {i}. \"{p['label']}\" (confidence: {p['confidence']:.2f})")
-            lines.append(f"     {p['member_count']} learnings across {p['session_count']} sessions")
-            lines.append(f"     Tags: {tags_str}")
-            lines.append("")
-        lines.append("")
-
-    return "\n".join(lines)
+    return format_report(run_id, created_at, patterns)
 
 
 # ---------------------------------------------------------------------------
-# Main pipeline
+# Main pipeline (orchestrator)
 # ---------------------------------------------------------------------------
+
 
 async def run_pattern_detection(
     min_cluster_size: int = 5,
@@ -331,31 +453,38 @@ async def run_pattern_detection(
 
     # Load data
     logger.info("Loading learnings...")
-    learnings = await load_learnings(pool)
-    logger.info("Loaded %d learnings", len(learnings))
+    learnings, rejected = await load_learnings(pool)
+    logger.info("Loaded %d learnings (%d rejected)", len(learnings), rejected)
 
-    if not learnings:
-        # Still supersede previous snapshot so stale patterns don't persist
-        if not dry_run:
-            await write_patterns(pool, [], run_id)
+    # Abort on any parse rejections to preserve the existing snapshot.
+    # Mixed corpora produce unreliable pattern results.
+    if rejected > 0:
+        logger.error("Aborting: %d rows rejected during parsing", rejected)
         return {
-            "success": True,
-            "run_id": run_id,
-            "learnings_analyzed": 0,
-            "patterns_detected": 0,
-            "patterns_by_type": {},
-            "duration_seconds": time.monotonic() - start,
-            "dry_run": dry_run,
+            "success": False,
+            "error": f"{rejected} rows rejected during parsing; snapshot preserved",
+            "rejected_count": rejected,
+            "learnings_parsed": len(learnings),
         }
 
-    # Enrich tags from memory_tags table
+    if not learnings:
+        if not dry_run:
+            await write_patterns(pool, [], run_id)
+        return build_run_summary(
+            run_id=run_id,
+            learnings_count=0,
+            patterns_count=0,
+            patterns_by_type={},
+            written=0,
+            duration=time.monotonic() - start,
+            dry_run=dry_run,
+        )
+
+    # Enrich tags from memory_tags table (immutable)
     logger.info("Loading tags...")
     learning_ids = [lrn.id for lrn in learnings]
     db_tags = await load_tags_for_learnings(pool, learning_ids)
-    for lrn in learnings:
-        extra_tags = db_tags.get(lrn.id, [])
-        if extra_tags:
-            lrn.tags = list(set(lrn.tags + extra_tags))
+    learnings = merge_tags(learnings, db_tags)
 
     # Build classifier
     classifier = None
@@ -382,10 +511,7 @@ async def run_pattern_detection(
     )
     logger.info("Detected %d patterns", len(patterns))
 
-    # Count by type
-    by_type: dict[str, int] = {}
-    for p in patterns:
-        by_type[p.pattern_type] = by_type.get(p.pattern_type, 0) + 1
+    by_type = count_by_type(patterns)
 
     # Write results
     written = 0
@@ -394,35 +520,26 @@ async def run_pattern_detection(
         written = await write_patterns(pool, patterns, run_id)
         logger.info("Wrote %d patterns", written)
 
-    duration = time.monotonic() - start
+    duration = round(time.monotonic() - start, 2)
 
-    summary = {
-        "success": True,
-        "run_id": run_id,
-        "learnings_analyzed": len(learnings),
-        "patterns_detected": len(patterns),
-        "patterns_by_type": by_type,
-        "written": written,
-        "duration_seconds": round(duration, 2),
-        "dry_run": dry_run,
-    }
-
-    # Print pattern summaries for dry-run
     if dry_run and patterns:
-        print("\n--- Dry Run Results ---")
-        for i, p in enumerate(patterns, 1):
-            print(f"\n{i}. [{p.pattern_type}] {p.label}")
-            members = len(p.member_ids)
-            sess = p.session_count
-            print(f"   Confidence: {p.confidence:.2f} | Members: {members} | Sessions: {sess}")
-            print(f"   Tags: {', '.join(p.tags[:5])}")
+        print(format_dry_run_output(patterns))
 
-    return summary
+    return build_run_summary(
+        run_id=run_id,
+        learnings_count=len(learnings),
+        patterns_count=len(patterns),
+        patterns_by_type=by_type,
+        written=written,
+        duration=duration,
+        dry_run=dry_run,
+    )
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
 
 def main():
     parser = argparse.ArgumentParser(

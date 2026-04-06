@@ -243,13 +243,21 @@ async def _ensure_tables(pool) -> bool:
 # ---------------------------------------------------------------------------
 
 
-async def load_learnings(pool) -> tuple[list[Learning], int]:
+async def load_learnings(
+    pool,
+    *,
+    expected_dim: int = EXPECTED_EMBEDDING_DIM,
+) -> tuple[list[Learning], int]:
     """Load all active learnings with embeddings from PostgreSQL.
 
     Filters:
     - superseded_by IS NULL (active only)
     - embedding IS NOT NULL
     - Excludes SYNTHESIZED_PATTERN to prevent feedback loops
+
+    Args:
+        pool: asyncpg connection pool.
+        expected_dim: Expected embedding dimension (default 1024).
 
     Returns (learnings, rejected_count) so callers can detect parse failures.
     """
@@ -264,7 +272,7 @@ async def load_learnings(pool) -> tuple[list[Learning], int]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(query)
 
-    parsed = [parse_learning_row(row) for row in rows]
+    parsed = [parse_learning_row(row, expected_dim=expected_dim) for row in rows]
     valid = [lrn for lrn in parsed if lrn is not None]
     rejected = len(rows) - len(valid)
     if rejected > 0:

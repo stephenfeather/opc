@@ -564,6 +564,23 @@ class TestLoadLearnings:
         assert learnings[0].learning_type == "WORKING_SOLUTION"
 
     @pytest.mark.asyncio
+    async def test_expected_dim_passthrough(self):
+        """load_learnings passes expected_dim to parse_learning_row."""
+        rows = [_make_db_row(embedding_dim=384)]
+        pool, conn = _make_pool()
+        conn.fetch = AsyncMock(return_value=rows)
+
+        # Default dim=1024 should reject 384-dim embeddings
+        learnings, rejected = await load_learnings(pool)
+        assert len(learnings) == 0
+        assert rejected == 1
+
+        # Passing expected_dim=384 should accept them
+        learnings, rejected = await load_learnings(pool, expected_dim=384)
+        assert len(learnings) == 1
+        assert rejected == 0
+
+    @pytest.mark.asyncio
     async def test_empty_db_returns_empty(self):
         pool, conn = _make_pool()
         conn.fetch = AsyncMock(return_value=[])

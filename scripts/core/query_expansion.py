@@ -77,9 +77,12 @@ def _sanitize_query_words(query: str) -> list[str]:
     ]
     if words:
         return words
-    # Fallback: take first word cleaned, or empty string
-    fallback = re.sub(r"[^a-zA-Z0-9]", "", query.lower().split()[0]) if query.strip() else ""
-    return [fallback] if fallback else [""]
+    # Fallback: try first word cleaned; return empty list if nothing usable
+    if query.strip():
+        fallback = re.sub(r"[^a-zA-Z0-9]", "", query.lower().split()[0])
+        if fallback:
+            return [fallback]
+    return []
 
 
 def _compute_neighbor_df(contents: Iterable[str]) -> dict[str, int]:
@@ -148,8 +151,11 @@ def _score_expansion_candidates(
 
 
 def _format_tsquery(original_words: list[str], expansion_terms: list[str]) -> str:
-    """Join original and expansion terms into an OR-joined tsquery string."""
-    all_terms = original_words + expansion_terms
+    """Join original and expansion terms into an OR-joined tsquery string.
+
+    Filters out empty/blank terms to prevent malformed tsquery syntax.
+    """
+    all_terms = [t for t in original_words + expansion_terms if t.strip()]
     return " | ".join(all_terms)
 
 
@@ -173,7 +179,7 @@ def _is_cache_stale(
     except (ValueError, TypeError):
         return True
 
-    if cached.doc_count == 0:
+    if not isinstance(cached.doc_count, int) or cached.doc_count <= 0:
         return True
 
     drift = abs(current_count - cached.doc_count) / cached.doc_count

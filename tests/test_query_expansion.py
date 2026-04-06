@@ -327,18 +327,31 @@ class TestSanitizeQueryWords:
         assert "multi" in result
         assert "terminal" in result
 
-    def test_empty_query_fallback(self):
+    def test_empty_query_returns_empty_list(self):
         from scripts.core.query_expansion import _sanitize_query_words
 
         result = _sanitize_query_words("")
-        assert result == [""]
+        assert result == []
 
-    def test_only_short_words_fallback(self):
+    def test_only_short_words_uses_fallback(self):
         from scripts.core.query_expansion import _sanitize_query_words
 
+        # Fallback takes first cleaned word even if short
         result = _sanitize_query_words("a I")
-        assert isinstance(result, list)
-        assert len(result) >= 1
+        assert result == ["a"]
+
+    def test_punctuation_only_returns_empty_list(self):
+        from scripts.core.query_expansion import _sanitize_query_words
+
+        result = _sanitize_query_words("!!! ??? ...")
+        assert result == []
+
+    def test_stopwords_only_returns_short_fallback(self):
+        from scripts.core.query_expansion import _sanitize_query_words
+
+        # "the" is only 3 chars but passes the >2 length check
+        result = _sanitize_query_words("the")
+        assert result == ["the"]
 
 
 class TestComputeNeighborDf:
@@ -507,6 +520,18 @@ class TestFormatTsquery:
         result = _format_tsquery([], [])
         assert result == ""
 
+    def test_filters_blank_terms(self):
+        from scripts.core.query_expansion import _format_tsquery
+
+        result = _format_tsquery(["", "auth"], ["", "workflow"])
+        assert result == "auth | workflow"
+
+    def test_all_blank_terms_returns_empty(self):
+        from scripts.core.query_expansion import _format_tsquery
+
+        result = _format_tsquery(["", " "], [])
+        assert result == ""
+
 
 class TestFoldDocument:
     def test_folds_single_document(self):
@@ -627,6 +652,34 @@ class TestIsCacheStale:
             word_df={"test": 1},
             doc_count=100,
             built_at="not-a-timestamp",
+        )
+        assert _is_cache_stale(
+            cached, max_age_hours=24, current_count=100, drift_threshold=0.1
+        ) is True
+
+    def test_negative_doc_count_is_stale(self):
+        from datetime import UTC, datetime
+
+        from scripts.core.query_expansion import _is_cache_stale
+
+        cached = IDFIndex(
+            word_df={"test": 1},
+            doc_count=-5,
+            built_at=datetime.now(UTC).isoformat(),
+        )
+        assert _is_cache_stale(
+            cached, max_age_hours=24, current_count=100, drift_threshold=0.1
+        ) is True
+
+    def test_string_doc_count_is_stale(self):
+        from datetime import UTC, datetime
+
+        from scripts.core.query_expansion import _is_cache_stale
+
+        cached = IDFIndex(
+            word_df={"test": 1},
+            doc_count="ten",  # type: ignore[arg-type]
+            built_at=datetime.now(UTC).isoformat(),
         )
         assert _is_cache_stale(
             cached, max_age_hours=24, current_count=100, drift_threshold=0.1

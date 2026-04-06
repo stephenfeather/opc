@@ -20,10 +20,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts.core.store_learning import DEDUP_THRESHOLD, store_learning_v2
 
-# Patch targets: these are lazy imports inside store_learning_v2,
-# so we patch at the SOURCE module, not the target module.
-MEMORY_FACTORY = "scripts.core.db.memory_factory"
-EMBEDDING_SVC = "scripts.core.db.embedding_service"
+# Patch targets: imports are now at module level in store_learning,
+# so we patch at the consuming module.
+STORE_MOD = "scripts.core.store_learning"
 
 
 @pytest.fixture
@@ -60,9 +59,9 @@ def _patches(mock_memory_service, mock_embedder):
     mock_embed_cls = MagicMock(return_value=mock_embedder)
 
     return (
-        patch(f"{MEMORY_FACTORY}.create_memory_service", mock_create),
-        patch(f"{MEMORY_FACTORY}.get_default_backend", mock_get_backend),
-        patch(f"{EMBEDDING_SVC}.EmbeddingService", mock_embed_cls),
+        patch(f"{STORE_MOD}.create_memory_service", mock_create),
+        patch(f"{STORE_MOD}.get_default_backend", mock_get_backend),
+        patch(f"{STORE_MOD}.EmbeddingService", mock_embed_cls),
     )
 
 
@@ -214,9 +213,9 @@ async def test_fallback_to_session_scoped_search(mock_embedder):
     mock_embed_cls = MagicMock(return_value=mock_embedder)
 
     with (
-        patch(f"{MEMORY_FACTORY}.create_memory_service", mock_create),
-        patch(f"{MEMORY_FACTORY}.get_default_backend", mock_get_backend),
-        patch(f"{EMBEDDING_SVC}.EmbeddingService", mock_embed_cls),
+        patch(f"{STORE_MOD}.create_memory_service", mock_create),
+        patch(f"{STORE_MOD}.get_default_backend", mock_get_backend),
+        patch(f"{STORE_MOD}.EmbeddingService", mock_embed_cls),
     ):
         result = await store_learning_v2(
             session_id="my-session",

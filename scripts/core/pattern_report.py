@@ -196,11 +196,15 @@ def format_age(created: datetime, *, now: datetime | None = None) -> str:
     return f"{total_seconds // 60}m ago"
 
 
+_METADATA_PARSE_ERROR: dict = {"_parse_error": True}
+
+
 def parse_pattern_metadata(metadata: dict | str | None) -> dict:
     """Parse pattern metadata from dict or JSON string.
 
-    Returns empty dict for None, empty strings, malformed JSON,
-    or non-dict/non-string types.
+    Returns empty dict for None, empty strings, or non-dict/non-string types.
+    Returns ``_METADATA_PARSE_ERROR`` sentinel for malformed or non-object JSON
+    so callers can distinguish parse failures from legitimately empty metadata.
     """
     if isinstance(metadata, dict):
         return metadata
@@ -210,10 +214,10 @@ def parse_pattern_metadata(metadata: dict | str | None) -> dict:
         parsed = json.loads(metadata)
     except (json.JSONDecodeError, ValueError):
         logger.warning("Malformed pattern metadata: %s", metadata[:80])
-        return {}
+        return _METADATA_PARSE_ERROR
     if not isinstance(parsed, dict):
         logger.warning("Non-object pattern metadata: %s", type(parsed).__name__)
-        return {}
+        return _METADATA_PARSE_ERROR
     return parsed
 
 
@@ -246,7 +250,8 @@ def format_type_section(ptype: str, group: list[dict]) -> list[str]:
 
     for i, pat in enumerate(group, 1):
         meta = parse_pattern_metadata(pat["metadata"])
-        span = meta.get("temporal_span_days", 0)
+        has_error = meta.get("_parse_error", False)
+        span = "N/A" if has_error else f"{meta.get('temporal_span_days', 0)} days"
 
         lines.append(
             f"  {i}. \"{pat['label']}\""
@@ -255,7 +260,7 @@ def format_type_section(ptype: str, group: list[dict]) -> list[str]:
         lines.append(
             f"     {pat['member_count']} learnings"
             f" across {pat['session_count']} sessions"
-            f" | span: {span} days"
+            f" | span: {span}"
         )
         lines.append(f"     Tags: {_format_tags(pat['tags'])}")
 
@@ -326,6 +331,28 @@ def _format_human(
     return "\n".join(lines)
 
 
+def _format_pattern_json(pat: dict) -> dict:
+    """Format a single pattern for JSON output."""
+    meta = parse_pattern_metadata(pat["metadata"])
+    has_error = meta.get("_parse_error", False)
+    entry = {
+        "id": str(pat["id"]),
+        "pattern_type": pat["pattern_type"],
+        "label": pat["label"],
+        "confidence": pat["confidence"],
+        "member_count": pat["member_count"],
+        "session_count": pat["session_count"],
+        "tags": pat["tags"] or [],
+        "temporal_span_days": None if has_error else meta.get("temporal_span_days", 0),
+        "representative_content": _truncate(
+            pat.get("representative_content", ""), 200
+        ),
+    }
+    if has_error:
+        entry["metadata_error"] = True
+    return entry
+
+
 def _format_json(
     meta: dict,
     patterns: list[dict],
@@ -339,21 +366,7 @@ def _format_json(
         "total_sessions": total_sessions,
         "pattern_count": len(patterns),
         "patterns": [
-            {
-                "id": str(pat["id"]),
-                "pattern_type": pat["pattern_type"],
-                "label": pat["label"],
-                "confidence": pat["confidence"],
-                "member_count": pat["member_count"],
-                "session_count": pat["session_count"],
-                "tags": pat["tags"] or [],
-                "temporal_span_days": parse_pattern_metadata(
-                    pat["metadata"]
-                ).get("temporal_span_days", 0),
-                "representative_content": _truncate(
-                    pat.get("representative_content", ""), 200
-                ),
-            }
+            _format_pattern_json(pat)
             for pat in patterns
         ],
     }

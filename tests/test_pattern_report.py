@@ -184,20 +184,24 @@ class TestParsePatternMetadata:
     def test_empty_string_returns_empty_dict(self):
         assert parse_pattern_metadata("") == {}
 
-    def test_malformed_json_returns_empty_dict(self):
-        assert parse_pattern_metadata("not-json") == {}
+    def test_malformed_json_returns_error_sentinel(self):
+        result = parse_pattern_metadata("not-json")
+        assert result.get("_parse_error") is True
 
     def test_numeric_value_returns_empty_dict(self):
         assert parse_pattern_metadata(42) == {}
 
-    def test_json_array_returns_empty_dict(self):
-        assert parse_pattern_metadata("[]") == {}
+    def test_json_array_returns_error_sentinel(self):
+        result = parse_pattern_metadata("[]")
+        assert result.get("_parse_error") is True
 
-    def test_json_scalar_string_returns_empty_dict(self):
-        assert parse_pattern_metadata('"text"') == {}
+    def test_json_scalar_string_returns_error_sentinel(self):
+        result = parse_pattern_metadata('"text"')
+        assert result.get("_parse_error") is True
 
-    def test_json_number_string_returns_empty_dict(self):
-        assert parse_pattern_metadata("1") == {}
+    def test_json_number_string_returns_error_sentinel(self):
+        result = parse_pattern_metadata("1")
+        assert result.get("_parse_error") is True
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +306,7 @@ class TestGenerateReportFromData:
             total_sessions=5, as_json=False,
         )
         assert "Pattern Detection Report" in result
-        assert "0 days" in result
+        assert "span: N/A" in result
 
     def test_malformed_metadata_json_output(self):
         meta = _make_meta()
@@ -313,7 +317,8 @@ class TestGenerateReportFromData:
             total_sessions=5, as_json=True,
         )
         data = json.loads(result)
-        assert data["patterns"][0]["temporal_span_days"] == 0
+        assert data["patterns"][0]["temporal_span_days"] is None
+        assert data["patterns"][0]["metadata_error"] is True
 
 
 class TestGenerateSummaryFromData:

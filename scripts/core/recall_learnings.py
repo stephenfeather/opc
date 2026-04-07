@@ -42,9 +42,22 @@ logger = logging.getLogger(__name__)
 
 from dotenv import load_dotenv
 
-faulthandler.enable(
-    file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True
-)
+_FAULT_LOG_FILE = None
+
+
+def _enable_faulthandler() -> None:
+    """Enable faulthandler without breaking imports if log dir is missing."""
+    global _FAULT_LOG_FILE
+    log_path = Path.home() / ".claude" / "logs" / "opc_crash.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        _FAULT_LOG_FILE = log_path.open("a")
+        faulthandler.enable(file=_FAULT_LOG_FILE, all_threads=True)
+    except OSError:
+        faulthandler.enable(all_threads=True)
+
+
+_enable_faulthandler()
 
 # Load .env files
 global_env = Path.home() / ".claude" / ".env"
@@ -116,7 +129,7 @@ def filter_by_tags(
     if not strict or not tags:
         return results
     tag_set = set(tags)
-    return [r for r in results if set(r.get("metadata", {}).get("tags", [])) & tag_set]
+    return [r for r in results if set(r.get("metadata", {}).get("tags") or []) & tag_set]
 
 
 def build_pattern_lookup(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -181,8 +194,15 @@ def resolve_search_params(
 ) -> dict[str, Any]:
     """Resolve CLI flags into a search parameter dict.
 
-    Returns a dict with keys: mode, query, k, provider, similarity_threshold,
-    recency_weight, expand, max_expansion_terms, rebuild_idf.
+    All returned dicts include ``mode``, ``query``, and ``k``.
+
+    Additional keys depend on the selected mode:
+    - ``sqlite``: no additional keys.
+    - ``text_only``: no additional keys.
+    - ``vector``: adds ``provider``, ``similarity_threshold``,
+      ``recency_weight``, and ``text_fallback``.
+    - ``hybrid_rrf``: adds ``provider``, ``similarity_threshold``, ``expand``,
+      ``max_expansion_terms``, and ``rebuild_idf``.
     """
     if backend == "sqlite":
         return {"mode": "sqlite", "query": query, "k": fetch_k}
@@ -290,7 +310,7 @@ async def _fetch_pattern_rows(result_ids: list[str]) -> list[dict[str, Any]]:
             SELECT pm.memory_id,
                    MAX(dp.confidence * GREATEST(1.0 - COALESCE(pm.distance, 0), 0))
                        AS pattern_strength,
-                   ARRAY_AGG(DISTINCT unnested_tag)
+                   ARRAY_AGG(DISTINCT unnested_tag) FILTER (WHERE unnested_tag IS NOT NULL)
                        AS pattern_tags
             FROM pattern_members pm
             JOIN detected_patterns dp ON dp.id = pm.pattern_id
@@ -412,11 +432,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--json", action="store_true", help="JSON output")
     parser.add_argument("--json-full", action="store_true", help="Full JSON metadata output")
-    parser.add_argument("--text-only", action="store_true", help="Text search only (no embeddings)")
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--text-only", action="store_true", help="Text search only (no embeddings)"
+    )
+    mode_group.add_argument("--vector-only", action="store_true", help="Vector-only search")
     parser.add_argument(
         "--threshold", "-t", type=float, default=0.2, help="Minimum similarity (default: 0.2)"
     )
-    parser.add_argument("--vector-only", action="store_true", help="Vector-only search")
     parser.add_argument(
         "--recency", "-r", type=float, default=0.1, help="Recency weight (default: 0.1)"
     )

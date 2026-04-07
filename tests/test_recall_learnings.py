@@ -111,6 +111,12 @@ class TestFilterByTags:
         filtered = filter_by_tags(results, tags=["a"], strict=True)
         assert filtered == []
 
+    def test_strict_none_tags_value(self):
+        """Results with metadata.tags=None should not crash."""
+        results = [{"id": "1", "metadata": {"tags": None}}]
+        filtered = filter_by_tags(results, tags=["a"], strict=True)
+        assert filtered == []
+
     def test_does_not_mutate_input(self):
         results = [
             {"id": "1", "metadata": {"tags": ["a"]}},
@@ -449,6 +455,34 @@ class TestDispatchSearch:
             }
             await _dispatch_search(params)
             mock.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_hybrid_rrf_rebuild_idf(self):
+        from scripts.core.recall_learnings import _dispatch_search
+
+        with (
+            patch(
+                "scripts.core.recall_learnings.search_learnings_hybrid_rrf",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+            patch(
+                "scripts.core.query_expansion.get_idf_index",
+                new_callable=AsyncMock,
+            ) as mock_idf,
+        ):
+            params = {
+                "mode": "hybrid_rrf",
+                "query": "x",
+                "k": 10,
+                "provider": "local",
+                "similarity_threshold": 0.002,
+                "expand": True,
+                "max_expansion_terms": 5,
+                "rebuild_idf": True,
+            }
+            await _dispatch_search(params)
+            mock_idf.assert_called_once_with(force_rebuild=True)
 
 
 # ---------------------------------------------------------------------------

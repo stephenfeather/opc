@@ -32,3 +32,5 @@ thoughts/
 # IDE
 .idea/
 .vscode/
+
+.qlty/

@@ -36,6 +36,7 @@ Each file is treated as a separate stage following the Large Plan Workflow: git 
 | S23 | `store_learning.py` | #42 | DONE |
 | S24 | `recall_learnings.py` | #44 | DONE |
 | S25 | `push_learnings.py` | #45 | DONE |
+| S26 | `re_embed_voyage.py` | #46 | DONE |
 | S27 | `memory_metrics.py` | #48 | DONE |
 | S29 | `pattern_report.py` | #47 | DONE |
 

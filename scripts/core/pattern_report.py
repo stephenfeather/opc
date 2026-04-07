@@ -172,23 +172,45 @@ def _truncate(text: str, max_len: int = 80) -> str:
 
 
 def format_age(created: datetime, *, now: datetime | None = None) -> str:
-    """Format a datetime as a human-readable relative age string."""
+    """Format a datetime as a human-readable relative age string.
+
+    Handles future timestamps (clock skew) by showing 'in Xm/Xh/Xd'.
+    """
     now = now or datetime.now(UTC)
-    age = now - created
-    if age.days > 0:
-        return f"{age.days}d ago"
-    if age.seconds >= 3600:
-        return f"{age.seconds // 3600}h ago"
-    return f"{age.seconds // 60}m ago"
+    delta = now - created
+    total_seconds = int(delta.total_seconds())
+
+    if total_seconds < 0:
+        # Future timestamp — clock skew or backfill
+        future = -total_seconds
+        if future >= 86400:
+            return f"in {future // 86400}d"
+        if future >= 3600:
+            return f"in {future // 3600}h"
+        return f"in {future // 60}m"
+
+    if total_seconds >= 86400:
+        return f"{total_seconds // 86400}d ago"
+    if total_seconds >= 3600:
+        return f"{total_seconds // 3600}h ago"
+    return f"{total_seconds // 60}m ago"
 
 
 def parse_pattern_metadata(metadata: dict | str | None) -> dict:
-    """Parse pattern metadata from dict or JSON string."""
+    """Parse pattern metadata from dict or JSON string.
+
+    Returns empty dict for None, empty strings, malformed JSON,
+    or non-dict/non-string types.
+    """
     if isinstance(metadata, dict):
         return metadata
-    if not metadata:
+    if not isinstance(metadata, str) or not metadata:
         return {}
-    return json.loads(metadata)
+    try:
+        return json.loads(metadata)
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("Malformed pattern metadata: %s", metadata[:80])
+        return {}
 
 
 def format_type_breakdown(rows: list[dict]) -> str:

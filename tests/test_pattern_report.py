@@ -142,6 +142,25 @@ class TestFormatAge:
         result = format_age(created)
         assert result == "1d ago"
 
+    def test_future_timestamp_shows_skew(self):
+        now = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
+        created = now + timedelta(minutes=5)
+        result = format_age(created, now=now)
+        assert "ago" not in result
+        assert "in 5m" == result
+
+    def test_future_timestamp_hours(self):
+        now = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
+        created = now + timedelta(hours=2)
+        result = format_age(created, now=now)
+        assert "in 2h" == result
+
+    def test_future_timestamp_days(self):
+        now = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
+        created = now + timedelta(days=1)
+        result = format_age(created, now=now)
+        assert "in 1d" == result
+
 
 # ---------------------------------------------------------------------------
 # parse_pattern_metadata tests (pure function)
@@ -164,6 +183,12 @@ class TestParsePatternMetadata:
 
     def test_empty_string_returns_empty_dict(self):
         assert parse_pattern_metadata("") == {}
+
+    def test_malformed_json_returns_empty_dict(self):
+        assert parse_pattern_metadata("not-json") == {}
+
+    def test_numeric_value_returns_empty_dict(self):
+        assert parse_pattern_metadata(42) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +283,28 @@ class TestGenerateReportFromData:
         )
         data = json.loads(result)
         assert data["total_learnings"] == 100
+
+    def test_malformed_metadata_degrades_gracefully(self):
+        meta = _make_meta()
+        bad_pattern = _make_pattern_row()
+        bad_pattern["metadata"] = "not-json"
+        result = generate_report_from_data(
+            meta=meta, patterns=[bad_pattern], total_learnings=10,
+            total_sessions=5, as_json=False,
+        )
+        assert "Pattern Detection Report" in result
+        assert "0 days" in result
+
+    def test_malformed_metadata_json_output(self):
+        meta = _make_meta()
+        bad_pattern = _make_pattern_row()
+        bad_pattern["metadata"] = "not-json"
+        result = generate_report_from_data(
+            meta=meta, patterns=[bad_pattern], total_learnings=10,
+            total_sessions=5, as_json=True,
+        )
+        data = json.loads(result)
+        assert data["patterns"][0]["temporal_span_days"] == 0
 
 
 class TestGenerateSummaryFromData:

@@ -215,6 +215,10 @@ def parse_args(argv: list[str] | None = None) -> dict[str, Any]:
         help="Max characters per learning content (default: 150)",
     )
     args = parser.parse_args(argv)
+    if args.k < 1:
+        parser.error("--k must be >= 1")
+    if args.max_chars < 1:
+        parser.error("--max-chars must be >= 1")
     return {
         "project": args.project,
         "k": args.k,

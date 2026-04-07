@@ -426,6 +426,14 @@ class TestParseArgs:
         config = parse_args([])
         assert config["project"] is None
 
+    def test_negative_k_rejected(self):
+        with pytest.raises(SystemExit):
+            parse_args(["--project", "opc", "--k", "-1"])
+
+    def test_negative_max_chars_rejected(self):
+        with pytest.raises(SystemExit):
+            parse_args(["--project", "opc", "--max-chars", "-5"])
+
 
 # ---------------------------------------------------------------------------
 # build_cli_output (pure)

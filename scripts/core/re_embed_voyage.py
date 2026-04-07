@@ -157,12 +157,22 @@ async def count_pending(target_model: str) -> tuple[int, int]:
     return classify_pending(total, done)
 
 
+# States that are eligible for claiming (baseline states only).
+# Failed states (bge-failed, embed-failed-db) are quarantined until --retry-failed.
+CLAIMABLE_STATES = ("bge", "bge-v1")
+
+# States considered failed/stale — reset by --retry-failed.
+FAILED_STATES = ("bge-failed", "embed-failed-db", "in-progress")
+
+
 async def claim_batch(target_model: str, batch_size: int) -> list[dict]:
     """Atomically claim a batch of rows for re-embedding.
 
+    Only claims rows in baseline states (bge, bge-v1, NULL). Rows in failed
+    or in-progress states are quarantined until explicitly reset via --retry-failed.
+
     Uses SELECT ... FOR UPDATE SKIP LOCKED to prevent concurrent workers
-    from processing the same rows. Claimed rows are marked 'in-progress'
-    within the same transaction.
+    from processing the same rows.
     """
     async with get_connection() as conn:
         async with conn.transaction():
@@ -170,13 +180,13 @@ async def claim_batch(target_model: str, batch_size: int) -> list[dict]:
                 """
                 SELECT id, content
                 FROM archival_memory
-                WHERE embedding_model != $1
-                  AND embedding_model != 'in-progress'
-                  AND (embedding_model IS NULL OR embedding_model = embedding_model)
+                WHERE (embedding_model IS NULL OR embedding_model = ANY($1::text[]))
+                  AND embedding_model != $2
                 ORDER BY created_at ASC
-                LIMIT $2
+                LIMIT $3
                 FOR UPDATE SKIP LOCKED
                 """,
+                list(CLAIMABLE_STATES),
                 target_model,
                 batch_size,
             )
@@ -298,6 +308,17 @@ async def run(model: str, batch_size: int, dry_run: bool) -> None:
     while True:
         rows = await claim_batch(model, batch_size)
         if not rows:
+            # Check if rows are stuck in failed/in-progress states
+            remaining, _ = await count_pending(model)
+            if remaining > 0:
+                print(
+                    f"\n  WARNING: {remaining} rows remain unconverted but are not claimable."
+                )
+                print("  They may be stuck in a failed or in-progress state.")
+                print("  Run with --retry-failed to reset them.")
+                await provider.aclose()
+                await close_pool()
+                sys.exit(1)
             break
 
         batch_num = converted // batch_size + 1
@@ -316,7 +337,7 @@ async def run(model: str, batch_size: int, dry_run: bool) -> None:
 
         if result.failed_ids:
             print(f"  WARNING: Batch failed — {len(result.failed_ids)} rows skipped.")
-            print("    Marked as 'bge-failed' — re-run to retry them.")
+            print("    Quarantined — run with --retry-failed to reset them.")
 
         await asyncio.sleep(0.2)
 
@@ -329,7 +350,7 @@ async def run(model: str, batch_size: int, dry_run: bool) -> None:
 
 async def reset_failed() -> None:
     """Reset failed and stale in-progress rows back to bge so they're retried."""
-    reset_statuses = ("bge-failed", "embed-failed-db", "in-progress")
+    reset_statuses = FAILED_STATES
     async with get_connection() as conn:
         count = await conn.fetchval(
             "SELECT COUNT(*) FROM archival_memory WHERE embedding_model = ANY($1::text[])",

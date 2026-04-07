@@ -8,6 +8,8 @@ from uuid import uuid4
 import pytest
 
 from scripts.core.re_embed_voyage import (
+    CLAIMABLE_STATES,
+    FAILED_STATES,
     BatchResult,
     build_batch_texts,
     classify_pending,
@@ -228,3 +230,31 @@ class TestMarkFailedRows:
 
         call_args = mock_conn.execute.await_args[0]
         assert "embed-failed-db" in call_args[1]
+
+
+# ---------------------------------------------------------------------------
+# State machine tests
+# ---------------------------------------------------------------------------
+
+
+class TestStateMachineConstants:
+    """Verify the embedding_model state machine is correctly defined."""
+
+    def test_claimable_states_exclude_failed(self):
+        """Failed states must not be claimable."""
+        for state in FAILED_STATES:
+            assert state not in CLAIMABLE_STATES
+
+    def test_failed_states_include_in_progress(self):
+        """in-progress is a failed/stale state for reset purposes."""
+        assert "in-progress" in FAILED_STATES
+
+    def test_failed_states_include_both_failure_types(self):
+        assert "bge-failed" in FAILED_STATES
+        assert "embed-failed-db" in FAILED_STATES
+
+    def test_claimable_states_are_baseline_only(self):
+        """Only baseline (pre-migration) states should be claimable."""
+        for state in CLAIMABLE_STATES:
+            assert "failed" not in state
+            assert "progress" not in state

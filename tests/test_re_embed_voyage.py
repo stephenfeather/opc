@@ -162,10 +162,14 @@ class TestProcessSingleBatch:
     @pytest.mark.asyncio
     async def test_db_update_failure_marks_embed_failed_db(self):
         """When embed succeeds but DB update fails, rows get 'embed-failed-db'."""
+        import asyncpg
+
         rows = [{"id": uuid4(), "content": "text1"}]
         mock_provider = AsyncMock()
         mock_provider.embed_batch.return_value = [[0.1] * 1024]
-        mock_update = AsyncMock(side_effect=Exception("DB connection lost"))
+        mock_update = AsyncMock(
+            side_effect=asyncpg.PostgresError("DB connection lost")
+        )
         mock_mark_failed = AsyncMock()
 
         result = await process_single_batch(

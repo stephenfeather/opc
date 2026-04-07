@@ -44,6 +44,8 @@ load_dotenv()
 project_dir = os.environ.get("CLAUDE_PROJECT_DIR", str(Path(__file__).parent.parent.parent))
 sys.path.insert(0, project_dir)
 
+import asyncpg  # noqa: E402
+
 from scripts.core.config import get_config as _get_config  # noqa: E402
 from scripts.core.db.embedding_service import EmbeddingError, VoyageEmbeddingProvider  # noqa: E402
 from scripts.core.db.postgres_pool import close_pool, get_connection  # noqa: E402
@@ -269,7 +271,7 @@ async def process_single_batch(
     try:
         await update_fn(rows, embeddings, target_model)
         return BatchResult(converted=len(rows))
-    except Exception:
+    except (asyncpg.PostgresError, OSError):
         if mark_failed_fn is not None:
             await mark_failed_fn(ids, status="embed-failed-db")
         return BatchResult(converted=0, failed_ids=ids)
@@ -409,9 +411,12 @@ def main() -> None:
     parser.add_argument(
         "--retry-failed",
         action="store_true",
-        help="Reset bge-failed rows back to bge so they get retried",
+        help="Reset quarantined rows (bge-failed, embed-failed-db, in-progress) back to bge",
     )
     args = parser.parse_args()
+
+    if args.batch_size < 1 or args.batch_size > 128:
+        parser.error("--batch-size must be between 1 and 128")
 
     if args.retry_failed:
         asyncio.run(reset_failed())

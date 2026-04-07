@@ -2006,7 +2006,7 @@ wheels = [
 
 [[package]]
 name = "mcp-execution"
-version = "0.7.6"
+version = "0.7.7"
 source = { editable = "." }
 dependencies = [
     { name = "aiofiles" },

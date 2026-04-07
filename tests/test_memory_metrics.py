@@ -31,6 +31,7 @@ from scripts.core.memory_metrics_core import (  # noqa: E402
 
 # Backwards-compat re-exports from the original module
 from scripts.core.memory_metrics import (  # noqa: E402
+    _get_version,
     build_parser,
     collect_all_metrics,
     format_human as format_human_reexport,
@@ -276,6 +277,9 @@ def _make_query_results() -> dict:
     }
 
 
+_TEST_TIMESTAMP = "2026-04-01T12:00:00+00:00"
+
+
 class TestAssembleReport:
     def test_no_period(self):
         qr = _make_query_results()
@@ -285,9 +289,10 @@ class TestAssembleReport:
             end=None,
             all_time_learnings=110,
             version="0.7.3",
+            generated_at=_TEST_TIMESTAMP,
         )
         assert report["period"] is None
-        assert "generated_at" in report
+        assert report["generated_at"] == _TEST_TIMESTAMP
 
     def test_with_period(self):
         qr = _make_query_results()
@@ -299,6 +304,7 @@ class TestAssembleReport:
             end=end,
             all_time_learnings=110,
             version="0.7.3",
+            generated_at=_TEST_TIMESTAMP,
         )
         assert report["period"]["from"] == start.isoformat()
         assert report["period"]["to"] == end.isoformat()
@@ -311,6 +317,7 @@ class TestAssembleReport:
             end=None,
             all_time_learnings=110,
             version="0.7.3",
+            generated_at=_TEST_TIMESTAMP,
         )
         extraction = report["extraction_stats_alltime"]
         assert extraction["learnings_per_extraction"] == round(110 / 40, 2)
@@ -324,6 +331,7 @@ class TestAssembleReport:
             end=None,
             all_time_learnings=110,
             version="0.7.3",
+            generated_at=_TEST_TIMESTAMP,
         )
         assert report["extraction_stats_alltime"]["learnings_per_extraction"] == 0.0
 
@@ -336,6 +344,7 @@ class TestAssembleReport:
             end=None,
             all_time_learnings=110,
             version="0.7.3",
+            generated_at=_TEST_TIMESTAMP,
         )
         # Verify the input extraction dict was NOT mutated
         assert "learnings_per_extraction" not in qr["extraction"]
@@ -349,6 +358,7 @@ class TestAssembleReport:
             end=None,
             all_time_learnings=110,
             version="0.7.3",
+            generated_at=_TEST_TIMESTAMP,
         )
         expected_keys = {
             "generated_at", "period", "totals", "per_session",
@@ -370,20 +380,20 @@ class TestAssembleReport:
             end=None,
             all_time_learnings=110,
             version="1.2.3",
+            generated_at=_TEST_TIMESTAMP,
         )
         assert report["version"] == "1.2.3"
 
-    def test_deterministic_with_explicit_generated_at(self):
-        """Same inputs produce identical outputs when generated_at is injected."""
+    def test_deterministic(self):
+        """Same inputs produce identical outputs."""
         qr = _make_query_results()
-        ts = "2026-04-01T12:00:00+00:00"
         report1 = assemble_report(
             query_results=qr,
             start=None,
             end=None,
             all_time_learnings=110,
             version="0.7.3",
-            generated_at=ts,
+            generated_at=_TEST_TIMESTAMP,
         )
         report2 = assemble_report(
             query_results=qr,
@@ -391,7 +401,7 @@ class TestAssembleReport:
             end=None,
             all_time_learnings=110,
             version="0.7.3",
-            generated_at=ts,
+            generated_at=_TEST_TIMESTAMP,
         )
         assert report1 == report2
 
@@ -404,7 +414,7 @@ class TestAssembleReport:
             end=None,
             all_time_learnings=110,
             version="0.7.3",
-            generated_at="2026-04-01T12:00:00+00:00",
+            generated_at=_TEST_TIMESTAMP,
         )
         # Mutate the output
         report["totals"]["active_learnings"] = 999
@@ -422,7 +432,7 @@ class TestAssembleReport:
             end=None,
             all_time_learnings=110,
             version="0.7.3",
-            generated_at="2026-04-01T12:00:00+00:00",
+            generated_at=_TEST_TIMESTAMP,
         )
         # Mutate the input
         qr["totals"]["active_learnings"] = 999
@@ -444,6 +454,18 @@ class TestAssembleReport:
             generated_at=ts,
         )
         assert report["generated_at"] == ts
+
+    def test_generated_at_is_required(self):
+        """assemble_report must not be callable without generated_at."""
+        qr = _make_query_results()
+        with pytest.raises(TypeError):
+            assemble_report(
+                query_results=qr,
+                start=None,
+                end=None,
+                all_time_learnings=110,
+                version="0.7.3",
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -486,7 +508,7 @@ def _sample_metrics() -> dict:
     return {
         "generated_at": "2026-04-01T14:00:00+00:00",
         "period": None,
-        "version": "0.7.3",
+        "version": _get_version(),
         "totals": {
             "active_learnings": 100,
             "superseded_learnings": 10,
@@ -585,7 +607,7 @@ class TestHumanFormatter:
     def test_contains_header(self):
         output = format_human(_sample_metrics())
         assert "Memory Metrics Report" in output
-        assert "v0.7.3" in output
+        assert f"v{_get_version()}" in output
 
     def test_contains_totals(self):
         output = format_human(_sample_metrics())
@@ -694,7 +716,7 @@ class TestJSONStructure:
         metrics = _sample_metrics()
         serialized = json.dumps(metrics)
         parsed = json.loads(serialized)
-        assert parsed["version"] == "0.7.3"
+        assert parsed["version"] == _get_version()
 
     def test_all_top_level_keys_present(self):
         metrics = _sample_metrics()

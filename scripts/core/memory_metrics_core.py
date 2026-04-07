@@ -116,7 +116,7 @@ def assemble_report(
     end: datetime | None,
     all_time_learnings: int,
     version: str,
-    generated_at: str | None = None,
+    generated_at: str,
 ) -> dict[str, Any]:
     """Assemble the final metrics report dict from pre-fetched query results.
 
@@ -133,14 +133,12 @@ def assemble_report(
         end: Period end (None if unfiltered).
         all_time_learnings: Total learning count (all-time) for ratio computation.
         version: Version string to include in the report.
-        generated_at: ISO timestamp string. Caller provides this from the I/O boundary.
-            Defaults to current UTC time if not provided (for backwards compat).
+        generated_at: ISO timestamp string. Must be provided by the caller
+            from the I/O boundary (e.g. datetime.now(UTC).isoformat()).
 
     Returns:
         Complete metrics report dict ready for JSON serialization.
     """
-    if generated_at is None:
-        generated_at = datetime.now(UTC).isoformat()
 
     period = None
     if start or end:

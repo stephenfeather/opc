@@ -39,12 +39,14 @@ logger = logging.getLogger(__name__)
 
 async def _get_pool():
     from scripts.core.db.postgres_pool import get_pool
+
     return await get_pool()
 
 
 # ---------------------------------------------------------------------------
-# Data queries
+# Data queries (I/O boundary)
 # ---------------------------------------------------------------------------
+
 
 async def _fetch_run_metadata(conn, run_id=None) -> dict | None:
     """Get metadata for a specific run or the latest active run."""
@@ -125,83 +127,126 @@ async def _fetch_total_sessions(conn) -> int:
     return row["cnt"] if row else 0
 
 
+async def _fetch_type_breakdown(conn, run_id) -> list[dict]:
+    """Fetch pattern type counts for a run."""
+    rows = await conn.fetch(
+        """
+        SELECT pattern_type, COUNT(*) AS cnt
+        FROM detected_patterns
+        WHERE run_id = $1 AND superseded_at IS NULL
+        GROUP BY pattern_type
+        ORDER BY cnt DESC
+        """,
+        run_id,
+    )
+    return [dict(r) for r in rows]
+
+
 # ---------------------------------------------------------------------------
-# Report generation
+# Pure functions
 # ---------------------------------------------------------------------------
+
+_TYPE_LABELS: dict[str, str] = {
+    "cross_project": "CROSS-PROJECT PATTERNS",
+    "expertise": "EXPERTISE AREAS",
+    "tool_cluster": "TOOL CLUSTERS",
+    "problem_solution": "PROBLEM-SOLUTION PATTERNS",
+    "anti_pattern": "ANTI-PATTERNS",
+}
+
+_TYPE_ORDER: list[str] = [
+    "cross_project",
+    "expertise",
+    "tool_cluster",
+    "problem_solution",
+    "anti_pattern",
+]
+
 
 def _truncate(text: str, max_len: int = 80) -> str:
     if not text:
         return ""
     if len(text) <= max_len:
         return text
-    return text[:max_len - 3] + "..."
+    return text[: max_len - 3] + "..."
 
 
-async def generate_report(
-    run_id: str | None = None,
-    as_json: bool = False,
-) -> str:
-    """Generate a full pattern detection report.
-
-    If run_id is None, uses the most recent active run.
-    Returns formatted string (human-readable or JSON).
-    """
-    pool = await _get_pool()
-    async with pool.acquire() as conn:
-        meta = await _fetch_run_metadata(conn, run_id)
-        if not meta:
-            return "No pattern detection runs found."
-
-        rid = meta["run_id"]
-        patterns = await _fetch_patterns_with_members(conn, rid)
-        total_learnings = await _fetch_total_learnings(conn)
-        total_sessions = await _fetch_total_sessions(conn)
-
-    if as_json:
-        return _format_json(meta, patterns, total_learnings, total_sessions)
-    return _format_human(meta, patterns, total_learnings, total_sessions)
-
-
-async def generate_summary() -> str:
-    """One-liner summary for daemon status integration."""
-    pool = await _get_pool()
-    async with pool.acquire() as conn:
-        meta = await _fetch_run_metadata(conn)
-        if not meta:
-            return "Pattern detection: no runs yet"
-
-        rid = meta["run_id"]
-        created = meta["created_at"]
-        count = meta["pattern_count"]
-
-        # Get type breakdown
-        rows = await conn.fetch(
-            """
-            SELECT pattern_type, COUNT(*) AS cnt
-            FROM detected_patterns
-            WHERE run_id = $1 AND superseded_at IS NULL
-            GROUP BY pattern_type
-            ORDER BY cnt DESC
-            """,
-            rid,
-        )
-
-    now = datetime.now(UTC)
+def format_age(created: datetime, *, now: datetime | None = None) -> str:
+    """Format a datetime as a human-readable relative age string."""
+    now = now or datetime.now(UTC)
     age = now - created
     if age.days > 0:
-        age_str = f"{age.days}d ago"
-    elif age.seconds >= 3600:
-        age_str = f"{age.seconds // 3600}h ago"
-    else:
-        age_str = f"{age.seconds // 60}m ago"
+        return f"{age.days}d ago"
+    if age.seconds >= 3600:
+        return f"{age.seconds // 3600}h ago"
+    return f"{age.seconds // 60}m ago"
 
-    types = ", ".join(f"{r['cnt']} {r['pattern_type']}" for r in rows)
-    return f"Last pattern detection: {age_str}, {count} patterns ({types})"
+
+def parse_pattern_metadata(metadata: dict | str | None) -> dict:
+    """Parse pattern metadata from dict or JSON string."""
+    if isinstance(metadata, dict):
+        return metadata
+    if not metadata:
+        return {}
+    return json.loads(metadata)
+
+
+def format_type_breakdown(rows: list[dict]) -> str:
+    """Format type breakdown rows into a comma-separated summary."""
+    if not rows:
+        return ""
+    return ", ".join(f"{r['cnt']} {r['pattern_type']}" for r in rows)
+
+
+def _format_tags(tags: list[str] | None) -> str:
+    """Format a tags list with overflow indicator."""
+    tags = tags or []
+    tags_str = ", ".join(tags[:5])
+    if len(tags) > 5:
+        tags_str += f" (+{len(tags) - 5} more)"
+    return tags_str
+
+
+def format_type_section(ptype: str, group: list[dict]) -> list[str]:
+    """Format a single pattern type section as a list of lines.
+
+    Pure function — returns new list instead of mutating.
+    """
+    header = _TYPE_LABELS.get(ptype, ptype.upper())
+    lines = [
+        f"{header} ({len(group)} detected)",
+        "-" * 40,
+    ]
+
+    for i, pat in enumerate(group, 1):
+        meta = parse_pattern_metadata(pat["metadata"])
+        span = meta.get("temporal_span_days", 0)
+
+        lines.append(
+            f"  {i}. \"{pat['label']}\""
+            f" (confidence: {pat['confidence']:.2f})"
+        )
+        lines.append(
+            f"     {pat['member_count']} learnings"
+            f" across {pat['session_count']} sessions"
+            f" | span: {span} days"
+        )
+        lines.append(f"     Tags: {_format_tags(pat['tags'])}")
+
+        rep = pat.get("representative_content")
+        if rep:
+            lines.append(f"     Example: {_truncate(rep)}")
+
+        lines.append("")
+
+    lines.append("")
+    return lines
 
 
 # ---------------------------------------------------------------------------
-# Formatters
+# Report generation (pure orchestrators)
 # ---------------------------------------------------------------------------
+
 
 def _format_human(
     meta: dict,
@@ -229,28 +274,20 @@ def _format_human(
     for pat in patterns:
         by_type.setdefault(pat["pattern_type"], []).append(pat)
 
-    type_order = [
-        "cross_project",
-        "expertise",
-        "tool_cluster",
-        "problem_solution",
-        "anti_pattern",
-    ]
-    for ptype in type_order:
+    for ptype in _TYPE_ORDER:
         group = by_type.pop(ptype, [])
         if not group:
             continue
-        _format_type_section(lines, ptype, group)
+        lines.extend(format_type_section(ptype, group))
 
     # Any remaining types not in the order
     for ptype, group in sorted(by_type.items()):
-        _format_type_section(lines, ptype, group)
+        lines.extend(format_type_section(ptype, group))
 
     # Summary footer
     total_members = sum(p["member_count"] for p in patterns)
     avg_conf = (
-        sum(p["confidence"] for p in patterns) / len(patterns)
-        if patterns else 0
+        sum(p["confidence"] for p in patterns) / len(patterns) if patterns else 0
     )
     lines.extend([
         "-" * 56,
@@ -261,55 +298,6 @@ def _format_human(
     ])
 
     return "\n".join(lines)
-
-
-def _format_type_section(
-    lines: list[str],
-    ptype: str,
-    group: list[dict],
-) -> None:
-    type_labels = {
-        "cross_project": "CROSS-PROJECT PATTERNS",
-        "expertise": "EXPERTISE AREAS",
-        "tool_cluster": "TOOL CLUSTERS",
-        "problem_solution": "PROBLEM-SOLUTION PATTERNS",
-        "anti_pattern": "ANTI-PATTERNS",
-    }
-    header = type_labels.get(ptype, ptype.upper())
-    lines.append(f"{header} ({len(group)} detected)")
-    lines.append("-" * 40)
-
-    for i, pat in enumerate(group, 1):
-        tags = pat["tags"] or []
-        tags_str = ", ".join(tags[:5])
-        if len(tags) > 5:
-            tags_str += f" (+{len(tags) - 5} more)"
-
-        meta = (
-            pat["metadata"]
-            if isinstance(pat["metadata"], dict)
-            else json.loads(pat["metadata"] or "{}")
-        )
-        span = meta.get("temporal_span_days", 0)
-
-        lines.append(
-            f"  {i}. \"{pat['label']}\""
-            f" (confidence: {pat['confidence']:.2f})"
-        )
-        lines.append(
-            f"     {pat['member_count']} learnings"
-            f" across {pat['session_count']} sessions"
-            f" | span: {span} days"
-        )
-        lines.append(f"     Tags: {tags_str}")
-
-        rep = pat.get("representative_content")
-        if rep:
-            lines.append(f"     Example: {_truncate(rep)}")
-
-        lines.append("")
-
-    lines.append("")
 
 
 def _format_json(
@@ -324,33 +312,114 @@ def _format_json(
         "total_learnings": total_learnings,
         "total_sessions": total_sessions,
         "pattern_count": len(patterns),
-        "patterns": [],
+        "patterns": [
+            {
+                "id": str(pat["id"]),
+                "pattern_type": pat["pattern_type"],
+                "label": pat["label"],
+                "confidence": pat["confidence"],
+                "member_count": pat["member_count"],
+                "session_count": pat["session_count"],
+                "tags": pat["tags"] or [],
+                "temporal_span_days": parse_pattern_metadata(
+                    pat["metadata"]
+                ).get("temporal_span_days", 0),
+                "representative_content": _truncate(
+                    pat.get("representative_content", ""), 200
+                ),
+            }
+            for pat in patterns
+        ],
     }
-    for pat in patterns:
-        pmeta = (
-            pat["metadata"]
-            if isinstance(pat["metadata"], dict)
-            else json.loads(pat["metadata"] or "{}")
-        )
-        data["patterns"].append({
-            "id": str(pat["id"]),
-            "pattern_type": pat["pattern_type"],
-            "label": pat["label"],
-            "confidence": pat["confidence"],
-            "member_count": pat["member_count"],
-            "session_count": pat["session_count"],
-            "tags": pat["tags"] or [],
-            "temporal_span_days": pmeta.get("temporal_span_days", 0),
-            "representative_content": _truncate(
-                pat.get("representative_content", ""), 200
-            ),
-        })
     return json.dumps(data, indent=2)
+
+
+def generate_report_from_data(
+    *,
+    meta: dict | None,
+    patterns: list[dict],
+    total_learnings: int,
+    total_sessions: int,
+    as_json: bool,
+) -> str:
+    """Pure report generation from pre-fetched data."""
+    if not meta:
+        return "No pattern detection runs found."
+    if as_json:
+        return _format_json(meta, patterns, total_learnings, total_sessions)
+    return _format_human(meta, patterns, total_learnings, total_sessions)
+
+
+def generate_summary_from_data(
+    *,
+    meta: dict | None,
+    type_rows: list[dict],
+    now: datetime,
+) -> str:
+    """Pure summary generation from pre-fetched data."""
+    if not meta:
+        return "Pattern detection: no runs yet"
+    age_str = format_age(meta["created_at"], now=now)
+    types = format_type_breakdown(type_rows)
+    return f"Last pattern detection: {age_str}, {meta['pattern_count']} patterns ({types})"
+
+
+# ---------------------------------------------------------------------------
+# I/O orchestrators (thin wrappers)
+# ---------------------------------------------------------------------------
+
+
+async def generate_report(
+    run_id: str | None = None,
+    as_json: bool = False,
+) -> str:
+    """Generate a full pattern detection report.
+
+    If run_id is None, uses the most recent active run.
+    Returns formatted string (human-readable or JSON).
+    """
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        meta = await _fetch_run_metadata(conn, run_id)
+        if not meta:
+            return "No pattern detection runs found."
+
+        rid = meta["run_id"]
+        patterns = await _fetch_patterns_with_members(conn, rid)
+        total_learnings = await _fetch_total_learnings(conn)
+        total_sessions = await _fetch_total_sessions(conn)
+
+    return generate_report_from_data(
+        meta=meta,
+        patterns=patterns,
+        total_learnings=total_learnings,
+        total_sessions=total_sessions,
+        as_json=as_json,
+    )
+
+
+async def generate_summary() -> str:
+    """One-liner summary for daemon status integration."""
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        meta = await _fetch_run_metadata(conn)
+        if not meta:
+            return "Pattern detection: no runs yet"
+
+        rid = meta["run_id"]
+        type_rows = await _fetch_type_breakdown(conn, rid)
+
+    return generate_summary_from_data(
+        meta=meta,
+        type_rows=type_rows,
+        now=datetime.now(UTC),
+    )
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
 
 def main():
     parser = argparse.ArgumentParser(

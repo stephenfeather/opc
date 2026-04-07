@@ -26,26 +26,27 @@ import json
 import logging
 import os
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import asyncpg
 
+from scripts.core.db.postgres_pool import get_pool
+from scripts.core.recall_formatters import get_api_version
+from scripts.core.recall_learnings import get_backend
+
 logger = logging.getLogger(__name__)
 
 
-async def get_stale_learnings(
-    project: str, k: int, *, conn: Any = None
-) -> list[dict[str, Any]]:
-    """Fetch never-recalled, high/medium confidence learnings for a project."""
-    if conn is None:
-        from scripts.core.db.postgres_pool import get_pool
+# ---------------------------------------------------------------------------
+# SQL query builders (pure)
+# ---------------------------------------------------------------------------
 
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            return await get_stale_learnings(project, k, conn=conn)
-    rows = await conn.fetch(
-        """
+
+def build_stale_query_params(project: str, k: int) -> tuple[str, list[Any]]:
+    """Build SQL and params for fetching stale learnings."""
+    sql = """
         SELECT id, content, metadata, created_at, recall_count
         FROM archival_memory
         WHERE metadata->>'type' = 'session_learning'
@@ -57,25 +58,13 @@ async def get_stale_learnings(
           CASE metadata->>'confidence' WHEN 'high' THEN 0 ELSE 1 END,
           created_at DESC
         LIMIT $2
-        """,
-        project,
-        k,
-    )
-    return [_row_to_dict(row) for row in rows]
+    """
+    return sql, [project, k]
 
 
-async def get_pattern_representatives(
-    k: int, *, conn: Any = None
-) -> list[dict[str, Any]]:
-    """Fetch never-recalled pattern representatives from high-value clusters."""
-    if conn is None:
-        from scripts.core.db.postgres_pool import get_pool
-
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            return await get_pattern_representatives(k, conn=conn)
-    rows = await conn.fetch(
-        """
+def build_pattern_query_params(k: int) -> tuple[str, list[Any]]:
+    """Build SQL and params for fetching pattern representatives."""
+    sql = """
         SELECT a.id, a.content, a.metadata, a.created_at, a.recall_count,
                dp.pattern_type, dp.label AS pattern_label,
                dp.confidence AS pattern_confidence
@@ -87,24 +76,23 @@ async def get_pattern_representatives(
           AND a.superseded_by IS NULL
         ORDER BY dp.confidence DESC, a.created_at DESC
         LIMIT $1
-        """,
-        k,
-    )
-    results = []
-    for row in rows:
-        d = _row_to_dict(row)
-        d["pattern_label"] = row.get("pattern_label")
-        raw_conf = row.get("pattern_confidence")
-        d["pattern_confidence"] = float(raw_conf) if raw_conf is not None else None
-        results.append(d)
-    return results
+    """
+    return sql, [k]
 
 
-def _row_to_dict(row: Any) -> dict[str, Any]:
+# ---------------------------------------------------------------------------
+# Row converters (pure)
+# ---------------------------------------------------------------------------
+
+
+def _row_to_dict(row: Mapping[str, Any]) -> dict[str, Any]:
     """Convert an asyncpg Record to a plain dict."""
     metadata = row["metadata"]
     if isinstance(metadata, str):
-        metadata = json.loads(metadata)
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
     return {
         "id": str(row["id"]),
         "content": row["content"],
@@ -116,6 +104,20 @@ def _row_to_dict(row: Any) -> dict[str, Any]:
         "pattern_label": None,
         "pattern_confidence": None,
     }
+
+
+def parse_pattern_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Convert a pattern query row to a candidate dict with pattern fields."""
+    d = _row_to_dict(row)
+    d["pattern_label"] = row.get("pattern_label")
+    raw_conf = row.get("pattern_confidence")
+    d["pattern_confidence"] = float(raw_conf) if raw_conf is not None else None
+    return d
+
+
+# ---------------------------------------------------------------------------
+# Pure domain functions
+# ---------------------------------------------------------------------------
 
 
 def merge_candidates(
@@ -138,7 +140,6 @@ def merge_candidates(
 
 def truncate_content(content: str, max_chars: int) -> str:
     """Truncate content to max_chars, appending '...' if trimmed."""
-    # Collapse to single line for compact display
     one_line = " ".join(
         line.strip() for line in content.split("\n") if line.strip()
     )
@@ -151,11 +152,8 @@ def format_results(
     candidates: list[dict[str, Any]], project: str, max_chars: int
 ) -> dict[str, Any]:
     """Build the JSON output structure."""
-    from scripts.core.recall_formatters import get_api_version
-
-    results = []
-    for c in candidates:
-        results.append({
+    results = [
+        {
             "id": c["id"],
             "content": truncate_content(c["content"], max_chars),
             "learning_type": c["learning_type"],
@@ -166,13 +164,95 @@ def format_results(
                 if hasattr(c["created_at"], "isoformat")
                 else str(c["created_at"])
             ),
-        })
+        }
+        for c in candidates
+    ]
     return {
         "version": get_api_version(),
         "push_source": "session_start",
         "project": project,
         "results": results,
     }
+
+
+# ---------------------------------------------------------------------------
+# CLI helpers (pure)
+# ---------------------------------------------------------------------------
+
+
+def parse_args(argv: list[str] | None = None) -> dict[str, Any]:
+    """Parse CLI arguments into a config dict."""
+    parser = argparse.ArgumentParser(
+        description="Proactive memory push — surface never-recalled high-value learnings",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument(
+        "--project",
+        default=(
+            Path(os.environ["CLAUDE_PROJECT_DIR"]).name
+            if os.environ.get("CLAUDE_PROJECT_DIR")
+            else None
+        ),
+        help="Project name to filter by (default: auto-detect from CLAUDE_PROJECT_DIR)",
+    )
+    parser.add_argument(
+        "--k", type=int, default=5,
+        help="Max number of learnings to push (default: 5)",
+    )
+    parser.add_argument(
+        "--json", action="store_true", dest="json_output",
+        help="Output as JSON (for hook consumption)",
+    )
+    parser.add_argument(
+        "--no-record", action="store_true",
+        help="Don't update recall_count (dry run / testing)",
+    )
+    parser.add_argument(
+        "--max-chars", type=int, default=150,
+        help="Max characters per learning content (default: 150)",
+    )
+    args = parser.parse_args(argv)
+    return {
+        "project": args.project,
+        "k": args.k,
+        "json_output": args.json_output,
+        "no_record": args.no_record,
+        "max_chars": args.max_chars,
+    }
+
+
+def build_cli_output(
+    candidates: list[dict[str, Any]],
+    project: str,
+    *,
+    max_chars: int,
+    json_output: bool,
+) -> str:
+    """Build CLI output string from candidates (JSON or text)."""
+    if not candidates:
+        if json_output:
+            empty = {"push_source": "session_start", "project": project, "results": []}
+            return json.dumps(empty)
+        return ""
+
+    output = format_results(candidates, project, max_chars)
+    if json_output:
+        return json.dumps(output, default=str)
+
+    lines = [f"Pushing {len(candidates)} learnings for project '{project}':"]
+    for i, c in enumerate(candidates, 1):
+        label = f" (Pattern: {c['pattern_label']})" if c.get("pattern_label") else ""
+        lines.append(
+            f"  {i}. [{c['learning_type']}|{c['confidence']}] "
+            f"{truncate_content(c['content'], max_chars)}{label}"
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# I/O boundary
+# ---------------------------------------------------------------------------
 
 
 def write_cache_file(output: dict[str, Any]) -> None:
@@ -183,13 +263,36 @@ def write_cache_file(output: dict[str, Any]) -> None:
     cache_file.write_text(json.dumps(output, default=str))
 
 
+async def get_stale_learnings(
+    project: str, k: int, *, conn: Any = None
+) -> list[dict[str, Any]]:
+    """Fetch never-recalled, high/medium confidence learnings for a project."""
+    if conn is None:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            return await get_stale_learnings(project, k, conn=conn)
+    sql, params = build_stale_query_params(project, k)
+    rows = await conn.fetch(sql, *params)
+    return [_row_to_dict(row) for row in rows]
+
+
+async def get_pattern_representatives(
+    k: int, *, conn: Any = None
+) -> list[dict[str, Any]]:
+    """Fetch never-recalled pattern representatives from high-value clusters."""
+    if conn is None:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            return await get_pattern_representatives(k, conn=conn)
+    sql, params = build_pattern_query_params(k)
+    rows = await conn.fetch(sql, *params)
+    return [parse_pattern_row(row) for row in rows]
+
+
 async def get_push_candidates(
     project: str, k: int = 5
 ) -> list[dict[str, Any]]:
     """Main entry: fetch and merge push candidates from PostgreSQL."""
-    from scripts.core.db.postgres_pool import get_pool
-    from scripts.core.recall_learnings import get_backend
-
     if get_backend() != "postgres":
         return []
 
@@ -207,87 +310,48 @@ async def get_push_candidates(
 
 async def main() -> int:
     """CLI entry point for push_learnings."""
-    parser = argparse.ArgumentParser(
-        description="Proactive memory push — surface never-recalled high-value learnings",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-    parser.add_argument(
-        "--project",
-        default=Path(os.environ["CLAUDE_PROJECT_DIR"]).name if os.environ.get("CLAUDE_PROJECT_DIR") else None,  # noqa: E501
-        help="Project name to filter by (default: auto-detect from CLAUDE_PROJECT_DIR)",
-    )
-    parser.add_argument(
-        "--k",
-        type=int,
-        default=5,
-        help="Max number of learnings to push (default: 5)",
-    )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        dest="json_output",
-        help="Output as JSON (for hook consumption)",
-    )
-    parser.add_argument(
-        "--no-record",
-        action="store_true",
-        help="Don't update recall_count (dry run / testing)",
-    )
-    parser.add_argument(
-        "--max-chars",
-        type=int,
-        default=150,
-        help="Max characters per learning content (default: 150)",
-    )
-    args = parser.parse_args()
+    config = parse_args()
+    project = config["project"]
+    json_output = config["json_output"]
 
-    if not args.project:
-        if args.json_output:
+    if not project:
+        if json_output:
             print(json.dumps({"error": "No project specified", "results": []}))
         else:
             print("Error: --project required (or set CLAUDE_PROJECT_DIR)", file=sys.stderr)
         return 1
 
     try:
-        candidates = await get_push_candidates(args.project, args.k)
-    except Exception as e:
-        if args.json_output:
-            print(json.dumps({"error": str(e), "results": []}))
+        candidates = await get_push_candidates(project, config["k"])
+    except (asyncpg.PostgresError, ConnectionError, OSError) as e:
+        logger.debug("push_learnings error", exc_info=True)
+        if json_output:
+            print(json.dumps({"error": type(e).__name__, "results": []}))
         else:
-            print(f"Error: {e}", file=sys.stderr)
+            print(f"Error: {type(e).__name__}: see logs for details", file=sys.stderr)
         return 1
 
+    # Build cache data (always, even when empty)
     if not candidates:
-        empty = {
-            "push_source": "session_start",
-            "project": args.project,
-            "results": [],
+        cache_data: dict[str, Any] = {
+            "push_source": "session_start", "project": project, "results": [],
         }
-        # Always overwrite cache so stale data from previous runs isn't reused
-        write_cache_file(empty)
-        if args.json_output:
-            print(json.dumps(empty))
-        return 0
+    else:
+        cache_data = format_results(candidates, project, config["max_chars"])
+
+    write_cache_file(cache_data)
 
     # Record recall to break the death spiral (unless dry run)
-    if not args.no_record:
+    if candidates and not config["no_record"]:
         from scripts.core.recall_learnings import record_recall
         await record_recall([c["id"] for c in candidates])
 
-    output = format_results(candidates, args.project, args.max_chars)
-
-    # Write cache file for compaction survival
-    write_cache_file(output)
-
-    if args.json_output:
-        print(json.dumps(output, default=str))
-    else:
-        print(f"Pushing {len(candidates)} learnings for project '{args.project}':")
-        for i, c in enumerate(candidates, 1):
-            label = f" (Pattern: {c['pattern_label']})" if c.get("pattern_label") else ""
-            print(f"  {i}. [{c['learning_type']}|{c['confidence']}] "
-                  f"{truncate_content(c['content'], args.max_chars)}{label}")
+    output_str = build_cli_output(
+        candidates, project,
+        max_chars=config["max_chars"], json_output=json_output,
+    )
+    if output_str:
+        print(output_str)
 
     return 0
 

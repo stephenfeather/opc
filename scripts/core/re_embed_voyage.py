@@ -157,21 +157,36 @@ async def count_pending(target_model: str) -> tuple[int, int]:
     return classify_pending(total, done)
 
 
-async def fetch_batch(target_model: str, batch_size: int, offset: int) -> list[dict]:
-    """Fetch a batch of rows that still need re-embedding."""
+async def claim_batch(target_model: str, batch_size: int) -> list[dict]:
+    """Atomically claim a batch of rows for re-embedding.
+
+    Uses SELECT ... FOR UPDATE SKIP LOCKED to prevent concurrent workers
+    from processing the same rows. Claimed rows are marked 'in-progress'
+    within the same transaction.
+    """
     async with get_connection() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT id, content
-            FROM archival_memory
-            WHERE embedding_model != $1 OR embedding_model IS NULL
-            ORDER BY created_at ASC
-            LIMIT $2 OFFSET $3
-            """,
-            target_model,
-            batch_size,
-            offset,
-        )
+        async with conn.transaction():
+            rows = await conn.fetch(
+                """
+                SELECT id, content
+                FROM archival_memory
+                WHERE embedding_model != $1
+                  AND embedding_model != 'in-progress'
+                  AND (embedding_model IS NULL OR embedding_model = embedding_model)
+                ORDER BY created_at ASC
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+                """,
+                target_model,
+                batch_size,
+            )
+            if rows:
+                ids = [row["id"] for row in rows]
+                await conn.execute(
+                    "UPDATE archival_memory SET embedding_model = 'in-progress'"
+                    " WHERE id = ANY($1::uuid[])",
+                    ids,
+                )
     return [{"id": row["id"], "content": row["content"]} for row in rows]
 
 
@@ -194,15 +209,20 @@ async def update_batch(
                 )
 
 
-async def mark_failed_rows(row_ids: list[str]) -> None:
-    """Mark rows as 'bge-failed' so they can be retried later."""
+async def mark_failed_rows(row_ids: list[str], *, status: str = "bge-failed") -> None:
+    """Mark rows with a failure status so they can be retried later.
+
+    Args:
+        row_ids: UUIDs of rows to mark.
+        status: Failure status to set. 'bge-failed' for API errors,
+                'embed-failed-db' for DB write failures after successful embedding.
+    """
     async with get_connection() as conn:
-        async with conn.transaction():
-            for row_id in row_ids:
-                await conn.execute(
-                    "UPDATE archival_memory SET embedding_model = 'bge-failed' WHERE id = $1",
-                    UUID(row_id),
-                )
+        await conn.execute(
+            "UPDATE archival_memory SET embedding_model = $1 WHERE id = ANY($2::uuid[])",
+            status,
+            [UUID(rid) for rid in row_ids],
+        )
 
 
 async def process_single_batch(
@@ -212,16 +232,28 @@ async def process_single_batch(
     update_fn: Callable[..., Awaitable[None]],
     mark_failed_fn: Callable[..., Awaitable[None]] | None = None,
 ) -> BatchResult:
-    """Embed and update a single batch, returning an immutable result."""
+    """Embed and update a single batch, returning an immutable result.
+
+    Handles two failure modes separately:
+    - EmbeddingError: API call failed, rows marked 'bge-failed' for retry.
+    - DB update failure: embeddings succeeded but couldn't be persisted,
+      rows marked 'embed-failed-db' to avoid re-billing the API.
+    """
+    ids = [str(row["id"]) for row in rows]
     texts = build_batch_texts(rows)
     try:
         embeddings = await provider.embed_batch(texts)
+    except EmbeddingError:
+        if mark_failed_fn is not None:
+            await mark_failed_fn(ids, status="bge-failed")
+        return BatchResult(converted=0, failed_ids=ids)
+
+    try:
         await update_fn(rows, embeddings, target_model)
         return BatchResult(converted=len(rows))
-    except EmbeddingError:
-        ids = [str(row["id"]) for row in rows]
+    except Exception:
         if mark_failed_fn is not None:
-            await mark_failed_fn(ids)
+            await mark_failed_fn(ids, status="embed-failed-db")
         return BatchResult(converted=0, failed_ids=ids)
 
 
@@ -264,7 +296,7 @@ async def run(model: str, batch_size: int, dry_run: bool) -> None:
 
     print("Step 3: Converting...")
     while True:
-        rows = await fetch_batch(model, batch_size, offset=0)
+        rows = await claim_batch(model, batch_size)
         if not rows:
             break
 
@@ -296,19 +328,22 @@ async def run(model: str, batch_size: int, dry_run: bool) -> None:
 
 
 async def reset_failed() -> None:
-    """Reset bge-failed rows back to bge so they're retried."""
+    """Reset failed and stale in-progress rows back to bge so they're retried."""
+    reset_statuses = ("bge-failed", "embed-failed-db", "in-progress")
     async with get_connection() as conn:
         count = await conn.fetchval(
-            "SELECT COUNT(*) FROM archival_memory WHERE embedding_model = 'bge-failed'"
+            "SELECT COUNT(*) FROM archival_memory WHERE embedding_model = ANY($1::text[])",
+            list(reset_statuses),
         )
         if count == 0:
-            print("No failed rows to reset.")
+            print("No failed or stale rows to reset.")
             return
         await conn.execute(
             "UPDATE archival_memory SET embedding_model = 'bge'"
-            " WHERE embedding_model = 'bge-failed'"
+            " WHERE embedding_model = ANY($1::text[])",
+            list(reset_statuses),
         )
-        print(f"Reset {count} failed rows back to 'bge' — ready to retry.")
+        print(f"Reset {count} rows back to 'bge' — ready to retry.")
     await close_pool()
 
 

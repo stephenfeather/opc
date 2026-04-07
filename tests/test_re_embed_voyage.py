@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 import pytest
@@ -58,7 +57,9 @@ class TestFormatProgressLine:
     """format_progress_line produces a human-readable progress string."""
 
     def test_basic_format(self):
-        line = format_progress_line(batch_num=3, batch_len=16, converted=32, pending=100, elapsed=45.0)
+        line = format_progress_line(
+            batch_num=3, batch_len=16, converted=32, pending=100, elapsed=45.0
+        )
         assert "Batch 3" in line
         assert "16 rows" in line
         assert "32/100" in line
@@ -99,6 +100,11 @@ class TestBatchResult:
         assert r.converted == 0
         assert len(r.failed_ids) == 2
 
+    def test_frozen(self):
+        r = BatchResult(converted=5)
+        with pytest.raises(AttributeError):
+            r.converted = 10
+
 
 # ---------------------------------------------------------------------------
 # I/O boundary tests (mocked)
@@ -128,7 +134,7 @@ class TestProcessSingleBatch:
         mock_update.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_embedding_error_returns_failure(self):
+    async def test_embedding_error_marks_bge_failed(self):
         from scripts.core.db.embedding_service import EmbeddingError
 
         rows = [{"id": uuid4(), "content": "text1"}]
@@ -147,25 +153,78 @@ class TestProcessSingleBatch:
         assert result.converted == 0
         assert len(result.failed_ids) == 1
         mock_mark_failed.assert_awaited_once()
+        call_kwargs = mock_mark_failed.await_args
+        assert call_kwargs[1]["status"] == "bge-failed"
+
+    @pytest.mark.asyncio
+    async def test_db_update_failure_marks_embed_failed_db(self):
+        """When embed succeeds but DB update fails, rows get 'embed-failed-db'."""
+        rows = [{"id": uuid4(), "content": "text1"}]
+        mock_provider = AsyncMock()
+        mock_provider.embed_batch.return_value = [[0.1] * 1024]
+        mock_update = AsyncMock(side_effect=Exception("DB connection lost"))
+        mock_mark_failed = AsyncMock()
+
+        result = await process_single_batch(
+            rows=rows,
+            provider=mock_provider,
+            target_model="voyage-code-3",
+            update_fn=mock_update,
+            mark_failed_fn=mock_mark_failed,
+        )
+
+        assert result.converted == 0
+        assert len(result.failed_ids) == 1
+        mock_mark_failed.assert_awaited_once()
+        call_kwargs = mock_mark_failed.await_args
+        assert call_kwargs[1]["status"] == "embed-failed-db"
+
+    @pytest.mark.asyncio
+    async def test_no_mark_failed_fn_still_returns_failure(self):
+        """Without mark_failed_fn, failures still return correct BatchResult."""
+        from scripts.core.db.embedding_service import EmbeddingError
+
+        rows = [{"id": uuid4(), "content": "text1"}]
+        mock_provider = AsyncMock()
+        mock_provider.embed_batch.side_effect = EmbeddingError("API down")
+
+        result = await process_single_batch(
+            rows=rows,
+            provider=mock_provider,
+            target_model="voyage-code-3",
+            update_fn=AsyncMock(),
+        )
+
+        assert result.converted == 0
+        assert len(result.failed_ids) == 1
 
 
 class TestMarkFailedRows:
-    """mark_failed_rows updates DB rows to 'bge-failed'."""
+    """mark_failed_rows updates DB rows with specified failure status."""
 
     @pytest.mark.asyncio
-    async def test_marks_rows(self):
+    async def test_marks_rows_default_status(self):
         row_ids = [str(uuid4()), str(uuid4())]
         mock_conn = AsyncMock()
-
-        @asynccontextmanager
-        async def fake_transaction():
-            yield
-
-        mock_conn.transaction = fake_transaction
 
         with patch("scripts.core.re_embed_voyage.get_connection") as mock_get_conn:
             mock_get_conn.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
             mock_get_conn.return_value.__aexit__ = AsyncMock(return_value=False)
             await mark_failed_rows(row_ids)
 
-        assert mock_conn.execute.await_count == 2
+        mock_conn.execute.assert_awaited_once()
+        call_args = mock_conn.execute.await_args[0]
+        assert "bge-failed" in call_args[1]
+
+    @pytest.mark.asyncio
+    async def test_marks_rows_custom_status(self):
+        row_ids = [str(uuid4())]
+        mock_conn = AsyncMock()
+
+        with patch("scripts.core.re_embed_voyage.get_connection") as mock_get_conn:
+            mock_get_conn.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
+            mock_get_conn.return_value.__aexit__ = AsyncMock(return_value=False)
+            await mark_failed_rows(row_ids, status="embed-failed-db")
+
+        call_args = mock_conn.execute.await_args[0]
+        assert "embed-failed-db" in call_args[1]

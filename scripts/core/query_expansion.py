@@ -73,13 +73,13 @@ def _sanitize_query_words(query: str) -> list[str]:
     words = [
         clean
         for w in query.lower().replace("-", " ").split()
-        if len(clean := re.sub(r"[^a-zA-Z0-9]", "", w)) > 2
+        if len(clean := _ALNUM_RE.sub("", w)) > 2
     ]
     if words:
         return words
     # Fallback: try first word cleaned; return empty list if nothing usable
     if query.strip():
-        fallback = re.sub(r"[^a-zA-Z0-9]", "", query.lower().split()[0])
+        fallback = _ALNUM_RE.sub("", query.lower().split()[0])
         if fallback:
             return [fallback]
     return []
@@ -141,7 +141,7 @@ def _score_expansion_candidates(
         corpus_idf = idf_index.idf(term)
         if corpus_idf < min_idf:
             continue
-        clean = re.sub(r"[^a-zA-Z0-9]", "", term)
+        clean = _ALNUM_RE.sub("", term)
         if not clean or len(clean) <= 2:
             continue
         candidates.append((clean, ndf * corpus_idf))
@@ -153,10 +153,15 @@ def _score_expansion_candidates(
 def _format_tsquery(original_words: list[str], expansion_terms: list[str]) -> str:
     """Join original and expansion terms into an OR-joined tsquery string.
 
-    Filters out empty/blank terms to prevent malformed tsquery syntax.
+    Defense-in-depth: strips tsquery metacharacters and empty/blank terms
+    to prevent injection even if upstream sanitizers are bypassed.
     """
-    all_terms = [t for t in original_words + expansion_terms if t.strip()]
-    return " | ".join(all_terms)
+    all_terms = [
+        _ALNUM_RE.sub("", t)
+        for t in original_words + expansion_terms
+        if t.strip()
+    ]
+    return " | ".join(t for t in all_terms if t)
 
 
 def _is_cache_locally_invalid(cached: IDFIndex, *, max_age_hours: float) -> bool:
@@ -359,6 +364,7 @@ async def expand_query(
     """
     from scripts.core.db.postgres_pool import get_pool
 
+    max_neighbors = min(max_neighbors, 100)
     original_tokens = set(_tokenize(query))
     original_words = _sanitize_query_words(query)
 

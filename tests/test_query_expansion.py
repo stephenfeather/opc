@@ -532,6 +532,17 @@ class TestFormatTsquery:
         result = _format_tsquery(["", " "], [])
         assert result == ""
 
+    def test_strips_tsquery_metacharacters(self):
+        from scripts.core.query_expansion import _format_tsquery
+
+        result = _format_tsquery(["auth!"], ["work&flow", "tok:*ens"])
+        assert "!" not in result
+        assert "&" not in result
+        assert ":*" not in result
+        assert "auth" in result
+        assert "workflow" in result
+        assert "tokens" in result
+
 
 class TestFoldDocument:
     def test_folds_single_document(self):

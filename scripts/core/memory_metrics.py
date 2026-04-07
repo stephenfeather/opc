@@ -26,7 +26,7 @@ import asyncio
 import faulthandler
 import json
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -580,6 +580,7 @@ async def collect_all_metrics(
         end=end,
         all_time_learnings=all_time_learnings,
         version=_get_version(),
+        generated_at=datetime.now(UTC).isoformat(),
     )
 
 

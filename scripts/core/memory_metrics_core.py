@@ -8,6 +8,7 @@ The I/O boundary (database queries, CLI) stays in memory_metrics.py.
 
 from __future__ import annotations
 
+import copy
 from datetime import UTC, datetime
 from typing import Any
 
@@ -115,10 +116,12 @@ def assemble_report(
     end: datetime | None,
     all_time_learnings: int,
     version: str,
+    generated_at: str | None = None,
 ) -> dict[str, Any]:
     """Assemble the final metrics report dict from pre-fetched query results.
 
-    Does not perform I/O or mutate any input dicts.
+    Pure function: does not perform I/O, mutate inputs, or read the clock.
+    All nested dicts are deep-copied to prevent aliasing between input and output.
 
     Args:
         query_results: Dict with keys matching the individual query function names
@@ -130,10 +133,15 @@ def assemble_report(
         end: Period end (None if unfiltered).
         all_time_learnings: Total learning count (all-time) for ratio computation.
         version: Version string to include in the report.
+        generated_at: ISO timestamp string. Caller provides this from the I/O boundary.
+            Defaults to current UTC time if not provided (for backwards compat).
 
     Returns:
         Complete metrics report dict ready for JSON serialization.
     """
+    if generated_at is None:
+        generated_at = datetime.now(UTC).isoformat()
+
     period = None
     if start or end:
         period = {
@@ -143,31 +151,32 @@ def assemble_report(
 
     extracted = query_results["extraction"]["extracted"]
     extraction_with_ratio = {
-        **query_results["extraction"],
+        **copy.deepcopy(query_results["extraction"]),
         "learnings_per_extraction": (
             round(all_time_learnings / extracted, 2) if extracted else 0.0
         ),
     }
 
+    qr = query_results
     return {
-        "generated_at": datetime.now(UTC).isoformat(),
+        "generated_at": generated_at,
         "period": period,
-        "totals": query_results["totals"],
-        "per_session": query_results["per_session"],
-        "confidence_distribution": query_results["confidence"],
-        "classification_distribution": query_results["classification"],
-        "dedup_stats_alltime": query_results["dedup"],
-        "embedding_coverage_alltime": query_results["embedding_coverage"],
+        "totals": copy.deepcopy(qr["totals"]),
+        "per_session": copy.deepcopy(qr["per_session"]),
+        "confidence_distribution": copy.deepcopy(qr["confidence"]),
+        "classification_distribution": copy.deepcopy(qr["classification"]),
+        "dedup_stats_alltime": copy.deepcopy(qr["dedup"]),
+        "embedding_coverage_alltime": copy.deepcopy(qr["embedding_coverage"]),
         "extraction_stats_alltime": extraction_with_ratio,
-        "stale_learnings": query_results["stale"],
-        "top_tags_alltime": query_results["tags"],
-        "superseded_alltime": query_results["superseded"],
-        "temporal_alltime": query_results["temporal"],
-        "feedback_alltime": query_results["feedback"],
-        "feedback_velocity": query_results["feedback_velocity"],
-        "supersession_candidates": query_results["supersession_candidates"],
-        "recall_frequency": query_results["recall_frequency"],
-        "type_recall_correlation": query_results["type_recall_correlation"],
+        "stale_learnings": copy.deepcopy(qr["stale"]),
+        "top_tags_alltime": copy.deepcopy(qr["tags"]),
+        "superseded_alltime": copy.deepcopy(qr["superseded"]),
+        "temporal_alltime": copy.deepcopy(qr["temporal"]),
+        "feedback_alltime": copy.deepcopy(qr["feedback"]),
+        "feedback_velocity": copy.deepcopy(qr["feedback_velocity"]),
+        "supersession_candidates": copy.deepcopy(qr["supersession_candidates"]),
+        "recall_frequency": copy.deepcopy(qr["recall_frequency"]),
+        "type_recall_correlation": copy.deepcopy(qr["type_recall_correlation"]),
         "version": version,
     }
 

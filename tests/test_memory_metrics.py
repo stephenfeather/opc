@@ -373,6 +373,78 @@ class TestAssembleReport:
         )
         assert report["version"] == "1.2.3"
 
+    def test_deterministic_with_explicit_generated_at(self):
+        """Same inputs produce identical outputs when generated_at is injected."""
+        qr = _make_query_results()
+        ts = "2026-04-01T12:00:00+00:00"
+        report1 = assemble_report(
+            query_results=qr,
+            start=None,
+            end=None,
+            all_time_learnings=110,
+            version="0.7.3",
+            generated_at=ts,
+        )
+        report2 = assemble_report(
+            query_results=qr,
+            start=None,
+            end=None,
+            all_time_learnings=110,
+            version="0.7.3",
+            generated_at=ts,
+        )
+        assert report1 == report2
+
+    def test_no_output_to_input_aliasing(self):
+        """Mutating the output must not change the input query_results."""
+        qr = _make_query_results()
+        report = assemble_report(
+            query_results=qr,
+            start=None,
+            end=None,
+            all_time_learnings=110,
+            version="0.7.3",
+            generated_at="2026-04-01T12:00:00+00:00",
+        )
+        # Mutate the output
+        report["totals"]["active_learnings"] = 999
+        report["feedback_alltime"]["helpful"] = 999
+        # Verify input is untouched
+        assert qr["totals"]["active_learnings"] == 100
+        assert qr["feedback"]["helpful"] == 10
+
+    def test_no_input_to_output_aliasing(self):
+        """Mutating the input after assembly must not change the report."""
+        qr = _make_query_results()
+        report = assemble_report(
+            query_results=qr,
+            start=None,
+            end=None,
+            all_time_learnings=110,
+            version="0.7.3",
+            generated_at="2026-04-01T12:00:00+00:00",
+        )
+        # Mutate the input
+        qr["totals"]["active_learnings"] = 999
+        qr["feedback"]["helpful"] = 999
+        # Verify output is untouched
+        assert report["totals"]["active_learnings"] == 100
+        assert report["feedback_alltime"]["helpful"] == 10
+
+    def test_generated_at_passthrough(self):
+        """Explicit generated_at is used verbatim."""
+        qr = _make_query_results()
+        ts = "2026-01-01T00:00:00+00:00"
+        report = assemble_report(
+            query_results=qr,
+            start=None,
+            end=None,
+            all_time_learnings=110,
+            version="0.7.3",
+            generated_at=ts,
+        )
+        assert report["generated_at"] == ts
+
 
 # ---------------------------------------------------------------------------
 # CLI argument parsing

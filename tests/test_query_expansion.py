@@ -216,15 +216,19 @@ class TestIDFIndex:
 
     async def test_build_idf_index_streams_without_buffering(self):
         """Regression: build_idf_index must fold each row incrementally,
-        not buffer the entire corpus into a list first."""
-        consumed_count = 0
+        not buffer the entire corpus into a list first.
+
+        Proves interleaved iteration by patching _fold_document to record
+        call order relative to cursor consumption.
+        """
+        events: list[str] = []
 
         class StreamingCursor:
-            """Cursor that tracks consumption order."""
+            """Cursor that records 'read' events on each row consumed."""
 
             def __init__(self):
                 self._items = [
-                    {"content": f"document number {i} with unique content"} for i in range(100)
+                    {"content": f"document number {i} with unique content"} for i in range(5)
                 ]
                 self._idx = 0
 
@@ -232,13 +236,18 @@ class TestIDFIndex:
                 return self
 
             async def __anext__(self):
-                nonlocal consumed_count
                 if self._idx >= len(self._items):
                     raise StopAsyncIteration
                 item = self._items[self._idx]
                 self._idx += 1
-                consumed_count += 1
+                events.append("read")
                 return item
+
+        from scripts.core.query_expansion import _fold_document as real_fold
+
+        def tracking_fold(word_df, doc_count, text):
+            events.append("fold")
+            return real_fold(word_df, doc_count, text)
 
         mock_pool, _ = _make_pool_and_conn(
             cursor=MagicMock(return_value=StreamingCursor()),
@@ -246,10 +255,18 @@ class TestIDFIndex:
 
         with patch("scripts.core.db.postgres_pool.get_pool", return_value=mock_pool):
             with patch("scripts.core.query_expansion.save_idf_index"):  # noqa: SIM117
-                index = await build_idf_index()
+                with patch(
+                    "scripts.core.query_expansion._fold_document",
+                    side_effect=tracking_fold,
+                ):
+                    index = await build_idf_index()
 
-        assert index.doc_count == 100
-        assert consumed_count == 100
+        assert index.doc_count == 5
+        # Events must be interleaved: read, fold, read, fold, ...
+        # If buffered, it would be: read, read, read, ..., fold, fold, fold, ...
+        for i in range(0, len(events) - 1, 2):
+            assert events[i] == "read", f"Expected 'read' at position {i}, got {events[i]}"
+            assert events[i + 1] == "fold", f"Expected 'fold' at position {i+1}, got {events[i+1]}"
 
     async def test_get_idf_index_caches(self, tmp_path: Path):
         """Second call uses cached index when fresh."""

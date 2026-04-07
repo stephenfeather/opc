@@ -68,7 +68,8 @@ def _sanitize_query_words(query: str) -> list[str]:
     """Extract and sanitize query words for tsquery output.
 
     Lowercases, replaces hyphens, strips non-alnum, filters short words.
-    Falls back to first cleaned word (or empty string) when no words survive.
+    Falls back to the first cleaned word, or returns an empty list when
+    nothing usable is found.
     """
     words = [
         clean
@@ -364,7 +365,9 @@ async def expand_query(
     """
     from scripts.core.db.postgres_pool import get_pool
 
-    max_neighbors = min(max_neighbors, 100)
+    max_neighbors = max(0, min(max_neighbors, 100))
+    if max_neighbors == 0:
+        return _format_tsquery(_sanitize_query_words(query), [])
     original_tokens = set(_tokenize(query))
     original_words = _sanitize_query_words(query)
 

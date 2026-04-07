@@ -53,7 +53,22 @@ from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501, SIM115
+_FAULT_HANDLER_LOG: Any | None = None
+
+
+def _enable_faulthandler() -> None:
+    """Enable faulthandler without breaking import if the log path is unavailable."""
+    global _FAULT_HANDLER_LOG  # noqa: PLW0603
+    crash_log = Path.home() / ".claude" / "logs" / "opc_crash.log"
+    try:
+        crash_log.parent.mkdir(parents=True, exist_ok=True)
+        _FAULT_HANDLER_LOG = crash_log.open("a", encoding="utf-8")
+        faulthandler.enable(file=_FAULT_HANDLER_LOG, all_threads=True)
+    except OSError:
+        faulthandler.enable(file=sys.stderr, all_threads=True)
+
+
+_enable_faulthandler()
 
 # Load global ~/.claude/.env first, then local .env
 global_env = Path.home() / ".claude" / ".env"
@@ -95,7 +110,7 @@ DEDUP_THRESHOLD = _get_config().dedup.threshold  # noqa: E402
 
 
 def _dedup_threshold() -> float:
-    """Read live dedup threshold from config (not cached at import time)."""
+    """Return dedup threshold from config (cached after first get_config() call)."""
     return _get_config().dedup.threshold
 
 
@@ -114,12 +129,15 @@ def _pg_url() -> str | None:
 def detect_backend(env: dict[str, str], fallback: str | None = None) -> str:
     """Determine storage backend from environment variables.
 
-    Pure function -- takes env dict, returns backend name string.
+    Takes an env dict and returns a backend name string. When no URL is found
+    and no fallback is provided, delegates to get_default_backend() which
+    reads os.environ and may raise.
+
     Matches the precedence used by recall_learnings.get_backend():
     CONTINUOUS_CLAUDE_DB_URL > DATABASE_URL > fallback.
 
     NOTE: AGENTICA_MEMORY_BACKEND and OPC_POSTGRES_URL are intentionally
-    NOT checked here — recall_learnings, memory_daemon, and confidence_calibrator
+    NOT checked here -- recall_learnings, memory_daemon, and confidence_calibrator
     don't all honor them yet, so adding them here would create split-brain.
     TODO: Unify all backend/URL resolution behind a shared function.
     """
@@ -448,10 +466,11 @@ async def _try_auto_classify(
             result["error"],
             learning_type or "WORKING_SOLUTION",
         )
-    except ImportError:
+    except ImportError as e:
+        missing = getattr(e, "name", None) or str(e)[:80]
         logger.warning(
-            "braintrust_analyze not available for auto-classification. "
-            "Install with: pip install aiohttp"
+            "braintrust_analyze not available for auto-classification "
+            "(missing: %s)", missing
         )
     except Exception as e:
         logger.warning("Auto-classification error: %s", str(e)[:100])
@@ -501,6 +520,7 @@ async def store_learning_v2(
         return {"success": False, "error": "No content provided"}
 
     backend = detect_backend(dict(os.environ))
+    memory = None
 
     try:
         memory = await create_memory_service(backend=backend, session_id=session_id)
@@ -558,7 +578,6 @@ async def store_learning_v2(
                     context=context,
                     tags=tags,
                 )
-                await memory.close()
                 return {
                     "success": True,
                     "skipped": True,
@@ -611,8 +630,6 @@ async def store_learning_v2(
             project=project if backend == "postgres" else None,
         )
 
-        await memory.close()
-
         # content_hash dedup returns empty string
         if not memory_id:
             _record_rejection(
@@ -635,12 +652,16 @@ async def store_learning_v2(
             "content_length": len(content),
             "embedding_dim": len(embedding),
         }
-        if supersedes:
+        if supersedes and backend == "postgres":
             result_dict["superseded"] = supersedes
         return result_dict
 
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+    finally:
+        if memory is not None:
+            await memory.close()
 
 
 async def store_learning(
@@ -675,6 +696,7 @@ async def store_learning(
     }
 
     backend = detect_backend(dict(os.environ))
+    memory = None
 
     try:
         memory = await create_memory_service(backend=backend, session_id=session_id)
@@ -686,8 +708,6 @@ async def store_learning(
             learning_content, metadata=metadata, embedding=embedding
         )
 
-        await memory.close()
-
         return {
             "success": True,
             "memory_id": memory_id,
@@ -698,6 +718,10 @@ async def store_learning(
 
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+    finally:
+        if memory is not None:
+            await memory.close()
 
 
 # ===========================================================================

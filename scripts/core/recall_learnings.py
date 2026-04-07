@@ -199,6 +199,7 @@ def resolve_search_params(
             "provider": provider,
             "similarity_threshold": threshold,
             "recency_weight": sql_recency,
+            "text_fallback": True,
         }
 
     # Default: hybrid RRF — no recency_weight; temporal relevance is handled
@@ -216,7 +217,7 @@ def resolve_search_params(
 
 
 def select_output(
-    *, json_flag: bool, json_full: bool, structured: bool
+    *, json_flag: bool, json_full: bool
 ) -> str:
     """Choose output format: 'json_full', 'json', or 'human'."""
     if json_full:
@@ -367,6 +368,7 @@ async def _dispatch_search(params: dict[str, Any]) -> list[dict[str, Any]]:
             params["query"],
             params["k"],
             params["provider"],
+            text_fallback=params.get("text_fallback", True),
             similarity_threshold=params["similarity_threshold"],
             recency_weight=params["recency_weight"],
         )
@@ -433,9 +435,7 @@ async def main() -> int:
     """Run semantic recall on session learnings."""
     args = _build_arg_parser().parse_args()
 
-    output_mode = select_output(
-        json_flag=args.json, json_full=args.json_full, structured=args.structured
-    )
+    output_mode = select_output(json_flag=args.json, json_full=args.json_full)
     fetch_k = compute_fetch_k(args.k, no_rerank=args.no_rerank)
 
     if output_mode == "human":

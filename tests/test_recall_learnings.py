@@ -285,6 +285,7 @@ class TestResolveSearchParams:
         )
         assert params["mode"] == "vector"
         assert params["recency_weight"] == 0.0  # suppressed for reranking
+        assert params["text_fallback"] is True
 
     def test_vector_only_no_rerank_keeps_recency(self):
         params = resolve_search_params(
@@ -363,16 +364,91 @@ class TestResolveSearchParams:
 # ---------------------------------------------------------------------------
 class TestSelectOutput:
     def test_json_full(self):
-        assert select_output(json_flag=False, json_full=True, structured=False) == "json_full"
+        assert select_output(json_flag=False, json_full=True) == "json_full"
 
     def test_json(self):
-        assert select_output(json_flag=True, json_full=False, structured=True) == "json"
+        assert select_output(json_flag=True, json_full=False) == "json"
 
     def test_human(self):
-        assert select_output(json_flag=False, json_full=False, structured=False) == "human"
+        assert select_output(json_flag=False, json_full=False) == "human"
 
     def test_json_full_takes_priority(self):
-        assert select_output(json_flag=True, json_full=True, structured=False) == "json_full"
+        assert select_output(json_flag=True, json_full=True) == "json_full"
+
+
+# ---------------------------------------------------------------------------
+# _dispatch_search: I/O dispatch
+# ---------------------------------------------------------------------------
+class TestDispatchSearch:
+    @pytest.mark.asyncio
+    async def test_sqlite_mode(self):
+        from scripts.core.recall_learnings import _dispatch_search
+
+        with patch(
+            "scripts.core.recall_learnings.search_learnings_sqlite",
+            new_callable=AsyncMock,
+            return_value=[{"id": "1"}],
+        ) as mock:
+            result = await _dispatch_search({"mode": "sqlite", "query": "test", "k": 5})
+            mock.assert_called_once_with("test", 5)
+            assert len(result) == 1
+
+    @pytest.mark.asyncio
+    async def test_text_only_mode(self):
+        from scripts.core.recall_learnings import _dispatch_search
+
+        with patch(
+            "scripts.core.recall_learnings.search_learnings_text_only_postgres",
+            new_callable=AsyncMock,
+            return_value=[],
+        ) as mock:
+            await _dispatch_search({"mode": "text_only", "query": "x", "k": 5})
+            mock.assert_called_once_with("x", 5)
+
+    @pytest.mark.asyncio
+    async def test_vector_mode_passes_text_fallback(self):
+        from scripts.core.recall_learnings import _dispatch_search
+
+        with patch(
+            "scripts.core.recall_learnings.search_learnings_postgres",
+            new_callable=AsyncMock,
+            return_value=[],
+        ) as mock:
+            params = {
+                "mode": "vector",
+                "query": "x",
+                "k": 5,
+                "provider": "local",
+                "similarity_threshold": 0.2,
+                "recency_weight": 0.0,
+                "text_fallback": True,
+            }
+            await _dispatch_search(params)
+            mock.assert_called_once()
+            _, kwargs = mock.call_args
+            assert kwargs["text_fallback"] is True
+
+    @pytest.mark.asyncio
+    async def test_hybrid_rrf_mode(self):
+        from scripts.core.recall_learnings import _dispatch_search
+
+        with patch(
+            "scripts.core.recall_learnings.search_learnings_hybrid_rrf",
+            new_callable=AsyncMock,
+            return_value=[],
+        ) as mock:
+            params = {
+                "mode": "hybrid_rrf",
+                "query": "x",
+                "k": 10,
+                "provider": "local",
+                "similarity_threshold": 0.002,
+                "expand": True,
+                "max_expansion_terms": 5,
+                "rebuild_idf": False,
+            }
+            await _dispatch_search(params)
+            mock.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

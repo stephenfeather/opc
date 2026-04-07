@@ -71,11 +71,14 @@ def _make_candidate(
     }
 
 
+_UNSET = object()
+
+
 def _make_row(
     *,
     id: str = "aaaa-bbbb-cccc-dddd",
     content: str = "Test learning content",
-    metadata: dict[str, Any] | str | None = None,
+    metadata: Any = _UNSET,
     created_at: datetime | None = None,
     recall_count: int = 0,
     pattern_label: str | None = None,
@@ -83,7 +86,7 @@ def _make_row(
     pattern_type: str | None = None,
 ) -> Mapping[str, Any]:
     """Build a mock asyncpg-like row (Mapping)."""
-    if metadata is None:
+    if metadata is _UNSET:
         metadata = {
             "type": "session_learning",
             "learning_type": "WORKING_SOLUTION",
@@ -156,6 +159,22 @@ class TestRowToDict:
         assert result["metadata"] == {}
         assert result["learning_type"] == "UNKNOWN"
         assert result["confidence"] == "medium"
+
+    def test_null_metadata_defaults_to_empty(self):
+        row = _make_row(metadata=None)
+        result = _row_to_dict(row)
+        assert result["metadata"] == {}
+        assert result["learning_type"] == "UNKNOWN"
+
+    def test_list_metadata_defaults_to_empty(self):
+        row = _make_row(metadata=["not", "a", "dict"])
+        result = _row_to_dict(row)
+        assert result["metadata"] == {}
+
+    def test_numeric_metadata_defaults_to_empty(self):
+        row = _make_row(metadata=42)
+        result = _row_to_dict(row)
+        assert result["metadata"] == {}
 
 
 # ---------------------------------------------------------------------------

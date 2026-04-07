@@ -93,6 +93,8 @@ def _row_to_dict(row: Mapping[str, Any]) -> dict[str, Any]:
             metadata = json.loads(metadata)
         except (json.JSONDecodeError, TypeError):
             metadata = {}
+    if not isinstance(metadata, Mapping):
+        metadata = {}
     return {
         "id": str(row["id"]),
         "content": row["content"],
@@ -329,7 +331,10 @@ async def main() -> int:
             "error": type(e).__name__, "push_source": "session_start",
             "project": project, "results": [],
         }
-        write_cache_file(error_envelope)
+        try:
+            write_cache_file(error_envelope)
+        except OSError:
+            logger.debug("Failed to write error cache file", exc_info=True)
         if json_output:
             print(json.dumps(error_envelope))
         else:
@@ -352,7 +357,10 @@ async def main() -> int:
     else:
         cache_data = format_results(candidates, project, config["max_chars"])
 
-    write_cache_file(cache_data)
+    try:
+        write_cache_file(cache_data)
+    except OSError:
+        logger.debug("Failed to write cache file", exc_info=True)
 
     output_str = build_cli_output(
         candidates, project,

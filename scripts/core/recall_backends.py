@@ -337,8 +337,10 @@ async def search_learnings_sqlite(
     if not db_path.exists():
         return []
 
-    words = re.findall(r"\w+", query.lower())
-    fts_query = " OR ".join(words) if words else query
+    words = [w for w in re.findall(r"\w+", query.lower()) if len(w) > 2]
+    if not words:
+        words = ["a"]
+    fts_query = " OR ".join(words)
 
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row

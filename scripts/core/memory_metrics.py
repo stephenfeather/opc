@@ -26,7 +26,7 @@ import asyncio
 import faulthandler
 import json
 import sys
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +48,27 @@ if repo_root not in sys.path:
     sys.path.insert(0, repo_root)
 
 from scripts.core.db.postgres_pool import close_pool, get_connection  # noqa: E402
+from scripts.core.memory_metrics_core import (  # noqa: E402
+    assemble_report,
+    build_classification_map,
+    build_confidence_map,
+    calculate_pct,
+    format_human,
+    parse_period,
+)
+
+# Re-export pure functions for backwards compatibility
+__all__ = [
+    "assemble_report",
+    "build_classification_map",
+    "build_confidence_map",
+    "build_parser",
+    "calculate_pct",
+    "collect_all_metrics",
+    "format_human",
+    "main",
+    "parse_period",
+]
 
 
 def _get_version() -> str:
@@ -59,37 +80,13 @@ def _get_version() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Period parsing
+# Metric query functions (I/O boundary -- each takes a connection)
 # ---------------------------------------------------------------------------
 
-def parse_period(period_str: str | None) -> tuple[datetime | None, datetime | None]:
-    """Parse a period string like '2026-03-01:2026-03-31' into (start, end).
 
-    Returns (None, None) if period_str is None.
-    """
-    if not period_str:
-        return None, None
-    parts = period_str.split(":")
-    if len(parts) != 2:
-        raise ValueError(f"Invalid period format: {period_str!r}. Expected YYYY-MM-DD:YYYY-MM-DD")
-    start_str = parts[0].strip()
-    end_str = parts[1].strip()
-    start = datetime.strptime(start_str, "%Y-%m-%d").replace(tzinfo=UTC)
-    end = datetime.strptime(end_str, "%Y-%m-%d").replace(
-        hour=23, minute=59, second=59, microsecond=999999, tzinfo=UTC
-    )
-    if start > end:
-        raise ValueError(
-            f"Invalid period range: start date {start_str!r} is after end date {end_str!r}"
-        )
-    return start, end
-
-
-# ---------------------------------------------------------------------------
-# Metric query functions
-# ---------------------------------------------------------------------------
-
-async def get_totals(conn: Any, start: datetime | None, end: datetime | None) -> dict:
+async def get_totals(
+    conn: Any, start: datetime | None, end: datetime | None
+) -> dict[str, Any]:
     """Count active, superseded, and total learnings."""
     row = await conn.fetchrow(
         """
@@ -110,7 +107,9 @@ async def get_totals(conn: Any, start: datetime | None, end: datetime | None) ->
     }
 
 
-async def get_per_session_stats(conn: Any, start: datetime | None, end: datetime | None) -> dict:
+async def get_per_session_stats(
+    conn: Any, start: datetime | None, end: datetime | None
+) -> dict[str, Any]:
     """Compute learnings-per-session averages (recent 10 and overall)."""
     recent = await conn.fetchrow(
         """
@@ -161,10 +160,10 @@ async def get_per_session_stats(conn: Any, start: datetime | None, end: datetime
     }
 
 
-async def get_confidence_distribution(
+async def fetch_confidence_rows(
     conn: Any, start: datetime | None, end: datetime | None
-) -> dict:
-    """Count learnings by confidence level (high/medium/low) with percentages."""
+) -> list[dict[str, Any]]:
+    """Fetch raw confidence-level rows from the database."""
     rows = await conn.fetch(
         """
         SELECT
@@ -178,29 +177,13 @@ async def get_confidence_distribution(
         """,
         start, end,
     )
-    total = sum(r["count"] for r in rows)
-    by_level = {r["level"]: r["count"] for r in rows}
-    canonical = ["high", "medium", "low"]
-    result = {}
-    for level in canonical:
-        if level in by_level:
-            cnt = by_level.pop(level)
-            result[level] = {
-                "count": cnt,
-                "pct": round(100.0 * cnt / total, 1) if total else 0.0,
-            }
-    for level in sorted(by_level.keys()):
-        result[level] = {
-            "count": by_level[level],
-            "pct": round(100.0 * by_level[level] / total, 1) if total else 0.0,
-        }
-    return result
+    return [{"level": r["level"], "count": r["count"]} for r in rows]
 
 
-async def get_classification_distribution(
+async def fetch_classification_rows(
     conn: Any, start: datetime | None, end: datetime | None
-) -> dict:
-    """Count learnings by learning_type with percentages."""
+) -> list[dict[str, Any]]:
+    """Fetch raw classification rows from the database."""
     rows = await conn.fetch(
         """
         SELECT
@@ -215,17 +198,10 @@ async def get_classification_distribution(
         """,
         start, end,
     )
-    total = sum(r["count"] for r in rows)
-    result = {}
-    for r in rows:
-        result[r["learning_type"]] = {
-            "count": r["count"],
-            "pct": round(100.0 * r["count"] / total, 1) if total else 0.0,
-        }
-    return result
+    return [{"learning_type": r["learning_type"], "count": r["count"]} for r in rows]
 
 
-async def get_dedup_stats(conn: Any) -> dict:
+async def get_dedup_stats(conn: Any) -> dict[str, Any]:
     """Report content-hash coverage as a dedup eligibility proxy (all-time)."""
     row = await conn.fetchrow(
         """
@@ -240,12 +216,12 @@ async def get_dedup_stats(conn: Any) -> dict:
     return {
         "learnings_with_content_hash": row["with_hash"],
         "learnings_without_content_hash": row["without_hash"],
-        "hash_coverage_pct": round(100.0 * row["with_hash"] / total, 1) if total else 0.0,
+        "hash_coverage_pct": calculate_pct(row["with_hash"], total),
         "note": "Dedup rejections are not persisted; hash_coverage indicates dedup eligibility",
     }
 
 
-async def get_embedding_coverage(conn: Any) -> dict:
+async def get_embedding_coverage(conn: Any) -> dict[str, Any]:
     """Report what % of active learnings have valid embeddings (all-time)."""
     row = await conn.fetchrow(
         """
@@ -261,11 +237,11 @@ async def get_embedding_coverage(conn: Any) -> dict:
     return {
         "with_embedding": row["with_embedding"],
         "without_embedding": row["without_embedding"],
-        "coverage_pct": round(100.0 * row["with_embedding"] / total, 1) if total else 0.0,
+        "coverage_pct": calculate_pct(row["with_embedding"], total),
     }
 
 
-async def get_feedback_velocity(conn: Any) -> dict:
+async def get_feedback_velocity(conn: Any) -> dict[str, Any]:
     """Report feedback rate per week over the last 4 weeks (all-time table)."""
     table_exists = await conn.fetchval(
         "SELECT to_regclass('public.memory_feedback') IS NOT NULL"
@@ -303,11 +279,11 @@ async def get_feedback_velocity(conn: Any) -> dict:
     }
 
 
-async def get_supersession_candidates(conn: Any) -> dict:
+async def get_supersession_candidates(conn: Any) -> dict[str, Any]:
     """Report aged never-recalled learnings, broken down by confidence.
 
     Criteria: active, never recalled, older than 30 days.
-    Not a cleanup recommendation — high-confidence items may be valid long-tail knowledge.
+    Not a cleanup recommendation -- high-confidence items may be valid long-tail knowledge.
     Use the confidence breakdown to prioritize review.
     """
     row = await conn.fetchrow(
@@ -340,7 +316,7 @@ async def get_supersession_candidates(conn: Any) -> dict:
     }
 
 
-_RECALL_FREQ_UNAVAILABLE = {
+_RECALL_FREQ_UNAVAILABLE: dict[str, Any] = {
     "recalled_learnings": 0,
     "total_active": 0,
     "recall_rate_pct": 0.0,
@@ -351,7 +327,7 @@ _RECALL_FREQ_UNAVAILABLE = {
 }
 
 
-async def get_recall_frequency(conn: Any) -> dict:
+async def get_recall_frequency(conn: Any) -> dict[str, Any]:
     """Report recall usage across sessions (all-time).
 
     Uses recall_count on archival_memory. Degrades gracefully if the column
@@ -372,8 +348,6 @@ async def get_recall_frequency(conn: Any) -> dict:
             """
         )
     except Exception as e:
-        # Only degrade for schema-compatibility issues (missing column).
-        # asyncpg raises UndefinedColumnError; check by name to avoid import.
         if "UndefinedColumn" in type(e).__name__ or "column" in str(e).lower():
             return {**_RECALL_FREQ_UNAVAILABLE, "note": f"schema degraded: {e}"}
         raise
@@ -382,14 +356,14 @@ async def get_recall_frequency(conn: Any) -> dict:
     return {
         "recalled_learnings": recalled,
         "total_active": total,
-        "recall_rate_pct": round(100.0 * recalled / total, 1) if total else 0.0,
+        "recall_rate_pct": calculate_pct(recalled, total),
         "total_recall_events": int(row["total_recalls"]),
         "avg_recalls_per_recalled_learning": round(float(row["avg_recalls_when_used"]), 1),
         "max_recalls_single_learning": int(row["max_recalls"]),
     }
 
 
-async def get_type_recall_correlation(conn: Any) -> dict:
+async def get_type_recall_correlation(conn: Any) -> dict[str, Any]:
     """Compare learning_type distribution: stored vs. actually recalled.
 
     Degrades gracefully if recall_count column is missing.
@@ -412,20 +386,20 @@ async def get_type_recall_correlation(conn: Any) -> dict:
         if "UndefinedColumn" in type(e).__name__ or "column" in str(e).lower():
             return {}
         raise
-    result = {}
+    result: dict[str, Any] = {}
     for r in rows:
         total = r["total"]
         recalled = r["recalled"]
         result[r["learning_type"]] = {
             "stored": total,
             "recalled": recalled,
-            "recall_rate_pct": round(100.0 * recalled / total, 1) if total else 0.0,
+            "recall_rate_pct": calculate_pct(recalled, total),
             "total_recall_events": int(r["total_recalls"]),
         }
     return result
 
 
-async def get_extraction_stats(conn: Any) -> dict:
+async def get_extraction_stats(conn: Any) -> dict[str, Any]:
     """Count sessions by extraction status (all-time)."""
     row = await conn.fetchrow(
         """
@@ -446,13 +420,13 @@ async def get_extraction_stats(conn: Any) -> dict:
         "pending": row["pending"],
         "failed": row["failed"],
         "retried": row["retried"],
-        "extraction_rate_pct": round(100.0 * row["extracted"] / total, 1) if total else 0.0,
+        "extraction_rate_pct": calculate_pct(row["extracted"], total),
     }
 
 
 async def get_stale_learnings(
     conn: Any, start: datetime | None, end: datetime | None
-) -> dict:
+) -> dict[str, Any]:
     """Count learnings that have never been recalled."""
     row = await conn.fetchrow(
         """
@@ -470,11 +444,11 @@ async def get_stale_learnings(
     return {
         "never_recalled": row["never_recalled"],
         "total_active": total,
-        "never_recalled_pct": round(100.0 * row["never_recalled"] / total, 1) if total else 0.0,
+        "never_recalled_pct": calculate_pct(row["never_recalled"], total),
     }
 
 
-async def get_top_tags(conn: Any, limit: int = 10) -> list[dict]:
+async def get_top_tags(conn: Any, limit: int = 10) -> list[dict[str, Any]]:
     """Return the most common tags by frequency (all-time)."""
     rows = await conn.fetch(
         """
@@ -489,7 +463,7 @@ async def get_top_tags(conn: Any, limit: int = 10) -> list[dict]:
     return [{"tag": r["tag"], "count": r["count"]} for r in rows]
 
 
-async def get_superseded_stats(conn: Any) -> dict:
+async def get_superseded_stats(conn: Any) -> dict[str, Any]:
     """Count superseded vs total learnings (all-time)."""
     row = await conn.fetchrow(
         """
@@ -503,13 +477,11 @@ async def get_superseded_stats(conn: Any) -> dict:
     return {
         "superseded_count": row["superseded_count"],
         "total_learnings": total,
-        "superseded_pct": (
-            round(100.0 * row["superseded_count"] / total, 1) if total else 0.0
-        ),
+        "superseded_pct": calculate_pct(row["superseded_count"], total),
     }
 
 
-async def get_temporal_stats(conn: Any) -> dict:
+async def get_temporal_stats(conn: Any) -> dict[str, Any]:
     """Report oldest/newest learning and recent activity counts (all-time)."""
     row = await conn.fetchrow(
         """
@@ -530,7 +502,7 @@ async def get_temporal_stats(conn: Any) -> dict:
     }
 
 
-async def get_feedback_stats(conn: Any) -> dict:
+async def get_feedback_stats(conn: Any) -> dict[str, Any]:
     """Report memory feedback statistics (all-time). Returns zeroes if table missing."""
     table_exists = await conn.fetchval(
         "SELECT to_regclass('public.memory_feedback') IS NOT NULL"
@@ -559,214 +531,62 @@ async def get_feedback_stats(conn: Any) -> dict:
         "helpful": row["helpful"],
         "not_helpful": row["not_helpful"],
         "unique_learnings_rated": row["unique_learnings"],
-        "helpfulness_rate_pct": round(row["helpful"] / total * 100, 1) if total > 0 else 0.0,
+        "helpfulness_rate_pct": calculate_pct(row["helpful"], total),
     }
 
 
 # ---------------------------------------------------------------------------
-# Collector
+# Collector (I/O orchestration)
 # ---------------------------------------------------------------------------
+
 
 async def collect_all_metrics(
     start: datetime | None = None, end: datetime | None = None
-) -> dict:
+) -> dict[str, Any]:
     """Run all metric queries and return the full report dict."""
     async with get_connection() as conn:
-        totals = await get_totals(conn, start, end)
-        per_session = await get_per_session_stats(conn, start, end)
-        confidence = await get_confidence_distribution(conn, start, end)
-        classification = await get_classification_distribution(conn, start, end)
-        dedup = await get_dedup_stats(conn)  # always all-time
-        embedding_cov = await get_embedding_coverage(conn)  # always all-time
-        extraction = await get_extraction_stats(conn)  # always all-time
-        stale = await get_stale_learnings(conn, start, end)
-        tags = await get_top_tags(conn)  # always all-time
-        superseded = await get_superseded_stats(conn)  # always all-time
-        temporal = await get_temporal_stats(conn)  # always all-time
-        feedback = await get_feedback_stats(conn)  # always all-time
-        feedback_vel = await get_feedback_velocity(conn)  # always all-time
-        supersession_cand = await get_supersession_candidates(conn)  # always all-time
-        recall_freq = await get_recall_frequency(conn)  # always all-time
-        type_recall = await get_type_recall_correlation(conn)  # always all-time
+        confidence_rows = await fetch_confidence_rows(conn, start, end)
+        classification_rows = await fetch_classification_rows(conn, start, end)
 
-    period = None
-    if start or end:
-        period = {
-            "from": start.isoformat() if start else None,
-            "to": end.isoformat() if end else None,
+        query_results = {
+            "totals": await get_totals(conn, start, end),
+            "per_session": await get_per_session_stats(conn, start, end),
+            "confidence": build_confidence_map(confidence_rows),
+            "classification": build_classification_map(classification_rows),
+            "dedup": await get_dedup_stats(conn),
+            "embedding_coverage": await get_embedding_coverage(conn),
+            "extraction": await get_extraction_stats(conn),
+            "stale": await get_stale_learnings(conn, start, end),
+            "tags": await get_top_tags(conn),
+            "superseded": await get_superseded_stats(conn),
+            "temporal": await get_temporal_stats(conn),
+            "feedback": await get_feedback_stats(conn),
+            "feedback_velocity": await get_feedback_velocity(conn),
+            "supersession_candidates": await get_supersession_candidates(conn),
+            "recall_frequency": await get_recall_frequency(conn),
+            "type_recall_correlation": await get_type_recall_correlation(conn),
         }
 
-    # Compute learnings-per-extraction from consistent all-time scope
-    extracted = extraction["extracted"]
-    all_time_learnings = totals["total_learnings"]
+    # For the learnings-per-extraction ratio, we need all-time learnings
+    all_time_learnings = query_results["totals"]["total_learnings"]
     if start or end:
-        # totals is period-filtered; get all-time count for this ratio
         async with get_connection() as conn:
             all_time = await get_totals(conn, None, None)
         all_time_learnings = all_time["total_learnings"]
-    extraction["learnings_per_extraction"] = (
-        round(all_time_learnings / extracted, 2) if extracted else 0.0
+
+    return assemble_report(
+        query_results=query_results,
+        start=start,
+        end=end,
+        all_time_learnings=all_time_learnings,
+        version=_get_version(),
     )
-
-    return {
-        "generated_at": datetime.now(UTC).isoformat(),
-        "period": period,
-        "totals": totals,
-        "per_session": per_session,
-        "confidence_distribution": confidence,
-        "classification_distribution": classification,
-        "dedup_stats_alltime": dedup,
-        "embedding_coverage_alltime": embedding_cov,
-        "extraction_stats_alltime": extraction,
-        "stale_learnings": stale,
-        "top_tags_alltime": tags,
-        "superseded_alltime": superseded,
-        "temporal_alltime": temporal,
-        "feedback_alltime": feedback,
-        "feedback_velocity": feedback_vel,
-        "supersession_candidates": supersession_cand,
-        "recall_frequency": recall_freq,
-        "type_recall_correlation": type_recall,
-        "version": _get_version(),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Human-readable formatter
-# ---------------------------------------------------------------------------
-
-def format_human(metrics: dict) -> str:
-    """Format metrics as a human-readable report."""
-    lines: list[str] = []
-    lines.append(f"Memory Metrics Report  (v{metrics['version']})")
-    lines.append(f"Generated: {metrics['generated_at']}")
-    if metrics["period"]:
-        lines.append(f"Period: {metrics['period']['from']} to {metrics['period']['to']}")
-    lines.append("")
-
-    t = metrics["totals"]
-    lines.append(f"Totals:  {t['active_learnings']} active, "
-                 f"{t['superseded_learnings']} superseded, "
-                 f"{t['total_learnings']} total")
-    lines.append("")
-
-    ps = metrics["per_session"]
-    r10 = ps["recent_10_sessions"]
-    lines.append(f"Per Session (recent 10):  avg {r10['average']}, "
-                 f"min {r10['min']}, max {r10['max']}")
-    ov = ps["overall"]
-    lines.append(f"Per Session (overall):    avg {ov['average']}, "
-                 f"{ov['total_sessions_with_learnings']} sessions")
-    lines.append("")
-
-    lines.append("Confidence Distribution:")
-    for level, data in metrics["confidence_distribution"].items():
-        lines.append(f"  {level:8s}  {data['count']:4d}  ({data['pct']:.1f}%)")
-    lines.append("")
-
-    lines.append("Classification Distribution:")
-    for lt, data in metrics["classification_distribution"].items():
-        lines.append(f"  {lt:28s}  {data['count']:4d}  ({data['pct']:.1f}%)")
-    lines.append("")
-
-    # --- System Health ---
-    lines.append("═══ System Health ═══")
-    lines.append("")
-
-    emb = metrics.get("embedding_coverage_alltime", {})
-    lines.append(f"Embedding Coverage:  {emb.get('coverage_pct', 0):.1f}% "
-                 f"({emb.get('with_embedding', 0)} with, "
-                 f"{emb.get('without_embedding', 0)} without)")
-
-    d = metrics["dedup_stats_alltime"]
-    lines.append(f"Dedup Hash Coverage: {d['hash_coverage_pct']:.1f}% "
-                 f"({d['learnings_with_content_hash']} with, "
-                 f"{d['learnings_without_content_hash']} without)")
-
-    fb = metrics.get("feedback_alltime", {})
-    total_fb = fb.get("total_feedback", 0)
-    if total_fb > 0:
-        lines.append(
-            f"Feedback (all-time): {fb['helpful']} helpful, {fb['not_helpful']} not helpful "
-            f"out of {total_fb} ({fb['helpfulness_rate_pct']:.1f}% helpful), "
-            f"{fb['unique_learnings_rated']} unique learnings rated"
-        )
-    else:
-        lines.append("Feedback (all-time): No feedback recorded yet")
-
-    fv = metrics.get("feedback_velocity", {})
-    lines.append(f"Feedback Velocity:   {fv.get('avg_per_week', 0):.1f}/week (last 4 weeks)")
-
-    sc = metrics.get("supersession_candidates", {})
-    lines.append(f"Supersession Candidates: {sc.get('total_candidates', 0)} "
-                 f"(never recalled, >30d old)")
-    by_conf = sc.get("by_confidence", {})
-    if any(by_conf.values()):
-        lines.append(f"  low: {by_conf.get('low', 0)}, "
-                     f"medium: {by_conf.get('medium', 0)}, "
-                     f"high: {by_conf.get('high', 0)}")
-    lines.append("")
-
-    # --- Recall Quality ---
-    lines.append("═══ Recall Quality ═══")
-    lines.append("")
-
-    rf = metrics.get("recall_frequency", {})
-    lines.append(f"Recall Rate:  {rf.get('recalled_learnings', 0)}/{rf.get('total_active', 0)} "
-                 f"ever recalled ({rf.get('recall_rate_pct', 0):.1f}%)")
-    lines.append(f"  Total recall events: {rf.get('total_recall_events', 0)}, "
-                 f"avg per recalled: {rf.get('avg_recalls_per_recalled_learning', 0):.1f}, "
-                 f"max: {rf.get('max_recalls_single_learning', 0)}")
-
-    s = metrics["stale_learnings"]
-    lines.append(f"Stale:  {s['never_recalled']}/{s['total_active']} never recalled "
-                 f"({s['never_recalled_pct']:.1f}%)")
-
-    trc = metrics.get("type_recall_correlation", {})
-    if trc:
-        lines.append("")
-        lines.append("Type vs Recall:")
-        lines.append(f"  {'Type':28s}  {'Stored':>6s}  {'Recalled':>8s}  {'Rate':>6s}  {'Events':>6s}")
-        for lt, data in trc.items():
-            lines.append(
-                f"  {lt:28s}  {data['stored']:6d}  {data['recalled']:8d}  "
-                f"{data['recall_rate_pct']:5.1f}%  {data['total_recall_events']:6d}"
-            )
-    lines.append("")
-
-    # --- Storage & Extraction ---
-    lines.append("═══ Storage & Extraction ═══")
-    lines.append("")
-
-    e = metrics["extraction_stats_alltime"]
-    lines.append(f"Extraction (all-time):  {e['extracted']}/{e['total_sessions']} extracted "
-                 f"({e['extraction_rate_pct']:.1f}%), "
-                 f"{e['pending']} pending, {e['failed']} failed, {e['retried']} retried")
-    lpe = e.get("learnings_per_extraction", 0.0)
-    lines.append(f"  Learnings/Extraction:  {lpe:.2f}")
-    lines.append("")
-
-    sup = metrics["superseded_alltime"]
-    lines.append(f"Superseded (all-time):  {sup['superseded_count']}/{sup['total_learnings']} "
-                 f"({sup['superseded_pct']:.1f}%)")
-    lines.append("")
-
-    lines.append("Top Tags (all-time):")
-    for tag_data in metrics["top_tags_alltime"]:
-        lines.append(f"  {tag_data['tag']:20s}  {tag_data['count']:4d}")
-    lines.append("")
-
-    tmp = metrics["temporal_alltime"]
-    lines.append(f"Temporal (all-time):  oldest {tmp['oldest_learning']}")
-    lines.append(f"           newest {tmp['newest_learning']}")
-    lines.append(f"           last 7d: {tmp['last_7_days']},  last 30d: {tmp['last_30_days']}")
-
-    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser."""

@@ -1,0 +1,171 @@
+"""Tests for re_embed_voyage.py — TDD+FP refactor."""
+
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
+
+import pytest
+
+from scripts.core.re_embed_voyage import (
+    BatchResult,
+    build_batch_texts,
+    classify_pending,
+    format_progress_line,
+    format_summary,
+    mark_failed_rows,
+    process_single_batch,
+)
+
+
+# ---------------------------------------------------------------------------
+# Pure function tests
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyPending:
+    """classify_pending(total, done) -> (pending, already_done)"""
+
+    def test_all_pending(self):
+        assert classify_pending(total=100, done=0) == (100, 0)
+
+    def test_all_done(self):
+        assert classify_pending(total=50, done=50) == (0, 50)
+
+    def test_partial(self):
+        assert classify_pending(total=200, done=75) == (125, 75)
+
+    def test_zero_total(self):
+        assert classify_pending(total=0, done=0) == (0, 0)
+
+
+class TestBuildBatchTexts:
+    """build_batch_texts extracts content strings from row dicts."""
+
+    def test_extracts_content(self):
+        rows = [
+            {"id": uuid4(), "content": "hello"},
+            {"id": uuid4(), "content": "world"},
+        ]
+        assert build_batch_texts(rows) == ["hello", "world"]
+
+    def test_empty_rows(self):
+        assert build_batch_texts([]) == []
+
+
+class TestFormatProgressLine:
+    """format_progress_line produces a human-readable progress string."""
+
+    def test_basic_format(self):
+        line = format_progress_line(batch_num=3, batch_len=16, converted=32, pending=100, elapsed=45.0)
+        assert "Batch 3" in line
+        assert "16 rows" in line
+        assert "32/100" in line
+        assert "32%" in line
+        assert "45s" in line
+
+    def test_zero_pending(self):
+        line = format_progress_line(batch_num=1, batch_len=0, converted=0, pending=0, elapsed=1.0)
+        assert "100%" in line
+
+
+class TestFormatSummary:
+    """format_summary produces a multi-line summary string."""
+
+    def test_no_failures(self):
+        summary = format_summary(converted=50, failed_ids=[], elapsed=12.5)
+        assert "50" in summary
+        assert "12.5s" in summary
+        assert "Failed:    0" in summary
+        assert "retry" not in summary.lower()
+
+    def test_with_failures(self):
+        summary = format_summary(converted=40, failed_ids=["a", "b"], elapsed=30.0)
+        assert "Failed:    2" in summary
+        assert "retry" in summary.lower()
+
+
+class TestBatchResult:
+    """BatchResult data class."""
+
+    def test_success(self):
+        r = BatchResult(converted=10, failed_ids=[])
+        assert r.converted == 10
+        assert r.failed_ids == []
+
+    def test_failure(self):
+        r = BatchResult(converted=0, failed_ids=["id1", "id2"])
+        assert r.converted == 0
+        assert len(r.failed_ids) == 2
+
+
+# ---------------------------------------------------------------------------
+# I/O boundary tests (mocked)
+# ---------------------------------------------------------------------------
+
+
+class TestProcessSingleBatch:
+    """process_single_batch embeds and updates a batch, returning BatchResult."""
+
+    @pytest.mark.asyncio
+    async def test_success(self):
+        rows = [{"id": uuid4(), "content": "text1"}, {"id": uuid4(), "content": "text2"}]
+        mock_provider = AsyncMock()
+        mock_provider.embed_batch.return_value = [[0.1] * 1024, [0.2] * 1024]
+        mock_update = AsyncMock()
+
+        result = await process_single_batch(
+            rows=rows,
+            provider=mock_provider,
+            target_model="voyage-code-3",
+            update_fn=mock_update,
+        )
+
+        assert result.converted == 2
+        assert result.failed_ids == []
+        mock_provider.embed_batch.assert_awaited_once_with(["text1", "text2"])
+        mock_update.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_embedding_error_returns_failure(self):
+        from scripts.core.db.embedding_service import EmbeddingError
+
+        rows = [{"id": uuid4(), "content": "text1"}]
+        mock_provider = AsyncMock()
+        mock_provider.embed_batch.side_effect = EmbeddingError("API down")
+        mock_mark_failed = AsyncMock()
+
+        result = await process_single_batch(
+            rows=rows,
+            provider=mock_provider,
+            target_model="voyage-code-3",
+            update_fn=AsyncMock(),
+            mark_failed_fn=mock_mark_failed,
+        )
+
+        assert result.converted == 0
+        assert len(result.failed_ids) == 1
+        mock_mark_failed.assert_awaited_once()
+
+
+class TestMarkFailedRows:
+    """mark_failed_rows updates DB rows to 'bge-failed'."""
+
+    @pytest.mark.asyncio
+    async def test_marks_rows(self):
+        row_ids = [str(uuid4()), str(uuid4())]
+        mock_conn = AsyncMock()
+
+        @asynccontextmanager
+        async def fake_transaction():
+            yield
+
+        mock_conn.transaction = fake_transaction
+
+        with patch("scripts.core.re_embed_voyage.get_connection") as mock_get_conn:
+            mock_get_conn.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
+            mock_get_conn.return_value.__aexit__ = AsyncMock(return_value=False)
+            await mark_failed_rows(row_ids)
+
+        assert mock_conn.execute.await_count == 2

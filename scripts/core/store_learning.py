@@ -102,21 +102,30 @@ def _dedup_threshold() -> float:
 def _pg_url() -> str | None:
     """Return PostgreSQL connection URL from environment, or None.
 
-    Prefers CONTINUOUS_CLAUDE_DB_URL (canonical) over DATABASE_URL (fallback)
-    to match the resolution order used by postgres_pool.resolve_connection_url().
+    Follows the same priority as postgres_pool.resolve_connection_url():
+    CONTINUOUS_CLAUDE_DB_URL > DATABASE_URL > OPC_POSTGRES_URL.
     """
-    return os.environ.get("CONTINUOUS_CLAUDE_DB_URL") or os.environ.get("DATABASE_URL") or None
+    return (
+        os.environ.get("CONTINUOUS_CLAUDE_DB_URL")
+        or os.environ.get("DATABASE_URL")
+        or os.environ.get("OPC_POSTGRES_URL")
+        or None
+    )
 
 
 def detect_backend(env: dict[str, str], fallback: str | None = None) -> str:
     """Determine storage backend from environment variables.
 
     Pure function -- takes env dict, returns backend name string.
-    Prefers postgres when DATABASE_URL or CONTINUOUS_CLAUDE_DB_URL is set.
+    Matches the precedence used by recall_learnings.get_backend():
+    1. AGENTICA_MEMORY_BACKEND (explicit override)
+    2. URL-based inference (CONTINUOUS_CLAUDE_DB_URL > DATABASE_URL > OPC_POSTGRES_URL)
+    3. Provided fallback or get_default_backend()
     """
-    db_url = env.get("DATABASE_URL", "")
-    cc_url = env.get("CONTINUOUS_CLAUDE_DB_URL", "")
-    if db_url or cc_url:
+    explicit = env.get("AGENTICA_MEMORY_BACKEND", "").lower()
+    if explicit in ("sqlite", "postgres"):
+        return explicit
+    if env.get("CONTINUOUS_CLAUDE_DB_URL") or env.get("DATABASE_URL") or env.get("OPC_POSTGRES_URL"):
         return "postgres"
     if fallback is not None:
         return fallback

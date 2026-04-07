@@ -183,6 +183,26 @@ class TestProcessSingleBatch:
         assert call_kwargs[1]["status"] == "embed-failed-db"
 
     @pytest.mark.asyncio
+    async def test_embedding_count_mismatch_fails_batch(self):
+        """If provider returns wrong number of embeddings, batch fails."""
+        rows = [{"id": uuid4(), "content": "text1"}, {"id": uuid4(), "content": "text2"}]
+        mock_provider = AsyncMock()
+        mock_provider.embed_batch.return_value = [[0.1] * 1024]  # only 1 for 2 rows
+        mock_mark_failed = AsyncMock()
+
+        result = await process_single_batch(
+            rows=rows,
+            provider=mock_provider,
+            target_model="voyage-code-3",
+            update_fn=AsyncMock(),
+            mark_failed_fn=mock_mark_failed,
+        )
+
+        assert result.converted == 0
+        assert len(result.failed_ids) == 2
+        mock_mark_failed.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_no_mark_failed_fn_still_returns_failure(self):
         """Without mark_failed_fn, failures still return correct BatchResult."""
         from scripts.core.db.embedding_service import EmbeddingError

@@ -257,6 +257,10 @@ async def process_single_batch(
     texts = build_batch_texts(rows)
     try:
         embeddings = await provider.embed_batch(texts)
+        if len(embeddings) != len(rows):
+            raise EmbeddingError(
+                f"Expected {len(rows)} embeddings, got {len(embeddings)}"
+            )
     except EmbeddingError:
         if mark_failed_fn is not None:
             await mark_failed_fn(ids, status="bge-failed")

@@ -139,11 +139,11 @@ class TestStoreLearningV2Tags:
         mock_embedder._provider = MagicMock()
         mock_embedder._provider.model = "bge-large"
 
-        _es = "scripts.core.db.embedding_service.EmbeddingService"
-        _cm = "scripts.core.db.memory_factory.create_memory_service"
-        _gb = "scripts.core.db.memory_factory.get_default_backend"
+        _es = "scripts.core.store_learning.EmbeddingService"
+        _cm = "scripts.core.store_learning.create_memory_service"
+        _gb = "scripts.core.store_learning.get_default_backend"
         with patch(_es, return_value=mock_embedder), \
-             patch(_cm, return_value=mock_memory), \
+             patch(_cm, new_callable=AsyncMock, return_value=mock_memory), \
              patch(_gb, return_value="postgres"), \
              patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
             from scripts.core.store_learning import store_learning_v2
@@ -175,11 +175,11 @@ class TestStoreLearningV2Tags:
         mock_embedder._provider = MagicMock()
         mock_embedder._provider.model = "bge-large"
 
-        _es = "scripts.core.db.embedding_service.EmbeddingService"
-        _cm = "scripts.core.db.memory_factory.create_memory_service"
-        _gb = "scripts.core.db.memory_factory.get_default_backend"
+        _es = "scripts.core.store_learning.EmbeddingService"
+        _cm = "scripts.core.store_learning.create_memory_service"
+        _gb = "scripts.core.store_learning.get_default_backend"
         with patch(_es, return_value=mock_embedder), \
-             patch(_cm, return_value=mock_memory), \
+             patch(_cm, new_callable=AsyncMock, return_value=mock_memory), \
              patch(_gb, return_value="postgres"), \
              patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
             from scripts.core.store_learning import store_learning_v2
@@ -208,11 +208,11 @@ class TestStoreLearningV2Tags:
         mock_embedder._provider = MagicMock()
         mock_embedder._provider.model = "bge-large"
 
-        _es = "scripts.core.db.embedding_service.EmbeddingService"
-        _cm = "scripts.core.db.memory_factory.create_memory_service"
-        _gb = "scripts.core.db.memory_factory.get_default_backend"
+        _es = "scripts.core.store_learning.EmbeddingService"
+        _cm = "scripts.core.store_learning.create_memory_service"
+        _gb = "scripts.core.store_learning.get_default_backend"
         with patch(_es, return_value=mock_embedder), \
-             patch(_cm, return_value=mock_memory), \
+             patch(_cm, new_callable=AsyncMock, return_value=mock_memory), \
              patch(_gb, return_value="postgres"), \
              patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
             from scripts.core.store_learning import store_learning_v2
@@ -245,15 +245,15 @@ class TestStoreLearningV2Tags:
         mock_embedder._provider = MagicMock()
         mock_embedder._provider.model = "bge-large"
 
-        _es = "scripts.core.db.embedding_service.EmbeddingService"
-        _cm = "scripts.core.db.memory_factory.create_memory_service"
-        _gb = "scripts.core.db.memory_factory.get_default_backend"
+        _es = "scripts.core.store_learning.EmbeddingService"
+        _cm = "scripts.core.store_learning.create_memory_service"
+        _gb = "scripts.core.store_learning.get_default_backend"
         env_clean = {
             k: v for k, v in os.environ.items()
             if k not in ("DATABASE_URL", "CONTINUOUS_CLAUDE_DB_URL")
         }
         with patch(_es, return_value=mock_embedder), \
-             patch(_cm, return_value=mock_memory), \
+             patch(_cm, new_callable=AsyncMock, return_value=mock_memory), \
              patch(_gb, return_value="sqlite"), \
              patch.dict("os.environ", env_clean, clear=True):
             from scripts.core.store_learning import store_learning_v2

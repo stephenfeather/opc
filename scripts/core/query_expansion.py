@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -46,6 +47,9 @@ _IDF_MAX_AGE_HOURS = _qe_cfg.idf_max_age_hours
 _IDF_DRIFT_THRESHOLD = _qe_cfg.idf_drift_threshold
 
 
+# --- Pure functions ---
+
+
 def _tokenize(text: str) -> list[str]:
     """Tokenize text for IDF computation.
 
@@ -53,12 +57,164 @@ def _tokenize(text: str) -> list[str]:
     filter short words and stopwords.
     """
     text = text.lower().replace("-", " ")
-    words = []
-    for w in text.split():
-        w = _ALNUM_RE.sub("", w)
-        if len(w) > 2 and w not in STOPWORDS:
-            words.append(w)
-    return words
+    return [
+        clean
+        for w in text.split()
+        if len(clean := _ALNUM_RE.sub("", w)) > 2 and clean not in STOPWORDS
+    ]
+
+
+def _sanitize_query_words(query: str) -> list[str]:
+    """Extract and sanitize query words for tsquery output.
+
+    Lowercases, replaces hyphens, strips non-alnum, filters short words.
+    Falls back to the first cleaned word, or returns an empty list when
+    nothing usable is found.
+    """
+    words = [
+        clean
+        for w in query.lower().replace("-", " ").split()
+        if len(clean := _ALNUM_RE.sub("", w)) > 2
+    ]
+    if words:
+        return words
+    # Fallback: try first word cleaned; return empty list if nothing usable
+    if query.strip():
+        fallback = _ALNUM_RE.sub("", query.lower().split()[0])
+        if fallback:
+            return [fallback]
+    return []
+
+
+def _compute_neighbor_df(contents: Iterable[str]) -> dict[str, int]:
+    """Compute document frequency of tokens across neighbor documents.
+
+    Each document contributes at most once per unique token (set-based).
+    """
+    df: dict[str, int] = {}
+    for text in contents:
+        for w in set(_tokenize(text)):
+            df[w] = df.get(w, 0) + 1
+    return df
+
+
+def _fold_document(
+    word_df: dict[str, int], doc_count: int, text: str
+) -> tuple[dict[str, int], int]:
+    """Fold a single document into the word-DF accumulator.
+
+    Returns updated (word_df, doc_count). The caller's dict is mutated
+    for efficiency on large corpora, but the return value is canonical.
+    """
+    for w in set(_tokenize(text)):
+        word_df[w] = word_df.get(w, 0) + 1
+    return word_df, doc_count + 1
+
+
+def _compute_word_df(documents: Iterable[str]) -> tuple[dict[str, int], int]:
+    """Compute corpus-wide word document frequency.
+
+    Returns (word_df dict, document count). Delegates to _fold_document
+    for each document.
+    """
+    word_df: dict[str, int] = {}
+    doc_count = 0
+    for text in documents:
+        word_df, doc_count = _fold_document(word_df, doc_count, text)
+    return word_df, doc_count
+
+
+def _score_expansion_candidates(
+    neighbor_df: dict[str, int],
+    idf_index: IDFIndex,
+    original_tokens: set[str],
+    min_idf: float,
+) -> list[tuple[str, float]]:
+    """Score and filter expansion candidates by neighbor_df * corpus_idf.
+
+    Excludes original tokens, stopwords, short terms, and low-IDF terms.
+    Returns sorted list of (term, score) descending by score.
+    """
+    candidates: list[tuple[str, float]] = []
+    for term, ndf in neighbor_df.items():
+        if term in original_tokens or term in STOPWORDS or len(term) <= 2:
+            continue
+        corpus_idf = idf_index.idf(term)
+        if corpus_idf < min_idf:
+            continue
+        clean = _ALNUM_RE.sub("", term)
+        if not clean or len(clean) <= 2:
+            continue
+        candidates.append((clean, ndf * corpus_idf))
+
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    return candidates
+
+
+def _format_tsquery(original_words: list[str], expansion_terms: list[str]) -> str:
+    """Join original and expansion terms into an OR-joined tsquery string.
+
+    Defense-in-depth: strips tsquery metacharacters and empty/blank terms
+    to prevent injection even if upstream sanitizers are bypassed.
+    """
+    all_terms = [
+        _ALNUM_RE.sub("", t)
+        for t in original_words + expansion_terms
+        if t.strip()
+    ]
+    return " | ".join(t for t in all_terms if t)
+
+
+def _is_cache_locally_invalid(cached: IDFIndex, *, max_age_hours: float) -> bool:
+    """Check cache validity using only local metadata (no DB query needed).
+
+    Returns True (stale) when: timestamp unparseable, age exceeds max_age_hours,
+    or doc_count is non-integer / non-positive.
+    """
+    try:
+        built = datetime.fromisoformat(cached.built_at)
+        age_hours = (datetime.now(UTC) - built).total_seconds() / 3600
+        if age_hours >= max_age_hours:
+            return True
+    except (ValueError, TypeError):
+        return True
+
+    if not isinstance(cached.doc_count, int) or cached.doc_count <= 0:
+        return True
+
+    return False
+
+
+def _is_cache_drifted(
+    cached: IDFIndex, *, current_count: int, drift_threshold: float
+) -> bool:
+    """Check whether the cached doc count has drifted beyond threshold.
+
+    Caller must ensure cached.doc_count > 0 before calling.
+    """
+    drift = abs(current_count - cached.doc_count) / cached.doc_count
+    return drift > drift_threshold
+
+
+def _is_cache_stale(
+    cached: IDFIndex,
+    *,
+    max_age_hours: float,
+    current_count: int,
+    drift_threshold: float,
+) -> bool:
+    """Determine whether a cached IDF index needs rebuilding.
+
+    Checks local metadata first, then drift. Provided for test compatibility.
+    """
+    if _is_cache_locally_invalid(cached, max_age_hours=max_age_hours):
+        return True
+    return _is_cache_drifted(
+        cached, current_count=current_count, drift_threshold=drift_threshold
+    )
+
+
+# --- Data structures ---
 
 
 @dataclass
@@ -75,6 +231,9 @@ class IDFIndex:
         if df == 0:
             return math.log(self.doc_count + 1)  # max IDF for unknown
         return math.log(self.doc_count / (1 + df))
+
+
+# --- I/O boundary functions ---
 
 
 def save_idf_index(index: IDFIndex, path: Path | None = None) -> None:
@@ -109,10 +268,8 @@ def load_idf_index(path: Path | None = None) -> IDFIndex | None:
 async def build_idf_index(path: Path | None = None) -> IDFIndex:
     """Build IDF index from all active learnings in the database.
 
-    Uses a cursor to stream rows instead of loading the entire corpus into RAM.
-
-    Args:
-        path: Where to save the index. Defaults to _IDF_CACHE_PATH.
+    Streams rows via cursor, folding each document into the DF accumulator
+    without buffering the full corpus in memory.
     """
     from scripts.core.db.postgres_pool import get_pool
 
@@ -129,10 +286,7 @@ async def build_idf_index(path: Path | None = None) -> IDFIndex:
                 AND superseded_by IS NULL
                 """
             ):
-                doc_count += 1
-                unique_words = set(_tokenize(row["content"]))
-                for w in unique_words:
-                    word_df[w] = word_df.get(w, 0) + 1
+                word_df, doc_count = _fold_document(word_df, doc_count, row["content"])
 
     index = IDFIndex(
         word_df=word_df,
@@ -151,42 +305,37 @@ async def get_idf_index(
 
     Rebuilds when:
     - No cached index exists
-    - Cache is older than 24 hours
-    - Doc count has drifted >10% from cached count
+    - Cache is older than configured max age
+    - Doc count has drifted beyond configured threshold
     """
     if not force_rebuild:
         cached = load_idf_index(path)
         if cached is not None:
-            # Check age
-            try:
-                built = datetime.fromisoformat(cached.built_at)
-                age_hours = (datetime.now(UTC) - built).total_seconds() / 3600
-                if age_hours < _IDF_MAX_AGE_HOURS:
-                    # Check drift
-                    from scripts.core.db.postgres_pool import get_pool
+            # Short-circuit: check local metadata before querying DB
+            if _is_cache_locally_invalid(cached, max_age_hours=_IDF_MAX_AGE_HOURS):
+                logger.info("IDF cache locally invalid, rebuilding")
+            else:
+                # Cache metadata looks good; check drift against DB count
+                from scripts.core.db.postgres_pool import get_pool
 
-                    pool = await get_pool()
-                    async with pool.acquire() as conn:
-                        row = await conn.fetchrow(
-                            """
-                            SELECT COUNT(*) as cnt FROM archival_memory
-                            WHERE metadata->>'type' = 'session_learning'
-                            AND superseded_by IS NULL
-                            """
-                        )
-                    current_count = row["cnt"] if row else 0
-                    if cached.doc_count > 0:
-                        drift = abs(current_count - cached.doc_count) / cached.doc_count
-                    else:
-                        drift = 1.0
-                    if drift <= _IDF_DRIFT_THRESHOLD:
-                        return cached
-                    logger.info(
-                        "IDF index drift %.1f%% exceeds threshold, rebuilding",
-                        drift * 100,
+                pool = await get_pool()
+                async with pool.acquire() as conn:
+                    row = await conn.fetchrow(
+                        """
+                        SELECT COUNT(*) as cnt FROM archival_memory
+                        WHERE metadata->>'type' = 'session_learning'
+                        AND superseded_by IS NULL
+                        """
                     )
-            except (ValueError, TypeError):
-                pass  # bad timestamp, rebuild
+                current_count = row["cnt"] if row else 0
+
+                if not _is_cache_drifted(
+                    cached,
+                    current_count=current_count,
+                    drift_threshold=_IDF_DRIFT_THRESHOLD,
+                ):
+                    return cached
+                logger.info("IDF cache drift exceeded, rebuilding")
 
     return await build_idf_index(path)
 
@@ -216,20 +365,17 @@ async def expand_query(
     """
     from scripts.core.db.postgres_pool import get_pool
 
-    # Build original query terms for the OR string
+    max_neighbors = max(0, min(max_neighbors, 100))
+    if max_neighbors == 0:
+        return _format_tsquery(_sanitize_query_words(query), [])
     original_tokens = set(_tokenize(query))
-    # Sanitize original words for tsquery safety (strip FTS operators and non-alnum)
-    original_words = []
-    for w in query.lower().replace("-", " ").split():
-        clean = re.sub(r"[^a-zA-Z0-9]", "", w)
-        if len(clean) > 2:
-            original_words.append(clean)
-    if not original_words:
-        # Last resort: take first word, cleaned
-        fallback = re.sub(r"[^a-zA-Z0-9]", "", query.lower().split()[0]) if query.strip() else ""
-        original_words = [fallback] if fallback else [""]
+    original_words = _sanitize_query_words(query)
 
-    # Fetch vector neighbors (pool init registers pgvector codec per connection)
+    # Skip expansion entirely if no usable original terms survive sanitization
+    if not original_words:
+        return query
+
+    # Fetch vector neighbors (I/O boundary)
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -246,40 +392,14 @@ async def expand_query(
         )
 
     if not rows:
-        return " | ".join(original_words)
+        return _format_tsquery(original_words, [])
 
-    # Tokenize neighbors and count doc frequency within neighbor set
-    neighbor_df: dict[str, int] = {}
-    for row in rows:
-        unique_words = set(_tokenize(row["content"]))
-        for w in unique_words:
-            neighbor_df[w] = neighbor_df.get(w, 0) + 1
-
-    # Get corpus IDF
+    # Pure logic: compute neighbor df, score candidates, format output
+    neighbor_df = _compute_neighbor_df(row["content"] for row in rows)
     idf_index = await get_idf_index()
-
-    # Score: neighbor_df * corpus_idf
-    # High score = common among neighbors AND rare in corpus
-    candidates: list[tuple[str, float]] = []
-    for term, ndf in neighbor_df.items():
-        if term in original_tokens:
-            continue
-        if term in STOPWORDS or len(term) <= 2:
-            continue
-        corpus_idf = idf_index.idf(term)
-        if corpus_idf < min_idf:
-            continue
-        # Sanitize for tsquery safety
-        clean = re.sub(r"[^a-zA-Z0-9]", "", term)
-        if not clean or len(clean) <= 2:
-            continue
-        score = ndf * corpus_idf
-        candidates.append((clean, score))
-
-    # Sort by score descending, take top N
-    candidates.sort(key=lambda x: x[1], reverse=True)
+    candidates = _score_expansion_candidates(
+        neighbor_df, idf_index, original_tokens, min_idf
+    )
     expansion_terms = [t for t, _ in candidates[:max_expansion_terms]]
 
-    # Build OR-joined tsquery string
-    all_terms = original_words + expansion_terms
-    return " | ".join(all_terms)
+    return _format_tsquery(original_words, expansion_terms)

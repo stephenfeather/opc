@@ -322,6 +322,24 @@ class TestResolveSearchParams:
         assert params["mode"] == "hybrid_rrf"
         assert params["similarity_threshold"] == pytest.approx(0.002)  # 0.2 * 0.01
 
+    def test_hybrid_rrf_excludes_recency_weight(self):
+        params = resolve_search_params(
+            backend="postgres",
+            text_only=False,
+            vector_only=False,
+            query="test",
+            fetch_k=50,
+            provider="local",
+            threshold=0.2,
+            recency=0.5,
+            no_rerank=False,
+            no_expand=False,
+            expand_terms=5,
+            rebuild_idf=False,
+        )
+        assert params["mode"] == "hybrid_rrf"
+        assert "recency_weight" not in params
+
     def test_hybrid_no_expand(self):
         params = resolve_search_params(
             backend="postgres",

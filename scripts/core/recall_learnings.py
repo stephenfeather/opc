@@ -201,7 +201,8 @@ def resolve_search_params(
             "recency_weight": sql_recency,
         }
 
-    # Default: hybrid RRF
+    # Default: hybrid RRF — no recency_weight; temporal relevance is handled
+    # by recall_count boost in the SQL query, not a separate weight param.
     return {
         "mode": "hybrid_rrf",
         "query": query,
@@ -223,6 +224,11 @@ def select_output(
     if json_flag:
         return "json"
     return "human"
+
+
+# ---------------------------------------------------------------------------
+# Environment helpers (reads os.environ — not pure)
+# ---------------------------------------------------------------------------
 
 
 def get_backend() -> str:
@@ -273,7 +279,7 @@ async def record_recall(result_ids: list[str]) -> None:
 
 
 async def _fetch_pattern_rows(result_ids: list[str]) -> list[dict[str, Any]]:
-    """Fetch pattern strength/tags from PostgreSQL for given memory IDs."""
+    """Fetch pattern strength/tags from PostgreSQL. Caller must ensure Postgres backend."""
     from scripts.core.db.postgres_pool import get_pool
 
     pool = await get_pool()
@@ -357,10 +363,10 @@ async def _dispatch_search(params: dict[str, Any]) -> list[dict[str, Any]]:
     if mode == "text_only":
         return await search_learnings_text_only_postgres(params["query"], params["k"])
     if mode == "vector":
-        return await search_learnings(
-            query=params["query"],
-            k=params["k"],
-            provider=params["provider"],
+        return await search_learnings_postgres(
+            params["query"],
+            params["k"],
+            params["provider"],
             similarity_threshold=params["similarity_threshold"],
             recency_weight=params["recency_weight"],
         )

@@ -207,10 +207,14 @@ def parse_pattern_metadata(metadata: dict | str | None) -> dict:
     if not isinstance(metadata, str) or not metadata:
         return {}
     try:
-        return json.loads(metadata)
+        parsed = json.loads(metadata)
     except (json.JSONDecodeError, ValueError):
         logger.warning("Malformed pattern metadata: %s", metadata[:80])
         return {}
+    if not isinstance(parsed, dict):
+        logger.warning("Non-object pattern metadata: %s", type(parsed).__name__)
+        return {}
+    return parsed
 
 
 def format_type_breakdown(rows: list[dict]) -> str:

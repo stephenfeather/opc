@@ -190,6 +190,15 @@ class TestParsePatternMetadata:
     def test_numeric_value_returns_empty_dict(self):
         assert parse_pattern_metadata(42) == {}
 
+    def test_json_array_returns_empty_dict(self):
+        assert parse_pattern_metadata("[]") == {}
+
+    def test_json_scalar_string_returns_empty_dict(self):
+        assert parse_pattern_metadata('"text"') == {}
+
+    def test_json_number_string_returns_empty_dict(self):
+        assert parse_pattern_metadata("1") == {}
+
 
 # ---------------------------------------------------------------------------
 # format_type_section tests (pure, returns lines)

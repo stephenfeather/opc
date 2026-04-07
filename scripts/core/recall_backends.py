@@ -94,6 +94,7 @@ def format_row_metadata(metadata: Any) -> dict[str, Any]:
         try:
             return json.loads(metadata)
         except (json.JSONDecodeError, ValueError):
+            logger.warning("Malformed metadata JSON: %r", metadata[:200])
             return {}
     return {}
 
@@ -343,20 +344,36 @@ async def search_learnings_sqlite(
     conn.row_factory = sqlite3.Row
 
     try:
-        cursor = conn.execute(
-            """
-            SELECT
-                a.id, a.session_id, a.content, a.metadata_json,
-                a.created_at, bm25(archival_fts) as rank
-            FROM archival_memory a
-            JOIN archival_fts f ON a.rowid = f.rowid
-            WHERE archival_fts MATCH ?
-                AND json_extract(a.metadata_json, '$.type') = 'session_learning'
-            ORDER BY rank
-            LIMIT ?
-            """,
-            (fts_query, k),
-        )
+        try:
+            cursor = conn.execute(
+                """
+                SELECT
+                    a.id, a.session_id, a.content, a.metadata_json,
+                    a.created_at, bm25(archival_fts) as rank
+                FROM archival_memory a
+                JOIN archival_fts f ON a.rowid = f.rowid
+                WHERE archival_fts MATCH ?
+                    AND json_extract(a.metadata_json, '$.type') = 'session_learning'
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (fts_query, k),
+            )
+        except Exception:
+            logger.debug("SQLite json_extract not available, falling back", exc_info=True)
+            cursor = conn.execute(
+                """
+                SELECT
+                    a.id, a.session_id, a.content, a.metadata_json,
+                    a.created_at, bm25(archival_fts) as rank
+                FROM archival_memory a
+                JOIN archival_fts f ON a.rowid = f.rowid
+                WHERE archival_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (fts_query, k),
+            )
         return [
             format_sqlite_result(row, divisor=_recall_cfg.bm25_normalization_divisor)
             for row in cursor.fetchall()
@@ -514,7 +531,10 @@ async def search_learnings_postgres(
         try:
             query_embedding = await embedder.embed(query, input_type="query")
         except Exception:
-            logger.debug("Embedding generation failed", exc_info=True)
+            logger.warning(
+                "Embedding generation failed, falling back to text search",
+                exc_info=True,
+            )
             if text_fallback:
                 has_embeddings = False
             else:

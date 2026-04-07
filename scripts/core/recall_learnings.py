@@ -57,8 +57,6 @@ project_dir = os.environ.get("CLAUDE_PROJECT_DIR", str(Path(__file__).parent.par
 sys.path.insert(0, project_dir)
 
 # Re-export search backends for backward compatibility (tests import these directly)
-# Top-level imports for I/O helpers (avoid lazy imports)
-from scripts.core.db.postgres_pool import get_pool  # noqa: E402
 from scripts.core.recall_backends import (  # noqa: E402, F401
     search_learnings_hybrid_rrf,
     search_learnings_postgres,
@@ -74,7 +72,6 @@ from scripts.core.recall_formatters import (  # noqa: E402, F401
     format_result_preview,
     group_by_type,
 )
-from scripts.core.reranker import RecallContext, rerank  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Pure functions
@@ -156,8 +153,10 @@ def make_recall_context(
     project: str | None,
     tags: list[str] | None,
     retrieval_mode: str,
-) -> RecallContext:
+) -> Any:
     """Construct a RecallContext for the reranker."""
+    from scripts.core.reranker import RecallContext
+
     return RecallContext(
         project=project,
         tags_hint=tags,
@@ -256,6 +255,8 @@ async def record_recall(result_ids: list[str]) -> None:
         return
 
     try:
+        from scripts.core.db.postgres_pool import get_pool
+
         pool = await get_pool()
         async with pool.acquire() as conn:
             await conn.execute(
@@ -273,6 +274,8 @@ async def record_recall(result_ids: list[str]) -> None:
 
 async def _fetch_pattern_rows(result_ids: list[str]) -> list[dict[str, Any]]:
     """Fetch pattern strength/tags from PostgreSQL for given memory IDs."""
+    from scripts.core.db.postgres_pool import get_pool
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -485,6 +488,8 @@ async def main() -> int:
             tags=args.tags,
             retrieval_mode=retrieval_mode,
         )
+        from scripts.core.reranker import rerank
+
         results = rerank(results, ctx, k=args.k)
 
     # Record recall (skip benchmarking mode)

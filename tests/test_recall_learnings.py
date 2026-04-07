@@ -2,15 +2,11 @@
 
 from __future__ import annotations
 
-import json
-from types import SimpleNamespace
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from scripts.core.recall_learnings import (
-    RecallContext,
     apply_pattern_enrichment,
     build_pattern_lookup,
     compute_fetch_k,
@@ -37,7 +33,7 @@ def _patch_pool(mock_pool):
     """Return a patch context for get_pool that returns mock_pool."""
     async def fake_get_pool():
         return mock_pool
-    return patch("scripts.core.recall_learnings.get_pool", side_effect=fake_get_pool)
+    return patch("scripts.core.db.postgres_pool.get_pool", side_effect=fake_get_pool)
 
 
 # ---------------------------------------------------------------------------
@@ -402,7 +398,7 @@ class TestRecordRecall:
 
         with (
             patch("scripts.core.recall_learnings.get_backend", return_value="postgres"),
-            patch("scripts.core.recall_learnings.get_pool", side_effect=failing_pool),
+            patch("scripts.core.db.postgres_pool.get_pool", side_effect=failing_pool),
         ):
             await record_recall(["id-1"])  # should not raise
 
@@ -463,7 +459,7 @@ class TestEnrichWithPatternStrength:
 
         with (
             patch("scripts.core.recall_learnings.get_backend", return_value="postgres"),
-            patch("scripts.core.recall_learnings.get_pool", side_effect=failing_pool),
+            patch("scripts.core.db.postgres_pool.get_pool", side_effect=failing_pool),
         ):
             out = await enrich_with_pattern_strength(results)
             assert out == results
@@ -512,3 +508,57 @@ class TestSearchLearnings:
             results = await search_learnings("test", k=5)
             mock_pg.assert_called_once()
             assert len(results) == 1
+
+
+# ---------------------------------------------------------------------------
+# Regression: SQLite path must not require Postgres imports
+# ---------------------------------------------------------------------------
+class TestSqlitePathIndependence:
+    """Ensure SQLite code path works even when Postgres pool is unavailable."""
+
+    @pytest.mark.asyncio
+    async def test_search_learnings_sqlite_no_postgres(self):
+        from scripts.core.recall_learnings import search_learnings
+
+        with (
+            patch("scripts.core.recall_learnings.get_backend", return_value="sqlite"),
+            patch(
+                "scripts.core.recall_learnings.search_learnings_sqlite",
+                new_callable=AsyncMock,
+                return_value=[{"id": "1", "content": "test"}],
+            ),
+            patch(
+                "scripts.core.db.postgres_pool.get_pool",
+                side_effect=ImportError("asyncpg not installed"),
+            ),
+        ):
+            results = await search_learnings("test query", k=3)
+            assert len(results) == 1
+
+    @pytest.mark.asyncio
+    async def test_record_recall_sqlite_skips_postgres(self):
+        from scripts.core.recall_learnings import record_recall
+
+        with (
+            patch("scripts.core.recall_learnings.get_backend", return_value="sqlite"),
+            patch(
+                "scripts.core.db.postgres_pool.get_pool",
+                side_effect=ImportError("asyncpg not installed"),
+            ),
+        ):
+            await record_recall(["some-id"])  # should not raise
+
+    @pytest.mark.asyncio
+    async def test_enrich_sqlite_skips_postgres(self):
+        from scripts.core.recall_learnings import enrich_with_pattern_strength
+
+        results = [{"id": "abc", "content": "test"}]
+        with (
+            patch("scripts.core.recall_learnings.get_backend", return_value="sqlite"),
+            patch(
+                "scripts.core.db.postgres_pool.get_pool",
+                side_effect=ImportError("asyncpg not installed"),
+            ),
+        ):
+            out = await enrich_with_pattern_strength(results)
+            assert out == results

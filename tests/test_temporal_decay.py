@@ -65,11 +65,8 @@ class TestRecordRecall:
         pool, conn = mock_pool
         ids = [str(uuid.uuid4()), str(uuid.uuid4())]
 
-        async def fake_get_pool():
-            return pool
-
         with patch("scripts.core.recall_learnings.get_backend", return_value="postgres"), \
-             patch("scripts.core.recall_learnings.get_pool", side_effect=fake_get_pool):
+             patch("scripts.core.db.postgres_pool.get_pool", return_value=pool):
             await record_recall(ids)
 
         conn.execute.assert_called_once()
@@ -83,7 +80,8 @@ class TestRecordRecall:
         """record_recall does nothing for empty ID list."""
         pool, conn = mock_pool
 
-        with patch("scripts.core.recall_learnings.get_backend", return_value="postgres"):
+        with patch("scripts.core.recall_learnings.get_backend", return_value="postgres"), \
+             patch("scripts.core.db.postgres_pool.get_pool", return_value=pool):
             await record_recall([])
 
         conn.execute.assert_not_called()
@@ -104,11 +102,8 @@ class TestRecordRecall:
         conn.execute.side_effect = Exception("column does not exist")
         ids = [str(uuid.uuid4())]
 
-        async def fake_get_pool():
-            return pool
-
         with patch("scripts.core.recall_learnings.get_backend", return_value="postgres"), \
-             patch("scripts.core.recall_learnings.get_pool", side_effect=fake_get_pool):
+             patch("scripts.core.db.postgres_pool.get_pool", return_value=pool):
             # Should not raise
             await record_recall(ids)
 

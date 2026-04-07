@@ -9,6 +9,7 @@ import pytest
 
 from scripts.core.re_embed_voyage import (
     EXCLUDED_STATES,
+    FAILURE_STATES,
     BatchResult,
     build_batch_texts,
     build_excluded_states,
@@ -86,7 +87,7 @@ class TestFormatSummary:
     def test_with_failures(self):
         summary = format_summary(converted=40, failed_ids=["a", "b"], elapsed=30.0)
         assert "Failed:    2" in summary
-        assert "retry" in summary.lower()
+        assert "--retry-failed" in summary
 
 
 class TestBatchResult:
@@ -244,6 +245,11 @@ class TestMarkFailedRows:
 
 class TestStateMachine:
     """Verify the embedding_model state machine is correctly defined."""
+
+    def test_failure_states_are_subset_of_excluded(self):
+        """All failure states must be in the excluded set."""
+        for state in FAILURE_STATES:
+            assert state in EXCLUDED_STATES
 
     def test_excluded_states_include_in_progress(self):
         """in-progress is excluded from claiming."""

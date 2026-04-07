@@ -44,17 +44,9 @@ load_dotenv()
 project_dir = os.environ.get("CLAUDE_PROJECT_DIR", str(Path(__file__).parent.parent.parent))
 sys.path.insert(0, project_dir)
 
-import faulthandler
-
+from scripts.core.config import get_config as _get_config  # noqa: E402
 from scripts.core.db.embedding_service import EmbeddingError, VoyageEmbeddingProvider  # noqa: E402
 from scripts.core.db.postgres_pool import close_pool, get_connection  # noqa: E402
-
-_crash_log_dir = Path.home() / ".claude" / "logs"
-if _crash_log_dir.is_dir():
-    _crash_log = open(_crash_log_dir / "opc_crash.log", "a")  # noqa: SIM115
-    faulthandler.enable(file=_crash_log, all_threads=True)
-
-from scripts.core.config import get_config as _get_config
 
 BATCH_SIZE = _get_config().embedding.re_embed_batch_size
 TARGET_MODEL = "voyage-code-3"
@@ -115,13 +107,8 @@ def format_summary(converted: int, failed_ids: list[str], elapsed: float) -> str
     if failed_ids:
         lines += [
             "",
-            "To retry failed rows, run:",
+            "To retry failed rows (resets bge-failed, embed-failed-db, and stale in-progress):",
             "  uv run python scripts/core/re_embed_voyage.py --retry-failed",
-            "",
-            "Or reset them manually:",
-            "  docker exec continuous-claude-postgres psql -U claude -d continuous_claude -c \\",
-            "    \"UPDATE archival_memory SET embedding_model = 'bge'"
-            " WHERE embedding_model = 'bge-failed';\"",
         ]
     return "\n".join(lines)
 
@@ -147,7 +134,7 @@ async def ensure_embedding_model_column() -> None:
 
 
 async def count_pending(target_model: str) -> tuple[int, int]:
-    """Return (pending, total) row counts."""
+    """Return (pending, already_done) row counts."""
     async with get_connection() as conn:
         total = await conn.fetchval("SELECT COUNT(*) FROM archival_memory")
         done = await conn.fetchval(
@@ -157,8 +144,12 @@ async def count_pending(target_model: str) -> tuple[int, int]:
     return classify_pending(total, done)
 
 
-# States excluded from claiming — quarantined until --retry-failed.
-EXCLUDED_STATES = ("bge-failed", "embed-failed-db", "in-progress")
+# Failure states that mark_failed_rows can write.
+FAILURE_STATES = ("bge-failed", "embed-failed-db")
+
+# All states excluded from claiming — failure states + in-progress (active/stale claim).
+# Quarantined until --retry-failed.
+EXCLUDED_STATES = FAILURE_STATES + ("in-progress",)
 
 
 def build_excluded_states(target_model: str) -> list[str]:
@@ -228,9 +219,6 @@ async def update_batch(
                 )
 
 
-VALID_FAILURE_STATUSES = ("bge-failed", "embed-failed-db")
-
-
 async def mark_failed_rows(row_ids: list[str], *, status: str = "bge-failed") -> None:
     """Mark rows with a failure status so they can be retried later.
 
@@ -239,7 +227,7 @@ async def mark_failed_rows(row_ids: list[str], *, status: str = "bge-failed") ->
         status: Failure status to set. 'bge-failed' for API errors,
                 'embed-failed-db' for DB write failures after successful embedding.
     """
-    if status not in VALID_FAILURE_STATUSES:
+    if status not in FAILURE_STATES:
         raise ValueError(f"Invalid failure status: {status!r}")
     async with get_connection() as conn:
         await conn.execute(
@@ -300,8 +288,11 @@ async def run(model: str, batch_size: int, dry_run: bool) -> None:
     # Check for stale in-progress rows from crashed prior runs
     stale = await count_stale_in_progress()
     if stale > 0:
-        print(f"  WARNING: {stale} rows stuck in 'in-progress' from a prior interrupted run.")
-        print("  Run with --retry-failed to reset them before proceeding.")
+        # TODO: Add lease/heartbeat (claimed_at, worker_id) to distinguish live
+        # workers from truly stale claims. Currently --retry-failed resets all
+        # in-progress rows indiscriminately — do not use while another worker is active.
+        print(f"  WARNING: {stale} rows in 'in-progress' state (possibly from a crashed run).")
+        print("  If no other worker is running, use --retry-failed to reset them.")
         print()
 
     pending, already_done = await count_pending(model)

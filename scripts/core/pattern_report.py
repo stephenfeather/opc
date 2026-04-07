@@ -196,15 +196,18 @@ def format_age(created: datetime, *, now: datetime | None = None) -> str:
     return f"{total_seconds // 60}m ago"
 
 
-_METADATA_PARSE_ERROR: dict = {"_parse_error": True}
+def _make_parse_error() -> dict:
+    """Return a fresh parse-error sentinel dict."""
+    return {"_parse_error": True}
 
 
 def parse_pattern_metadata(metadata: dict | str | None) -> dict:
     """Parse pattern metadata from dict or JSON string.
 
     Returns empty dict for None, empty strings, or non-dict/non-string types.
-    Returns ``_METADATA_PARSE_ERROR`` sentinel for malformed or non-object JSON
-    so callers can distinguish parse failures from legitimately empty metadata.
+    Returns a fresh ``_parse_error`` sentinel dict for malformed or non-object
+    JSON so callers can distinguish parse failures from legitimately empty
+    metadata without risking shared-state mutation.
     """
     if isinstance(metadata, dict):
         return metadata
@@ -213,11 +216,11 @@ def parse_pattern_metadata(metadata: dict | str | None) -> dict:
     try:
         parsed = json.loads(metadata)
     except (json.JSONDecodeError, ValueError):
-        logger.warning("Malformed pattern metadata: %s", metadata[:80])
-        return _METADATA_PARSE_ERROR
+        logger.warning("Malformed pattern metadata: %r", metadata[:80])
+        return _make_parse_error()
     if not isinstance(parsed, dict):
         logger.warning("Non-object pattern metadata: %s", type(parsed).__name__)
-        return _METADATA_PARSE_ERROR
+        return _make_parse_error()
     return parsed
 
 

@@ -804,7 +804,7 @@ class TestCollectMetrics:
     @pytest.mark.asyncio
     async def test_version_present(self):
         metrics = await collect_all_metrics()
-        assert isinstance(metrics["version"], str)
+        assert metrics["version"] == _get_version()
 
     @pytest.mark.asyncio
     async def test_top_tags_is_list(self):

@@ -115,12 +115,7 @@ def format_sqlite_result(
     row: Mapping[str, Any], *, divisor: float,
 ) -> dict[str, Any]:
     """Convert a SQLite FTS5 row to a result dict with normalized BM25 score."""
-    metadata = {}
-    if row["metadata_json"]:
-        try:
-            metadata = json.loads(row["metadata_json"])
-        except (json.JSONDecodeError, ValueError):
-            logger.warning("Malformed SQLite metadata_json: %r", str(row["metadata_json"])[:200])
+    metadata = format_row_metadata(row["metadata_json"])
 
     return {
         "id": row["id"] or "",
@@ -464,28 +459,44 @@ async def search_learnings_hybrid_rrf(
     async with pool.acquire() as conn:
         await init_pgvector(conn)
         boost = _recall_cfg.recall_boost_multiplier
-        query_args = (text_query, str(query_embedding), rrf_k, k * 2, boost)
+        embedding_str = str(query_embedding)
+        boosted_args = (text_query, embedding_str, rrf_k, k * 2, boost)
+        plain_args = (text_query, embedding_str, rrf_k, k * 2)
 
         try:
-            rows = await conn.fetch(rrf_cte + boosted_tail, *query_args)
+            rows = await conn.fetch(rrf_cte + boosted_tail, *boosted_args)
         except Exception:
             logger.debug("RRF boosted+chain fallback", exc_info=True)
             has_decay_columns = False
             try:
-                rows = await conn.fetch(rrf_cte + plain_tail, *query_args)
+                rows = await conn.fetch(rrf_cte + plain_tail, *plain_args)
             except Exception:
                 logger.debug("RRF plain+chain fallback", exc_info=True)
-                rows = await conn.fetch(rrf_cte_plain + plain_tail, *query_args)
+                rows = await conn.fetch(
+                    rrf_cte_plain + plain_tail, *plain_args,
+                )
 
         if not rows and use_tsquery:
             logger.debug("Expanded tsquery returned no results, falling back to plainto_tsquery")
             plain_cte = build_rrf_cte(chain_filter=True, use_tsquery=False)
-            plain_args = (query, str(query_embedding), rrf_k, k * 2, boost)
+            fb_boosted = (query, embedding_str, rrf_k, k * 2, boost)
+            fb_plain = (query, embedding_str, rrf_k, k * 2)
             try:
-                tail = boosted_tail if has_decay_columns else plain_tail
-                rows = await conn.fetch(plain_cte + tail, *plain_args)
+                if has_decay_columns:
+                    rows = await conn.fetch(plain_cte + boosted_tail, *fb_boosted)
+                else:
+                    rows = await conn.fetch(plain_cte + plain_tail, *fb_plain)
             except Exception:
-                logger.debug("plainto_tsquery fallback also failed", exc_info=True)
+                logger.debug("plainto_tsquery chain fallback", exc_info=True)
+                try:
+                    no_chain_cte = build_rrf_cte(
+                        chain_filter=False, use_tsquery=False,
+                    )
+                    rows = await conn.fetch(
+                        no_chain_cte + plain_tail, *fb_plain,
+                    )
+                except Exception:
+                    logger.debug("plainto_tsquery fallback also failed", exc_info=True)
 
     results = []
     for row in rows:

@@ -188,8 +188,17 @@ class TestParsePatternMetadata:
         result = parse_pattern_metadata("not-json")
         assert result.get("_parse_error") is True
 
-    def test_numeric_value_returns_empty_dict(self):
-        assert parse_pattern_metadata(42) == {}
+    def test_numeric_value_returns_error_sentinel(self):
+        result = parse_pattern_metadata(42)
+        assert result.get("_parse_error") is True
+
+    def test_decoded_list_returns_error_sentinel(self):
+        result = parse_pattern_metadata([1, 2, 3])
+        assert result.get("_parse_error") is True
+
+    def test_decoded_bool_returns_error_sentinel(self):
+        result = parse_pattern_metadata(True)
+        assert result.get("_parse_error") is True
 
     def test_json_array_returns_error_sentinel(self):
         result = parse_pattern_metadata("[]")

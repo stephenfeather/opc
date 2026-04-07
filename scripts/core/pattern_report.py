@@ -201,27 +201,32 @@ def _make_parse_error() -> dict:
     return {"_parse_error": True}
 
 
-def parse_pattern_metadata(metadata: dict | str | None) -> dict:
-    """Parse pattern metadata from dict or JSON string.
+def parse_pattern_metadata(metadata: object | None) -> dict:
+    """Parse pattern metadata from a dict, JSON string, or decoded JSON value.
 
-    Returns empty dict for None, empty strings, or non-dict/non-string types.
-    Returns a fresh ``_parse_error`` sentinel dict for malformed or non-object
-    JSON so callers can distinguish parse failures from legitimately empty
-    metadata without risking shared-state mutation.
+    Returns empty dict only for ``None`` or empty strings. Returns a fresh
+    ``_parse_error`` sentinel dict for malformed JSON or any non-object JSON
+    value (including pre-decoded lists, ints, bools from asyncpg JSONB) so
+    callers can distinguish parse failures from legitimately empty metadata.
     """
     if isinstance(metadata, dict):
         return metadata
-    if not isinstance(metadata, str) or not metadata:
+    if metadata is None:
         return {}
-    try:
-        parsed = json.loads(metadata)
-    except (json.JSONDecodeError, ValueError):
-        logger.warning("Malformed pattern metadata: %r", metadata[:80])
-        return _make_parse_error()
-    if not isinstance(parsed, dict):
-        logger.warning("Non-object pattern metadata: %s", type(parsed).__name__)
-        return _make_parse_error()
-    return parsed
+    if isinstance(metadata, str):
+        if not metadata:
+            return {}
+        try:
+            parsed = json.loads(metadata)
+        except (json.JSONDecodeError, ValueError):
+            logger.warning("Malformed pattern metadata: %r", metadata[:80])
+            return _make_parse_error()
+        if not isinstance(parsed, dict):
+            logger.warning("Non-object pattern metadata: %s", type(parsed).__name__)
+            return _make_parse_error()
+        return parsed
+    logger.warning("Non-object pattern metadata: %s", type(metadata).__name__)
+    return _make_parse_error()
 
 
 def format_type_breakdown(rows: list[dict]) -> str:

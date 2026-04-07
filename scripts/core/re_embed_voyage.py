@@ -157,37 +157,46 @@ async def count_pending(target_model: str) -> tuple[int, int]:
     return classify_pending(total, done)
 
 
-# States that are eligible for claiming (baseline states only).
-# Failed states (bge-failed, embed-failed-db) are quarantined until --retry-failed.
-CLAIMABLE_STATES = ("bge", "bge-v1")
+# States excluded from claiming — quarantined until --retry-failed.
+EXCLUDED_STATES = ("bge-failed", "embed-failed-db", "in-progress")
 
-# States considered failed/stale — reset by --retry-failed.
-FAILED_STATES = ("bge-failed", "embed-failed-db", "in-progress")
+
+def build_excluded_states(target_model: str) -> list[str]:
+    """Build the full exclusion list: quarantined states + target model."""
+    return list(EXCLUDED_STATES) + [target_model]
+
+
+async def count_stale_in_progress() -> int:
+    """Count rows stuck in 'in-progress' (from a crashed prior run)."""
+    async with get_connection() as conn:
+        return await conn.fetchval(
+            "SELECT COUNT(*) FROM archival_memory WHERE embedding_model = 'in-progress'"
+        )
 
 
 async def claim_batch(target_model: str, batch_size: int) -> list[dict]:
     """Atomically claim a batch of rows for re-embedding.
 
-    Only claims rows in baseline states (bge, bge-v1, NULL). Rows in failed
-    or in-progress states are quarantined until explicitly reset via --retry-failed.
+    Claims any row not in the target model or a quarantined state. This supports
+    model-to-model migrations (e.g. voyage-3 -> voyage-code-3) without manual SQL.
 
     Uses SELECT ... FOR UPDATE SKIP LOCKED to prevent concurrent workers
     from processing the same rows.
     """
+    excluded = build_excluded_states(target_model)
     async with get_connection() as conn:
         async with conn.transaction():
             rows = await conn.fetch(
                 """
                 SELECT id, content
                 FROM archival_memory
-                WHERE (embedding_model IS NULL OR embedding_model = ANY($1::text[]))
-                  AND embedding_model != $2
+                WHERE (embedding_model IS NULL
+                       OR embedding_model != ALL($1::text[]))
                 ORDER BY created_at ASC
-                LIMIT $3
+                LIMIT $2
                 FOR UPDATE SKIP LOCKED
                 """,
-                list(CLAIMABLE_STATES),
-                target_model,
+                excluded,
                 batch_size,
             )
             if rows:
@@ -247,7 +256,9 @@ async def process_single_batch(
     Handles two failure modes separately:
     - EmbeddingError: API call failed, rows marked 'bge-failed' for retry.
     - DB update failure: embeddings succeeded but couldn't be persisted,
-      rows marked 'embed-failed-db' to avoid re-billing the API.
+      rows marked 'embed-failed-db'. Note: retry will re-call the API since
+      embeddings are not persisted separately. The distinct status helps
+      operators diagnose whether failures are API-side or DB-side.
     """
     ids = [str(row["id"]) for row in rows]
     texts = build_batch_texts(rows)
@@ -280,6 +291,13 @@ async def run(model: str, batch_size: int, dry_run: bool) -> None:
 
     print("Step 1: Ensuring embedding_model column exists...")
     await ensure_embedding_model_column()
+
+    # Check for stale in-progress rows from crashed prior runs
+    stale = await count_stale_in_progress()
+    if stale > 0:
+        print(f"  WARNING: {stale} rows stuck in 'in-progress' from a prior interrupted run.")
+        print("  Run with --retry-failed to reset them before proceeding.")
+        print()
 
     pending, already_done = await count_pending(model)
     total = pending + already_done
@@ -350,7 +368,7 @@ async def run(model: str, batch_size: int, dry_run: bool) -> None:
 
 async def reset_failed() -> None:
     """Reset failed and stale in-progress rows back to bge so they're retried."""
-    reset_statuses = FAILED_STATES
+    reset_statuses = EXCLUDED_STATES
     async with get_connection() as conn:
         count = await conn.fetchval(
             "SELECT COUNT(*) FROM archival_memory WHERE embedding_model = ANY($1::text[])",

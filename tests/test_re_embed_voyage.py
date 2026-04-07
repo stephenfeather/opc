@@ -8,10 +8,10 @@ from uuid import uuid4
 import pytest
 
 from scripts.core.re_embed_voyage import (
-    CLAIMABLE_STATES,
-    FAILED_STATES,
+    EXCLUDED_STATES,
     BatchResult,
     build_batch_texts,
+    build_excluded_states,
     classify_pending,
     format_progress_line,
     format_summary,
@@ -237,24 +237,27 @@ class TestMarkFailedRows:
 # ---------------------------------------------------------------------------
 
 
-class TestStateMachineConstants:
+class TestStateMachine:
     """Verify the embedding_model state machine is correctly defined."""
 
-    def test_claimable_states_exclude_failed(self):
-        """Failed states must not be claimable."""
-        for state in FAILED_STATES:
-            assert state not in CLAIMABLE_STATES
+    def test_excluded_states_include_in_progress(self):
+        """in-progress is excluded from claiming."""
+        assert "in-progress" in EXCLUDED_STATES
 
-    def test_failed_states_include_in_progress(self):
-        """in-progress is a failed/stale state for reset purposes."""
-        assert "in-progress" in FAILED_STATES
+    def test_excluded_states_include_both_failure_types(self):
+        assert "bge-failed" in EXCLUDED_STATES
+        assert "embed-failed-db" in EXCLUDED_STATES
 
-    def test_failed_states_include_both_failure_types(self):
-        assert "bge-failed" in FAILED_STATES
-        assert "embed-failed-db" in FAILED_STATES
+    def test_build_excluded_states_includes_target(self):
+        """Target model is excluded so already-converted rows aren't reclaimed."""
+        excluded = build_excluded_states("voyage-code-3")
+        assert "voyage-code-3" in excluded
+        for state in EXCLUDED_STATES:
+            assert state in excluded
 
-    def test_claimable_states_are_baseline_only(self):
-        """Only baseline (pre-migration) states should be claimable."""
-        for state in CLAIMABLE_STATES:
-            assert "failed" not in state
-            assert "progress" not in state
+    def test_build_excluded_states_supports_model_migration(self):
+        """Switching target model only excludes the new target, not the old one."""
+        excluded = build_excluded_states("voyage-3")
+        assert "voyage-3" in excluded
+        # A row with voyage-code-3 is NOT excluded — it can be re-embedded to voyage-3
+        assert "voyage-code-3" not in excluded

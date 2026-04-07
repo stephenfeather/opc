@@ -79,7 +79,7 @@ class TestNoRerankFlag:
                 return_value=fake_results,
             ),
             patch("scripts.core.recall_learnings.record_recall", new_callable=AsyncMock) as mock_record,
-            patch("scripts.core.reranker.rerank") as mock_rerank,
+            patch("scripts.core.recall_learnings.rerank") as mock_rerank,
             patch("sys.argv", ["recall", "--query", "test", "--k", "3", "--no-rerank", "--json"]),
         ):
             from scripts.core.recall_learnings import main
@@ -128,7 +128,7 @@ class TestProjectFlag:
                 return_value=fake_results,
             ),
             patch("scripts.core.recall_learnings.record_recall", new_callable=AsyncMock),
-            patch("scripts.core.reranker.rerank", side_effect=spy_rerank),
+            patch("scripts.core.recall_learnings.rerank", side_effect=spy_rerank),
             patch("sys.argv", ["recall", "--query", "test", "--k", "3", "--project", "my-project", "--json"]),
         ):
             from scripts.core.recall_learnings import main
@@ -351,7 +351,7 @@ class TestRetrievalModeDetection:
             patch("sys.argv", ["recall", "--query", "test", "--k", "3", "--text-only", "--json"]),
         ):
             # Patch the reranker module-level function so the lazy import picks it up
-            with patch("scripts.core.reranker.rerank", side_effect=spy_rerank):
+            with patch("scripts.core.recall_learnings.rerank", side_effect=spy_rerank):
                 from scripts.core.recall_learnings import main
 
                 await main()
@@ -381,7 +381,7 @@ class TestRetrievalModeDetection:
             patch("scripts.core.recall_learnings.record_recall", new_callable=AsyncMock),
             patch("sys.argv", ["recall", "--query", "test", "--k", "3", "--json"]),
         ):
-            with patch("scripts.core.reranker.rerank", side_effect=spy_rerank):
+            with patch("scripts.core.recall_learnings.rerank", side_effect=spy_rerank):
                 from scripts.core.recall_learnings import main
 
                 await main()
@@ -411,7 +411,7 @@ class TestRetrievalModeDetection:
             patch("scripts.core.recall_learnings.record_recall", new_callable=AsyncMock),
             patch("sys.argv", ["recall", "--query", "test", "--k", "3", "--json"]),
         ):
-            with patch("scripts.core.reranker.rerank", side_effect=spy_rerank):
+            with patch("scripts.core.recall_learnings.rerank", side_effect=spy_rerank):
                 from scripts.core.recall_learnings import main
 
                 await main()

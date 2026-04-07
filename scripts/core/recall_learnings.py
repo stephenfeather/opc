@@ -35,7 +35,6 @@ import logging
 import os
 import sys
 import uuid
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -43,7 +42,9 @@ logger = logging.getLogger(__name__)
 
 from dotenv import load_dotenv
 
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+faulthandler.enable(
+    file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True
+)
 
 # Load .env files
 global_env = Path.home() / ".claude" / ".env"
@@ -56,6 +57,8 @@ project_dir = os.environ.get("CLAUDE_PROJECT_DIR", str(Path(__file__).parent.par
 sys.path.insert(0, project_dir)
 
 # Re-export search backends for backward compatibility (tests import these directly)
+# Top-level imports for I/O helpers (avoid lazy imports)
+from scripts.core.db.postgres_pool import get_pool  # noqa: E402
 from scripts.core.recall_backends import (  # noqa: E402, F401
     search_learnings_hybrid_rrf,
     search_learnings_postgres,
@@ -71,6 +74,173 @@ from scripts.core.recall_formatters import (  # noqa: E402, F401
     format_result_preview,
     group_by_type,
 )
+from scripts.core.reranker import RecallContext, rerank  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Pure functions
+# ---------------------------------------------------------------------------
+
+
+def compute_fetch_k(k: int, *, no_rerank: bool) -> int:
+    """Compute how many candidates to fetch from the backend.
+
+    When reranking is enabled, over-fetch 3x (minimum 50) so the reranker
+    has enough candidates to trim.
+    """
+    if no_rerank:
+        return k
+    return max(3 * k, 50)
+
+
+def determine_retrieval_mode(
+    backend: str, *, text_only: bool, vector_only: bool
+) -> str:
+    """Map backend + flags to a retrieval mode string for the reranker."""
+    if backend == "sqlite":
+        return "sqlite"
+    if text_only:
+        return "text"
+    if vector_only:
+        return "vector"
+    return "hybrid_rrf"
+
+
+def filter_by_tags(
+    results: list[dict[str, Any]],
+    tags: list[str] | None,
+    *,
+    strict: bool,
+) -> list[dict[str, Any]]:
+    """Hard-filter results to those sharing at least one tag.
+
+    Returns results unchanged when strict is False, tags is None, or tags is empty.
+    Does not mutate the input list.
+    """
+    if not strict or not tags:
+        return results
+    tag_set = set(tags)
+    return [r for r in results if set(r.get("metadata", {}).get("tags", [])) & tag_set]
+
+
+def build_pattern_lookup(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Build a {memory_id: {pattern_strength, pattern_tags}} lookup from DB rows."""
+    lookup: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        mid = str(row["memory_id"])
+        lookup[mid] = {
+            "pattern_strength": float(row["pattern_strength"] or 0.0),
+            "pattern_tags": row["pattern_tags"] or [],
+        }
+    return lookup
+
+
+def apply_pattern_enrichment(
+    results: list[dict[str, Any]],
+    lookup: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return a new list with pattern_strength/pattern_tags merged from lookup.
+
+    Does not mutate the input results.
+    """
+    enriched: list[dict[str, Any]] = []
+    for result in results:
+        rid = result.get("id")
+        if rid and rid in lookup:
+            enriched.append({**result, **lookup[rid]})
+        else:
+            enriched.append(result)
+    return enriched
+
+
+def make_recall_context(
+    project: str | None,
+    tags: list[str] | None,
+    retrieval_mode: str,
+) -> RecallContext:
+    """Construct a RecallContext for the reranker."""
+    return RecallContext(
+        project=project,
+        tags_hint=tags,
+        retrieval_mode=retrieval_mode,
+    )
+
+
+def resolve_search_params(
+    *,
+    backend: str,
+    text_only: bool,
+    vector_only: bool,
+    query: str,
+    fetch_k: int,
+    provider: str,
+    threshold: float,
+    recency: float,
+    no_rerank: bool,
+    no_expand: bool,
+    expand_terms: int,
+    rebuild_idf: bool,
+) -> dict[str, Any]:
+    """Resolve CLI flags into a search parameter dict.
+
+    Returns a dict with keys: mode, query, k, provider, similarity_threshold,
+    recency_weight, expand, max_expansion_terms, rebuild_idf.
+    """
+    if backend == "sqlite":
+        return {"mode": "sqlite", "query": query, "k": fetch_k}
+
+    if text_only:
+        return {"mode": "text_only", "query": query, "k": fetch_k}
+
+    if vector_only:
+        sql_recency = 0.0 if not no_rerank else recency
+        return {
+            "mode": "vector",
+            "query": query,
+            "k": fetch_k,
+            "provider": provider,
+            "similarity_threshold": threshold,
+            "recency_weight": sql_recency,
+        }
+
+    # Default: hybrid RRF
+    return {
+        "mode": "hybrid_rrf",
+        "query": query,
+        "k": fetch_k,
+        "provider": provider,
+        "similarity_threshold": threshold * 0.01,  # RRF scores are ~0.01-0.03 range
+        "expand": not no_expand,
+        "max_expansion_terms": expand_terms,
+        "rebuild_idf": rebuild_idf,
+    }
+
+
+def select_output(
+    *, json_flag: bool, json_full: bool, structured: bool
+) -> str:
+    """Choose output format: 'json_full', 'json', or 'human'."""
+    if json_full:
+        return "json_full"
+    if json_flag:
+        return "json"
+    return "human"
+
+
+def get_backend() -> str:
+    """Determine which backend to use (sqlite or postgres)."""
+    backend = os.environ.get("AGENTICA_MEMORY_BACKEND", "").lower()
+    if backend in ("sqlite", "postgres"):
+        return backend
+
+    if os.environ.get("CONTINUOUS_CLAUDE_DB_URL") or os.environ.get("DATABASE_URL"):
+        return "postgres"
+
+    return "sqlite"
+
+
+# ---------------------------------------------------------------------------
+# I/O helpers
+# ---------------------------------------------------------------------------
 
 
 async def record_recall(result_ids: list[str]) -> None:
@@ -82,13 +252,10 @@ async def record_recall(result_ids: list[str]) -> None:
     if not result_ids:
         return
 
-    backend = get_backend()
-    if backend != "postgres":
+    if get_backend() != "postgres":
         return
 
     try:
-        from scripts.core.db.postgres_pool import get_pool
-
         pool = await get_pool()
         async with pool.acquire() as conn:
             await conn.execute(
@@ -101,8 +268,31 @@ async def record_recall(result_ids: list[str]) -> None:
                 result_ids,
             )
     except Exception:
-        # Graceful degradation: don't break recall if columns missing or DB error
         pass
+
+
+async def _fetch_pattern_rows(result_ids: list[str]) -> list[dict[str, Any]]:
+    """Fetch pattern strength/tags from PostgreSQL for given memory IDs."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT pm.memory_id,
+                   MAX(dp.confidence * GREATEST(1.0 - COALESCE(pm.distance, 0), 0))
+                       AS pattern_strength,
+                   ARRAY_AGG(DISTINCT unnested_tag)
+                       AS pattern_tags
+            FROM pattern_members pm
+            JOIN detected_patterns dp ON dp.id = pm.pattern_id
+            LEFT JOIN LATERAL unnest(dp.tags) AS unnested_tag
+                ON true
+            WHERE dp.superseded_at IS NULL
+              AND pm.memory_id = ANY($1::uuid[])
+            GROUP BY pm.memory_id
+            """,
+            [uuid.UUID(rid) for rid in result_ids],
+        )
+    return [dict(row) for row in rows]
 
 
 async def enrich_with_pattern_strength(
@@ -121,67 +311,15 @@ async def enrich_with_pattern_strength(
         return results
 
     try:
-        from scripts.core.db.postgres_pool import get_pool
-
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT pm.memory_id,
-                       MAX(dp.confidence * GREATEST(1.0 - COALESCE(pm.distance, 0), 0))
-                           AS pattern_strength,
-                       ARRAY_AGG(DISTINCT unnested_tag)
-                           AS pattern_tags
-                FROM pattern_members pm
-                JOIN detected_patterns dp ON dp.id = pm.pattern_id
-                LEFT JOIN LATERAL unnest(dp.tags) AS unnested_tag
-                    ON true
-                WHERE dp.superseded_at IS NULL
-                  AND pm.memory_id = ANY($1::uuid[])
-                GROUP BY pm.memory_id
-                """,
-                [uuid.UUID(rid) for rid in result_ids],
-            )
-
-        # Build lookup
-        lookup: dict[str, dict] = {}
-        for row in rows:
-            mid = str(row["memory_id"])
-            lookup[mid] = {
-                "pattern_strength": float(row["pattern_strength"] or 0.0),
-                "pattern_tags": row["pattern_tags"] or [],
-            }
-
-        # Enrich results in place
-        for result in results:
-            rid = result.get("id")
-            if rid and rid in lookup:
-                result["pattern_strength"] = lookup[rid]["pattern_strength"]
-                result["pattern_tags"] = lookup[rid]["pattern_tags"]
-
+        rows = await _fetch_pattern_rows(result_ids)
+        lookup = build_pattern_lookup(rows)
+        return apply_pattern_enrichment(results, lookup)
     except (ImportError, OSError, ConnectionError) as e:
-        # Expected: tables don't exist, DB unreachable, pool import fails
         logger.debug("Pattern enrichment unavailable: %s", e)
     except Exception as e:
-        # Unexpected: surface for debugging but don't break recall
         logger.warning("Pattern enrichment error: %s", e, exc_info=True)
 
     return results
-
-
-def get_backend() -> str:
-    """Determine which backend to use (sqlite or postgres)."""
-    # Check explicit env var first
-    backend = os.environ.get("AGENTICA_MEMORY_BACKEND", "").lower()
-    if backend in ("sqlite", "postgres"):
-        return backend
-
-    # Check if CONTINUOUS_CLAUDE_DB_URL or DATABASE_URL is set (canonical first)
-    if os.environ.get("CONTINUOUS_CLAUDE_DB_URL") or os.environ.get("DATABASE_URL"):
-        return "postgres"
-
-    # Default to sqlite for simplicity
-    return "sqlite"
 
 
 async def search_learnings(
@@ -195,17 +333,6 @@ async def search_learnings(
     """Search archival_memory for session learnings.
 
     Automatically selects SQLite (BM25) or PostgreSQL (vector) based on environment.
-
-    Args:
-        query: Search query for semantic matching
-        k: Number of results to return
-        provider: Embedding provider ("local" or "voyage") - PostgreSQL only
-        text_fallback: If True, use text search when no embeddings exist
-        similarity_threshold: Minimum similarity score (default 0.2 filters garbage)
-        recency_weight: Weight for recency boost (0.0-1.0). 0=no boost, 0.3=30% recency
-
-    Returns:
-        List of matching learnings with similarity scores
     """
     if not query.strip():
         return []
@@ -213,215 +340,159 @@ async def search_learnings(
     backend = get_backend()
 
     if backend == "sqlite":
-        results = await search_learnings_sqlite(query, k)
-    else:
-        results = await search_learnings_postgres(query, k, provider, text_fallback, similarity_threshold, recency_weight)
+        return await search_learnings_sqlite(query, k)
+    return await search_learnings_postgres(
+        query, k, provider, text_fallback, similarity_threshold, recency_weight
+    )
 
-    return results
+
+async def _dispatch_search(params: dict[str, Any]) -> list[dict[str, Any]]:
+    """Dispatch a search call based on resolved params dict."""
+    mode = params["mode"]
+    if mode == "sqlite":
+        return await search_learnings_sqlite(params["query"], params["k"])
+    if mode == "text_only":
+        return await search_learnings_text_only_postgres(params["query"], params["k"])
+    if mode == "vector":
+        return await search_learnings(
+            query=params["query"],
+            k=params["k"],
+            provider=params["provider"],
+            similarity_threshold=params["similarity_threshold"],
+            recency_weight=params["recency_weight"],
+        )
+    # hybrid_rrf
+    if params.get("rebuild_idf"):
+        from scripts.core.query_expansion import get_idf_index
+
+        await get_idf_index(force_rebuild=True)
+    return await search_learnings_hybrid_rrf(
+        query=params["query"],
+        k=params["k"],
+        provider=params["provider"],
+        similarity_threshold=params["similarity_threshold"],
+        expand=params.get("expand", True),
+        max_expansion_terms=params.get("max_expansion_terms", 5),
+    )
 
 
-async def main() -> int:
-    """Run semantic recall on session learnings."""
+def _format_output(
+    results: list[dict[str, Any]], *, output_mode: str, structured: bool
+) -> str:
+    """Format results for the chosen output mode."""
+    if output_mode == "json_full":
+        return format_json_full_output(results)
+    if output_mode == "json":
+        return format_json_output(results, structured=structured)
+    return format_human_output(results, structured=structured)
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """Construct the CLI argument parser."""
     parser = argparse.ArgumentParser(
         description="Semantic recall of session learnings from archival_memory",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+    parser.add_argument("--query", "-q", required=True, help="Search query")
+    parser.add_argument("--k", type=int, default=5, help="Number of results (default: 5)")
     parser.add_argument(
-        "--query",
-        "-q",
-        required=True,
-        help="Search query for semantic matching",
+        "--provider", choices=["local", "voyage"], default="local", help="Embedding provider"
     )
+    parser.add_argument("--json", action="store_true", help="JSON output")
+    parser.add_argument("--json-full", action="store_true", help="Full JSON metadata output")
+    parser.add_argument("--text-only", action="store_true", help="Text search only (no embeddings)")
     parser.add_argument(
-        "--k",
-        type=int,
-        default=5,
-        help="Number of results to return (default: 5)",
+        "--threshold", "-t", type=float, default=0.2, help="Minimum similarity (default: 0.2)"
     )
+    parser.add_argument("--vector-only", action="store_true", help="Vector-only search")
     parser.add_argument(
-        "--provider",
-        choices=["local", "voyage"],
-        default="local",
-        help="Embedding provider (default: local)",
+        "--recency", "-r", type=float, default=0.1, help="Recency weight (default: 0.1)"
     )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Output results as JSON (for programmatic use)",
-    )
-    parser.add_argument(
-        "--json-full",
-        action="store_true",
-        help="Output full result metadata as JSON (for benchmarking)",
-    )
-    parser.add_argument(
-        "--text-only",
-        action="store_true",
-        help="Use text search only (faster, no embeddings)",
-    )
-    parser.add_argument(
-        "--threshold",
-        "-t",
-        type=float,
-        default=0.2,
-        help="Minimum similarity threshold (default: 0.2, filters low-quality results)",
-    )
-    parser.add_argument(
-        "--vector-only",
-        action="store_true",
-        help="Use vector-only search (disables hybrid RRF, enables recency)",
-    )
-    parser.add_argument(
-        "--recency",
-        "-r",
-        type=float,
-        default=0.1,
-        help="Recency weight for vector-only mode (0.0-1.0, default: 0.1)",
-    )
-    parser.add_argument(
-        "--tags",
-        nargs="+",
-        help="Boost results matching these tags via reranker (space-separated)",
-    )
-    parser.add_argument(
-        "--tags-strict",
-        action="store_true",
-        help="Hard-filter to results sharing at least one tag with --tags",
-    )
-    parser.add_argument(
-        "--no-rerank",
-        action="store_true",
-        help="Bypass contextual re-ranking (use raw retrieval scores)",
-    )
-    parser.add_argument(
-        "--no-expand",
-        action="store_true",
-        help="Disable TF-IDF query expansion for hybrid RRF search",
-    )
-    parser.add_argument(
-        "--expand-terms",
-        type=int,
-        default=5,
-        help="Number of expansion terms to add (default: 5)",
-    )
-    parser.add_argument(
-        "--rebuild-idf",
-        action="store_true",
-        help="Force rebuild of the IDF index before searching",
-    )
-    parser.add_argument(
-        "--project",
-        help="Project context for re-ranking (default: auto-detect from CLAUDE_PROJECT_DIR)",
-    )
-    parser.add_argument(
-        "--structured",
-        action="store_true",
-        help="Group results by learning_type in output",
-    )
+    parser.add_argument("--tags", nargs="+", help="Boost results matching these tags")
+    parser.add_argument("--tags-strict", action="store_true", help="Hard-filter by tags")
+    parser.add_argument("--no-rerank", action="store_true", help="Bypass re-ranking")
+    parser.add_argument("--no-expand", action="store_true", help="Disable TF-IDF query expansion")
+    parser.add_argument("--expand-terms", type=int, default=5, help="Expansion terms (default: 5)")
+    parser.add_argument("--rebuild-idf", action="store_true", help="Force rebuild IDF index")
+    parser.add_argument("--project", help="Project context for re-ranking")
+    parser.add_argument("--structured", action="store_true", help="Group results by type")
+    return parser
 
-    args = parser.parse_args()
 
-    # Adaptive over-fetch: retrieve more candidates when reranking will trim
-    fetch_k = args.k if args.no_rerank else max(3 * args.k, 50)
+async def main() -> int:
+    """Run semantic recall on session learnings."""
+    args = _build_arg_parser().parse_args()
 
-    # JSON mode: suppress human-readable output
-    if not args.json and not args.json_full:
+    output_mode = select_output(
+        json_flag=args.json, json_full=args.json_full, structured=args.structured
+    )
+    fetch_k = compute_fetch_k(args.k, no_rerank=args.no_rerank)
+
+    if output_mode == "human":
         print(f'Recalling learnings for: "{args.query}"')
         print(f"Provider: {args.provider}")
         print()
 
+    backend = get_backend()
+
+    # Resolve and dispatch search
     try:
-        backend = get_backend()
+        params = resolve_search_params(
+            backend=backend,
+            text_only=args.text_only,
+            vector_only=args.vector_only,
+            query=args.query,
+            fetch_k=fetch_k,
+            provider=args.provider,
+            threshold=args.threshold,
+            recency=args.recency,
+            no_rerank=args.no_rerank,
+            no_expand=args.no_expand,
+            expand_terms=args.expand_terms,
+            rebuild_idf=args.rebuild_idf,
+        )
 
-        if backend == "sqlite":
-            # SQLite only supports text search (no pgvector)
-            if not args.text_only and not args.json and not args.json_full:
-                print("  (SQLite backend - using text search)")
-            results = await search_learnings_sqlite(args.query, fetch_k)
-        elif args.text_only:
-            # Fast text-only search (no embeddings)
-            results = await search_learnings_text_only_postgres(args.query, fetch_k)
-        elif args.vector_only:
-            # When reranking, suppress SQL-level recency blend to avoid
-            # double-counting (the reranker applies its own recency signal).
-            sql_recency = 0.0 if not args.no_rerank else args.recency
-            results = await search_learnings(
-                query=args.query,
-                k=fetch_k,
-                provider=args.provider,
-                similarity_threshold=args.threshold,
-                recency_weight=sql_recency,
-            )
-        else:
-            # Default: Hybrid RRF search (text + vector combined)
-            if args.rebuild_idf:
-                from scripts.core.query_expansion import get_idf_index
+        if backend == "sqlite" and output_mode == "human" and not args.text_only:
+            print("  (SQLite backend - using text search)")
 
-                await get_idf_index(force_rebuild=True)
-            results = await search_learnings_hybrid_rrf(
-                query=args.query,
-                k=fetch_k,
-                provider=args.provider,
-                similarity_threshold=args.threshold * 0.01,  # RRF scores are ~0.01-0.03 range
-                expand=not args.no_expand,
-                max_expansion_terms=args.expand_terms,
-            )
+        results = await _dispatch_search(params)
     except Exception as e:
-        if args.json or args.json_full:
+        if output_mode != "human":
             from scripts.core.recall_formatters import get_api_version
+
             print(json.dumps({"version": get_api_version(), "error": str(e), "results": []}))
         else:
             print(f"Error: {e}", file=sys.stderr)
         return 1
 
-    # Enrich with pattern strength for reranker or full JSON export
+    # Pattern enrichment
     if (not args.no_rerank or args.json_full) and backend == "postgres":
         results = await enrich_with_pattern_strength(results)
 
-    # Hard-filter by tags BEFORE reranking (so reranker sees filtered pool)
-    if args.tags_strict and args.tags:
-        tag_set = set(args.tags)
-        results = [
-            r for r in results
-            if set(r.get("metadata", {}).get("tags", [])) & tag_set
-        ]
+    # Tag filtering
+    results = filter_by_tags(results, args.tags, strict=args.tags_strict)
 
-    # Apply contextual re-ranking
+    # Reranking
     if not args.no_rerank:
-        from scripts.core.reranker import RecallContext, rerank
-
-        # Determine retrieval mode from backend and flags
-        if backend == "sqlite":
-            retrieval_mode = "sqlite"
-        elif args.text_only:
-            retrieval_mode = "text"
-        elif args.vector_only:
-            retrieval_mode = "vector"
-        else:
-            retrieval_mode = "hybrid_rrf"
-
-        ctx = RecallContext(
-            project=args.project or os.environ.get("CLAUDE_PROJECT_DIR", "").rsplit("/", 1)[-1] or None,
-            tags_hint=args.tags,
+        retrieval_mode = determine_retrieval_mode(
+            backend, text_only=args.text_only, vector_only=args.vector_only
+        )
+        ctx = make_recall_context(
+            project=args.project
+            or os.environ.get("CLAUDE_PROJECT_DIR", "").rsplit("/", 1)[-1]
+            or None,
+            tags=args.tags,
             retrieval_mode=retrieval_mode,
         )
         results = rerank(results, ctx, k=args.k)
 
-    # Record recall ONLY for final results (after rerank trims).
-    # Skip when --json-full is set (benchmarking mode, read-only).
+    # Record recall (skip benchmarking mode)
     if not args.json_full:
         await record_recall([r["id"] for r in results])
 
-    # Output results
-    if args.json_full:
-        # Full metadata output for benchmarking
-        print(format_json_full_output(results))
-    elif args.json:
-        print(format_json_output(results, structured=args.structured))
-    else:
-        print(format_human_output(results, structured=args.structured))
-
+    # Output
+    print(_format_output(results, output_mode=output_mode, structured=args.structured))
     return 0
 
 

@@ -23,6 +23,7 @@ import argparse
 import asyncio
 import json
 import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -46,7 +47,7 @@ from scripts.core.db.postgres_pool import close_pool, get_connection  # noqa: E4
 # ---------------------------------------------------------------------------
 
 
-def format_feedback_row(row: dict[str, Any]) -> dict[str, Any]:
+def format_feedback_row(row: Mapping[str, Any]) -> dict[str, Any]:
     """Transform a single DB row into a serializable feedback dict."""
     return {
         "id": str(row["id"]),
@@ -59,7 +60,7 @@ def format_feedback_row(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def aggregate_feedback(
-    rows: list[dict[str, Any]], learning_id: str
+    rows: Sequence[Mapping[str, Any]], learning_id: str
 ) -> dict[str, Any]:
     """Aggregate raw feedback rows into a summary for one learning."""
     feedback = [format_feedback_row(r) for r in rows]
@@ -86,7 +87,7 @@ def compute_helpfulness_rate(total: int, helpful: int) -> float:
 
 
 def format_top_entries(
-    rows: list[dict[str, Any]], count_key: str
+    rows: Sequence[Mapping[str, Any]], count_key: str
 ) -> list[dict[str, Any]]:
     """Format top-N learning rows, truncating content to 120 chars."""
     return [
@@ -100,9 +101,9 @@ def format_top_entries(
 
 
 def format_summary_result(
-    totals: dict[str, Any],
-    top_helpful_rows: list[dict[str, Any]],
-    top_not_helpful_rows: list[dict[str, Any]],
+    totals: Mapping[str, Any],
+    top_helpful_rows: Sequence[Mapping[str, Any]],
+    top_not_helpful_rows: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     """Build the feedback summary dict from query results."""
     total = totals["total"]

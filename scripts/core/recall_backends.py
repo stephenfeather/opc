@@ -360,7 +360,7 @@ async def search_learnings_sqlite(
                 (fts_query, k),
             )
         except Exception:
-            logger.debug("SQLite json_extract not available, falling back", exc_info=True)
+            logger.debug("SQLite json_extract not available, filtering in Python", exc_info=True)
             cursor = conn.execute(
                 """
                 SELECT
@@ -372,12 +372,18 @@ async def search_learnings_sqlite(
                 ORDER BY rank
                 LIMIT ?
                 """,
-                (fts_query, k),
+                (fts_query, k * 3),
             )
-        return [
-            format_sqlite_result(row, divisor=_recall_cfg.bm25_normalization_divisor)
-            for row in cursor.fetchall()
-        ]
+        rows = cursor.fetchall()
+        results = []
+        for row in rows:
+            formatted = format_sqlite_result(row, divisor=_recall_cfg.bm25_normalization_divisor)
+            if formatted["metadata"].get("type") != "session_learning":
+                continue
+            results.append(formatted)
+            if len(results) >= k:
+                break
+        return results
     finally:
         conn.close()
 

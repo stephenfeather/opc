@@ -231,6 +231,11 @@ class TestMarkFailedRows:
         call_args = mock_conn.execute.await_args[0]
         assert "embed-failed-db" in call_args[1]
 
+    @pytest.mark.asyncio
+    async def test_rejects_invalid_status(self):
+        with pytest.raises(ValueError, match="Invalid failure status"):
+            await mark_failed_rows([str(uuid4())], status="bogus")
+
 
 # ---------------------------------------------------------------------------
 # State machine tests

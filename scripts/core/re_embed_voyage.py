@@ -49,10 +49,10 @@ import faulthandler
 from scripts.core.db.embedding_service import EmbeddingError, VoyageEmbeddingProvider  # noqa: E402
 from scripts.core.db.postgres_pool import close_pool, get_connection  # noqa: E402
 
-faulthandler.enable(
-    file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"),
-    all_threads=True,
-)
+_crash_log_dir = Path.home() / ".claude" / "logs"
+if _crash_log_dir.is_dir():
+    _crash_log = open(_crash_log_dir / "opc_crash.log", "a")  # noqa: SIM115
+    faulthandler.enable(file=_crash_log, all_threads=True)
 
 from scripts.core.config import get_config as _get_config
 
@@ -228,6 +228,9 @@ async def update_batch(
                 )
 
 
+VALID_FAILURE_STATUSES = ("bge-failed", "embed-failed-db")
+
+
 async def mark_failed_rows(row_ids: list[str], *, status: str = "bge-failed") -> None:
     """Mark rows with a failure status so they can be retried later.
 
@@ -236,6 +239,8 @@ async def mark_failed_rows(row_ids: list[str], *, status: str = "bge-failed") ->
         status: Failure status to set. 'bge-failed' for API errors,
                 'embed-failed-db' for DB write failures after successful embedding.
     """
+    if status not in VALID_FAILURE_STATUSES:
+        raise ValueError(f"Invalid failure status: {status!r}")
     async with get_connection() as conn:
         await conn.execute(
             "UPDATE archival_memory SET embedding_model = $1 WHERE id = ANY($2::uuid[])",
@@ -312,7 +317,7 @@ async def run(model: str, batch_size: int, dry_run: bool) -> None:
         print("Dry run complete. Run without --dry-run to apply changes.")
         return
 
-    api_key = os.environ.get("VOYAGE_API_KEY")
+    api_key = os.environ.get("VOYAGE_API_KEY", "").strip()
     if not api_key:
         print("ERROR: VOYAGE_API_KEY is not set. Add it to ~/.claude/.env or opc/.env")
         sys.exit(1)

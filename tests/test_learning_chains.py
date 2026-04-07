@@ -70,13 +70,11 @@ class TestRecallChainFilter:
         assert "superseded_by IS NULL" in source
 
     async def test_hybrid_rrf_query_includes_chain_filter(self):
-        """search_learnings_hybrid_rrf SQL should reference superseded_by."""
-        import inspect
+        """build_rrf_cte (used by search_learnings_hybrid_rrf) should include superseded_by."""
+        from scripts.core.recall_backends import build_rrf_cte
 
-        from scripts.core.recall_learnings import search_learnings_hybrid_rrf
-
-        source = inspect.getsource(search_learnings_hybrid_rrf)
-        assert "superseded_by IS NULL" in source
+        cte_sql = build_rrf_cte(chain_filter=True, use_tsquery=False)
+        assert "superseded_by IS NULL" in cte_sql
 
     async def test_postgres_vector_query_includes_chain_filter(self):
         """search_learnings_postgres SQL should reference superseded_by."""

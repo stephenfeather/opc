@@ -323,15 +323,28 @@ async def main() -> int:
 
     try:
         candidates = await get_push_candidates(project, config["k"])
-    except (asyncpg.PostgresError, ConnectionError, OSError) as e:
+    except Exception as e:
         logger.debug("push_learnings error", exc_info=True)
+        error_envelope: dict[str, Any] = {
+            "error": type(e).__name__, "push_source": "session_start",
+            "project": project, "results": [],
+        }
+        write_cache_file(error_envelope)
         if json_output:
-            print(json.dumps({"error": type(e).__name__, "results": []}))
+            print(json.dumps(error_envelope))
         else:
             print(f"Error: {type(e).__name__}: see logs for details", file=sys.stderr)
         return 1
 
-    # Build cache data (always, even when empty)
+    # Record recall BEFORE writing cache to prevent duplicate pushes on crash.
+    # If record_recall succeeds but cache write fails, worst case is a missed
+    # push (safe). If cache writes first but record_recall crashes, the same
+    # learnings get re-pushed indefinitely (the death spiral this script prevents).
+    if candidates and not config["no_record"]:
+        from scripts.core.recall_learnings import record_recall
+        await record_recall([c["id"] for c in candidates])
+
+    # Build and persist cache data (always, even when empty)
     if not candidates:
         cache_data: dict[str, Any] = {
             "push_source": "session_start", "project": project, "results": [],
@@ -340,11 +353,6 @@ async def main() -> int:
         cache_data = format_results(candidates, project, config["max_chars"])
 
     write_cache_file(cache_data)
-
-    # Record recall to break the death spiral (unless dry run)
-    if candidates and not config["no_record"]:
-        from scripts.core.recall_learnings import record_recall
-        await record_recall([c["id"] for c in candidates])
 
     output_str = build_cli_output(
         candidates, project,

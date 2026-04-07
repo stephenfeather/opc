@@ -5,9 +5,7 @@ from __future__ import annotations
 import re
 from datetime import datetime
 from typing import Any
-from unittest.mock import MagicMock
 from uuid import UUID
-
 
 # ==================== tsquery Sanitization ====================
 
@@ -326,30 +324,28 @@ class TestFormatSqliteResult:
     def test_normalizes_bm25_score(self):
         from scripts.core.recall_backends import format_sqlite_result
 
-        row = MagicMock()
-        row.__getitem__ = lambda self, k: {
+        row: dict[str, Any] = {
             "id": "abc",
             "session_id": "s-1",
             "content": "test",
             "metadata_json": '{"type": "session_learning"}',
             "created_at": 1704067200,  # 2024-01-01
             "rank": -5.0,
-        }[k]
+        }
         result = format_sqlite_result(row, divisor=10.0)
         assert result["similarity"] == 0.5
 
     def test_missing_fields_use_defaults(self):
         from scripts.core.recall_backends import format_sqlite_result
 
-        row = MagicMock()
-        row.__getitem__ = lambda self, k: {
+        row: dict[str, Any] = {
             "id": None,
             "session_id": None,
             "content": None,
             "metadata_json": None,
             "created_at": None,
             "rank": None,
-        }[k]
+        }
         result = format_sqlite_result(row, divisor=10.0)
         assert result["id"] == ""
         assert result["session_id"] == "unknown"

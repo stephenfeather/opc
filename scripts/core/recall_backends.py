@@ -120,7 +120,7 @@ def format_sqlite_result(
         try:
             metadata = json.loads(row["metadata_json"])
         except (json.JSONDecodeError, ValueError):
-            pass
+            logger.warning("Malformed SQLite metadata_json: %r", str(row["metadata_json"])[:200])
 
     return {
         "id": row["id"] or "",
@@ -340,7 +340,7 @@ async def search_learnings_sqlite(
     words = [w for w in re.findall(r"\w+", query.lower()) if len(w) > 2]
     if not words:
         words = ["a"]
-    fts_query = " OR ".join(words)
+    fts_query = " OR ".join(f'"{w}"' for w in words)
 
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row

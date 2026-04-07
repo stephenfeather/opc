@@ -351,6 +351,7 @@ async def search_learnings_sqlite(
             FROM archival_memory a
             JOIN archival_fts f ON a.rowid = f.rowid
             WHERE archival_fts MATCH ?
+                AND json_extract(a.metadata_json, '$.type') = 'session_learning'
             ORDER BY rank
             LIMIT ?
             """,
@@ -488,22 +489,40 @@ async def search_learnings_postgres(
     pool = await get_pool()
 
     async with pool.acquire() as conn:
-        count_row = await conn.fetchrow(
-            """
-            SELECT COUNT(*) as cnt FROM archival_memory
-            WHERE metadata->>'type' = 'session_learning'
-                AND embedding IS NOT NULL
-            """
-        )
+        try:
+            count_row = await conn.fetchrow(
+                """
+                SELECT COUNT(*) as cnt FROM archival_memory
+                WHERE metadata->>'type' = 'session_learning'
+                    AND embedding IS NOT NULL
+                    AND superseded_by IS NULL
+                """
+            )
+        except Exception:
+            logger.debug("Chain filter fallback in embedding probe", exc_info=True)
+            count_row = await conn.fetchrow(
+                """
+                SELECT COUNT(*) as cnt FROM archival_memory
+                WHERE metadata->>'type' = 'session_learning'
+                    AND embedding IS NOT NULL
+                """
+            )
         has_embeddings = count_row["cnt"] > 0
 
     if has_embeddings:
         embedder = EmbeddingService(provider=provider)
         try:
             query_embedding = await embedder.embed(query, input_type="query")
+        except Exception:
+            logger.debug("Embedding generation failed", exc_info=True)
+            if text_fallback:
+                has_embeddings = False
+            else:
+                return []
         finally:
             await embedder.aclose()
 
+    if has_embeddings:
         async with pool.acquire() as conn:
             from scripts.core.db.postgres_pool import init_pgvector
             await init_pgvector(conn)

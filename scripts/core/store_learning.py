@@ -102,15 +102,13 @@ def _dedup_threshold() -> float:
 def _pg_url() -> str | None:
     """Return PostgreSQL connection URL from environment, or None.
 
-    Follows the same priority as postgres_pool.resolve_connection_url():
-    CONTINUOUS_CLAUDE_DB_URL > DATABASE_URL > OPC_POSTGRES_URL.
+    Prefers CONTINUOUS_CLAUDE_DB_URL (canonical) over DATABASE_URL (fallback)
+    to match the resolution order used by recall_learnings and memory_daemon.
+    OPC_POSTGRES_URL is intentionally NOT included here — adding it would
+    create split-brain behavior with consumers that don't check it yet.
+    TODO: Unify all backend/URL resolution behind a shared function.
     """
-    return (
-        os.environ.get("CONTINUOUS_CLAUDE_DB_URL")
-        or os.environ.get("DATABASE_URL")
-        or os.environ.get("OPC_POSTGRES_URL")
-        or None
-    )
+    return os.environ.get("CONTINUOUS_CLAUDE_DB_URL") or os.environ.get("DATABASE_URL") or None
 
 
 def detect_backend(env: dict[str, str], fallback: str | None = None) -> str:
@@ -118,14 +116,14 @@ def detect_backend(env: dict[str, str], fallback: str | None = None) -> str:
 
     Pure function -- takes env dict, returns backend name string.
     Matches the precedence used by recall_learnings.get_backend():
-    1. AGENTICA_MEMORY_BACKEND (explicit override)
-    2. URL-based inference (CONTINUOUS_CLAUDE_DB_URL > DATABASE_URL > OPC_POSTGRES_URL)
-    3. Provided fallback or get_default_backend()
+    CONTINUOUS_CLAUDE_DB_URL > DATABASE_URL > fallback.
+
+    NOTE: AGENTICA_MEMORY_BACKEND and OPC_POSTGRES_URL are intentionally
+    NOT checked here — recall_learnings, memory_daemon, and confidence_calibrator
+    don't all honor them yet, so adding them here would create split-brain.
+    TODO: Unify all backend/URL resolution behind a shared function.
     """
-    explicit = env.get("AGENTICA_MEMORY_BACKEND", "").lower()
-    if explicit in ("sqlite", "postgres"):
-        return explicit
-    if env.get("CONTINUOUS_CLAUDE_DB_URL") or env.get("DATABASE_URL") or env.get("OPC_POSTGRES_URL"):
+    if env.get("CONTINUOUS_CLAUDE_DB_URL") or env.get("DATABASE_URL"):
         return "postgres"
     if fallback is not None:
         return fallback

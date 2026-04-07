@@ -78,28 +78,6 @@ class TestDetectBackend:
             result = detect_backend({})
         assert result == "sqlite"
 
-    def test_agentica_backend_overrides_url(self) -> None:
-        """AGENTICA_MEMORY_BACKEND=sqlite wins even when DATABASE_URL is set."""
-        env = {
-            "AGENTICA_MEMORY_BACKEND": "sqlite",
-            "DATABASE_URL": "postgresql://localhost/test",
-        }
-        assert detect_backend(env) == "sqlite"
-
-    def test_agentica_backend_postgres_honored(self) -> None:
-        env = {"AGENTICA_MEMORY_BACKEND": "postgres"}
-        assert detect_backend(env) == "postgres"
-
-    def test_agentica_backend_unknown_ignored(self) -> None:
-        """Unknown AGENTICA_MEMORY_BACKEND values are not honored."""
-        env = {"AGENTICA_MEMORY_BACKEND": "redis"}
-        assert detect_backend(env, fallback="sqlite") == "sqlite"
-
-    def test_opc_postgres_url_detected(self) -> None:
-        """OPC_POSTGRES_URL triggers postgres backend."""
-        env = {"OPC_POSTGRES_URL": "postgresql://localhost/test"}
-        assert detect_backend(env) == "postgres"
-
     def test_ignores_empty_string_env_vars(self) -> None:
         env = {"DATABASE_URL": "", "CONTINUOUS_CLAUDE_DB_URL": ""}
         assert detect_backend(env, fallback="sqlite") == "sqlite"

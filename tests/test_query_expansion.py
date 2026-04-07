@@ -589,6 +589,94 @@ class TestComputeWordDf:
         assert word_df["tokens"] == 1
 
 
+class TestIsCacheLocallyInvalid:
+    def test_fresh_valid_cache(self):
+        from datetime import UTC, datetime
+
+        from scripts.core.query_expansion import _is_cache_locally_invalid
+
+        cached = IDFIndex(
+            word_df={"test": 1},
+            doc_count=100,
+            built_at=datetime.now(UTC).isoformat(),
+        )
+        assert _is_cache_locally_invalid(cached, max_age_hours=24) is False
+
+    def test_expired_cache(self):
+        from scripts.core.query_expansion import _is_cache_locally_invalid
+
+        cached = IDFIndex(
+            word_df={"test": 1},
+            doc_count=100,
+            built_at="2020-01-01T00:00:00+00:00",
+        )
+        assert _is_cache_locally_invalid(cached, max_age_hours=24) is True
+
+    def test_bad_timestamp(self):
+        from scripts.core.query_expansion import _is_cache_locally_invalid
+
+        cached = IDFIndex(word_df={}, doc_count=100, built_at="garbage")
+        assert _is_cache_locally_invalid(cached, max_age_hours=24) is True
+
+    def test_zero_doc_count(self):
+        from datetime import UTC, datetime
+
+        from scripts.core.query_expansion import _is_cache_locally_invalid
+
+        cached = IDFIndex(
+            word_df={}, doc_count=0, built_at=datetime.now(UTC).isoformat()
+        )
+        assert _is_cache_locally_invalid(cached, max_age_hours=24) is True
+
+    def test_negative_doc_count(self):
+        from datetime import UTC, datetime
+
+        from scripts.core.query_expansion import _is_cache_locally_invalid
+
+        cached = IDFIndex(
+            word_df={}, doc_count=-5, built_at=datetime.now(UTC).isoformat()
+        )
+        assert _is_cache_locally_invalid(cached, max_age_hours=24) is True
+
+    def test_string_doc_count(self):
+        from datetime import UTC, datetime
+
+        from scripts.core.query_expansion import _is_cache_locally_invalid
+
+        cached = IDFIndex(
+            word_df={},
+            doc_count="ten",  # type: ignore[arg-type]
+            built_at=datetime.now(UTC).isoformat(),
+        )
+        assert _is_cache_locally_invalid(cached, max_age_hours=24) is True
+
+
+class TestIsCacheDrifted:
+    def test_no_drift(self):
+        from scripts.core.query_expansion import _is_cache_drifted
+
+        cached = IDFIndex(word_df={}, doc_count=100, built_at="t")
+        assert _is_cache_drifted(
+            cached, current_count=100, drift_threshold=0.1
+        ) is False
+
+    def test_within_threshold(self):
+        from scripts.core.query_expansion import _is_cache_drifted
+
+        cached = IDFIndex(word_df={}, doc_count=100, built_at="t")
+        assert _is_cache_drifted(
+            cached, current_count=105, drift_threshold=0.1
+        ) is False
+
+    def test_exceeds_threshold(self):
+        from scripts.core.query_expansion import _is_cache_drifted
+
+        cached = IDFIndex(word_df={}, doc_count=100, built_at="t")
+        assert _is_cache_drifted(
+            cached, current_count=150, drift_threshold=0.1
+        ) is True
+
+
 class TestIsCacheStale:
     def test_fresh_cache_not_stale(self):
         from datetime import UTC, datetime
@@ -844,6 +932,16 @@ class TestExpandQuery:
 
         assert "auth" in result
         assert "patterns" in result
+
+    async def test_unsanitizable_query_skips_expansion(self):
+        """Punctuation-only queries skip expansion and return original."""
+        result = await expand_query("!!! ???", [0.1] * 1024)
+        assert result == "!!! ???"
+
+    async def test_empty_query_skips_expansion(self):
+        """Empty queries skip expansion and return original."""
+        result = await expand_query("", [0.1] * 1024)
+        assert result == ""
 
     async def test_expansion_failure_returns_original(self):
         """If expand_query raises, the caller should handle gracefully."""

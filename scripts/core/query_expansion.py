@@ -159,17 +159,11 @@ def _format_tsquery(original_words: list[str], expansion_terms: list[str]) -> st
     return " | ".join(all_terms)
 
 
-def _is_cache_stale(
-    cached: IDFIndex,
-    *,
-    max_age_hours: float,
-    current_count: int,
-    drift_threshold: float,
-) -> bool:
-    """Determine whether a cached IDF index needs rebuilding.
+def _is_cache_locally_invalid(cached: IDFIndex, *, max_age_hours: float) -> bool:
+    """Check cache validity using only local metadata (no DB query needed).
 
-    Stale when: age exceeds max_age_hours, doc count drift exceeds threshold,
-    zero cached docs, or unparseable timestamp.
+    Returns True (stale) when: timestamp unparseable, age exceeds max_age_hours,
+    or doc_count is non-integer / non-positive.
     """
     try:
         built = datetime.fromisoformat(cached.built_at)
@@ -182,8 +176,36 @@ def _is_cache_stale(
     if not isinstance(cached.doc_count, int) or cached.doc_count <= 0:
         return True
 
+    return False
+
+
+def _is_cache_drifted(
+    cached: IDFIndex, *, current_count: int, drift_threshold: float
+) -> bool:
+    """Check whether the cached doc count has drifted beyond threshold.
+
+    Caller must ensure cached.doc_count > 0 before calling.
+    """
     drift = abs(current_count - cached.doc_count) / cached.doc_count
     return drift > drift_threshold
+
+
+def _is_cache_stale(
+    cached: IDFIndex,
+    *,
+    max_age_hours: float,
+    current_count: int,
+    drift_threshold: float,
+) -> bool:
+    """Determine whether a cached IDF index needs rebuilding.
+
+    Checks local metadata first, then drift. Provided for test compatibility.
+    """
+    if _is_cache_locally_invalid(cached, max_age_hours=max_age_hours):
+        return True
+    return _is_cache_drifted(
+        cached, current_count=current_count, drift_threshold=drift_threshold
+    )
 
 
 # --- Data structures ---
@@ -283,27 +305,31 @@ async def get_idf_index(
     if not force_rebuild:
         cached = load_idf_index(path)
         if cached is not None:
-            from scripts.core.db.postgres_pool import get_pool
+            # Short-circuit: check local metadata before querying DB
+            if _is_cache_locally_invalid(cached, max_age_hours=_IDF_MAX_AGE_HOURS):
+                logger.info("IDF cache locally invalid, rebuilding")
+            else:
+                # Cache metadata looks good; check drift against DB count
+                from scripts.core.db.postgres_pool import get_pool
 
-            pool = await get_pool()
-            async with pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    """
-                    SELECT COUNT(*) as cnt FROM archival_memory
-                    WHERE metadata->>'type' = 'session_learning'
-                    AND superseded_by IS NULL
-                    """
-                )
-            current_count = row["cnt"] if row else 0
+                pool = await get_pool()
+                async with pool.acquire() as conn:
+                    row = await conn.fetchrow(
+                        """
+                        SELECT COUNT(*) as cnt FROM archival_memory
+                        WHERE metadata->>'type' = 'session_learning'
+                        AND superseded_by IS NULL
+                        """
+                    )
+                current_count = row["cnt"] if row else 0
 
-            if not _is_cache_stale(
-                cached,
-                max_age_hours=_IDF_MAX_AGE_HOURS,
-                current_count=current_count,
-                drift_threshold=_IDF_DRIFT_THRESHOLD,
-            ):
-                return cached
-            logger.info("IDF cache stale, rebuilding")
+                if not _is_cache_drifted(
+                    cached,
+                    current_count=current_count,
+                    drift_threshold=_IDF_DRIFT_THRESHOLD,
+                ):
+                    return cached
+                logger.info("IDF cache drift exceeded, rebuilding")
 
     return await build_idf_index(path)
 
@@ -335,6 +361,10 @@ async def expand_query(
 
     original_tokens = set(_tokenize(query))
     original_words = _sanitize_query_words(query)
+
+    # Skip expansion entirely if no usable original terms survive sanitization
+    if not original_words:
+        return query
 
     # Fetch vector neighbors (I/O boundary)
     pool = await get_pool()

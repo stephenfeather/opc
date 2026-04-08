@@ -332,3 +332,130 @@ class TestReapZombieProcess:
         count = reap_completed_extractions()
         assert count == 1
         assert 42 not in self.state.active_extractions
+
+
+# ---------------------------------------------------------------------------
+# Step 5.1 — Daemon lifecycle tests
+# ---------------------------------------------------------------------------
+
+
+class TestIsRunning:
+    """is_running checks PID file and process liveness."""
+
+    def test_returns_false_when_no_pid_file(self, tmp_path):
+        import scripts.core.memory_daemon as mod
+
+        original = mod.PID_FILE
+        try:
+            mod.PID_FILE = tmp_path / "nonexistent.pid"
+            running, pid = mod.is_running()
+            assert running is False
+            assert pid is None
+        finally:
+            mod.PID_FILE = original
+
+    def test_returns_true_for_own_pid(self, tmp_path):
+        import scripts.core.memory_daemon as mod
+
+        pid_file = tmp_path / "test.pid"
+        pid_file.write_text(str(os.getpid()))
+        original = mod.PID_FILE
+        try:
+            mod.PID_FILE = pid_file
+            running, pid = mod.is_running()
+            assert running is True
+            assert pid == os.getpid()
+        finally:
+            mod.PID_FILE = original
+
+    def test_cleans_stale_pid_file(self, tmp_path):
+        import scripts.core.memory_daemon as mod
+
+        pid_file = tmp_path / "test.pid"
+        pid_file.write_text("999999999")  # very unlikely to be running
+        original = mod.PID_FILE
+        try:
+            mod.PID_FILE = pid_file
+            running, pid = mod.is_running()
+            assert running is False
+            assert not pid_file.exists()  # cleaned up stale file
+        finally:
+            mod.PID_FILE = original
+
+
+class TestStopDaemon:
+    """stop_daemon sends SIGTERM and cleans PID file."""
+
+    def test_reports_not_running(self, tmp_path):
+        import scripts.core.memory_daemon as mod
+
+        original = mod.PID_FILE
+        try:
+            mod.PID_FILE = tmp_path / "nonexistent.pid"
+            rc = mod.stop_daemon()
+            assert rc == 0
+        finally:
+            mod.PID_FILE = original
+
+
+# ---------------------------------------------------------------------------
+# Step 5.2 — CLI dispatch tests
+# ---------------------------------------------------------------------------
+
+
+class TestMainCli:
+    """main() dispatches to start/stop/status."""
+
+    @patch("scripts.core.memory_daemon.start_daemon", return_value=0)
+    def test_start_command(self, mock_start):
+        import scripts.core.memory_daemon as mod
+
+        with patch("sys.argv", ["memory_daemon.py", "start"]):
+            rc = mod.main()
+        assert rc == 0
+        mock_start.assert_called_once()
+
+    @patch("scripts.core.memory_daemon.stop_daemon", return_value=0)
+    def test_stop_command(self, mock_stop):
+        import scripts.core.memory_daemon as mod
+
+        with patch("sys.argv", ["memory_daemon.py", "stop"]):
+            rc = mod.main()
+        assert rc == 0
+        mock_stop.assert_called_once()
+
+    @patch("scripts.core.memory_daemon.status_daemon")
+    def test_status_command(self, mock_status):
+        import scripts.core.memory_daemon as mod
+
+        with patch("sys.argv", ["memory_daemon.py", "status"]):
+            mod.main()
+        mock_status.assert_called_once()
+
+    def test_no_command_prints_help(self):
+        import scripts.core.memory_daemon as mod
+
+        with patch("sys.argv", ["memory_daemon.py"]):
+            rc = mod.main()
+        assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# Step 5.3 — Import cycle smoke test
+# ---------------------------------------------------------------------------
+
+
+class TestImportSmoke:
+    """All four modules import without cycles."""
+
+    def test_all_modules_import_cleanly(self):
+        import importlib
+
+        for name in [
+            "scripts.core.memory_daemon_core",
+            "scripts.core.memory_daemon_db",
+            "scripts.core.memory_daemon_extractors",
+            "scripts.core.memory_daemon",
+        ]:
+            mod = importlib.import_module(name)
+            assert mod is not None

@@ -61,6 +61,7 @@ class TestExtractMemoriesImpl:
             subprocess_popen=MagicMock(),
             is_blocked_fn=lambda _: True,
             mark_extracted_fn=mock_mark,
+            mark_failed_fn=MagicMock(),
             log_fn=mock_log,
             daemon_cfg=MagicMock(),
             allowed_models=frozenset({"sonnet"}),
@@ -83,6 +84,7 @@ class TestExtractMemoriesImpl:
             subprocess_popen=MagicMock(),
             is_blocked_fn=lambda _: False,
             mark_extracted_fn=mock_mark,
+            mark_failed_fn=MagicMock(),
             log_fn=MagicMock(),
             daemon_cfg=MagicMock(),
             allowed_models=frozenset({"sonnet"}),
@@ -92,12 +94,13 @@ class TestExtractMemoriesImpl:
         assert result is False
         mock_mark.assert_called_once_with("s1")
 
-    def test_invalid_model_skips_without_marking_extracted(self, tmp_path):
+    def test_invalid_model_marks_failed_and_returns_false(self, tmp_path):
         from scripts.core.memory_daemon_extractors import extract_memories_impl
 
         jsonl = tmp_path / "session.jsonl"
         jsonl.write_text('{"type":"msg"}\n')
-        mock_mark = MagicMock()
+        mock_mark_extracted = MagicMock()
+        mock_mark_failed = MagicMock()
         cfg = MagicMock()
         cfg.extraction_model = "gpt-evil"
 
@@ -108,7 +111,8 @@ class TestExtractMemoriesImpl:
             active_extractions={},
             subprocess_popen=MagicMock(),
             is_blocked_fn=lambda _: False,
-            mark_extracted_fn=mock_mark,
+            mark_extracted_fn=mock_mark_extracted,
+            mark_failed_fn=mock_mark_failed,
             log_fn=MagicMock(),
             daemon_cfg=cfg,
             allowed_models=frozenset({"sonnet", "haiku", "opus"}),
@@ -116,7 +120,8 @@ class TestExtractMemoriesImpl:
         )
 
         assert result is False
-        mock_mark.assert_not_called()
+        mock_mark_extracted.assert_not_called()
+        mock_mark_failed.assert_called_once_with("s1")
 
     def test_successful_extraction_starts_subprocess(self, tmp_path):
         from scripts.core.memory_daemon_extractors import extract_memories_impl
@@ -139,6 +144,7 @@ class TestExtractMemoriesImpl:
             subprocess_popen=mock_popen,
             is_blocked_fn=lambda _: False,
             mark_extracted_fn=MagicMock(),
+            mark_failed_fn=MagicMock(),
             log_fn=MagicMock(),
             daemon_cfg=cfg,
             allowed_models=frozenset({"sonnet", "haiku", "opus"}),

@@ -311,6 +311,7 @@ def extract_memories(
         subprocess_popen=subprocess.Popen,
         is_blocked_fn=_is_extraction_blocked,
         mark_extracted_fn=mark_extracted,
+        mark_failed_fn=mark_extraction_failed,
         log_fn=log,
         daemon_cfg=_daemon_cfg,
         allowed_models=_ALLOWED_EXTRACTION_MODELS,

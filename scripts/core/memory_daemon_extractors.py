@@ -45,6 +45,7 @@ def extract_memories_impl(
     subprocess_popen: Callable,
     is_blocked_fn: Callable[[str], bool],
     mark_extracted_fn: Callable[[str], None],
+    mark_failed_fn: Callable[[str], None],
     log_fn: Callable[[str], None],
     daemon_cfg: Any,
     allowed_models: frozenset[str],
@@ -106,8 +107,9 @@ def extract_memories_impl(
             log_fn(
                 f"Invalid extraction_model '{daemon_cfg.extraction_model}', "
                 f"must be one of {sorted(allowed_models)}. "
-                f"Session {session_id} will retry on next cycle."
+                f"Session {session_id} marked failed for retry."
             )
+            mark_failed_fn(session_id)
             return False
 
         env = os.environ.copy()

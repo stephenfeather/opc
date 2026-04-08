@@ -243,45 +243,45 @@ def log(msg: str):
 
 
 def pg_get_stale_sessions() -> list:
-    """Wrapper: injects config into memory_daemon_db.pg_get_stale_sessions."""
+    """Wrapper: reads config from live _daemon_cfg at call time (D3)."""
     return _pg_get_stale_sessions_impl(
-        stale_threshold=STALE_THRESHOLD,
-        max_retries=MAX_RETRIES,
-        harvest_grace_period=HARVEST_GRACE_PERIOD,
+        stale_threshold=_daemon_cfg.stale_threshold,
+        max_retries=_daemon_cfg.max_retries,
+        harvest_grace_period=_daemon_cfg.harvest_grace_period,
     )
 
 
 def sqlite_get_stale_sessions() -> list:
-    """Wrapper: injects config into memory_daemon_db.sqlite_get_stale_sessions."""
+    """Wrapper: reads config from live _daemon_cfg at call time (D3)."""
     return _sqlite_get_stale_sessions_impl(
-        stale_threshold=STALE_THRESHOLD,
-        max_retries=MAX_RETRIES,
-        harvest_grace_period=HARVEST_GRACE_PERIOD,
+        stale_threshold=_daemon_cfg.stale_threshold,
+        max_retries=_daemon_cfg.max_retries,
+        harvest_grace_period=_daemon_cfg.harvest_grace_period,
     )
 
 
 def get_stale_sessions() -> list:
-    """Wrapper: injects config into memory_daemon_db.get_stale_sessions."""
+    """Wrapper: reads config from live _daemon_cfg at call time (D3)."""
     return _get_stale_sessions_impl(
-        stale_threshold=STALE_THRESHOLD,
-        max_retries=MAX_RETRIES,
-        harvest_grace_period=HARVEST_GRACE_PERIOD,
+        stale_threshold=_daemon_cfg.stale_threshold,
+        max_retries=_daemon_cfg.max_retries,
+        harvest_grace_period=_daemon_cfg.harvest_grace_period,
     )
 
 
 def pg_mark_extraction_failed(session_id: str):
-    """Wrapper: injects MAX_RETRIES into memory_daemon_db.pg_mark_extraction_failed."""
-    _pg_mark_extraction_failed_impl(session_id, max_retries=MAX_RETRIES)
+    """Wrapper: reads max_retries from live config at call time (D3)."""
+    _pg_mark_extraction_failed_impl(session_id, max_retries=_daemon_cfg.max_retries)
 
 
 def sqlite_mark_extraction_failed(session_id: str):
-    """Wrapper: injects MAX_RETRIES into memory_daemon_db.sqlite_mark_extraction_failed."""
-    _sqlite_mark_extraction_failed_impl(session_id, max_retries=MAX_RETRIES)
+    """Wrapper: reads max_retries from live config at call time (D3)."""
+    _sqlite_mark_extraction_failed_impl(session_id, max_retries=_daemon_cfg.max_retries)
 
 
 def mark_extraction_failed(session_id: str):
-    """Wrapper: injects MAX_RETRIES into memory_daemon_db.mark_extraction_failed."""
-    _mark_extraction_failed_impl(session_id, max_retries=MAX_RETRIES)
+    """Wrapper: reads max_retries from live config at call time (D3)."""
+    _mark_extraction_failed_impl(session_id, max_retries=_daemon_cfg.max_retries)
 
 
 def _count_session_learnings(session_id: str) -> int | None:
@@ -584,8 +584,9 @@ def daemon_loop():
     ensure_schema()
     recover_stalled_extractions()
 
-    # Create DaemonState and set module-level pointer (D14)
-    _daemon_state = create_daemon_state()
+    # Reuse existing DaemonState if lazily initialized, else create (D14)
+    if _daemon_state is None:
+        _daemon_state = create_daemon_state()
     _daemon_state.last_pattern_run = _seed_last_pattern_run()
     if _daemon_state.last_pattern_run:
         log(f"Seeded last pattern run from DB: "

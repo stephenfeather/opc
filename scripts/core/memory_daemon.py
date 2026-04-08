@@ -71,19 +71,23 @@ except Exception:
     DAEMON_VERSION = "0.7.3"  # fallback
 
 
-def _is_extraction_blocked(project_dir: str) -> bool:
-    """Return True if this project has opted out of memory extraction."""
-    if not project_dir:
-        return False
-    sentinel = Path(project_dir) / ".claude" / "no-extract"
-    return sentinel.exists()
-
+# Re-exports from memory_daemon_extractors (D12: shims per step)
+from scripts.core.memory_daemon_extractors import (  # noqa: E402
+    is_extraction_blocked as _is_extraction_blocked,
+    extract_memories_impl as _extract_memories_impl,
+    archive_session_jsonl as _archive_session_jsonl_impl,
+    calibrate_session_confidence as _calibrate_session_confidence_impl,
+    extract_and_store_workflows as _extract_and_store_workflows_impl,
+    generate_mini_handoff as _generate_mini_handoff_impl,
+    count_session_rejections as _count_session_rejections_impl,
+)
 
 # Re-exports from memory_daemon_core (D12: shims per step)
 from scripts.core.memory_daemon_core import (  # noqa: E402
     StaleSession,
     _ALLOWED_EXTRACTION_MODELS,
     _normalize_project,
+    strip_yaml_frontmatter,
 )
 
 # Re-exports from memory_daemon_db (D12: shims per step)
@@ -299,297 +303,55 @@ def extract_memories(
     project_dir: str,
     transcript_path: str | None = None,
 ) -> bool:
-    """Run memory extraction for a session. Returns True if subprocess started."""
-    log(f"Extracting memories for session {session_id} "
-        f"(project={project_dir or 'unknown'})")
-
-    if _is_extraction_blocked(project_dir):
-        log(f"Extraction blocked by .claude/no-extract sentinel "
-            f"(project={project_dir}), marking as extracted (skip)")
-        mark_extracted(session_id)
-        return False
-
-    # Use transcript_path from DB — no glob fallback (wrong-file guessing caused orphaned extractions)
-    jsonl_path = None
-    if transcript_path:
-        candidate = Path(transcript_path)
-        if candidate.exists():
-            jsonl_path = candidate
-
-    if not jsonl_path:
-        reason = "no transcript_path in DB" if not transcript_path else "file missing from disk"
-        log(f"No JSONL for session {session_id} "
-            f"(project={project_dir or 'unknown'}, {reason}), marking as extracted (skip)")
-        mark_extracted(session_id)
-        return False
-
-    # Run headless memory extraction
-    try:
-        # Read agent prompt from memory-extractor.md (strip YAML frontmatter)
-        config_dir = Path(os.environ.get('CLAUDE_CONFIG_DIR', str(Path.home() / '.claude')))
-        agent_file = config_dir / "agents" / "memory-extractor.md"
-
-        agent_prompt = ""
-        if agent_file.exists():
-            content = agent_file.read_text()
-            # Strip YAML frontmatter if present
-            if content.startswith("---"):
-                parts = content.split("---", 2)
-                agent_prompt = parts[2].strip() if len(parts) >= 3 else content
-            else:
-                agent_prompt = content
-        else:
-            # Fallback minimal prompt
-            agent_prompt = """Extract learnings from this Claude Code session.
-Look for decisions, what worked, what failed, and patterns discovered.
-Store each learning using store_learning.py with appropriate type and tags."""
-
-        if _daemon_cfg.extraction_model not in _ALLOWED_EXTRACTION_MODELS:
-            log(
-                f"Invalid extraction_model '{_daemon_cfg.extraction_model}', "
-                f"must be one of {sorted(_ALLOWED_EXTRACTION_MODELS)}"
-            )
-            mark_extracted(session_id)
-            return False
-
-        env = os.environ.copy()
-        env["CLAUDE_MEMORY_EXTRACTION"] = "1"  # Prevent session-register from registering extraction sessions
-        if project_dir:
-            env["CLAUDE_PROJECT_DIR"] = project_dir
-
-        proc = subprocess.Popen(
-            [
-                "claude", "-p",
-                "--model", _daemon_cfg.extraction_model,
-                "--dangerously-skip-permissions",
-                "--allowedTools", "Bash,Read",
-                "--max-turns", str(_daemon_cfg.extraction_max_turns),
-                "--append-system-prompt", agent_prompt,
-                f"Extract learnings from session {session_id}. JSONL path: {jsonl_path}"
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=env,
-        )
-        get_active_extractions()[proc.pid] = (
-            session_id, proc, jsonl_path, project_dir, time.time()
-        )
-        log(f"Started extraction for {session_id} "
-            f"(pid={proc.pid}, file={jsonl_path.name}, "
-            f"active={len(get_active_extractions())})")
-        return True
-    except Exception as e:
-        log(f"Failed to start extraction: {e}")
-        return False
+    """D1 wrapper: resolves collaborators and delegates to extractors."""
+    return _extract_memories_impl(
+        session_id=session_id,
+        project_dir=project_dir,
+        transcript_path=transcript_path,
+        active_extractions=get_active_extractions(),
+        subprocess_popen=subprocess.Popen,
+        is_blocked_fn=_is_extraction_blocked,
+        mark_extracted_fn=mark_extracted,
+        log_fn=log,
+        daemon_cfg=_daemon_cfg,
+        allowed_models=_ALLOWED_EXTRACTION_MODELS,
+        strip_frontmatter_fn=strip_yaml_frontmatter,
+    )
 
 
 def archive_session_jsonl(session_id: str, jsonl_path: Path | None = None):
-    """Compress and upload session JSONL to S3, then delete local copy."""
-    bucket = os.environ.get("CLAUDE_SESSION_ARCHIVE_BUCKET")
-    if not bucket:
-        return
-
-    if not jsonl_path or not jsonl_path.exists():
-        log(f"Archive skipped for {session_id}: JSONL not found")
-        return
-
-    project_name = jsonl_path.parent.name
-    s3_key = f"s3://{bucket}/sessions/{project_name}/{jsonl_path.stem}.jsonl.zst"
-    zst_path = jsonl_path.with_suffix(".jsonl.zst")
-
-    try:
-        # Compress with zstd
-        result = subprocess.run(
-            ["zstd", "-q", "--rm", str(jsonl_path)],
-            capture_output=True, timeout=300,
-        )
-        if result.returncode != 0:
-            log(f"zstd failed for {session_id}: {result.stderr.decode()}")
-            return
-
-        # Upload to S3
-        result = subprocess.run(
-            ["aws", "s3", "cp", str(zst_path), s3_key, "--quiet"],
-            capture_output=True, timeout=120,
-        )
-        if result.returncode != 0:
-            log(f"S3 upload failed for {session_id}: {result.stderr.decode()}")
-            # Restore original file on upload failure
-            subprocess.run(
-                ["zstd", "-d", "-q", "--rm", str(zst_path)],
-                capture_output=True, timeout=300,
-            )
-            return
-
-        # Clean up local compressed file
-        zst_path.unlink(missing_ok=True)
-
-        # Mark archived in DB
-        try:
-            pg_mark_archived(session_id, s3_key)
-        except Exception as e:
-            log(f"Archive DB update failed for {session_id} (file already in S3): {e}")
-
-        log(f"Archived {session_id} -> {s3_key}")
-
-    except subprocess.TimeoutExpired:
-        log(f"Archive timeout for {session_id}")
-        # Restore if compressed but not uploaded
-        if zst_path.exists() and not jsonl_path.exists():
-            subprocess.run(
-                ["zstd", "-d", "-q", "--rm", str(zst_path)],
-                capture_output=True, timeout=300,
-            )
-    except Exception as e:
-        log(f"Archive error for {session_id}: {e}")
+    """Wrapper: delegates to memory_daemon_extractors.archive_session_jsonl."""
+    _archive_session_jsonl_impl(
+        session_id, jsonl_path, log_fn=log, mark_archived_fn=pg_mark_archived,
+    )
 
 
 def _calibrate_session_confidence(session_id: str):
-    """Run confidence calibration on learnings from a completed extraction."""
-    try:
-        import asyncio
-
-        from scripts.core.confidence_calibrator import calibrate_session
-
-        result = asyncio.run(calibrate_session(session_id))
-        stats = result["stats"]
-        if stats["total"] > 0:
-            log(
-                f"Confidence calibration for {session_id}: "
-                f"{stats['updated']} updated, "
-                f"{stats['unchanged']} unchanged"
-            )
-    except Exception as e:
-        log(f"Confidence calibration failed for {session_id}: {e}")
+    """Wrapper: delegates to memory_daemon_extractors."""
+    _calibrate_session_confidence_impl(session_id, log_fn=log)
 
 
-def _extract_and_store_workflows(
-    session_id: str,
-    jsonl_path: Path,
-    project: str | None,
-):
-    """Extract workflow patterns and store as learnings. Non-fatal."""
-    try:
-        from scripts.core.extract_workflow_patterns import (
-            detect_workflow_sequences,
-            extract_tool_uses,
-            format_pattern_as_learning,
-        )
-    except ImportError as e:
-        log(f"Workflow extraction unavailable: {e}")
-        return
-
-    try:
-        tool_uses = extract_tool_uses(jsonl_path, max_entries=50_000)
-        patterns = detect_workflow_sequences(tool_uses)
-        successful = [p for p in patterns if p.get("success") is True]
-
-        if not successful:
-            log(f"No successful workflow patterns for {session_id}")
-            return
-
-        from scripts.core.store_learning import store_learning_v2
-
-        stored = 0
-        for pattern in successful:
-            content = format_pattern_as_learning(pattern)
-            try:
-                import asyncio
-                project_name = _normalize_project(project) if project else None
-                result = asyncio.run(store_learning_v2(
-                    session_id=session_id,
-                    content=content,
-                    learning_type="WORKING_SOLUTION",
-                    context=project or "unknown",
-                    tags=["workflow", pattern["pattern_type"]],
-                    confidence="high",
-                    project=project_name,
-                ))
-                if result.get("success") and not result.get("skipped"):
-                    stored += 1
-            except Exception as e:
-                log(f"Failed to store workflow learning: {e}")
-
-        log(f"Stored {stored} workflow patterns for {session_id}")
-    except Exception as e:
-        log(f"Workflow extraction failed for {session_id}: {e}")
+def _extract_and_store_workflows(session_id: str, jsonl_path: Path, project: str | None):
+    """Wrapper: delegates to memory_daemon_extractors."""
+    _extract_and_store_workflows_impl(
+        session_id, jsonl_path, project,
+        log_fn=log, normalize_project_fn=_normalize_project,
+    )
 
 
-def _generate_mini_handoff(
-    session_id: str,
-    jsonl_path: Path,
-    project: str | None,
-):
-    """Generate a mini-handoff YAML from session data. Non-fatal.
-
-    Prefers state file (real-time hook data) over JSONL (post-session transcript).
-    Cleans up state file after successful generation.
-    """
-    try:
-        from scripts.core.generate_mini_handoff import (
-            generate_handoff,
-            write_handoff,
-        )
-    except ImportError as e:
-        log(f"Mini-handoff generation unavailable: {e}")
-        return
-
-    if not project:
-        log(f"Mini-handoff skipped for {session_id}: no project dir")
-        return
-
-    # Check for state file from session-state-collector hook
-    state_file = Path(project) / ".claude" / "cache" / "session-state" / f"{session_id}.jsonl"
-    use_state_file = state_file.exists() and state_file.stat().st_size > 0
-
-    try:
-        handoff = generate_handoff(
-            session_id=session_id,
-            project_dir=project,
-            jsonl_path=jsonl_path,
-            state_file=state_file if use_state_file else None,
-        )
-        output_path = write_handoff(handoff, Path(project), session_id)
-        source = "state_file" if use_state_file else "jsonl"
-        log(f"Mini-handoff written for {session_id} (source={source}): {output_path}")
-
-        # Clean up state file after successful generation
-        if use_state_file:
-            try:
-                state_file.unlink()
-                log(f"State file cleaned up for {session_id}")
-            except OSError as cleanup_err:
-                log(f"State file cleanup failed for {session_id}: {cleanup_err}")
-    except Exception as e:
-        log(f"Mini-handoff generation failed for {session_id}: {e}")
+def _generate_mini_handoff(session_id: str, jsonl_path: Path, project: str | None):
+    """Wrapper: delegates to memory_daemon_extractors."""
+    _generate_mini_handoff_impl(session_id, jsonl_path, project, log_fn=log)
 
 
 def _count_session_learnings(session_id: str) -> int | None:
-    """Count learnings stored for a session. Returns None on error."""
-    try:
-        if use_postgres():
-            conn = pg_connect()
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT COUNT(*) FROM archival_memory WHERE session_id = %s",
-                (session_id,),
-            )
-            count = cur.fetchone()[0]
-            conn.close()
-            return count
-    except Exception:
-        return None
-    return None
+    """Wrapper: delegates to memory_daemon_db.count_session_learnings."""
+    return _count_session_learnings_db(session_id)
 
 
 def _count_session_rejections(session_id: str) -> int | None:
-    """Count rejected learnings for a session. Returns None on error."""
-    try:
-        from scripts.core.store_learning import get_rejection_count
-
-        return get_rejection_count(session_id)
-    except Exception:
-        return None
+    """Wrapper: delegates to memory_daemon_extractors.count_session_rejections."""
+    return _count_session_rejections_impl(session_id)
 
 
 def reap_completed_extractions():
@@ -619,6 +381,12 @@ def reap_completed_extractions():
 
     for pid in completed:
         del ae[pid]
+        # Reap zombie process (Popen.poll uses same syscall, but explicit
+        # waitpid ensures the process table entry is cleaned up)
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass  # Already reaped between poll() and waitpid()
 
     return len(completed)
 

@@ -5,7 +5,9 @@ Phase 3 of S30 TDD+FP refactor.
 
 from __future__ import annotations
 
+import os
 from dataclasses import fields
+from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -255,3 +257,78 @@ class TestDaemonTickStaleFiltering:
 
         mock_mark_extracting.assert_called_once_with("sess-2")
         mock_queue.assert_called_once_with("sess-2", "proj", "/t.jsonl")
+
+
+# ---------------------------------------------------------------------------
+# Step 4.4 — os.waitpid zombie reaping in reap_completed_extractions
+# ---------------------------------------------------------------------------
+
+
+class TestReapZombieProcess:
+    """reap_completed_extractions calls os.waitpid to clean up zombies."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_state(self):
+        import scripts.core.memory_daemon as mod
+
+        self.mod = mod
+        self.state = mod.create_daemon_state()
+        self.original = mod._daemon_state
+        mod._daemon_state = self.state
+        yield
+        mod._daemon_state = self.original
+
+    @patch("scripts.core.memory_daemon.archive_session_jsonl")
+    @patch("scripts.core.memory_daemon._generate_mini_handoff")
+    @patch("scripts.core.memory_daemon._extract_and_store_workflows")
+    @patch("scripts.core.memory_daemon._calibrate_session_confidence")
+    @patch("scripts.core.memory_daemon.mark_extracted")
+    @patch("scripts.core.memory_daemon._count_session_rejections", return_value=None)
+    @patch("scripts.core.memory_daemon._count_session_learnings", return_value=None)
+    @patch("scripts.core.memory_daemon.log")
+    @patch("os.waitpid")
+    def test_waitpid_called_on_completed(
+        self, mock_waitpid, mock_log, mock_count, mock_rej,
+        mock_mark, mock_cal, mock_wf, mock_hoff, mock_arch
+    ):
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 0
+        mock_proc.pid = 42
+        self.state.active_extractions[42] = (
+            "sess-1", mock_proc, Path("/t.jsonl"), "proj", 0
+        )
+
+        from scripts.core.memory_daemon import reap_completed_extractions
+
+        reap_completed_extractions()
+
+        mock_waitpid.assert_called_once_with(42, os.WNOHANG)
+        assert 42 not in self.state.active_extractions
+
+    @patch("scripts.core.memory_daemon.archive_session_jsonl")
+    @patch("scripts.core.memory_daemon._generate_mini_handoff")
+    @patch("scripts.core.memory_daemon._extract_and_store_workflows")
+    @patch("scripts.core.memory_daemon._calibrate_session_confidence")
+    @patch("scripts.core.memory_daemon.mark_extracted")
+    @patch("scripts.core.memory_daemon._count_session_rejections", return_value=None)
+    @patch("scripts.core.memory_daemon._count_session_learnings", return_value=None)
+    @patch("scripts.core.memory_daemon.log")
+    @patch("os.waitpid", side_effect=ChildProcessError("already reaped"))
+    def test_handles_child_already_reaped(
+        self, mock_waitpid, mock_log, mock_count, mock_rej,
+        mock_mark, mock_cal, mock_wf, mock_hoff, mock_arch
+    ):
+        """Gracefully handles case where child is reaped between poll() and waitpid()."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 0
+        mock_proc.pid = 42
+        self.state.active_extractions[42] = (
+            "sess-1", mock_proc, Path("/t.jsonl"), "proj", 0
+        )
+
+        from scripts.core.memory_daemon import reap_completed_extractions
+
+        # Should not raise
+        count = reap_completed_extractions()
+        assert count == 1
+        assert 42 not in self.state.active_extractions

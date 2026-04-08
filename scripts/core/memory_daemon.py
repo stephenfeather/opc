@@ -87,6 +87,38 @@ from scripts.core.memory_daemon_core import (  # noqa: E402
     _normalize_project,
 )
 
+# Re-exports from memory_daemon_db (D12: shims per step)
+from scripts.core.memory_daemon_db import (  # noqa: E402
+    get_postgres_url,
+    use_postgres,
+    pg_connect,
+    get_sqlite_path,
+    pg_ensure_column,
+    sqlite_ensure_table,
+    ensure_schema,
+    pg_get_stale_sessions as _pg_get_stale_sessions_impl,
+    sqlite_get_stale_sessions as _sqlite_get_stale_sessions_impl,
+    get_stale_sessions as _get_stale_sessions_impl,
+    pg_mark_extracting,
+    pg_mark_extracted,
+    pg_mark_extraction_failed as _pg_mark_extraction_failed_impl,
+    pg_mark_archived,
+    pg_mark_session_exited,
+    sqlite_mark_extracting,
+    sqlite_mark_extracted,
+    sqlite_mark_extraction_failed as _sqlite_mark_extraction_failed_impl,
+    sqlite_mark_session_exited,
+    pg_recover_stalled_extractions,
+    sqlite_recover_stalled_extractions,
+    recover_stalled_extractions,
+    mark_extracting,
+    mark_extracted,
+    mark_extraction_failed as _mark_extraction_failed_impl,
+    mark_session_exited,
+    count_session_learnings as _count_session_learnings_db,
+    seed_last_pattern_run as _seed_last_pattern_run_db,
+)
+
 # Config from opc.toml [daemon]
 from scripts.core.config import get_config as _get_config
 _daemon_cfg = _get_config().daemon
@@ -137,24 +169,8 @@ _logger = _setup_logging()
 
 
 def _seed_last_pattern_run() -> float:
-    """Read the most recent pattern detection timestamp from PostgreSQL.
-
-    Returns a Unix timestamp so the daemon skips an immediate re-run
-    after restart if a recent detection already happened.
-    """
-    if not use_postgres():
-        return 0
-    try:
-        conn = pg_connect()
-        cur = conn.cursor()
-        cur.execute("SELECT MAX(created_at) FROM detected_patterns")
-        row = cur.fetchone()
-        conn.close()
-        if row and row[0]:
-            return row[0].timestamp()
-    except Exception:
-        pass
-    return 0
+    """Wrapper: delegates to memory_daemon_db.seed_last_pattern_run."""
+    return _seed_last_pattern_run_db()
 
 
 def log(msg: str):
@@ -165,304 +181,71 @@ def log(msg: str):
         pass  # Don't crash on log failures
 
 
-def get_postgres_url() -> str | None:
-    """Get PostgreSQL URL from environment (canonical first)."""
-    return os.environ.get("CONTINUOUS_CLAUDE_DB_URL") or os.environ.get("DATABASE_URL")
-
-
-def use_postgres() -> bool:
-    """Check if PostgreSQL is available."""
-    url = get_postgres_url()
-    if not url:
-        return False
-    try:
-        import psycopg2  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
 # Database operations - PostgreSQL
-
-def pg_connect(max_retries: int = 3, base_delay: float = 2.0):
-    """Connect to PostgreSQL with retry logic for transient failures."""
-    import psycopg2
-    last_error = None
-    for attempt in range(max_retries):
-        try:
-            return psycopg2.connect(get_postgres_url())
-        except psycopg2.OperationalError as e:
-            last_error = e
-            if attempt < max_retries - 1:
-                delay = base_delay * (2 ** attempt)  # 2s, 4s, 8s
-                log(f"DB connection failed (attempt {attempt + 1}/{max_retries}), "
-                    f"retrying in {delay}s: {e}")
-                time.sleep(delay)
-    raise last_error
+# (get_postgres_url, use_postgres, pg_connect moved to memory_daemon_db.py)
 
 
-def pg_ensure_column():
-    """Ensure extraction columns exist in PostgreSQL."""
-    conn = pg_connect()
-    cur = conn.cursor()
-    for col, typedef in [
-        ("memory_extracted_at", "TIMESTAMP"),
-        ("extraction_status", "TEXT DEFAULT 'pending'"),
-        ("extraction_attempts", "INTEGER DEFAULT 0"),
-        ("transcript_path", "TEXT"),
-        ("archived_at", "TIMESTAMP"),
-        ("archive_path", "TEXT"),
-    ]:
-        cur.execute(f"""
-            ALTER TABLE sessions
-            ADD COLUMN IF NOT EXISTS {col} {typedef}
-        """)
-    conn.commit()
-    conn.close()
+# (pg_ensure_column moved to memory_daemon_db.py)
 
 
 def pg_get_stale_sessions() -> list:
-    """Get sessions with stale heartbeat that need extraction.
-
-    Returns rows where either:
-      - exited_at IS NULL (daemon must mark and wait), or
-      - exited_at is older than harvest_grace_period (ready to harvest).
-    Sessions within the grace period are excluded by the DB clock.
-    """
-    conn = pg_connect()
-    cur = conn.cursor()
-    # Use DB clock for all time comparisons to avoid local-vs-UTC mismatch
-    cur.execute("""
-        SELECT id, project, transcript_path, pid, exited_at FROM sessions
-        WHERE last_heartbeat < NOW() - INTERVAL '%s seconds'
-        AND extraction_status = 'pending'
-        AND extraction_attempts < %s
-        AND (exited_at IS NULL
-             OR exited_at < NOW() - INTERVAL '%s seconds')
-    """, (STALE_THRESHOLD, MAX_RETRIES, HARVEST_GRACE_PERIOD))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+    """Wrapper: injects config into memory_daemon_db.pg_get_stale_sessions."""
+    return _pg_get_stale_sessions_impl(
+        stale_threshold=STALE_THRESHOLD,
+        max_retries=MAX_RETRIES,
+        harvest_grace_period=HARVEST_GRACE_PERIOD,
+    )
 
 
-def pg_mark_extracting(session_id: str):
-    """Mark session as actively being extracted in PostgreSQL."""
-    conn = pg_connect()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE sessions
-        SET extraction_status = 'extracting',
-            extraction_attempts = COALESCE(extraction_attempts, 0) + 1
-        WHERE id = %s
-    """, (session_id,))
-    conn.commit()
-    conn.close()
+# (pg_mark_*, sqlite_mark_*, recovery, dispatchers moved to memory_daemon_db.py)
+# Config-injecting wrappers for functions that took module-level globals (D3):
 
 
-def pg_mark_extracted(session_id: str):
-    """Mark session as successfully extracted in PostgreSQL."""
-    conn = pg_connect()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE sessions
-        SET memory_extracted_at = NOW(),
-            extraction_status = 'extracted'
-        WHERE id = %s
-    """, (session_id,))
-    conn.commit()
-    conn.close()
-
-
-def pg_mark_extraction_failed(session_id: str):
-    """Mark extraction as failed; retry if under MAX_RETRIES, else give up."""
-    conn = pg_connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT extraction_attempts FROM sessions WHERE id = %s
-    """, (session_id,))
-    row = cur.fetchone()
-    attempts = row[0] if row else 0
-
-    if attempts < MAX_RETRIES:
-        cur.execute("""
-            UPDATE sessions SET extraction_status = 'pending' WHERE id = %s
-        """, (session_id,))
-        log(f"Extraction failed for {session_id} (attempt {attempts}/{MAX_RETRIES}), will retry")
-    else:
-        cur.execute("""
-            UPDATE sessions SET extraction_status = 'failed' WHERE id = %s
-        """, (session_id,))
-        log(f"Extraction permanently failed for {session_id} after {attempts} attempts")
-
-    conn.commit()
-    conn.close()
-
-
-def pg_mark_archived(session_id: str, archive_path: str):
-    """Mark session as archived in PostgreSQL and stamp learnings with archive_path."""
-    conn = pg_connect()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE sessions
-        SET archived_at = NOW(), archive_path = %s
-        WHERE id = %s
-    """, (archive_path, session_id))
-    # Stamp archival_memory with source traceability
-    cur.execute("""
-        UPDATE archival_memory
-        SET metadata = COALESCE(metadata, '{}'::jsonb) ||
-            jsonb_build_object('source_session_id', %s, 'archive_path', %s)
-        WHERE session_id = %s
-        AND (metadata->>'archive_path') IS NULL
-    """, (session_id, archive_path, session_id))
-    conn.commit()
-    conn.close()
-
-
-def pg_mark_session_exited(session_id: str):
-    """Set exited_at for a session the daemon observed as dead (no clean exit)."""
-    conn = pg_connect()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE sessions SET exited_at = NOW()
-        WHERE id = %s AND exited_at IS NULL
-    """, (session_id,))
-    conn.commit()
-    conn.close()
-
-
-# Database operations - SQLite
-def get_sqlite_path() -> Path:
-    """Get SQLite database path."""
-    return Path.home() / ".claude" / "sessions.db"
-
-
-def sqlite_ensure_table():
-    """Ensure sessions table exists in SQLite with required columns."""
-    db_path = get_sqlite_path()
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            id TEXT PRIMARY KEY,
-            project TEXT,
-            working_on TEXT,
-            started_at TIMESTAMP,
-            last_heartbeat TIMESTAMP,
-            memory_extracted_at TIMESTAMP,
-            extraction_status TEXT DEFAULT 'pending',
-            extraction_attempts INTEGER DEFAULT 0,
-            transcript_path TEXT,
-            archived_at TIMESTAMP,
-            archive_path TEXT
-        )
-    """)
-    # Add columns if table already exists without them
-    for col, typedef in [
-        ("memory_extracted_at", "TIMESTAMP"),
-        ("extraction_status", "TEXT DEFAULT 'pending'"),
-        ("extraction_attempts", "INTEGER DEFAULT 0"),
-        ("transcript_path", "TEXT"),
-        ("archived_at", "TIMESTAMP"),
-        ("archive_path", "TEXT"),
-    ]:
-        try:
-            conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {typedef}")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-    conn.commit()
-    conn.close()
+def pg_get_stale_sessions() -> list:
+    """Wrapper: injects config into memory_daemon_db.pg_get_stale_sessions."""
+    return _pg_get_stale_sessions_impl(
+        stale_threshold=STALE_THRESHOLD,
+        max_retries=MAX_RETRIES,
+        harvest_grace_period=HARVEST_GRACE_PERIOD,
+    )
 
 
 def sqlite_get_stale_sessions() -> list:
-    """Get sessions with stale heartbeat that need extraction.
-
-    Returns rows where either:
-      - exited_at IS NULL (daemon must mark and wait), or
-      - exited_at is older than harvest_grace_period (ready to harvest).
-    Sessions within the grace period are excluded.
-    """
-    db_path = get_sqlite_path()
-    if not db_path.exists():
-        return []
-    conn = sqlite3.connect(db_path)
-    stale_threshold = (datetime.now() - timedelta(seconds=STALE_THRESHOLD)).isoformat()
-    grace_threshold = (datetime.now() - timedelta(seconds=HARVEST_GRACE_PERIOD)).isoformat()
-    cursor = conn.execute("""
-        SELECT id, project, transcript_path, pid, exited_at FROM sessions
-        WHERE last_heartbeat < ?
-        AND extraction_status = 'pending'
-        AND COALESCE(extraction_attempts, 0) < ?
-        AND (exited_at IS NULL
-             OR exited_at < ?)
-    """, (stale_threshold, MAX_RETRIES, grace_threshold))
-    rows = cursor.fetchall()
-    conn.close()
-    return rows
+    """Wrapper: injects config into memory_daemon_db.sqlite_get_stale_sessions."""
+    return _sqlite_get_stale_sessions_impl(
+        stale_threshold=STALE_THRESHOLD,
+        max_retries=MAX_RETRIES,
+        harvest_grace_period=HARVEST_GRACE_PERIOD,
+    )
 
 
-def sqlite_mark_extracting(session_id: str):
-    """Mark session as actively being extracted in SQLite."""
-    db_path = get_sqlite_path()
-    conn = sqlite3.connect(db_path)
-    conn.execute("""
-        UPDATE sessions
-        SET extraction_status = 'extracting',
-            extraction_attempts = COALESCE(extraction_attempts, 0) + 1
-        WHERE id = ?
-    """, (session_id,))
-    conn.commit()
-    conn.close()
+def get_stale_sessions() -> list:
+    """Wrapper: injects config into memory_daemon_db.get_stale_sessions."""
+    return _get_stale_sessions_impl(
+        stale_threshold=STALE_THRESHOLD,
+        max_retries=MAX_RETRIES,
+        harvest_grace_period=HARVEST_GRACE_PERIOD,
+    )
 
 
-def sqlite_mark_extracted(session_id: str):
-    """Mark session as extracted in SQLite."""
-    db_path = get_sqlite_path()
-    conn = sqlite3.connect(db_path)
-    conn.execute("""
-        UPDATE sessions
-        SET memory_extracted_at = ?,
-            extraction_status = 'extracted'
-        WHERE id = ?
-    """, (datetime.now().isoformat(), session_id))
-    conn.commit()
-    conn.close()
+def pg_mark_extraction_failed(session_id: str):
+    """Wrapper: injects MAX_RETRIES into memory_daemon_db.pg_mark_extraction_failed."""
+    _pg_mark_extraction_failed_impl(session_id, max_retries=MAX_RETRIES)
 
 
 def sqlite_mark_extraction_failed(session_id: str):
-    """Mark extraction as failed in SQLite; retry if under MAX_RETRIES."""
-    db_path = get_sqlite_path()
-    conn = sqlite3.connect(db_path)
-    cursor = conn.execute(
-        "SELECT extraction_attempts FROM sessions WHERE id = ?", (session_id,)
-    )
-    row = cursor.fetchone()
-    attempts = row[0] if row else 0
-
-    if attempts < MAX_RETRIES:
-        conn.execute(
-            "UPDATE sessions SET extraction_status = 'pending' WHERE id = ?",
-            (session_id,),
-        )
-    else:
-        conn.execute(
-            "UPDATE sessions SET extraction_status = 'failed' WHERE id = ?",
-            (session_id,),
-        )
-    conn.commit()
-    conn.close()
+    """Wrapper: injects MAX_RETRIES into memory_daemon_db.sqlite_mark_extraction_failed."""
+    _sqlite_mark_extraction_failed_impl(session_id, max_retries=MAX_RETRIES)
 
 
-def sqlite_mark_session_exited(session_id: str):
-    """Set exited_at for a session the daemon observed as dead (no clean exit)."""
-    db_path = get_sqlite_path()
-    conn = sqlite3.connect(db_path)
-    conn.execute(
-        "UPDATE sessions SET exited_at = ? WHERE id = ? AND exited_at IS NULL",
-        (datetime.now().isoformat(), session_id),
-    )
-    conn.commit()
-    conn.close()
+def mark_extraction_failed(session_id: str):
+    """Wrapper: injects MAX_RETRIES into memory_daemon_db.mark_extraction_failed."""
+    _mark_extraction_failed_impl(session_id, max_retries=MAX_RETRIES)
+
+
+def _count_session_learnings(session_id: str) -> int | None:
+    """Wrapper: delegates to memory_daemon_db.count_session_learnings."""
+    return _count_session_learnings_db(session_id)
 
 
 # Unified interface
@@ -475,97 +258,6 @@ def _is_process_alive(pid: int | None) -> bool:
         return True
     except (ProcessLookupError, PermissionError):
         return False
-
-
-def pg_recover_stalled_extractions():
-    """Reset sessions stuck in 'extracting' back to 'pending' on daemon startup."""
-    conn = pg_connect()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE sessions
-        SET extraction_status = 'pending'
-        WHERE extraction_status = 'extracting'
-        RETURNING id
-    """)
-    recovered = [row[0] for row in cur.fetchall()]
-    conn.commit()
-    conn.close()
-    if recovered:
-        log(f"Startup recovery: reset {len(recovered)} stalled sessions: {', '.join(recovered)}")
-
-
-def sqlite_recover_stalled_extractions():
-    """Reset sessions stuck in 'extracting' back to 'pending' on daemon startup."""
-    db_path = get_sqlite_path()
-    if not db_path.exists():
-        return
-    conn = sqlite3.connect(db_path)
-    cursor = conn.execute("""
-        UPDATE sessions
-        SET extraction_status = 'pending'
-        WHERE extraction_status = 'extracting'
-        RETURNING id
-    """)
-    recovered = [row[0] for row in cursor.fetchall()]
-    conn.commit()
-    conn.close()
-    if recovered:
-        log(f"Startup recovery: reset {len(recovered)} stalled sessions: {', '.join(recovered)}")
-
-
-def recover_stalled_extractions():
-    """Reset stalled extractions on daemon startup (handles sleep/crash recovery)."""
-    if use_postgres():
-        pg_recover_stalled_extractions()
-    else:
-        sqlite_recover_stalled_extractions()
-
-
-def ensure_schema():
-    """Ensure database schema is ready."""
-    if use_postgres():
-        pg_ensure_column()
-    else:
-        sqlite_ensure_table()
-
-
-def get_stale_sessions() -> list:
-    """Get stale sessions from database."""
-    if use_postgres():
-        return pg_get_stale_sessions()
-    return sqlite_get_stale_sessions()
-
-
-def mark_extracting(session_id: str):
-    """Mark session as actively being extracted."""
-    if use_postgres():
-        pg_mark_extracting(session_id)
-    else:
-        sqlite_mark_extracting(session_id)
-
-
-def mark_extracted(session_id: str):
-    """Mark session as extracted."""
-    if use_postgres():
-        pg_mark_extracted(session_id)
-    else:
-        sqlite_mark_extracted(session_id)
-
-
-def mark_extraction_failed(session_id: str):
-    """Mark extraction as failed (will retry if under MAX_RETRIES)."""
-    if use_postgres():
-        pg_mark_extraction_failed(session_id)
-    else:
-        sqlite_mark_extraction_failed(session_id)
-
-
-def mark_session_exited(session_id: str):
-    """Record exited_at for a session whose PID the daemon observed as dead."""
-    if use_postgres():
-        pg_mark_session_exited(session_id)
-    else:
-        sqlite_mark_session_exited(session_id)
 
 
 def extract_memories(

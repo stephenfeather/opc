@@ -537,13 +537,13 @@ def daemon_tick() -> None:
             for row in stale_rows
         ]
 
-        truly_stale, newly_dead_ids, still_alive_ids = filter_truly_stale_sessions(
+        truly_stale, newly_dead_ids, still_alive = filter_truly_stale_sessions(
             stale_sessions, is_alive=_is_process_alive
         )
 
         # Log still-alive sessions
-        for sid in still_alive_ids:
-            log(f"Skipping {sid}: process still alive")
+        for s in still_alive:
+            log(f"Skipping {s.id}: process {s.pid} still alive")
 
         # Mark newly-dead sessions (grace period starts)
         for sid in newly_dead_ids:

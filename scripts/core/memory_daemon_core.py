@@ -124,27 +124,27 @@ def filter_truly_stale_sessions(
     sessions: list[StaleSession],
     *,
     is_alive: Callable[[int | None], bool],
-) -> tuple[list[StaleSession], list[str], list[str]]:
+) -> tuple[list[StaleSession], list[str], list[StaleSession]]:
     """Partition stale sessions into three categories.
 
-    Returns (truly_stale, newly_dead_ids, still_alive_ids).
+    Returns (truly_stale, newly_dead_ids, still_alive).
 
     - truly_stale: dead process, exited_at already set (past grace period)
     - newly_dead_ids: dead process, exited_at is None (first discovery)
-    - still_alive_ids: process is still running
+    - still_alive: process is still running (full StaleSession for logging)
 
     The is_alive predicate is injected — this function performs no I/O.
     """
     truly_stale: list[StaleSession] = []
     newly_dead_ids: list[str] = []
-    still_alive_ids: list[str] = []
+    still_alive: list[StaleSession] = []
 
     for session in sessions:
         if is_alive(session.pid):
-            still_alive_ids.append(session.id)
+            still_alive.append(session)
         elif session.exited_at is None:
             newly_dead_ids.append(session.id)
         else:
             truly_stale.append(session)
 
-    return truly_stale, newly_dead_ids, still_alive_ids
+    return truly_stale, newly_dead_ids, still_alive

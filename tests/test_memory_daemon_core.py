@@ -258,7 +258,7 @@ class TestFilterTrulyStaleSessions:
         truly_stale, newly_dead, still_alive = filter_truly_stale_sessions(
             sessions, is_alive=lambda _pid: True,
         )
-        assert still_alive == ["s1"]
+        assert [s.id for s in still_alive] == ["s1"]
         assert truly_stale == []
         assert newly_dead == []
 
@@ -279,7 +279,7 @@ class TestFilterTrulyStaleSessions:
         assert len(truly_stale) == 1
         assert truly_stale[0].id == "s1"
         assert newly_dead == []
-        assert still_alive == []
+        assert [s.id for s in still_alive] == []
 
     def test_none_pid_treated_as_dead(self):
         sessions = [self._make_session("s1", pid=None, exited_at="2026-01-01")]
@@ -298,7 +298,7 @@ class TestFilterTrulyStaleSessions:
         truly_stale, newly_dead, still_alive = filter_truly_stale_sessions(
             sessions, is_alive=lambda pid: pid in alive_pids,
         )
-        assert still_alive == ["alive"]
+        assert [s.id for s in still_alive] == ["alive"]
         assert newly_dead == ["new-dead"]
         assert [s.id for s in truly_stale] == ["stale"]
 

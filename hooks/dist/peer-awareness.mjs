@@ -209,8 +209,13 @@ function readPeerCache(cachePath, project, ttlSeconds) {
   try {
     const raw = readFileSync3(cachePath, "utf-8");
     const data = JSON.parse(raw);
+    if (typeof data.cached_at !== "string" || typeof data.project !== "string" || !Array.isArray(data.sessions)) {
+      return null;
+    }
     if (data.project !== project) return null;
-    const age = (Date.now() - new Date(data.cached_at).getTime()) / 1e3;
+    const cachedTime = new Date(data.cached_at).getTime();
+    if (!isFinite(cachedTime)) return null;
+    const age = (Date.now() - cachedTime) / 1e3;
     if (age >= ttlSeconds) return null;
     return data.sessions;
   } catch {
@@ -252,6 +257,10 @@ function main() {
   }
   if (!ownSessionId) {
     ownSessionId = readSessionId();
+  }
+  if (!ownSessionId) {
+    console.log(JSON.stringify({}));
+    return;
   }
   const project = getProject();
   const cachePath = join4(process.env.HOME || "/tmp", ".claude", "cache", "peer-sessions.json");

@@ -39,6 +39,13 @@ export function main(): void {
     ownSessionId = readSessionId();
   }
 
+  // If we can't determine our own session ID, stay silent to avoid
+  // showing self in the peer list (breaks "silent when solo")
+  if (!ownSessionId) {
+    console.log(JSON.stringify({}));
+    return;
+  }
+
   const project = getProject();
   const cachePath = join(process.env.HOME || '/tmp', '.claude', 'cache', 'peer-sessions.json');
 

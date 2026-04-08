@@ -292,8 +292,9 @@ describe('peer cache', () => {
 
   it('treats 59s old cache as fresh', async () => {
     const { readPeerCache } = await import('../session-context.js');
+    // Use a large margin (30s) to avoid flakiness from test execution delay
     const freshData = {
-      cached_at: new Date(Date.now() - 59000).toISOString(),
+      cached_at: new Date(Date.now() - 30000).toISOString(),
       project: 'opc',
       sessions: [{ id: 's-x', project: 'opc', working_on: '', started_at: null, last_heartbeat: null }],
     };

@@ -266,7 +266,7 @@ function main() {
     return;
   }
   const sessionId = input.session_id;
-  if (!isValidId(sessionId)) {
+  if (typeof sessionId !== "string" || !isValidId(sessionId)) {
     console.log(JSON.stringify({ result: "continue" }));
     return;
   }

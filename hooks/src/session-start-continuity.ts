@@ -551,11 +551,15 @@ async function main() {
         message = startupMsg;
 
         // Also inject as additionalContext for system-level awareness
-        const ledgerStat = fs.statSync(path.join(ledgerDir, mostRecent));
-        const ageMs = Date.now() - ledgerStat.mtime.getTime();
-        const ageHours = Math.round(ageMs / 3600000);
-        const ageStr = ageHours < 1 ? 'less than 1h ago' : `${ageHours}h ago`;
-        additionalContext = `Last session context:\nGoal: ${goalSummary}\nFocus: ${currentFocus}\nLedger: ${mostRecent} (${ageStr})\nRun /resume-handoff for full context.`;
+        try {
+          const ledgerStat = fs.statSync(path.join(ledgerDir, mostRecent));
+          const ageMs = Date.now() - ledgerStat.mtime.getTime();
+          const ageHours = Math.round(ageMs / 3600000);
+          const ageStr = ageHours < 1 ? 'less than 1h ago' : `${ageHours}h ago`;
+          additionalContext = `Last session context:\nGoal: ${goalSummary}\nFocus: ${currentFocus}\nLedger: ${mostRecent} (${ageStr})\nRun /resume-handoff for full context.`;
+        } catch {
+          additionalContext = `Last session context:\nGoal: ${goalSummary}\nFocus: ${currentFocus}\nLedger: ${mostRecent}\nRun /resume-handoff for full context.`;
+        }
       } else {
         // resume/clear/compact: load full context
         console.error(`✓ Ledger loaded: ${sessionName} → ${currentFocus}`);

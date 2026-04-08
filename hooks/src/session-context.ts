@@ -144,14 +144,22 @@ export function readPeerCache(
 ): SessionInfo[] | null {
   try {
     const raw = readFileSync(cachePath, 'utf-8');
-    const data: PeerCache = JSON.parse(raw);
+    const data = JSON.parse(raw) as Record<string, unknown>;
+
+    // Validate cache shape before trusting
+    if (typeof data.cached_at !== 'string' || typeof data.project !== 'string' || !Array.isArray(data.sessions)) {
+      return null;
+    }
 
     if (data.project !== project) return null;
 
-    const age = (Date.now() - new Date(data.cached_at).getTime()) / 1000;
+    const cachedTime = new Date(data.cached_at).getTime();
+    if (!isFinite(cachedTime)) return null;
+
+    const age = (Date.now() - cachedTime) / 1000;
     if (age >= ttlSeconds) return null;
 
-    return data.sessions;
+    return data.sessions as SessionInfo[];
   } catch {
     return null;
   }

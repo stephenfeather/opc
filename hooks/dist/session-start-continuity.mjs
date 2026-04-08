@@ -396,15 +396,23 @@ Full handoff available at: ${handoffPath}
         }
         startupMsg += " (run /resume-handoff for full context)";
         message = startupMsg;
-        const ledgerStat = fs.statSync(path.join(ledgerDir, mostRecent));
-        const ageMs = Date.now() - ledgerStat.mtime.getTime();
-        const ageHours = Math.round(ageMs / 36e5);
-        const ageStr = ageHours < 1 ? "less than 1h ago" : `${ageHours}h ago`;
-        additionalContext = `Last session context:
+        try {
+          const ledgerStat = fs.statSync(path.join(ledgerDir, mostRecent));
+          const ageMs = Date.now() - ledgerStat.mtime.getTime();
+          const ageHours = Math.round(ageMs / 36e5);
+          const ageStr = ageHours < 1 ? "less than 1h ago" : `${ageHours}h ago`;
+          additionalContext = `Last session context:
 Goal: ${goalSummary}
 Focus: ${currentFocus}
 Ledger: ${mostRecent} (${ageStr})
 Run /resume-handoff for full context.`;
+        } catch {
+          additionalContext = `Last session context:
+Goal: ${goalSummary}
+Focus: ${currentFocus}
+Ledger: ${mostRecent}
+Run /resume-handoff for full context.`;
+        }
       } else {
         console.error(`\u2713 Ledger loaded: ${sessionName} \u2192 ${currentFocus}`);
         message = `[${sessionType}] Loaded: ${mostRecent} | Goal: ${goalSummary} | Focus: ${currentFocus}`;

@@ -45,7 +45,17 @@ function formatTimestamp(now: Date): string {
 }
 
 function main(): void {
-  const input: UserPromptSubmitInput = JSON.parse(readStdin());
+  let input: UserPromptSubmitInput;
+  try {
+    input = JSON.parse(readStdin());
+  } catch {
+    // Malformed or empty stdin — no-op to avoid killing the hook
+    return;
+  }
+
+  if (!input || typeof input !== 'object' || !input.hook_event_name) {
+    return;
+  }
 
   // Skip for subagents — they don't need timestamps
   if (process.env.CLAUDE_AGENT_ID) {

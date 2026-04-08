@@ -3,15 +3,16 @@
  *
  * This hook:
  * 1. Registers the session in PostgreSQL for cross-session awareness
- * 2. Injects a system reminder about coordination layer features
- * 3. Shows other active sessions working on the same project
+ * 2. Injects session ID, memory system health, and pending tasks summary
  *
- * Part of the coordination layer architecture (Phase 1).
+ * Peer session awareness is handled by peer-awareness.ts (UserPromptSubmit).
  */
 
 import { readFileSync } from 'fs';
-import { registerSession, getActiveSessions } from './shared/db-utils-pg.js';
+import { join } from 'path';
+import { registerSession } from './shared/db-utils-pg.js';
 import { writeSessionId, getProject } from './shared/session-id.js';
+import { checkMemoryHealth, formatHealthWarnings, getPendingTasksSummary } from './session-context.js';
 import type { SessionStartInput, HookOutput } from './shared/types.js';
 
 /**
@@ -50,37 +51,30 @@ export function main(): void {
   // process.ppid is the Claude CLI process that spawned this hook
   const registerResult = registerSession(sessionId, project, '', input.session_id, input.transcript_path, process.ppid);
 
-  // Get other active sessions
-  const sessionsResult = getActiveSessions(project);
-  const otherSessions = sessionsResult.sessions.filter(s => s.id !== sessionId);
+  // Check memory system health (piggyback on registration result for PG status)
+  const daemonPidPath = join(process.env.HOME || '/tmp', '.claude', 'memory-daemon.pid');
+  const health = checkMemoryHealth(registerResult.success, daemonPidPath);
+  const healthWarnings = formatHealthWarnings(health);
+
+  // Check for pending tasks
+  const tasksPath = join(project, 'thoughts', 'shared', 'Tasks.md');
+  const tasksSummary = getPendingTasksSummary(tasksPath);
 
   // Build awareness message
   let awarenessMessage = `
 <system-reminder>
-MULTI-SESSION COORDINATION ACTIVE
-
 Session: ${sessionId}
-Project: ${projectName}
-`;
+Project: ${projectName}`;
 
-  if (otherSessions.length > 0) {
-    awarenessMessage += `
-Active peer sessions (${otherSessions.length}):
-${otherSessions.map(s => `  - ${s.id}: ${s.working_on || 'working...'}`).join('\n')}
-
-Coordination features:
-- File edits are tracked to prevent conflicts
-- Research findings are shared automatically
-- Use Task tool normally - coordination happens via hooks
-`;
-  } else {
-    awarenessMessage += `
-No other sessions active on this project.
-You are the only session currently working here.
-`;
+  if (healthWarnings) {
+    awarenessMessage += `\n\n${healthWarnings}`;
   }
 
-  awarenessMessage += `</system-reminder>`;
+  if (tasksSummary) {
+    awarenessMessage += `\n\n${tasksSummary}`;
+  }
+
+  awarenessMessage += `\n</system-reminder>`;
 
   // Output hook result with awareness injection
   const output: HookOutput = {

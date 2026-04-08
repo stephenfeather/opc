@@ -307,7 +307,15 @@ async function main() {
         const { sessionName, goalSummary, currentFocus, content: ledgerSection, handoffPath } = mostRecentLedger;
         const handoffFilename = path.basename(handoffPath);
         if (sessionType === "startup") {
-          message = `\u{1F4CB} Handoff Ledger: ${sessionName} \u2192 ${currentFocus} (run /resume_handoff to continue)`;
+          message = `\u{1F4CB} Handoff Ledger: ${sessionName} \u2192 ${currentFocus} (run /resume-handoff for full context)`;
+          const ageMs = Date.now() - mostRecentLedger.mtime;
+          const ageHours = Math.round(ageMs / 36e5);
+          const ageStr = ageHours < 1 ? "less than 1h ago" : `${ageHours}h ago`;
+          additionalContext = `Last session context:
+Goal: ${goalSummary}
+Focus: ${currentFocus}
+Handoff: ${handoffFilename} (${ageStr})
+Run /resume-handoff for full context.`;
         } else {
           console.error(`\u2713 Handoff Ledger loaded: ${sessionName} \u2192 ${currentFocus}`);
           message = `[${sessionType}] Loaded from handoff: ${handoffFilename} | Goal: ${goalSummary} | Focus: ${currentFocus}`;
@@ -386,8 +394,17 @@ Full handoff available at: ${handoffPath}
             startupMsg += ` | Last handoff: task-${latestHandoff.taskNumber} (${latestHandoff.status})`;
           }
         }
-        startupMsg += " (run /resume_handoff to continue)";
+        startupMsg += " (run /resume-handoff for full context)";
         message = startupMsg;
+        const ledgerStat = fs.statSync(path.join(ledgerDir, mostRecent));
+        const ageMs = Date.now() - ledgerStat.mtime.getTime();
+        const ageHours = Math.round(ageMs / 36e5);
+        const ageStr = ageHours < 1 ? "less than 1h ago" : `${ageHours}h ago`;
+        additionalContext = `Last session context:
+Goal: ${goalSummary}
+Focus: ${currentFocus}
+Ledger: ${mostRecent} (${ageStr})
+Run /resume-handoff for full context.`;
       } else {
         console.error(`\u2713 Ledger loaded: ${sessionName} \u2192 ${currentFocus}`);
         message = `[${sessionType}] Loaded: ${mostRecent} | Goal: ${goalSummary} | Focus: ${currentFocus}`;

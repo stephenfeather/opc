@@ -1,5 +1,6 @@
 // src/session-register.ts
-import { readFileSync as readFileSync3 } from "fs";
+import { readFileSync as readFileSync4 } from "fs";
+import { join as join3 } from "path";
 
 // src/shared/db-utils-pg.ts
 import { spawnSync } from "child_process";
@@ -54,6 +55,12 @@ function requireOpcDir() {
     process.exit(0);
   }
   return opcDir;
+}
+
+// src/shared/pattern-router.ts
+var SAFE_ID_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
+function isValidId(id) {
+  return SAFE_ID_PATTERN.test(id);
 }
 
 // src/shared/db-utils-pg.ts
@@ -171,66 +178,6 @@ asyncio.run(main())
   }
   return { success: true };
 }
-function getActiveSessions(project) {
-  const pythonCode = `
-import asyncpg
-import os
-import json
-from datetime import datetime, timedelta
-
-project_filter = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] != 'null' else None
-pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL', 'postgresql://claude:claude_dev@localhost:5432/continuous_claude')
-
-async def main():
-    conn = await asyncpg.connect(pg_url)
-    try:
-        # Get sessions active in last 5 minutes
-        cutoff = datetime.utcnow() - timedelta(minutes=5)
-
-        if project_filter:
-            rows = await conn.fetch('''
-                SELECT id, project, working_on, started_at, last_heartbeat
-                FROM sessions
-                WHERE project = $1 AND last_heartbeat > $2
-                ORDER BY started_at DESC
-            ''', project_filter, cutoff)
-        else:
-            rows = await conn.fetch('''
-                SELECT id, project, working_on, started_at, last_heartbeat
-                FROM sessions
-                WHERE last_heartbeat > $1
-                ORDER BY started_at DESC
-            ''', cutoff)
-
-        sessions = []
-        for row in rows:
-            sessions.append({
-                'id': row['id'],
-                'project': row['project'],
-                'working_on': row['working_on'],
-                'started_at': row['started_at'].isoformat() if row['started_at'] else None,
-                'last_heartbeat': row['last_heartbeat'].isoformat() if row['last_heartbeat'] else None
-            })
-
-        print(json.dumps(sessions))
-    except Exception as e:
-        print(json.dumps([]))
-    finally:
-        await conn.close()
-
-asyncio.run(main())
-`;
-  const result = runPgQuery(pythonCode, [project || "null"]);
-  if (!result.success) {
-    return { success: false, sessions: [] };
-  }
-  try {
-    const sessions = JSON.parse(result.stdout || "[]");
-    return { success: true, sessions };
-  } catch {
-    return { success: false, sessions: [] };
-  }
-}
 
 // src/shared/session-id.ts
 import { mkdirSync, readFileSync as readFileSync2, writeFileSync } from "fs";
@@ -259,6 +206,50 @@ function getProject() {
   return process.env.CLAUDE_PROJECT_DIR || process.cwd();
 }
 
+// src/session-context.ts
+import { readFileSync as readFileSync3, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, renameSync } from "fs";
+function checkMemoryHealth(pgRegistrationSucceeded, pidFilePath) {
+  const pgHealthy = pgRegistrationSucceeded;
+  let daemonRunning = false;
+  try {
+    const pidContent = readFileSync3(pidFilePath, "utf-8").trim();
+    const pid = parseInt(pidContent, 10);
+    if (!isNaN(pid) && pid > 0) {
+      process.kill(pid, 0);
+      daemonRunning = true;
+    }
+  } catch {
+    daemonRunning = false;
+  }
+  return { pgHealthy, daemonRunning };
+}
+function formatHealthWarnings(health) {
+  const warnings = [];
+  if (!health.pgHealthy) {
+    warnings.push("- PostgreSQL: unreachable");
+  }
+  if (!health.daemonRunning) {
+    warnings.push("- Memory daemon: not running");
+  }
+  if (warnings.length === 0) return null;
+  return `Health warnings:
+${warnings.join("\n")}`;
+}
+function getPendingTasksSummary(tasksFilePath) {
+  try {
+    const content = readFileSync3(tasksFilePath, "utf-8");
+    if (!content.trim()) return null;
+    const titles = content.split("\n").filter((line) => line.startsWith("## ")).map((line) => line.slice(3).trim());
+    if (titles.length === 0) return null;
+    const MAX_SHOWN = 3;
+    const shown = titles.slice(0, MAX_SHOWN);
+    const suffix = titles.length > MAX_SHOWN ? ", ..." : "";
+    return `Pending tasks (${titles.length}): ${shown.join(", ")}${suffix}`;
+  } catch {
+    return null;
+  }
+}
+
 // src/session-register.ts
 //! @hook SessionStart @preserve
 function main() {
@@ -268,13 +259,17 @@ function main() {
   }
   let input;
   try {
-    const stdinContent = readFileSync3(0, "utf-8");
+    const stdinContent = readFileSync4(0, "utf-8");
     input = JSON.parse(stdinContent);
   } catch {
     console.log(JSON.stringify({ result: "continue" }));
     return;
   }
   const sessionId = input.session_id;
+  if (typeof sessionId !== "string" || !isValidId(sessionId)) {
+    console.log(JSON.stringify({ result: "continue" }));
+    return;
+  }
   const project = getProject();
   const projectName = project.split("/").pop() || "unknown";
   process.env.COORDINATION_SESSION_ID = sessionId;
@@ -282,32 +277,27 @@ function main() {
     console.error(`[session-register] WARNING: Failed to persist session ID ${sessionId} to file`);
   }
   const registerResult = registerSession(sessionId, project, "", input.session_id, input.transcript_path, process.ppid);
-  const sessionsResult = getActiveSessions(project);
-  const otherSessions = sessionsResult.sessions.filter((s) => s.id !== sessionId);
+  const daemonPidPath = join3(process.env.HOME || "/tmp", ".claude", "memory-daemon.pid");
+  const health = checkMemoryHealth(registerResult.success, daemonPidPath);
+  const healthWarnings = formatHealthWarnings(health);
+  const tasksPath = join3(project, "thoughts", "shared", "Tasks.md");
+  const tasksSummary = getPendingTasksSummary(tasksPath);
   let awarenessMessage = `
 <system-reminder>
-MULTI-SESSION COORDINATION ACTIVE
-
 Session: ${sessionId}
-Project: ${projectName}
-`;
-  if (otherSessions.length > 0) {
+Project: ${projectName}`;
+  if (healthWarnings) {
     awarenessMessage += `
-Active peer sessions (${otherSessions.length}):
-${otherSessions.map((s) => `  - ${s.id}: ${s.working_on || "working..."}`).join("\n")}
 
-Coordination features:
-- File edits are tracked to prevent conflicts
-- Research findings are shared automatically
-- Use Task tool normally - coordination happens via hooks
-`;
-  } else {
-    awarenessMessage += `
-No other sessions active on this project.
-You are the only session currently working here.
-`;
+${healthWarnings}`;
   }
-  awarenessMessage += `</system-reminder>`;
+  if (tasksSummary) {
+    awarenessMessage += `
+
+${tasksSummary}`;
+  }
+  awarenessMessage += `
+</system-reminder>`;
   const output = {
     result: "continue",
     message: awarenessMessage

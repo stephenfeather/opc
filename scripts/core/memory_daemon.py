@@ -123,21 +123,34 @@ from scripts.core.memory_daemon_db import (  # noqa: E402
     seed_last_pattern_run as _seed_last_pattern_run_db,
 )
 
-# Config from opc.toml [daemon]
+# Config from opc.toml [daemon] — read at call time, not import time (D3)
 from scripts.core.config import get_config as _get_config
 _daemon_cfg = _get_config().daemon
 
-POLL_INTERVAL = _daemon_cfg.poll_interval
-STALE_THRESHOLD = _daemon_cfg.stale_threshold
-MAX_CONCURRENT_EXTRACTIONS = _daemon_cfg.max_concurrent_extractions
-MAX_RETRIES = _daemon_cfg.max_retries
-EXTRACTION_TIMEOUT = _daemon_cfg.extraction_timeout
-HARVEST_GRACE_PERIOD = _daemon_cfg.harvest_grace_period
 PID_FILE = Path.home() / ".claude" / "memory-daemon.pid"
 LOG_FILE = Path.home() / ".claude" / "memory-daemon.log"
 
-# Pattern detection interval (config-derived constant)
-_PATTERN_DETECTION_INTERVAL = _daemon_cfg.pattern_detection_interval_hours * 3600
+
+# All config-derived values are read at call time via properties on _daemon_cfg.
+# These uppercase names are kept for backward compat but now delegate to live config.
+def _poll_interval() -> int:
+    return _daemon_cfg.poll_interval
+
+
+def _max_concurrent() -> int:
+    return _daemon_cfg.max_concurrent_extractions
+
+
+def _extraction_timeout() -> int:
+    return _daemon_cfg.extraction_timeout
+
+
+def _harvest_grace_period() -> int:
+    return _daemon_cfg.harvest_grace_period
+
+
+def _pattern_detection_interval() -> float:
+    return _daemon_cfg.pattern_detection_interval_hours * 3600
 
 
 # ---------------------------------------------------------------------------
@@ -394,7 +407,7 @@ def watchdog_stuck_extractions():
     killed = []
     for pid, (session_id, proc, jsonl_path, project, start_time) in list(ae.items()):
         elapsed = now - start_time
-        if elapsed > EXTRACTION_TIMEOUT:
+        if elapsed > _extraction_timeout():
             elapsed_min = int(elapsed / 60)
             log(f"Watchdog: killing stuck extraction "
                 f"{session_id} (pid={pid}, "
@@ -420,7 +433,7 @@ def process_pending_queue():
     ae = get_active_extractions()
     pq = get_pending_queue()
     spawned = 0
-    while pq and len(ae) < MAX_CONCURRENT_EXTRACTIONS:
+    while pq and len(ae) < _max_concurrent():
         session_id, project, transcript_path = pq.pop(0)
         log(f"Dequeuing {session_id} (project={project or 'unknown'}, "
             f"queue remaining: {len(pq)})")
@@ -437,7 +450,7 @@ def queue_or_extract(
     """Queue extraction if at limit, otherwise extract immediately."""
     ae = get_active_extractions()
     pq = get_pending_queue()
-    if len(ae) >= MAX_CONCURRENT_EXTRACTIONS:
+    if len(ae) >= _max_concurrent():
         pq.append((session_id, project, transcript_path))
         log(f"Queued {session_id} (active={len(ae)}, "
             f"queue={len(pq)})")
@@ -546,7 +559,7 @@ def daemon_tick() -> None:
         for sid in newly_dead_ids:
             mark_session_exited(sid)
             log(f"Skipping {sid}: marked exited, "
-                f"grace period {HARVEST_GRACE_PERIOD}s")
+                f"grace period {_harvest_grace_period()}s")
 
         # Extract truly stale sessions
         if truly_stale:
@@ -566,7 +579,7 @@ def daemon_tick() -> None:
     _check_pattern_detection()
     if use_postgres():
         elapsed = time.time() - _ensure_daemon_state().last_pattern_run
-        if elapsed > _PATTERN_DETECTION_INTERVAL:
+        if elapsed > _pattern_detection_interval():
             _run_pattern_detection_batch()
 
 
@@ -577,7 +590,7 @@ def daemon_loop():
     db_type = "PostgreSQL" if use_postgres() else "SQLite"
     log(f"Memory daemon v{DAEMON_VERSION} started "
         f"(using {db_type}, "
-        f"max_concurrent={MAX_CONCURRENT_EXTRACTIONS})")
+        f"max_concurrent={_max_concurrent()})")
     ensure_schema()
     recover_stalled_extractions()
 
@@ -594,7 +607,7 @@ def daemon_loop():
             daemon_tick()
         except Exception as e:
             log(f"Error in daemon loop: {e}")
-        time.sleep(POLL_INTERVAL)
+        time.sleep(_poll_interval())
 
 
 def is_running() -> tuple[bool, int | None]:
@@ -745,7 +758,7 @@ def status_daemon():
                 print(f"\nPattern Detection:")
                 print(f"  Last run: {last_run}")
                 print(f"  Active patterns: {count}")
-                interval_h = _PATTERN_DETECTION_INTERVAL // 3600
+                interval_h = int(_pattern_detection_interval()) // 3600
                 print(f"  Interval: every {interval_h}h")
             else:
                 print("\nPattern Detection: no runs yet")

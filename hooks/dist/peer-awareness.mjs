@@ -239,15 +239,14 @@ function main() {
   } catch {
   }
   const project = getProject();
-  const projectName = project.split("/").pop() || "unknown";
   const ownSessionId = readSessionId();
   const cachePath = join3(process.env.HOME || "/tmp", ".claude", "cache", "peer-sessions.json");
-  let sessions = readPeerCache(cachePath, projectName, CACHE_TTL_SECONDS);
+  let sessions = readPeerCache(cachePath, project, CACHE_TTL_SECONDS);
   if (sessions === null) {
     const result = getActiveSessions(project);
     if (result.success) {
       sessions = result.sessions;
-      writePeerCache(cachePath, projectName, sessions);
+      writePeerCache(cachePath, project, sessions);
     } else {
       console.log(JSON.stringify({}));
       return;

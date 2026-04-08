@@ -30,19 +30,19 @@ export function main(): void {
   }
 
   const project = getProject();
-  const projectName = project.split('/').pop() || 'unknown';
   const ownSessionId = readSessionId();
   const cachePath = join(process.env.HOME || '/tmp', '.claude', 'cache', 'peer-sessions.json');
 
-  // Try cache first
-  let sessions = readPeerCache(cachePath, projectName, CACHE_TTL_SECONDS);
+  // Use full project path as cache key to prevent cross-project/worktree bleed
+  // (basename alone would collide between repos or worktrees with the same name)
+  let sessions = readPeerCache(cachePath, project, CACHE_TTL_SECONDS);
 
   if (sessions === null) {
     // Cache miss or stale — query DB
     const result = getActiveSessions(project);
     if (result.success) {
       sessions = result.sessions;
-      writePeerCache(cachePath, projectName, sessions);
+      writePeerCache(cachePath, project, sessions);
     } else {
       // DB unreachable — degrade gracefully, no output
       console.log(JSON.stringify({}));

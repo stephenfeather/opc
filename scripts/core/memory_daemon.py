@@ -80,17 +80,12 @@ def _is_extraction_blocked(project_dir: str) -> bool:
     return sentinel.exists()
 
 
-def _normalize_project(path_str: str) -> str | None:
-    """Normalize project path to short name, handling worktrees."""
-    if not path_str:
-        return None
-    p = Path(path_str)
-    parts = p.parts
-    if ".worktrees" in parts:
-        idx = parts.index(".worktrees")
-        name = parts[idx - 1] if idx > 0 else p.name
-        return name or None
-    return p.name or None
+# Re-exports from memory_daemon_core (D12: shims per step)
+from scripts.core.memory_daemon_core import (  # noqa: E402
+    StaleSession,
+    _ALLOWED_EXTRACTION_MODELS,
+    _normalize_project,
+)
 
 # Config from opc.toml [daemon]
 from scripts.core.config import get_config as _get_config
@@ -114,9 +109,6 @@ pending_queue: list[tuple[str, str, str | None]] = []  # [(session_id, project, 
 _PATTERN_DETECTION_INTERVAL = _daemon_cfg.pattern_detection_interval_hours * 3600
 _pattern_proc: subprocess.Popen | None = None
 _last_pattern_run: float = 0
-
-# Allowlist of Claude models permitted for extraction subprocesses.
-_ALLOWED_EXTRACTION_MODELS = frozenset({"sonnet", "haiku", "opus"})
 
 
 def _setup_logging() -> logging.Logger:

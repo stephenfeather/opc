@@ -234,12 +234,19 @@ function main() {
     console.log(JSON.stringify({}));
     return;
   }
+  let ownSessionId = null;
   try {
-    readFileSync4(0, "utf-8");
+    const stdinContent = readFileSync4(0, "utf-8");
+    const input = JSON.parse(stdinContent);
+    if (input && typeof input.session_id === "string") {
+      ownSessionId = input.session_id;
+    }
   } catch {
   }
+  if (!ownSessionId) {
+    ownSessionId = readSessionId();
+  }
   const project = getProject();
-  const ownSessionId = readSessionId();
   const cachePath = join3(process.env.HOME || "/tmp", ".claude", "cache", "peer-sessions.json");
   let sessions = readPeerCache(cachePath, project, CACHE_TTL_SECONDS);
   if (sessions === null) {

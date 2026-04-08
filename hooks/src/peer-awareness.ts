@@ -22,15 +22,24 @@ export function main(): void {
     return;
   }
 
-  // Read stdin (required by hook protocol, but we don't need the content)
+  // Read stdin to get current session_id (authoritative for self-filtering)
+  let ownSessionId: string | null = null;
   try {
-    readFileSync(0, 'utf-8');
+    const stdinContent = readFileSync(0, 'utf-8');
+    const input = JSON.parse(stdinContent);
+    if (input && typeof input.session_id === 'string') {
+      ownSessionId = input.session_id;
+    }
   } catch {
-    // stdin read failure is non-fatal
+    // stdin parse failure — fall back to persisted file
+  }
+
+  // Fall back to persisted session ID only if stdin didn't provide one
+  if (!ownSessionId) {
+    ownSessionId = readSessionId();
   }
 
   const project = getProject();
-  const ownSessionId = readSessionId();
   const cachePath = join(process.env.HOME || '/tmp', '.claude', 'cache', 'peer-sessions.json');
 
   // Use full project path as cache key to prevent cross-project/worktree bleed

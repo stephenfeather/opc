@@ -54,14 +54,15 @@ class TestDaemonState:
 class TestGetActiveExtractions:
     """get_active_extractions returns the live dict from _daemon_state."""
 
-    def test_raises_without_state(self):
+    def test_lazy_inits_without_state(self):
         import scripts.core.memory_daemon as mod
 
         original = mod._daemon_state
         try:
             mod._daemon_state = None
-            with pytest.raises(RuntimeError, match="daemon context"):
-                mod.get_active_extractions()
+            result = mod.get_active_extractions()
+            assert isinstance(result, dict)
+            assert mod._daemon_state is not None  # lazy-initialized
         finally:
             mod._daemon_state = original
 
@@ -83,14 +84,15 @@ class TestGetActiveExtractions:
 class TestGetPendingQueue:
     """get_pending_queue returns the live list from _daemon_state."""
 
-    def test_raises_without_state(self):
+    def test_lazy_inits_without_state(self):
         import scripts.core.memory_daemon as mod
 
         original = mod._daemon_state
         try:
             mod._daemon_state = None
-            with pytest.raises(RuntimeError, match="daemon context"):
-                mod.get_pending_queue()
+            result = mod.get_pending_queue()
+            assert isinstance(result, list)
+            assert mod._daemon_state is not None
         finally:
             mod._daemon_state = original
 
@@ -140,7 +142,7 @@ class TestDaemonTick:
     ):
         from scripts.core.memory_daemon import daemon_tick
 
-        daemon_tick(self.state)
+        daemon_tick()
 
         mock_reap.assert_called_once()
         mock_watchdog.assert_called_once()
@@ -159,7 +161,7 @@ class TestDaemonTick:
     ):
         from scripts.core.memory_daemon import daemon_tick
 
-        daemon_tick(self.state)
+        daemon_tick()
         mock_check.assert_called_once()
 
     @patch("scripts.core.memory_daemon._run_pattern_detection_batch")
@@ -177,7 +179,7 @@ class TestDaemonTick:
 
         # Set last_pattern_run far in the past
         self.state.last_pattern_run = 0
-        daemon_tick(self.state)
+        daemon_tick()
         mock_run.assert_called_once()
 
 
@@ -223,7 +225,7 @@ class TestDaemonTickStaleFiltering:
         mock_stale.return_value = [
             ("sess-1", "proj", "/t.jsonl", 1234, None),
         ]
-        daemon_tick(self.state)
+        daemon_tick()
 
         mock_mark_exited.assert_called_once_with("sess-1")
         mock_mark_extracting.assert_not_called()
@@ -253,7 +255,7 @@ class TestDaemonTickStaleFiltering:
         mock_stale.return_value = [
             ("sess-2", "proj", "/t.jsonl", 1234, datetime(2020, 1, 1)),
         ]
-        daemon_tick(self.state)
+        daemon_tick()
 
         mock_mark_extracting.assert_called_once_with("sess-2")
         mock_queue.assert_called_once_with("sess-2", "proj", "/t.jsonl")

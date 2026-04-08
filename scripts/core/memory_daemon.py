@@ -166,28 +166,31 @@ def create_daemon_state() -> DaemonState:
     return DaemonState()
 
 
-# Module-level state pointer (set in daemon_loop before while True)
+# Module-level state pointer (set in daemon_loop before while True,
+# lazy-initialized by accessors for backward compat outside daemon context)
 _daemon_state: DaemonState | None = None
 
 
-def get_active_extractions() -> dict:
-    """Return the live active_extractions dict from daemon state.
+def _ensure_daemon_state() -> DaemonState:
+    """Return _daemon_state, lazy-initializing if needed.
 
-    Raises RuntimeError if called outside daemon context.
+    This allows callers outside daemon_loop (tests, one-off extract_memories
+    calls) to work without requiring daemon_loop setup first.
     """
+    global _daemon_state
     if _daemon_state is None:
-        raise RuntimeError("get_active_extractions called outside daemon context")
-    return _daemon_state.active_extractions
+        _daemon_state = create_daemon_state()
+    return _daemon_state
+
+
+def get_active_extractions() -> dict:
+    """Return the live active_extractions dict from daemon state."""
+    return _ensure_daemon_state().active_extractions
 
 
 def get_pending_queue() -> list:
-    """Return the live pending_queue list from daemon state.
-
-    Raises RuntimeError if called outside daemon context.
-    """
-    if _daemon_state is None:
-        raise RuntimeError("get_pending_queue called outside daemon context")
-    return _daemon_state.pending_queue
+    """Return the live pending_queue list from daemon state."""
+    return _ensure_daemon_state().pending_queue
 
 
 
@@ -510,10 +513,10 @@ def _check_pattern_detection():
         state.pattern_proc = None
 
 
-def daemon_tick(state: DaemonState) -> None:
+def daemon_tick() -> None:
     """Execute one iteration of the daemon loop.
 
-    Mutates state in place (D9). Called from daemon_loop's while True.
+    Reads/writes _daemon_state (the single source of truth).
     try/except and time.sleep stay in daemon_loop, NOT here.
     """
     # Reap completed, kill stuck, then process pending queue
@@ -569,7 +572,7 @@ def daemon_tick(state: DaemonState) -> None:
     # Only runs on PostgreSQL — pattern_batch.py requires asyncpg
     _check_pattern_detection()
     if use_postgres():
-        elapsed = time.time() - state.last_pattern_run
+        elapsed = time.time() - _daemon_state.last_pattern_run
         if elapsed > _PATTERN_DETECTION_INTERVAL:
             _run_pattern_detection_batch()
 
@@ -594,7 +597,7 @@ def daemon_loop():
 
     while True:
         try:
-            daemon_tick(_daemon_state)
+            daemon_tick()
         except Exception as e:
             log(f"Error in daemon loop: {e}")
         time.sleep(POLL_INTERVAL)

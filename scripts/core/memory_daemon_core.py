@@ -10,7 +10,7 @@ a predicate parameter — the core function itself remains pure.
 from __future__ import annotations
 
 from collections.abc import Callable
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import NamedTuple
 
 # ---------------------------------------------------------------------------
@@ -52,7 +52,7 @@ def _normalize_project(path_str: str | None) -> str | None:
     """
     if not path_str:
         return None
-    p = PurePosixPath(path_str)
+    p = Path(path_str)
     parts = p.parts
     if ".worktrees" in parts:
         idx = parts.index(".worktrees")

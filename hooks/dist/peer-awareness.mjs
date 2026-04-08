@@ -1,6 +1,6 @@
 // src/peer-awareness.ts
 import { readFileSync as readFileSync4 } from "fs";
-import { join as join3 } from "path";
+import { join as join4 } from "path";
 
 // src/shared/db-utils-pg.ts
 import { spawnSync } from "child_process";
@@ -55,6 +55,12 @@ function requireOpcDir() {
     process.exit(0);
   }
   return opcDir;
+}
+
+// src/shared/pattern-router.ts
+var SAFE_ID_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
+function isValidId(id) {
+  return SAFE_ID_PATTERN.test(id);
 }
 
 // src/shared/db-utils-pg.ts
@@ -189,7 +195,7 @@ function getProject() {
 }
 
 // src/session-context.ts
-import { existsSync as existsSync2, readFileSync as readFileSync3, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2 } from "fs";
+import { readFileSync as readFileSync3, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, renameSync } from "fs";
 import { dirname } from "path";
 function formatPeerMessage(peers) {
   if (peers.length === 0) return null;
@@ -201,7 +207,6 @@ ${lines.join("\n")}`;
 }
 function readPeerCache(cachePath, project, ttlSeconds) {
   try {
-    if (!existsSync2(cachePath)) return null;
     const raw = readFileSync3(cachePath, "utf-8");
     const data = JSON.parse(raw);
     if (data.project !== project) return null;
@@ -221,7 +226,9 @@ function writePeerCache(cachePath, project, sessions) {
       project,
       sessions
     };
-    writeFileSync2(cachePath, JSON.stringify(data), { encoding: "utf-8" });
+    const tmpPath = cachePath + ".tmp." + process.pid;
+    writeFileSync2(tmpPath, JSON.stringify(data), { encoding: "utf-8" });
+    renameSync(tmpPath, cachePath);
   } catch {
   }
 }
@@ -238,7 +245,7 @@ function main() {
   try {
     const stdinContent = readFileSync4(0, "utf-8");
     const input = JSON.parse(stdinContent);
-    if (input && typeof input.session_id === "string") {
+    if (input && typeof input.session_id === "string" && isValidId(input.session_id)) {
       ownSessionId = input.session_id;
     }
   } catch {
@@ -247,7 +254,7 @@ function main() {
     ownSessionId = readSessionId();
   }
   const project = getProject();
-  const cachePath = join3(process.env.HOME || "/tmp", ".claude", "cache", "peer-sessions.json");
+  const cachePath = join4(process.env.HOME || "/tmp", ".claude", "cache", "peer-sessions.json");
   let sessions = readPeerCache(cachePath, project, CACHE_TTL_SECONDS);
   if (sessions === null) {
     const result = getActiveSessions(project);

@@ -57,6 +57,12 @@ function requireOpcDir() {
   return opcDir;
 }
 
+// src/shared/pattern-router.ts
+var SAFE_ID_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
+function isValidId(id) {
+  return SAFE_ID_PATTERN.test(id);
+}
+
 // src/shared/db-utils-pg.ts
 function getPgConnectionString() {
   return process.env.CONTINUOUS_CLAUDE_DB_URL || process.env.DATABASE_URL || process.env.OPC_POSTGRES_URL || "postgresql://claude:claude_dev@localhost:5432/continuous_claude";
@@ -201,18 +207,16 @@ function getProject() {
 }
 
 // src/session-context.ts
-import { existsSync as existsSync2, readFileSync as readFileSync3, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2 } from "fs";
+import { readFileSync as readFileSync3, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, renameSync } from "fs";
 function checkMemoryHealth(pgRegistrationSucceeded, pidFilePath) {
   const pgHealthy = pgRegistrationSucceeded;
   let daemonRunning = false;
   try {
-    if (existsSync2(pidFilePath)) {
-      const pidContent = readFileSync3(pidFilePath, "utf-8").trim();
-      const pid = parseInt(pidContent, 10);
-      if (!isNaN(pid)) {
-        process.kill(pid, 0);
-        daemonRunning = true;
-      }
+    const pidContent = readFileSync3(pidFilePath, "utf-8").trim();
+    const pid = parseInt(pidContent, 10);
+    if (!isNaN(pid) && pid > 0) {
+      process.kill(pid, 0);
+      daemonRunning = true;
     }
   } catch {
     daemonRunning = false;
@@ -233,7 +237,6 @@ ${warnings.join("\n")}`;
 }
 function getPendingTasksSummary(tasksFilePath) {
   try {
-    if (!existsSync2(tasksFilePath)) return null;
     const content = readFileSync3(tasksFilePath, "utf-8");
     if (!content.trim()) return null;
     const titles = content.split("\n").filter((line) => line.startsWith("## ")).map((line) => line.slice(3).trim());
@@ -263,6 +266,10 @@ function main() {
     return;
   }
   const sessionId = input.session_id;
+  if (!isValidId(sessionId)) {
+    console.log(JSON.stringify({ result: "continue" }));
+    return;
+  }
   const project = getProject();
   const projectName = project.split("/").pop() || "unknown";
   process.env.COORDINATION_SESSION_ID = sessionId;

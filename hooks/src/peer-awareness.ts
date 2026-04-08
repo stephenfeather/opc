@@ -9,7 +9,7 @@
 
 import { readFileSync } from 'fs';
 import { join } from 'path';
-import { getActiveSessions } from './shared/db-utils-pg.js';
+import { getActiveSessions, isValidId } from './shared/db-utils-pg.js';
 import { readSessionId, getProject } from './shared/session-id.js';
 import { readPeerCache, writePeerCache, formatPeerMessage } from './session-context.js';
 
@@ -27,7 +27,7 @@ export function main(): void {
   try {
     const stdinContent = readFileSync(0, 'utf-8');
     const input = JSON.parse(stdinContent);
-    if (input && typeof input.session_id === 'string') {
+    if (input && typeof input.session_id === 'string' && isValidId(input.session_id)) {
       ownSessionId = input.session_id;
     }
   } catch {

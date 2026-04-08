@@ -1,17 +1,15 @@
 // src/session-context.ts
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
+import { readFileSync, writeFileSync, mkdirSync, renameSync } from "fs";
 import { dirname } from "path";
 function checkMemoryHealth(pgRegistrationSucceeded, pidFilePath) {
   const pgHealthy = pgRegistrationSucceeded;
   let daemonRunning = false;
   try {
-    if (existsSync(pidFilePath)) {
-      const pidContent = readFileSync(pidFilePath, "utf-8").trim();
-      const pid = parseInt(pidContent, 10);
-      if (!isNaN(pid)) {
-        process.kill(pid, 0);
-        daemonRunning = true;
-      }
+    const pidContent = readFileSync(pidFilePath, "utf-8").trim();
+    const pid = parseInt(pidContent, 10);
+    if (!isNaN(pid) && pid > 0) {
+      process.kill(pid, 0);
+      daemonRunning = true;
     }
   } catch {
     daemonRunning = false;
@@ -32,7 +30,6 @@ ${warnings.join("\n")}`;
 }
 function getPendingTasksSummary(tasksFilePath) {
   try {
-    if (!existsSync(tasksFilePath)) return null;
     const content = readFileSync(tasksFilePath, "utf-8");
     if (!content.trim()) return null;
     const titles = content.split("\n").filter((line) => line.startsWith("## ")).map((line) => line.slice(3).trim());
@@ -55,7 +52,6 @@ ${lines.join("\n")}`;
 }
 function readPeerCache(cachePath, project, ttlSeconds) {
   try {
-    if (!existsSync(cachePath)) return null;
     const raw = readFileSync(cachePath, "utf-8");
     const data = JSON.parse(raw);
     if (data.project !== project) return null;
@@ -75,7 +71,9 @@ function writePeerCache(cachePath, project, sessions) {
       project,
       sessions
     };
-    writeFileSync(cachePath, JSON.stringify(data), { encoding: "utf-8" });
+    const tmpPath = cachePath + ".tmp." + process.pid;
+    writeFileSync(tmpPath, JSON.stringify(data), { encoding: "utf-8" });
+    renameSync(tmpPath, cachePath);
   } catch {
   }
 }

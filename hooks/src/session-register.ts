@@ -10,7 +10,7 @@
 
 import { readFileSync } from 'fs';
 import { join } from 'path';
-import { registerSession } from './shared/db-utils-pg.js';
+import { registerSession, isValidId } from './shared/db-utils-pg.js';
 import { writeSessionId, getProject } from './shared/session-id.js';
 import { checkMemoryHealth, formatHealthWarnings, getPendingTasksSummary } from './session-context.js';
 import type { SessionStartInput, HookOutput } from './shared/types.js';
@@ -38,6 +38,11 @@ export function main(): void {
   }
 
   const sessionId = input.session_id;
+  if (!isValidId(sessionId)) {
+    console.log(JSON.stringify({ result: 'continue' }));
+    return;
+  }
+
   const project = getProject();
   const projectName = project.split('/').pop() || 'unknown';
 

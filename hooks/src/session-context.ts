@@ -8,8 +8,8 @@
  * All functions are pure or have isolated I/O — no DB access, no stdin parsing.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
-import { dirname } from 'path';
+import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
+import { dirname, join } from 'path';
 import type { SessionInfo } from './shared/db-utils-pg.js';
 
 // ---------------------------------------------------------------------------
@@ -36,13 +36,11 @@ export function checkMemoryHealth(
   let daemonRunning = false;
 
   try {
-    if (existsSync(pidFilePath)) {
-      const pidContent = readFileSync(pidFilePath, 'utf-8').trim();
-      const pid = parseInt(pidContent, 10);
-      if (!isNaN(pid)) {
-        process.kill(pid, 0); // signal 0 = existence check
-        daemonRunning = true;
-      }
+    const pidContent = readFileSync(pidFilePath, 'utf-8').trim();
+    const pid = parseInt(pidContent, 10);
+    if (!isNaN(pid) && pid > 0) {
+      process.kill(pid, 0); // signal 0 = existence check
+      daemonRunning = true;
     }
   } catch {
     // Process not found or permission error — daemon is not running
@@ -83,8 +81,6 @@ export function formatHealthWarnings(health: HealthStatus): string | null {
  */
 export function getPendingTasksSummary(tasksFilePath: string): string | null {
   try {
-    if (!existsSync(tasksFilePath)) return null;
-
     const content = readFileSync(tasksFilePath, 'utf-8');
     if (!content.trim()) return null;
 
@@ -147,8 +143,6 @@ export function readPeerCache(
   ttlSeconds: number,
 ): SessionInfo[] | null {
   try {
-    if (!existsSync(cachePath)) return null;
-
     const raw = readFileSync(cachePath, 'utf-8');
     const data: PeerCache = JSON.parse(raw);
 
@@ -182,7 +176,10 @@ export function writePeerCache(
       sessions,
     };
 
-    writeFileSync(cachePath, JSON.stringify(data), { encoding: 'utf-8' });
+    // Atomic write: write to temp file then rename to avoid corruption from concurrent hooks
+    const tmpPath = cachePath + '.tmp.' + process.pid;
+    writeFileSync(tmpPath, JSON.stringify(data), { encoding: 'utf-8' });
+    renameSync(tmpPath, cachePath);
   } catch {
     // Cache write failure is non-fatal — next call will query DB
   }

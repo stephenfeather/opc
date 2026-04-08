@@ -1,4 +1,4 @@
-/**
+/*!
  * PostToolUse Hook: TypeScript Pre-flight Check
  *
  * Runs tsc + qlty after Edit/Write on .ts/.tsx files to catch errors immediately.

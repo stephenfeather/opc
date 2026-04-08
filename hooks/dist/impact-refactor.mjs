@@ -8,7 +8,17 @@ import { join, resolve } from "path";
 import { tmpdir } from "os";
 import * as net from "net";
 import * as crypto from "crypto";
-//! @hook none (shared library) @preserve
+/*!
+ * Shared TypeScript client for TLDR daemon.
+ *
+ * Used by all TypeScript hooks to query the TLDR daemon instead of
+ * spawning individual `tldr` processes. This provides:
+ * - Faster queries (daemon holds indexes in memory)
+ * - Reduced process overhead
+ * - Consistent timeout handling
+ * - Auto-start capability
+ * - Graceful degradation when indexing
+ */
 function resolveProjectDir(projectDir) {
   return resolve(projectDir);
 }
@@ -259,6 +269,14 @@ function trackHookActivitySync(hookName, projectDir, success = true, metrics = {
 }
 
 // src/impact-refactor.ts
+/*!
+ * UserPromptSubmit Hook: Impact Analysis for Refactoring (DAEMON)
+ *
+ * When user mentions refactor/change/rename + function name, automatically
+ * runs impact analysis via daemon and injects the results as context.
+ *
+ * Uses TLDR daemon for fast cached responses (50ms vs 500ms CLI).
+ */
 var REFACTOR_KEYWORDS = [
   /\brefactor\b/i,
   /\brename\b/i,

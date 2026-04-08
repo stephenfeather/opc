@@ -1,5 +1,4 @@
-//! @hook PostToolUse:Bash|Task @preserve
-/**
+/*!
  * Failure Detection Hook (PostToolUse:Bash|Task)
  *
  * Detects errors in Bash and Task tool responses and suggests

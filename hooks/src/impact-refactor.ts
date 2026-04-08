@@ -1,4 +1,4 @@
-/**
+/*!
  * UserPromptSubmit Hook: Impact Analysis for Refactoring (DAEMON)
  *
  * When user mentions refactor/change/rename + function name, automatically

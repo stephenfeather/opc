@@ -1,4 +1,4 @@
-/**
+/*!
  * PreToolUse Hook: Architecture Context Injection
  *
  * When a Task prompt mentions planning, design, or architecture keywords,

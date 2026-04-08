@@ -1,5 +1,4 @@
-//! @hook UserPromptSubmit @preserve
-/**
+/*!
  * Memory Awareness Hook (UserPromptSubmit)
  *
  * Checks if user prompt is similar to stored learnings.

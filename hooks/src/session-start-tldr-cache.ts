@@ -1,4 +1,4 @@
-/**
+/*!
  * SessionStart Hook: TLDR Cache Warming (Async)
  *
  * On session startup, triggers cache warming in a detached background process.

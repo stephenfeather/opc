@@ -1,5 +1,4 @@
-//! @hook PostToolUse:Grep|Read @preserve
-/**
+/*!
  * Epistemic Reminder Hook (PostToolUse:Grep|Read)
  *
  * Injects epistemic discipline reminders after Grep and Read results.

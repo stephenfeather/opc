@@ -1,4 +1,4 @@
-/**
+/*!
  * PreToolUse Hook: Modern CLI Enforcer
  *
  * Intercepts Bash tool calls that use legacy CLI commands and denies them

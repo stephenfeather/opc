@@ -1,6 +1,16 @@
 // src/failure-detection.ts
 import { readFileSync } from "fs";
-//! @hook PostToolUse:Bash|Task @preserve
+/*!
+ * Failure Detection Hook (PostToolUse:Bash|Task)
+ *
+ * Detects errors in Bash and Task tool responses and suggests
+ * documentation searches for resolution.
+ *
+ * - Bash: checks exit_code !== 0 and extracts error from stderr/stdout
+ * - Task: scans response text for error/exception/crash patterns
+ * - Extracts specific Python exception context (ModuleNotFoundError, etc.)
+ * - Suggests Nia documentation search with the error context
+ */
 var TASK_ERROR_PATTERNS = [
   /\berror\b/i,
   /\bfailed\b/i,

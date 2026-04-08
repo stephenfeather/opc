@@ -1,4 +1,4 @@
-/**
+/*!
  * Prompt-Based Skill Validation
  *
  * Reduces false-positive skill activations by using LLM validation to

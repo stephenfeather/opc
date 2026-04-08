@@ -1,4 +1,4 @@
-/**
+/*!
  * Path-based rule injection hook
  *
  * Fires on PreToolUse for Read/Edit/Write

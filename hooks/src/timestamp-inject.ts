@@ -1,5 +1,4 @@
-//! @hook UserPromptSubmit @preserve
-/**
+/*!
  * Timestamp Injection Hook (UserPromptSubmit)
  *
  * Injects the current local time into every prompt as additionalContext,

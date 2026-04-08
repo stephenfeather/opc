@@ -1,5 +1,4 @@
-#!/usr/bin/env node
-/**
+/*!
  * Import Error Detector - PostToolUse hook that detects Python import errors
  * and suggests the /dependency-preflight skill.
  *

@@ -1,4 +1,4 @@
-/**
+/*!
  * Pytest Runner Hook (PostToolUse)
  *
  * Runs pytest after Edit/Write of Python source files.

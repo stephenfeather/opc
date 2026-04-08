@@ -230,7 +230,16 @@ function getProject() {
 }
 
 // src/file-claims.ts
-//! @hook PreToolUse:Edit @preserve
+/*!
+ * PreToolUse:Edit Hook - Check and claim files for conflict prevention.
+ *
+ * This hook:
+ * 1. Checks if another session has claimed the file
+ * 2. Warns if file is being edited by another session
+ * 3. Claims the file for the current session
+ *
+ * Part of the coordination layer architecture (Phase 1).
+ */
 function main() {
   let input;
   try {

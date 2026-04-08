@@ -1,4 +1,4 @@
-/**
+/*!
  * TLDR Read Enforcer Hook - BLOCKING VERSION (DAEMON)
  *
  * Intercepts Read tool calls for code files and BLOCKS with TLDR context.

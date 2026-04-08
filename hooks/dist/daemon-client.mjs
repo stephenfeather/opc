@@ -5,7 +5,17 @@ import { join, resolve } from "path";
 import { tmpdir } from "os";
 import * as net from "net";
 import * as crypto from "crypto";
-//! @hook none (shared library) @preserve
+/*!
+ * Shared TypeScript client for TLDR daemon.
+ *
+ * Used by all TypeScript hooks to query the TLDR daemon instead of
+ * spawning individual `tldr` processes. This provides:
+ * - Faster queries (daemon holds indexes in memory)
+ * - Reduced process overhead
+ * - Consistent timeout handling
+ * - Auto-start capability
+ * - Graceful degradation when indexing
+ */
 function resolveProjectDir(projectDir) {
   return resolve(projectDir);
 }

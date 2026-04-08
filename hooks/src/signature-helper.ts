@@ -1,4 +1,4 @@
-/**
+/*!
  * Signature Helper Hook (PreToolUse:Edit)
  *
  * When Claude edits code containing function calls, inject the function signatures.

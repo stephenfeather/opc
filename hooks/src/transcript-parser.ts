@@ -1,5 +1,4 @@
-//! @hook none (shared library) @preserve
-/**
+/*!
  * Transcript Parser Module
  *
  * Parses JSONL transcript files from Claude Code sessions and extracts

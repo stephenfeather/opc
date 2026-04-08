@@ -1,4 +1,11 @@
 // src/agent-subagent-guard.ts
+/*!
+ * PreToolUse:Agent hook — blocks Agent calls with missing/null subagent_type.
+ *
+ * The general-purpose default (Claude Code internal) grants all tools including
+ * Write/Edit, which is too permissive. This hook denies the call and suggests
+ * appropriate specialist agent types based on the prompt content.
+ */
 var AGENT_SUGGESTIONS = [
   { keyword: /\b(fix|bug|debug|error|fail|broken|trace|root.?cause)\b/i, agent: "sleuth", description: "Bug investigation and root cause analysis" },
   { keyword: /\b(implement|build|create|add|feature|write code)\b/i, agent: "kraken", description: "Implementation (large) or spark (small fix)" },

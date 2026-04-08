@@ -1,4 +1,4 @@
-/**
+/*!
  * TLDR Context Injection Hook - Intent-Aware Version (DAEMON)
  *
  * Routes to different TLDR layers based on detected intent:

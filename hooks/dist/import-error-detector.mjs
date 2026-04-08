@@ -1,7 +1,16 @@
-#!/usr/bin/env node
-
 // src/import-error-detector.ts
 import { readFileSync } from "fs";
+/*!
+ * Import Error Detector - PostToolUse hook that detects Python import errors
+ * and suggests the /dependency-preflight skill.
+ *
+ * Runs on Bash tool output, matches patterns like:
+ * - ModuleNotFoundError: No module named 'X'
+ * - ImportError: cannot import name 'Y'
+ * - No module named 'Z'
+ *
+ * Returns a system reminder suggesting the skill when errors are detected.
+ */
 var IMPORT_ERROR_PATTERNS = [
   /ModuleNotFoundError:\s*No module named\s*['"]?(\w+)['"]?/i,
   /ImportError:\s*cannot import name\s*['"]?(\w+)['"]?/i,

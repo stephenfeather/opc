@@ -1,6 +1,12 @@
 // src/path-rules.ts
 import { readFileSync, existsSync } from "fs";
 import { join } from "path";
+/*!
+ * Path-based rule injection hook
+ *
+ * Fires on PreToolUse for Read/Edit/Write
+ * Matches file paths against patterns and injects relevant skill content
+ */
 var PATH_RULES = [
   // Hook development
   { pattern: /\.claude\/hooks\//, skillName: "hooks", description: "Hook development" },

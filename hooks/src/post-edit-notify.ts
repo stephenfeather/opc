@@ -1,4 +1,4 @@
-/**
+/*!
  * Post-Edit Notification Hook
  *
  * Notifies TLDR daemon after file edits for dirty-count tracking.

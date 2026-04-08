@@ -1,5 +1,4 @@
-#!/usr/bin/env node
-/**
+/*!
  * PreToolUse Hook: TLDR Search Sanitizer
  *
  * Removes unsupported "--project" flag from `tldr search` Bash commands.

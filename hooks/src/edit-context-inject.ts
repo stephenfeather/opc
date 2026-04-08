@@ -1,4 +1,4 @@
-/**
+/*!
  * Pre-Edit Context Injection Hook
  *
  * Injects file structure from TLDR before Claude edits a file.

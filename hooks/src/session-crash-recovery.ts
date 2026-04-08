@@ -1,5 +1,4 @@
-//! @hook SessionStart @preserve
-/**
+/*!
  * Session Crash Recovery Hook (SessionStart)
  *
  * Detects when a previous session crashed (no clean exit recorded in DB)

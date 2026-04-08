@@ -1,5 +1,4 @@
-//! @hook Stop @preserve
-/**
+/*!
  * Session Clean Exit Hook (SessionEnd)
  *
  * Marks the session as cleanly exited in PostgreSQL.

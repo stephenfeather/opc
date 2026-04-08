@@ -47,7 +47,18 @@ function getOpcDir() {
 }
 
 // src/memory-awareness.ts
-//! @hook UserPromptSubmit @preserve
+/*!
+ * Memory Awareness Hook (UserPromptSubmit)
+ *
+ * Checks if user prompt is similar to stored learnings.
+ * Shows hint to BOTH user (visible) AND Claude (system context).
+ *
+ * Flow:
+ * 1. Extract INTENT from user prompt (not just keywords)
+ * 2. Semantic search using hybrid RRF (text + vector)
+ * 3. If score > threshold, show visible hint with top learning preview
+ * 4. Claude proactively discloses and acts on relevant memories
+ */
 function readStdin() {
   return readFileSync2(0, "utf-8");
 }

@@ -1,5 +1,4 @@
-//! @hook SessionStart @preserve
-/**
+/*!
  * Session Start Memory Push Hook (SessionStart, type=startup)
  *
  * Proactively surfaces high-value, never-recalled learnings at session start.

@@ -1,4 +1,4 @@
-/**
+/*!
  * PHP Test Runner Hook (PostToolUse)
  *
  * Runs composer-defined test scripts after Edit/Write of PHP source files.

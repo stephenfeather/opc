@@ -1,4 +1,13 @@
 // src/modern-cli-enforcer.ts
+/*!
+ * PreToolUse Hook: Modern CLI Enforcer
+ *
+ * Intercepts Bash tool calls that use legacy CLI commands and denies them
+ * with a hint about the correct modern alternative.
+ *
+ * Catches commands that bypass settings.json deny rules (e.g., piped commands,
+ * subshells, or commands settings.json patterns don't match).
+ */
 var REWRITABLE_COMMANDS = {
   "ls": ["eza", "-la", false],
   "du": ["dust", "", false],

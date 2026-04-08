@@ -1,4 +1,4 @@
-/**
+/*!
  * Compiler-in-the-Loop Stop Hook
  *
  * Prevents Claude from stopping if there are unresolved Lean errors/sorries.

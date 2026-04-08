@@ -1,4 +1,4 @@
-/**
+/*!
  * PreToolUse:Agent hook — blocks Agent calls with missing/null subagent_type.
  *
  * The general-purpose default (Claude Code internal) grants all tools including

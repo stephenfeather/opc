@@ -1,5 +1,4 @@
-//! @hook SessionStart @preserve
-/**
+/*!
  * SessionStart Hook - Registers session in coordination layer.
  *
  * This hook:

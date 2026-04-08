@@ -1,4 +1,4 @@
-/**
+/*!
  * Compiler-in-the-Loop Hook
  *
  * PostToolUse handler for .lean files:

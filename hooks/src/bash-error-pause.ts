@@ -1,5 +1,4 @@
-//! @hook PostToolUse:Bash @preserve
-/**
+/*!
  * Bash Error Pause Hook (PostToolUse:Bash)
  *
  * Scans Bash tool responses for warnings and errors, then injects

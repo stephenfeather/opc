@@ -1,4 +1,4 @@
-/**
+/*!
  * Import Validator Hook (PostToolUse)
  *
  * After Write/Edit, checks if imports reference symbols that exist.

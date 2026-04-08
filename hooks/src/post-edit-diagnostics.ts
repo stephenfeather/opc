@@ -1,4 +1,4 @@
-/**
+/*!
  * Post-Edit Diagnostics Hook
  *
  * Runs shift-left diagnostics after file edits.

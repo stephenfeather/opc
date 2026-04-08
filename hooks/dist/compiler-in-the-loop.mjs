@@ -3,6 +3,15 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { execSync } from "child_process";
 import { join } from "path";
 import { tmpdir } from "os";
+/*!
+ * Compiler-in-the-Loop Hook
+ *
+ * PostToolUse handler for .lean files:
+ * - Runs Lean compiler on written files
+ * - Calls Goedel-Prover-V2-8B via LMStudio for tactic suggestions
+ * - Stores errors in state file for Stop hook
+ * - Provides compiler feedback + AI suggestions to Claude
+ */
 var LMSTUDIO_BASE_URL = process.env.LMSTUDIO_BASE_URL || "http://127.0.0.1:1234";
 var LMSTUDIO_ENDPOINT = process.env.LMSTUDIO_ENDPOINT || `${LMSTUDIO_BASE_URL}/v1/completions`;
 var GOEDEL_ENABLED = process.env.GOEDEL_ENABLED !== "false";

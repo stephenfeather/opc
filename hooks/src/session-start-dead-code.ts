@@ -1,4 +1,4 @@
-/**
+/*!
  * SessionStart Hook: Dead Code Detection
  *
  * On session startup/resume, runs `tldr dead` to detect unused functions

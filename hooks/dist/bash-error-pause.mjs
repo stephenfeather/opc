@@ -1,6 +1,11 @@
 // src/bash-error-pause.ts
 import { readFileSync } from "fs";
-//! @hook PostToolUse:Bash @preserve
+/*!
+ * Bash Error Pause Hook (PostToolUse:Bash)
+ *
+ * Scans Bash tool responses for warnings and errors, then injects
+ * a reminder to verify the root cause before explaining to the user.
+ */
 var WARNING_PATTERNS = [
   /\bwarn(ing)?\b/i,
   /\bdeprecated\b/i,

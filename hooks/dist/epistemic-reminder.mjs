@@ -1,6 +1,16 @@
 // src/epistemic-reminder.ts
 import { readFileSync } from "fs";
-//! @hook PostToolUse:Grep|Read @preserve
+/*!
+ * Epistemic Reminder Hook (PostToolUse:Grep|Read)
+ *
+ * Injects epistemic discipline reminders after Grep and Read results.
+ * Referenced by claim-verification.md rule.
+ *
+ * - After Read: reminds to update ? INFERRED claims to ✓ VERIFIED
+ * - After Grep (existence checks or file-list mode): warns that grep
+ *   results are not proof and Read is required for verification
+ * - After Grep (other): lighter reminder
+ */
 function main() {
   let input;
   try {

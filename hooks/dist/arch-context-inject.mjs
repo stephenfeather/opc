@@ -8,7 +8,17 @@ import { join, resolve } from "path";
 import { tmpdir } from "os";
 import * as net from "net";
 import * as crypto from "crypto";
-//! @hook none (shared library) @preserve
+/*!
+ * Shared TypeScript client for TLDR daemon.
+ *
+ * Used by all TypeScript hooks to query the TLDR daemon instead of
+ * spawning individual `tldr` processes. This provides:
+ * - Faster queries (daemon holds indexes in memory)
+ * - Reduced process overhead
+ * - Consistent timeout handling
+ * - Auto-start capability
+ * - Graceful degradation when indexing
+ */
 function resolveProjectDir(projectDir) {
   return resolve(projectDir);
 }
@@ -259,6 +269,15 @@ function trackHookActivitySync(hookName, projectDir, success = true, metrics = {
 }
 
 // src/arch-context-inject.ts
+/*!
+ * PreToolUse Hook: Architecture Context Injection
+ *
+ * When a Task prompt mentions planning, design, or architecture keywords,
+ * this hook runs `tldr arch` and injects the architectural layer information
+ * into the prompt.
+ *
+ * This gives agents/subagents architectural context for better planning.
+ */
 var PLANNING_PATTERNS = [
   /\bplan\b/i,
   /\bdesign\b/i,

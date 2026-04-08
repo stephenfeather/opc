@@ -1,4 +1,4 @@
-/**
+/*!
  * PreToolUse Hook: Smart Search Router
  *
  * Routes Grep calls to the most token-efficient tool:

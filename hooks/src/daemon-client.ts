@@ -1,5 +1,4 @@
-//! @hook none (shared library) @preserve
-/**
+/*!
  * Shared TypeScript client for TLDR daemon.
  *
  * Used by all TypeScript hooks to query the TLDR daemon instead of

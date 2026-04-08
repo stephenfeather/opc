@@ -1,4 +1,3 @@
-//! @hook SessionStart @preserve
 import * as fs from 'fs';
 import * as path from 'path';
 import { execSync, spawn } from 'child_process';
@@ -14,8 +13,8 @@ interface SessionStartInput {
 // UUID ISOLATION: Path construction & parsing
 // ============================================
 
-/**
- * Build handoff directory name with UUID suffix for isolation.
+/*!
+ * Build handoff directory name with UUID suffix for isolation. (SessionStart)
  * Format: {sessionName}-{first8CharsOfUUID}
  * Example: "auth-refactor-550e8400"
  */

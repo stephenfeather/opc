@@ -15,12 +15,14 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _clean_active_extractions():
-    """Clear active_extractions before each test to avoid cross-test pollution."""
-    from scripts.core.memory_daemon import active_extractions
+    """Set up DaemonState so get_active_extractions() works in tests."""
+    import scripts.core.memory_daemon as mod
 
-    active_extractions.clear()
+    state = mod.create_daemon_state()
+    original = mod._daemon_state
+    mod._daemon_state = state
     yield
-    active_extractions.clear()
+    mod._daemon_state = original
 
 
 @pytest.fixture(autouse=True)

@@ -32,11 +32,10 @@ import logging
 import logging.handlers
 import os
 import signal
-import sqlite3
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -132,15 +131,61 @@ HARVEST_GRACE_PERIOD = _daemon_cfg.harvest_grace_period
 PID_FILE = Path.home() / ".claude" / "memory-daemon.pid"
 LOG_FILE = Path.home() / ".claude" / "memory-daemon.log"
 
-# Worker queue state (module-level for daemon process)
-active_extractions: dict = {}  # pid -> (session_id, proc, jsonl_path, project, start_time)
-pending_queue: list[tuple[str, str, str | None]] = []  # [(session_id, project, transcript_path), ...]
-
-# Pattern detection state (module-level for daemon process)
-# Interval configurable via PATTERN_DETECTION_INTERVAL_HOURS env var
+# Pattern detection interval (config-derived constant)
 _PATTERN_DETECTION_INTERVAL = _daemon_cfg.pattern_detection_interval_hours * 3600
-_pattern_proc: subprocess.Popen | None = None
-_last_pattern_run: float = 0
+
+
+# ---------------------------------------------------------------------------
+# DaemonState (D14: single source of truth for mutable daemon state)
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass, field  # noqa: E402
+
+
+@dataclass
+class DaemonState:
+    """All mutable state for the daemon process.
+
+    Replaces module-level globals (active_extractions, pending_queue,
+    _pattern_proc, _last_pattern_run). Created once in daemon_loop(),
+    stored in _daemon_state for accessor helpers.
+    """
+
+    active_extractions: dict = field(default_factory=dict)
+    pending_queue: list = field(default_factory=list)
+    pattern_proc: subprocess.Popen | None = None
+    last_pattern_run: float = 0.0
+
+
+def create_daemon_state() -> DaemonState:
+    """Factory: create a fresh DaemonState with empty collections."""
+    return DaemonState()
+
+
+# Module-level state pointer (set in daemon_loop before while True)
+_daemon_state: DaemonState | None = None
+
+
+def get_active_extractions() -> dict:
+    """Return the live active_extractions dict from daemon state.
+
+    Raises RuntimeError if called outside daemon context.
+    """
+    if _daemon_state is None:
+        raise RuntimeError("get_active_extractions called outside daemon context")
+    return _daemon_state.active_extractions
+
+
+def get_pending_queue() -> list:
+    """Return the live pending_queue list from daemon state.
+
+    Raises RuntimeError if called outside daemon context.
+    """
+    if _daemon_state is None:
+        raise RuntimeError("get_pending_queue called outside daemon context")
+    return _daemon_state.pending_queue
+
+
 
 
 def _setup_logging() -> logging.Logger:
@@ -186,17 +231,6 @@ def log(msg: str):
 
 
 # (pg_ensure_column moved to memory_daemon_db.py)
-
-
-def pg_get_stale_sessions() -> list:
-    """Wrapper: injects config into memory_daemon_db.pg_get_stale_sessions."""
-    return _pg_get_stale_sessions_impl(
-        stale_threshold=STALE_THRESHOLD,
-        max_retries=MAX_RETRIES,
-        harvest_grace_period=HARVEST_GRACE_PERIOD,
-    )
-
-
 # (pg_mark_*, sqlite_mark_*, recovery, dispatchers moved to memory_daemon_db.py)
 # Config-injecting wrappers for functions that took module-level globals (D3):
 
@@ -337,12 +371,12 @@ Store each learning using store_learning.py with appropriate type and tags."""
             stderr=subprocess.DEVNULL,
             env=env,
         )
-        active_extractions[proc.pid] = (
+        get_active_extractions()[proc.pid] = (
             session_id, proc, jsonl_path, project_dir, time.time()
         )
         log(f"Started extraction for {session_id} "
             f"(pid={proc.pid}, file={jsonl_path.name}, "
-            f"active={len(active_extractions)})")
+            f"active={len(get_active_extractions())})")
         return True
     except Exception as e:
         log(f"Failed to start extraction: {e}")
@@ -560,8 +594,9 @@ def _count_session_rejections(session_id: str) -> int | None:
 
 def reap_completed_extractions():
     """Check for completed extraction processes and remove from active set."""
+    ae = get_active_extractions()
     completed = []
-    for pid, (session_id, proc, jsonl_path, project, _start) in list(active_extractions.items()):
+    for pid, (session_id, proc, jsonl_path, project, _start) in list(ae.items()):
         exit_code = proc.poll()
         if exit_code is not None:
             completed.append(pid)
@@ -583,18 +618,17 @@ def reap_completed_extractions():
                 mark_extraction_failed(session_id)
 
     for pid in completed:
-        del active_extractions[pid]
+        del ae[pid]
 
     return len(completed)
 
 
 def watchdog_stuck_extractions():
     """Kill extraction subprocesses that exceed EXTRACTION_TIMEOUT."""
+    ae = get_active_extractions()
     now = time.time()
     killed = []
-    for pid, (session_id, proc, jsonl_path, project, start_time) in list(
-        active_extractions.items()
-    ):
+    for pid, (session_id, proc, jsonl_path, project, start_time) in list(ae.items()):
         elapsed = now - start_time
         if elapsed > EXTRACTION_TIMEOUT:
             elapsed_min = int(elapsed / 60)
@@ -610,7 +644,7 @@ def watchdog_stuck_extractions():
             mark_extraction_failed(session_id)
 
     for pid in killed:
-        del active_extractions[pid]
+        del ae[pid]
 
     if killed:
         log(f"Watchdog: killed {len(killed)} stuck extractions")
@@ -619,11 +653,13 @@ def watchdog_stuck_extractions():
 
 def process_pending_queue():
     """Spawn extractions from queue if under concurrency limit."""
+    ae = get_active_extractions()
+    pq = get_pending_queue()
     spawned = 0
-    while pending_queue and len(active_extractions) < MAX_CONCURRENT_EXTRACTIONS:
-        session_id, project, transcript_path = pending_queue.pop(0)
+    while pq and len(ae) < MAX_CONCURRENT_EXTRACTIONS:
+        session_id, project, transcript_path = pq.pop(0)
         log(f"Dequeuing {session_id} (project={project or 'unknown'}, "
-            f"queue remaining: {len(pending_queue)})")
+            f"queue remaining: {len(pq)})")
         extract_memories(session_id, project, transcript_path)
         spawned += 1
     return spawned
@@ -635,10 +671,12 @@ def queue_or_extract(
     transcript_path: str | None = None,
 ):
     """Queue extraction if at limit, otherwise extract immediately."""
-    if len(active_extractions) >= MAX_CONCURRENT_EXTRACTIONS:
-        pending_queue.append((session_id, project, transcript_path))
-        log(f"Queued {session_id} (active={len(active_extractions)}, "
-            f"queue={len(pending_queue)})")
+    ae = get_active_extractions()
+    pq = get_pending_queue()
+    if len(ae) >= MAX_CONCURRENT_EXTRACTIONS:
+        pq.append((session_id, project, transcript_path))
+        log(f"Queued {session_id} (active={len(ae)}, "
+            f"queue={len(pq)})")
     else:
         extract_memories(session_id, project, transcript_path)
 
@@ -652,22 +690,23 @@ def _run_pattern_detection_batch():
 
     Uses Popen to avoid blocking the daemon loop (detection can take
     minutes on large datasets). Only one detection run at a time.
+    Operates on _daemon_state fields (D14).
     """
-    global _pattern_proc, _last_pattern_run
+    state = _daemon_state
     # Don't start if already running
-    if _pattern_proc is not None and _pattern_proc.poll() is None:
+    if state.pattern_proc is not None and state.pattern_proc.poll() is None:
         log("Pattern detection already running, skipping")
         return
     try:
         project_root = Path(__file__).parent.parent.parent
         log("Starting pattern detection batch...")
-        _pattern_proc = subprocess.Popen(
+        state.pattern_proc = subprocess.Popen(
             [sys.executable, "-m", "scripts.core.pattern_batch"],
             cwd=str(project_root),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        _last_pattern_run = time.time()
+        state.last_pattern_run = time.time()
     except Exception as e:
         log(f"Pattern detection launch error: {e}")
 
@@ -675,15 +714,15 @@ def _run_pattern_detection_batch():
 def _check_pattern_detection():
     """Check if background pattern detection finished.
 
-    Called from daemon loop each iteration.
+    Called from daemon loop each iteration. Operates on _daemon_state (D14).
     """
-    global _pattern_proc
-    if _pattern_proc is None:
+    state = _daemon_state
+    if state.pattern_proc is None:
         return
-    rc = _pattern_proc.poll()
+    rc = state.pattern_proc.poll()
     if rc is not None:
         if rc == 0:
-            stdout = _pattern_proc.stdout.read().decode()
+            stdout = state.pattern_proc.stdout.read().decode()
             try:
                 import json as _json
                 data = _json.loads(stdout)
@@ -698,13 +737,79 @@ def _check_pattern_detection():
             except (_json.JSONDecodeError, KeyError):
                 log(f"Pattern detection completed: {stdout[:200]}")
         else:
-            stderr = _pattern_proc.stderr.read().decode()[:200]
+            stderr = state.pattern_proc.stderr.read().decode()[:200]
             log(f"Pattern detection failed (rc={rc}): {stderr}")
-        _pattern_proc = None
+        state.pattern_proc = None
+
+
+def daemon_tick(state: DaemonState) -> None:
+    """Execute one iteration of the daemon loop.
+
+    Mutates state in place (D9). Called from daemon_loop's while True.
+    try/except and time.sleep stay in daemon_loop, NOT here.
+    """
+    # Reap completed, kill stuck, then process pending queue
+    reap_completed_extractions()
+    watchdog_stuck_extractions()
+    process_pending_queue()
+
+    # Find stale sessions (SQL excludes those within grace period)
+    stale_rows = get_stale_sessions()
+    if stale_rows:
+        # Convert raw tuples to StaleSession NamedTuples
+        from scripts.core.memory_daemon_core import filter_truly_stale_sessions
+
+        stale_sessions = [
+            StaleSession(
+                id=row[0],
+                project=row[1],
+                transcript_path=row[2] if len(row) > 2 else None,
+                pid=row[3] if len(row) > 3 else None,
+                exited_at=row[4] if len(row) > 4 else None,
+            )
+            for row in stale_rows
+        ]
+
+        truly_stale, newly_dead_ids, still_alive_ids = filter_truly_stale_sessions(
+            stale_sessions, is_alive=_is_process_alive
+        )
+
+        # Log still-alive sessions
+        for sid in still_alive_ids:
+            log(f"Skipping {sid}: process still alive")
+
+        # Mark newly-dead sessions (grace period starts)
+        for sid in newly_dead_ids:
+            mark_session_exited(sid)
+            log(f"Skipping {sid}: marked exited, "
+                f"grace period {HARVEST_GRACE_PERIOD}s")
+
+        # Extract truly stale sessions
+        if truly_stale:
+            summary = ", ".join(
+                f"{s.id}({s.project or '?'})" for s in truly_stale
+            )
+            log(f"Found {len(truly_stale)} stale sessions: "
+                f"{summary}")
+            for s in truly_stale:
+                mark_extracting(s.id)
+                queue_or_extract(
+                    s.id, s.project or "", s.transcript_path
+                )
+
+    # Pattern detection: check completion, trigger if due
+    # Only runs on PostgreSQL — pattern_batch.py requires asyncpg
+    _check_pattern_detection()
+    if use_postgres():
+        elapsed = time.time() - state.last_pattern_run
+        if elapsed > _PATTERN_DETECTION_INTERVAL:
+            _run_pattern_detection_batch()
 
 
 def daemon_loop():
-    """Main daemon loop."""
+    """Main daemon loop: init, then tick + sleep forever."""
+    global _daemon_state
+
     db_type = "PostgreSQL" if use_postgres() else "SQLite"
     log(f"Memory daemon v{DAEMON_VERSION} started "
         f"(using {db_type}, "
@@ -712,67 +817,18 @@ def daemon_loop():
     ensure_schema()
     recover_stalled_extractions()
 
-    global _last_pattern_run
-    _last_pattern_run = _seed_last_pattern_run()
-    if _last_pattern_run:
+    # Create DaemonState and set module-level pointer (D14)
+    _daemon_state = create_daemon_state()
+    _daemon_state.last_pattern_run = _seed_last_pattern_run()
+    if _daemon_state.last_pattern_run:
         log(f"Seeded last pattern run from DB: "
-            f"{datetime.fromtimestamp(_last_pattern_run).isoformat()}")
+            f"{datetime.fromtimestamp(_daemon_state.last_pattern_run).isoformat()}")
 
     while True:
         try:
-            # Reap completed, kill stuck, then process pending queue
-            reap_completed_extractions()
-            watchdog_stuck_extractions()
-            process_pending_queue()
-
-            # Find stale sessions (SQL excludes those within grace period)
-            stale = get_stale_sessions()
-            if stale:
-                # Filter: skip alive processes, mark newly-dead sessions
-                truly_stale = []
-                for row in stale:
-                    session_id = row[0]
-                    pid = row[3] if len(row) > 3 else None
-                    exited_at = row[4] if len(row) > 4 else None
-                    if _is_process_alive(pid):
-                        log(f"Skipping {session_id}: process {pid} "
-                            f"still alive")
-                        continue
-                    if exited_at is None:
-                        # First time daemon sees this session as dead;
-                        # record exited_at so grace period starts
-                        mark_session_exited(session_id)
-                        log(f"Skipping {session_id}: marked exited, "
-                            f"grace period {HARVEST_GRACE_PERIOD}s")
-                        continue
-                    # exited_at exists and past grace period (SQL filtered)
-                    truly_stale.append(row)
-
-                if truly_stale:
-                    summary = ", ".join(
-                        f"{sid}({proj or '?'})"
-                        for sid, proj, *_ in truly_stale
-                    )
-                    log(f"Found {len(truly_stale)} stale sessions: "
-                        f"{summary}")
-                    for row in truly_stale:
-                        session_id, project = row[0], row[1]
-                        tp = row[2] if len(row) > 2 else None
-                        mark_extracting(session_id)
-                        queue_or_extract(
-                            session_id, project or "", tp
-                        )
-            # Pattern detection: check completion, trigger if due
-            # Only runs on PostgreSQL — pattern_batch.py requires asyncpg
-            _check_pattern_detection()
-            if use_postgres():
-                elapsed = time.time() - _last_pattern_run
-                if elapsed > _PATTERN_DETECTION_INTERVAL:
-                    _run_pattern_detection_batch()
-
+            daemon_tick(_daemon_state)
         except Exception as e:
             log(f"Error in daemon loop: {e}")
-
         time.sleep(POLL_INTERVAL)
 
 

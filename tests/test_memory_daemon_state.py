@@ -266,8 +266,8 @@ class TestDaemonTickStaleFiltering:
 # ---------------------------------------------------------------------------
 
 
-class TestReapZombieProcess:
-    """reap_completed_extractions calls os.waitpid to clean up zombies."""
+class TestReapCompletedExtractions:
+    """reap_completed_extractions removes completed PIDs from active set."""
 
     @pytest.fixture(autouse=True)
     def _setup_state(self):
@@ -288,9 +288,8 @@ class TestReapZombieProcess:
     @patch("scripts.core.memory_daemon._count_session_rejections", return_value=None)
     @patch("scripts.core.memory_daemon._count_session_learnings", return_value=None)
     @patch("scripts.core.memory_daemon.log")
-    @patch("os.waitpid")
-    def test_waitpid_called_on_completed(
-        self, mock_waitpid, mock_log, mock_count, mock_rej,
+    def test_removes_completed_pid_from_active(
+        self, mock_log, mock_count, mock_rej,
         mock_mark, mock_cal, mock_wf, mock_hoff, mock_arch
     ):
         mock_proc = MagicMock()
@@ -302,27 +301,21 @@ class TestReapZombieProcess:
 
         from scripts.core.memory_daemon import reap_completed_extractions
 
-        reap_completed_extractions()
+        count = reap_completed_extractions()
 
-        mock_waitpid.assert_called_once_with(42, os.WNOHANG)
+        assert count == 1
         assert 42 not in self.state.active_extractions
+        mock_mark.assert_called_once_with("sess-1")
 
-    @patch("scripts.core.memory_daemon.archive_session_jsonl")
-    @patch("scripts.core.memory_daemon._generate_mini_handoff")
-    @patch("scripts.core.memory_daemon._extract_and_store_workflows")
-    @patch("scripts.core.memory_daemon._calibrate_session_confidence")
-    @patch("scripts.core.memory_daemon.mark_extracted")
+    @patch("scripts.core.memory_daemon.mark_extraction_failed")
     @patch("scripts.core.memory_daemon._count_session_rejections", return_value=None)
     @patch("scripts.core.memory_daemon._count_session_learnings", return_value=None)
     @patch("scripts.core.memory_daemon.log")
-    @patch("os.waitpid", side_effect=ChildProcessError("already reaped"))
-    def test_handles_child_already_reaped(
-        self, mock_waitpid, mock_log, mock_count, mock_rej,
-        mock_mark, mock_cal, mock_wf, mock_hoff, mock_arch
+    def test_marks_failed_on_nonzero_exit(
+        self, mock_log, mock_count, mock_rej, mock_fail
     ):
-        """Gracefully handles case where child is reaped between poll() and waitpid()."""
         mock_proc = MagicMock()
-        mock_proc.poll.return_value = 0
+        mock_proc.poll.return_value = 1
         mock_proc.pid = 42
         self.state.active_extractions[42] = (
             "sess-1", mock_proc, Path("/t.jsonl"), "proj", 0
@@ -330,10 +323,10 @@ class TestReapZombieProcess:
 
         from scripts.core.memory_daemon import reap_completed_extractions
 
-        # Should not raise
         count = reap_completed_extractions()
+
         assert count == 1
-        assert 42 not in self.state.active_extractions
+        mock_fail.assert_called_once_with("sess-1")
 
 
 # ---------------------------------------------------------------------------

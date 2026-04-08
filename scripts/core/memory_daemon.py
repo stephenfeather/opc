@@ -384,12 +384,8 @@ def reap_completed_extractions():
 
     for pid in completed:
         del ae[pid]
-        # Reap zombie process (Popen.poll uses same syscall, but explicit
-        # waitpid ensures the process table entry is cleaned up)
-        try:
-            os.waitpid(pid, os.WNOHANG)
-        except ChildProcessError:
-            pass  # Already reaped between poll() and waitpid()
+        # Note: Popen.poll() already calls waitpid internally, so the
+        # child is fully reaped. No explicit os.waitpid needed here.
 
     return len(completed)
 

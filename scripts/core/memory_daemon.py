@@ -106,6 +106,7 @@ from scripts.core.memory_daemon_db import (  # noqa: E402
     pg_mark_extracted,
     pg_mark_extraction_failed as _pg_mark_extraction_failed_impl,
     pg_mark_archived,
+    mark_archived,
     pg_mark_session_exited,
     sqlite_mark_extracting,
     sqlite_mark_extracted,
@@ -284,11 +285,6 @@ def mark_extraction_failed(session_id: str):
     _mark_extraction_failed_impl(session_id, max_retries=_daemon_cfg.max_retries)
 
 
-def _count_session_learnings(session_id: str) -> int | None:
-    """Wrapper: delegates to memory_daemon_db.count_session_learnings."""
-    return _count_session_learnings_db(session_id)
-
-
 # Unified interface
 def _is_process_alive(pid: int | None) -> bool:
     """Check if a process is still running via kill(0) signal."""
@@ -325,7 +321,7 @@ def extract_memories(
 def archive_session_jsonl(session_id: str, jsonl_path: Path | None = None):
     """Wrapper: delegates to memory_daemon_extractors.archive_session_jsonl."""
     _archive_session_jsonl_impl(
-        session_id, jsonl_path, log_fn=log, mark_archived_fn=pg_mark_archived,
+        session_id, jsonl_path, log_fn=log, mark_archived_fn=mark_archived,
     )
 
 
@@ -459,7 +455,7 @@ def _run_pattern_detection_batch():
     minutes on large datasets). Only one detection run at a time.
     Operates on _daemon_state fields (D14).
     """
-    state = _daemon_state
+    state = _ensure_daemon_state()
     # Don't start if already running
     if state.pattern_proc is not None and state.pattern_proc.poll() is None:
         log("Pattern detection already running, skipping")
@@ -483,7 +479,7 @@ def _check_pattern_detection():
 
     Called from daemon loop each iteration. Operates on _daemon_state (D14).
     """
-    state = _daemon_state
+    state = _ensure_daemon_state()
     if state.pattern_proc is None:
         return
     rc = state.pattern_proc.poll()
@@ -568,7 +564,7 @@ def daemon_tick() -> None:
     # Only runs on PostgreSQL — pattern_batch.py requires asyncpg
     _check_pattern_detection()
     if use_postgres():
-        elapsed = time.time() - _daemon_state.last_pattern_run
+        elapsed = time.time() - _ensure_daemon_state().last_pattern_run
         if elapsed > _PATTERN_DETECTION_INTERVAL:
             _run_pattern_detection_batch()
 

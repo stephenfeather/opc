@@ -325,6 +325,14 @@ def pg_mark_archived(session_id: str, archive_path: str):
     conn.close()
 
 
+def mark_archived(session_id: str, archive_path: str):
+    """Mark session as archived. PostgreSQL-only; no-op on SQLite."""
+    if use_postgres():
+        pg_mark_archived(session_id, archive_path)
+    else:
+        logger.info("mark_archived skipped: SQLite does not support archive metadata")
+
+
 def pg_mark_session_exited(session_id: str):
     """Set exited_at for a session the daemon observed as dead (no clean exit)."""
     conn = pg_connect()

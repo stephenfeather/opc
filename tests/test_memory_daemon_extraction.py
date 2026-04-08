@@ -15,12 +15,14 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _clean_active_extractions():
-    """Clear active_extractions before each test to avoid cross-test pollution."""
-    from scripts.core.memory_daemon import active_extractions
+    """Set up DaemonState so get_active_extractions() works in tests."""
+    import scripts.core.memory_daemon as mod
 
-    active_extractions.clear()
+    state = mod.create_daemon_state()
+    original = mod._daemon_state
+    mod._daemon_state = state
     yield
-    active_extractions.clear()
+    mod._daemon_state = original
 
 
 @pytest.fixture(autouse=True)
@@ -107,7 +109,7 @@ def test_invalid_model_rejects_and_skips_popen(
 
     assert result is False
     mock_popen.assert_not_called()
-    mock_mark.assert_called_once_with("sess-3")
+    mock_mark.assert_not_called()  # should not mark as extracted — mark_extraction_failed handles it
 
 
 @pytest.mark.parametrize("model", ["sonnet", "haiku", "opus"])

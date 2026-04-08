@@ -36,7 +36,10 @@ export function main(): void {
 
   // Fall back to persisted session ID only if stdin didn't provide one
   if (!ownSessionId) {
-    ownSessionId = readSessionId();
+    const persisted = readSessionId();
+    if (persisted && isValidId(persisted)) {
+      ownSessionId = persisted;
+    }
   }
 
   // If we can't determine our own session ID, stay silent to avoid

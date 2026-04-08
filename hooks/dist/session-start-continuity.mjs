@@ -49,6 +49,7 @@ function getOpcDir() {
 
 // src/session-start-continuity.ts
 //! @hook SessionStart @preserve
+var MS_PER_HOUR = 36e5;
 function buildHandoffDirName(sessionName, sessionId) {
   const uuidShort = sessionId.replace(/-/g, "").slice(0, 8);
   return `${sessionName}-${uuidShort}`;
@@ -309,7 +310,7 @@ async function main() {
         if (sessionType === "startup") {
           message = `\u{1F4CB} Handoff Ledger: ${sessionName} \u2192 ${currentFocus} (run /resume-handoff for full context)`;
           const ageMs = Date.now() - mostRecentLedger.mtime;
-          const ageHours = Math.round(ageMs / 36e5);
+          const ageHours = Math.round(ageMs / MS_PER_HOUR);
           const ageStr = ageHours < 1 ? "less than 1h ago" : `${ageHours}h ago`;
           additionalContext = `Last session context:
 Goal: ${goalSummary}
@@ -399,7 +400,7 @@ Full handoff available at: ${handoffPath}
         try {
           const ledgerStat = fs.statSync(path.join(ledgerDir, mostRecent));
           const ageMs = Date.now() - ledgerStat.mtime.getTime();
-          const ageHours = Math.round(ageMs / 36e5);
+          const ageHours = Math.round(ageMs / MS_PER_HOUR);
           const ageStr = ageHours < 1 ? "less than 1h ago" : `${ageHours}h ago`;
           additionalContext = `Last session context:
 Goal: ${goalSummary}

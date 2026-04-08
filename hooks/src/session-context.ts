@@ -134,7 +134,7 @@ interface PeerCache {
  * Returns null if cache is missing, corrupt, stale, or for a different project.
  *
  * @param cachePath - Path to peer-sessions.json
- * @param project - Current project name (must match cached project)
+ * @param project - Cache key for project isolation (use full canonical path to prevent cross-project collisions)
  * @param ttlSeconds - Cache TTL in seconds (entries >= this age are stale)
  */
 export function readPeerCache(

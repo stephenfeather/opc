@@ -9,6 +9,8 @@ interface SessionStartInput {
   session_id: string;
 }
 
+const MS_PER_HOUR = 3_600_000;
+
 // ============================================
 // UUID ISOLATION: Path construction & parsing
 // ============================================
@@ -451,10 +453,10 @@ async function main() {
         const handoffFilename = path.basename(handoffPath);
 
         if (sessionType === 'startup') {
-          // Fresh startup: inject goal + focus so Claude has context without needing /resume_handoff
+          // Fresh startup: inject goal + focus so Claude has context without needing /resume-handoff
           message = `📋 Handoff Ledger: ${sessionName} → ${currentFocus} (run /resume-handoff for full context)`;
           const ageMs = Date.now() - mostRecentLedger.mtime;
-          const ageHours = Math.round(ageMs / 3600000);
+          const ageHours = Math.round(ageMs / MS_PER_HOUR);
           const ageStr = ageHours < 1 ? 'less than 1h ago' : `${ageHours}h ago`;
           additionalContext = `Last session context:\nGoal: ${goalSummary}\nFocus: ${currentFocus}\nHandoff: ${handoffFilename} (${ageStr})\nRun /resume-handoff for full context.`;
         } else {
@@ -538,7 +540,7 @@ async function main() {
       const latestHandoff = getLatestHandoff(handoffDir);
 
       if (sessionType === 'startup') {
-        // Fresh startup: inject goal + focus so Claude has context without needing /resume_handoff
+        // Fresh startup: inject goal + focus so Claude has context without needing /resume-handoff
         let startupMsg = `📋 Ledger available: ${sessionName} → ${currentFocus}`;
         if (latestHandoff) {
           if (latestHandoff.isAutoHandoff) {
@@ -554,7 +556,7 @@ async function main() {
         try {
           const ledgerStat = fs.statSync(path.join(ledgerDir, mostRecent));
           const ageMs = Date.now() - ledgerStat.mtime.getTime();
-          const ageHours = Math.round(ageMs / 3600000);
+          const ageHours = Math.round(ageMs / MS_PER_HOUR);
           const ageStr = ageHours < 1 ? 'less than 1h ago' : `${ageHours}h ago`;
           additionalContext = `Last session context:\nGoal: ${goalSummary}\nFocus: ${currentFocus}\nLedger: ${mostRecent} (${ageStr})\nRun /resume-handoff for full context.`;
         } catch {

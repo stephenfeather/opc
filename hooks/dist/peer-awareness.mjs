@@ -256,7 +256,10 @@ function main() {
   } catch {
   }
   if (!ownSessionId) {
-    ownSessionId = readSessionId();
+    const persisted = readSessionId();
+    if (persisted && isValidId(persisted)) {
+      ownSessionId = persisted;
+    }
   }
   if (!ownSessionId) {
     console.log(JSON.stringify({}));

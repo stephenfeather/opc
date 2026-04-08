@@ -105,6 +105,8 @@ def sqlite_ensure_table():
             working_on TEXT,
             started_at TIMESTAMP,
             last_heartbeat TIMESTAMP,
+            pid INTEGER,
+            exited_at TIMESTAMP,
             memory_extracted_at TIMESTAMP,
             extraction_status TEXT DEFAULT 'pending',
             extraction_attempts INTEGER DEFAULT 0,
@@ -115,6 +117,8 @@ def sqlite_ensure_table():
     """)
     # Add columns if table already exists without them
     for col, typedef in [
+        ("pid", "INTEGER"),
+        ("exited_at", "TIMESTAMP"),
         ("memory_extracted_at", "TIMESTAMP"),
         ("extraction_status", "TEXT DEFAULT 'pending'"),
         ("extraction_attempts", "INTEGER DEFAULT 0"),
@@ -325,12 +329,31 @@ def pg_mark_archived(session_id: str, archive_path: str):
     conn.close()
 
 
+def sqlite_mark_archived(session_id: str, archive_path: str):
+    """Mark session as archived in SQLite."""
+    import sqlite3
+    from datetime import datetime
+
+    db_path = get_sqlite_path()
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        UPDATE sessions
+        SET archived_at = ?, archive_path = ?
+        WHERE id = ?
+    """,
+        (datetime.now().isoformat(), archive_path, session_id),
+    )
+    conn.commit()
+    conn.close()
+
+
 def mark_archived(session_id: str, archive_path: str):
-    """Mark session as archived. PostgreSQL-only; no-op on SQLite."""
+    """Mark session as archived."""
     if use_postgres():
         pg_mark_archived(session_id, archive_path)
     else:
-        logger.info("mark_archived skipped: SQLite does not support archive metadata")
+        sqlite_mark_archived(session_id, archive_path)
 
 
 def pg_mark_session_exited(session_id: str):

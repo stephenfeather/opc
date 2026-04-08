@@ -92,7 +92,7 @@ class TestExtractMemoriesImpl:
         assert result is False
         mock_mark.assert_called_once_with("s1")
 
-    def test_invalid_model_marks_extracted_and_returns_false(self, tmp_path):
+    def test_invalid_model_skips_without_marking_extracted(self, tmp_path):
         from scripts.core.memory_daemon_extractors import extract_memories_impl
 
         jsonl = tmp_path / "session.jsonl"
@@ -116,7 +116,7 @@ class TestExtractMemoriesImpl:
         )
 
         assert result is False
-        mock_mark.assert_called_once_with("s1")
+        mock_mark.assert_not_called()
 
     def test_successful_extraction_starts_subprocess(self, tmp_path):
         from scripts.core.memory_daemon_extractors import extract_memories_impl

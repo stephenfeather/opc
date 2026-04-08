@@ -109,7 +109,7 @@ def test_invalid_model_rejects_and_skips_popen(
 
     assert result is False
     mock_popen.assert_not_called()
-    mock_mark.assert_called_once_with("sess-3")
+    mock_mark.assert_not_called()  # invalid model should NOT mark as extracted
 
 
 @pytest.mark.parametrize("model", ["sonnet", "haiku", "opus"])

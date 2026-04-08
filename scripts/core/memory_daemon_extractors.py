@@ -105,9 +105,9 @@ def extract_memories_impl(
         if daemon_cfg.extraction_model not in allowed_models:
             log_fn(
                 f"Invalid extraction_model '{daemon_cfg.extraction_model}', "
-                f"must be one of {sorted(allowed_models)}"
+                f"must be one of {sorted(allowed_models)}. "
+                f"Session {session_id} will retry on next cycle."
             )
-            mark_extracted_fn(session_id)
             return False
 
         env = os.environ.copy()
@@ -213,11 +213,14 @@ def archive_session_jsonl(
     except subprocess.TimeoutExpired:
         log_fn(f"Archive timeout for {session_id}")
         if zst_path.exists() and not jsonl_path.exists():
-            subprocess.run(
-                ["zstd", "-d", "-q", "--rm", str(zst_path)],
-                capture_output=True,
-                timeout=300,
-            )
+            try:
+                subprocess.run(
+                    ["zstd", "-d", "-q", "--rm", str(zst_path)],
+                    capture_output=True,
+                    timeout=300,
+                )
+            except (subprocess.TimeoutExpired, OSError) as restore_err:
+                log_fn(f"Archive cleanup failed for {session_id}: {restore_err}")
     except Exception as e:
         log_fn(f"Archive error for {session_id}: {e}")
 

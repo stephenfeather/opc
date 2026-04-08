@@ -10,13 +10,7 @@ async function readStdin() {
   });
 }
 async function main() {
-  let input;
-  try {
-    input = JSON.parse(await readStdin());
-  } catch {
-    console.log(JSON.stringify({ result: "continue" }));
-    return;
-  }
+  const input = JSON.parse(await readStdin());
   const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
   if (input.reason === "other") {
     console.log(JSON.stringify({ result: "continue" }));

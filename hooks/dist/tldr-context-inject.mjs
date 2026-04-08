@@ -9,6 +9,7 @@ import { join, resolve } from "path";
 import { tmpdir } from "os";
 import * as net from "net";
 import * as crypto from "crypto";
+//! @hook none (shared library) @preserve
 function resolveProjectDir(projectDir) {
   return resolve(projectDir);
 }

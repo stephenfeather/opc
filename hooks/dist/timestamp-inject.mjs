@@ -1,4 +1,4 @@
-// hooks/src/timestamp-inject.ts
+// src/timestamp-inject.ts
 import { readFileSync } from "fs";
 //! @hook UserPromptSubmit @preserve
 function readStdin() {
@@ -20,7 +20,15 @@ function formatTimestamp(now) {
   return `Current time: ${local} (${tz}) | ISO: ${iso}`;
 }
 function main() {
-  const input = JSON.parse(readStdin());
+  let input;
+  try {
+    input = JSON.parse(readStdin());
+  } catch {
+    return;
+  }
+  if (!input || typeof input !== "object" || !input.hook_event_name) {
+    return;
+  }
   if (process.env.CLAUDE_AGENT_ID) {
     return;
   }

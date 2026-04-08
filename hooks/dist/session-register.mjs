@@ -318,4 +318,3 @@ main();
 export {
   main
 };
-//! @hook SessionStart @preserve

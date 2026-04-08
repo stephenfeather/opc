@@ -26,7 +26,7 @@ class StaleSession(NamedTuple):
     """
 
     id: str
-    project: str
+    project: str | None
     transcript_path: str | None
     pid: int | None
     exited_at: object  # datetime | str | None — varies by backend
@@ -117,7 +117,9 @@ def build_s3_key(bucket: str, project_name: str, stem: str) -> str:
 
 def build_zst_path(jsonl_path: Path) -> Path:
     """Compute the .jsonl.zst path from a .jsonl path."""
-    return jsonl_path.with_suffix(".jsonl.zst")
+    if not jsonl_path.name.endswith(".jsonl"):
+        raise ValueError(f"Expected .jsonl file, got: {jsonl_path}")
+    return jsonl_path.parent / (jsonl_path.stem + ".jsonl.zst")
 
 
 def filter_truly_stale_sessions(

@@ -52,8 +52,9 @@ def extract_memories_impl(
 ) -> bool:
     """Run memory extraction for a session. Returns True if subprocess started.
 
-    All collaborators are injected (D1) — this function does NOT import
-    subprocess, mark_extracted, or _daemon_cfg directly.
+    All collaborators are injected (D1) — subprocess_popen, mark_extracted,
+    and _daemon_cfg are passed in, not imported directly. The module-level
+    subprocess import is used only for subprocess.DEVNULL constants.
     """
     log_fn(
         f"Extracting memories for session {session_id} "
@@ -255,7 +256,7 @@ def extract_and_store_workflows(
     jsonl_path: Path,
     project: str | None,
     log_fn: Callable[[str], None],
-    normalize_project_fn: Callable[[str], str],
+    normalize_project_fn: Callable[[str | None], str | None],
 ) -> None:
     """Extract workflow patterns and store as learnings. Non-fatal."""
     try:

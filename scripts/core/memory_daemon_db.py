@@ -525,21 +525,25 @@ def mark_session_exited(session_id: str):
 
 
 def count_session_learnings(session_id: str) -> int | None:
-    """Count learnings stored for a session. Returns None on error."""
-    try:
-        if use_postgres():
-            conn = pg_connect()
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT COUNT(*) FROM archival_memory WHERE session_id = %s",
-                (session_id,),
-            )
-            count = cur.fetchone()[0]
-            conn.close()
-            return count
-    except Exception:
+    """Count learnings stored for a session.
+
+    Returns None on error or when using SQLite (not implemented for SQLite).
+    """
+    if not use_postgres():
         return None
-    return None
+    try:
+        conn = pg_connect()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COUNT(*) FROM archival_memory WHERE session_id = %s",
+            (session_id,),
+        )
+        count = cur.fetchone()[0]
+        conn.close()
+        return count
+    except Exception as e:
+        logger.debug("count_session_learnings failed for %s: %s", session_id, e)
+        return None
 
 
 def seed_last_pattern_run() -> float:
@@ -558,6 +562,6 @@ def seed_last_pattern_run() -> float:
         conn.close()
         if row and row[0]:
             return row[0].timestamp()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("seed_last_pattern_run failed: %s", e)
     return 0

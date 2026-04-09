@@ -206,6 +206,14 @@ fi
 LOCK_DIR="${TMPDIR:-/tmp}/opc-deploy-hooks.lock.d"
 LOCK_PID_FILE="$LOCK_DIR/pid"
 LOCK_MAX_ATTEMPTS=5
+LOCK_GRACE_MS=100
+
+# PR #107 Copilot follow-up: track whether WE actually acquired the lock
+# before the trap fires. Previously the trap unconditionally rm -rf'd
+# $LOCK_DIR on exit, which meant an early-exit failure (before or during
+# acquisition) could delete a *different* process's freshly-acquired lock.
+# Gate the cleanup on _lock_acquired so we only release what we own.
+_lock_acquired=0
 
 _acquire_lock() {
     local attempt=0
@@ -213,54 +221,80 @@ _acquire_lock() {
         attempt=$((attempt + 1))
 
         if mkdir "$LOCK_DIR" 2>/dev/null; then
-            echo "$$" >"$LOCK_PID_FILE"
-            # Paranoia: verify the PID file still matches our PID. If
-            # another process raced in via the retry loop and quarantined
-            # our freshly-created lock, cat will return something else
-            # (or nothing), and we should loop back.
+            # Write the PID, tolerating failure. Between our mkdir and
+            # this write, another process could have quarantined our
+            # fresh lock (via the stale-reclaim path below). If the PID
+            # write fails — or the file no longer matches our PID after
+            # writing — loop back and try again. Without this, `set -e`
+            # would kill the script on a write failure and the trap
+            # would try to rm -rf a directory that now belongs to someone
+            # else.
+            if ! printf '%s\n' "$$" >"$LOCK_PID_FILE" 2>/dev/null; then
+                continue
+            fi
             if [ "$(cat "$LOCK_PID_FILE" 2>/dev/null || true)" = "$$" ]; then
+                _lock_acquired=1
                 return 0
             fi
             continue
         fi
 
-        # Lock dir already exists. Check liveness of the owning PID.
+        # Lock dir already exists. Read owner PID.
         local owner=""
         if [ -f "$LOCK_PID_FILE" ]; then
             owner="$(cat "$LOCK_PID_FILE" 2>/dev/null || true)"
         fi
+
+        # PR #107 Copilot follow-up: grace period for in-flight
+        # acquisitions. Another process may be in the narrow window
+        # between `mkdir "$LOCK_DIR"` and writing the PID file.
+        # Immediately treating a missing PID file as stale would let us
+        # quarantine a lock that's currently being created. Sleep briefly
+        # and re-read; if the PID file is still missing after the grace
+        # period, the creator almost certainly crashed and reclamation
+        # is justified.
+        if [ -z "$owner" ]; then
+            sleep "0.$(printf '%03d' "$LOCK_GRACE_MS")"
+            if [ -f "$LOCK_PID_FILE" ]; then
+                owner="$(cat "$LOCK_PID_FILE" 2>/dev/null || true)"
+            fi
+        fi
+
         if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
-            # Live owner - real contention, regardless of age. Never steal
-            # a lock from a running process.
+            # Live owner - real contention, regardless of age. Never
+            # steal a lock from a running process.
             return 1
         fi
 
-        # Stale: owner PID is dead or the PID file is missing. Atomically
-        # quarantine the stale lock dir. `mv` on a directory is a rename()
-        # syscall, which is atomic at the POSIX level - only one concurrent
-        # racer can win. The losing racer loops back and re-checks.
+        # Stale: owner PID is dead or the PID file is still missing
+        # after the grace period. Atomically quarantine the stale lock
+        # dir. `mv` on a directory is a rename() syscall, which is
+        # atomic at the POSIX level - only one concurrent racer can win.
+        # The losing racer loops back and re-checks.
         local quarantine="${LOCK_DIR}.stale.$$.$attempt"
         if mv "$LOCK_DIR" "$quarantine" 2>/dev/null; then
             rm -rf "$quarantine" 2>/dev/null || true
             echo "deploy_hooks: reclaimed stale lock (owner=${owner:-unknown})" >&2
-            # Loop back and try to create a fresh lock. Another reclaimer
-            # may have already created one, in which case we fall through
-            # to the liveness check on the next iteration.
             continue
         fi
-
-        # Another reclaimer beat us to the rename. Loop and re-check;
-        # either their fresh lock is now visible (live PID → exit 5) or
-        # the lock is gone and we get to mkdir it.
     done
     return 1
+}
+
+_release_lock() {
+    # Only clean up if we actually acquired the lock. Prevents an
+    # early-exit trap from wiping another process's lock.
+    if [ "$_lock_acquired" = "1" ]; then
+        rm -rf "$LOCK_DIR" 2>/dev/null || true
+        _lock_acquired=0
+    fi
 }
 
 if ! _acquire_lock; then
     echo "deploy_hooks: another deploy is in progress ($LOCK_DIR) - skipping" >&2
     exit 5
 fi
-trap 'rm -rf "$LOCK_DIR" 2>/dev/null || true' EXIT INT TERM
+trap _release_lock EXIT INT TERM
 
 # Defense-in-depth: re-check the target (and its subdirs) is still not a
 # symlink right before each filesystem mutation. Closes the TOCTOU window

@@ -647,6 +647,78 @@ class TestLockSerialization:
         # Target must NOT have been written.
         assert not (target / "src" / "sample.ts").exists()
 
+    def test_trap_does_not_remove_live_owners_lock_on_early_exit(
+        self, tmp_path: Path
+    ) -> None:
+        """PR #107 Copilot regression: the trap used to unconditionally
+        rm -rf $LOCK_DIR on exit, which could wipe a DIFFERENT process's
+        lock if this process hit an early-exit path (bad target, etc.).
+        After the fix, _lock_acquired gates the cleanup so only the
+        owner's trap removes the lock.
+
+        Setup: a live-owner lock dir exists. Run the script with a bad
+        target (exit 4 before lock acquisition). The lock dir must still
+        be there and contain the original owner's PID file."""
+        import os
+
+        opc_root, script, _target = _build_fixture(tmp_path)
+        lock_parent = tmp_path / "lock-test"
+        lock_parent.mkdir()
+        lock_dir = lock_parent / "opc-deploy-hooks.lock.d"
+        lock_dir.mkdir()
+        # Simulate a live owner (the test process itself).
+        owner_pid = str(os.getpid())
+        (lock_dir / "pid").write_text(f"{owner_pid}\n")
+
+        # Bad target (non-'hooks' basename) triggers exit 4 before
+        # acquisition.
+        bad_target = tmp_path / "claude-home" / "not-hooks"
+
+        result = _run(
+            script,
+            bad_target,
+            extra_env={"TMPDIR": str(lock_parent)},
+        )
+
+        assert result.returncode == 4
+        # The live owner's lock dir must still exist.
+        assert lock_dir.exists()
+        # And the PID file must be unchanged.
+        assert (lock_dir / "pid").read_text() == f"{owner_pid}\n"
+
+    def test_grace_period_tolerates_missing_pid_file_briefly(
+        self, tmp_path: Path
+    ) -> None:
+        """PR #107 Copilot regression: when mkdir just created $LOCK_DIR
+        but the PID write hasn't happened yet, another process that
+        sees an empty lock dir used to treat it as stale and quarantine
+        it — briefly violating mutual exclusion. The grace period gives
+        in-flight acquisitions ~100ms to complete before declaring stale.
+
+        Test: pre-create an empty lock dir (simulating the mid-acquire
+        state), then run the script. After the grace period, the PID
+        file is still missing, so reclamation proceeds as expected. This
+        mostly exercises the grace-period code path end-to-end; a strict
+        timing test would be flaky."""
+        opc_root, script, target = _build_fixture(tmp_path)
+        lock_parent = tmp_path / "lock-test"
+        lock_parent.mkdir()
+        lock_dir = lock_parent / "opc-deploy-hooks.lock.d"
+        lock_dir.mkdir()
+        # No PID file — simulates either a crash mid-acquire or a
+        # concurrent creator still in the window.
+
+        result = _run(
+            script,
+            target,
+            extra_env={"TMPDIR": str(lock_parent)},
+        )
+
+        # After the grace period elapses with no PID file appearing,
+        # the script reclaims and proceeds.
+        assert result.returncode == 0, result.stderr
+        assert (target / "src" / "sample.ts").exists()
+
     def test_parallel_reclaimers_yield_single_critical_section(
         self, tmp_path: Path
     ) -> None:

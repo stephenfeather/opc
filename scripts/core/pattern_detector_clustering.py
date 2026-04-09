@@ -49,6 +49,7 @@ def cluster_by_embeddings(
         min_cluster_size=min_cluster_size,
         min_samples=min_samples,
         metric="euclidean",
+        copy=True,
     )
     labels = clusterer.fit_predict(normalized)
 

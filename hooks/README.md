@@ -10,16 +10,93 @@ Claude Code hooks that enable skill auto-activation, file tracking, and validati
 
 ```
 hooks/
-├── src/              # TypeScript source (for development)
-├── dist/             # Pre-bundled JS (committed, ready to run)
-├── *.sh              # Shell wrappers (call node dist/*.mjs)
-├── build.sh          # Rebuild dist/ after modifying src/
-└── package.json      # Dev dependencies only (esbuild)
+├── src/              # TypeScript source (source of truth)
+├── dist/             # Bundled *.mjs artifacts (built by esbuild)
+└── package.json      # Build + dev dependencies (esbuild, vitest)
+
+scripts/
+└── deploy_hooks.sh   # Mirrors hooks/{src,dist} → $HOME/.claude/hooks/
 ```
 
-**For users:** Just clone the repo. Hooks work immediately.
+**For users** (using the committed pre-bundled artifacts):
+Clone the repo and run `cd hooks && npm run deploy`, or from the
+project root `./scripts/deploy_hooks.sh`. No `npm install`, no build
+step — the deploy script just mirrors the committed `src/` and
+`dist/` into `$HOME/.claude/hooks/` via `rsync`. That's where Claude
+Code's `settings.json` loads hooks from.
 
-**For developers:** Edit `src/*.ts`, then run `./build.sh` to rebuild.
+**For developers** (editing the TypeScript source):
+Run `cd hooks && npm install && npm run build`. `npm install` pulls
+esbuild + vitest; `npm run build` compiles `src/*.ts` to `dist/*.mjs`,
+and the `postbuild` step automatically mirrors `src/` and `dist/`
+into `$HOME/.claude/hooks/`. Edit → `npm run build` → done.
+
+> `~/.claude/hooks/src/` and `~/.claude/hooks/dist/` are **mirrors** of this
+> tree — do not edit them directly. The deploy script uses `rsync --delete`,
+> so any files there that do not exist in `opc/hooks/{src,dist}/` will be
+> removed on the next build.
+
+### Deploy entry points
+
+| Command (from `hooks/`)            | What it does                                       |
+|------------------------------------|----------------------------------------------------|
+| `npm run build`                    | Build + auto-deploy (via `postbuild --auto`)       |
+| `npm run deploy`                   | Deploy unconditionally (works from worktrees)      |
+| `../scripts/deploy_hooks.sh`       | Standalone shell entry (unconditional)             |
+| `../scripts/deploy_hooks.sh --auto`| Standalone shell entry (skips from worktrees)      |
+
+**Worktree guard.** The `postbuild` step passes `--auto`, which skips
+deploy when `OPC_ROOT` is inside any git worktree. Detection uses
+`git rev-parse --git-dir` vs `--git-common-dir` — when they differ,
+it's a linked worktree. A pathname check on `/.worktrees/` and
+`/.claude/worktrees/` remains as a belt-and-suspenders fallback for
+environments where git is unavailable. This keeps experimental branches
+from stomping the live `~/.claude/hooks/` tree used by other Claude Code
+sessions. If you *want* to deploy from a worktree, run `npm run deploy`
+(no `--auto`) — that bypass is explicit and opt-in.
+
+**Target validation.** The script refuses to run with `DEPLOY_TARGET`
+pointing at `/`, `$HOME`, or `$HOME/.claude` (logical or physical path),
+and requires the target's basename to be `hooks`. The parent is resolved
+physically via `cd -P && pwd -P` so symlinks in the parent chain are
+followed, but the target itself must not be a symlink — the script
+refuses to follow one into an unrelated tree. These guards exist because
+`rsync --delete` prunes any file in the target that isn't in the source.
+
+**Lock serialization.** The script acquires an `mkdir`-based lock at
+`$TMPDIR/opc-deploy-hooks.lock.d` before touching the target. The lock
+dir contains a `pid` file. On contention the script:
+
+1. Checks whether the owning PID is still alive via `kill -0`.
+2. If alive — exits 5 (real contention), **regardless of lock age**.
+   A running deploy is never preempted: stealing its lock would admit
+   concurrent `rsync --delete` runs against the same target, which is
+   exactly the failure this lock exists to prevent.
+3. If dead or the PID file is missing — atomically `mv`s the stale
+   lock to a unique quarantine name (`rename()` is atomic at the POSIX
+   level, so two concurrent reclaimers cannot both win), then retries
+   the acquire.
+
+`rsync --delay-updates` additionally batches file renames into the
+final moment of each sync, so in-flight Claude Code sessions see either
+the old or new tree — not a half-updated mix.
+
+**Wedged deploy recovery.** If a legitimate deploy genuinely hangs
+(e.g. rsync stuck on a dead NFS mount), the lock stays until the user
+manually investigates: `rm -rf $TMPDIR/opc-deploy-hooks.lock.d` after
+confirming no running deploy. This is the intentional tradeoff — a
+recoverable wedge is preferable to silent concurrent writes.
+
+### Environment overrides
+
+| Variable         | Default                         | Purpose                                      |
+|------------------|---------------------------------|----------------------------------------------|
+| `DEPLOY_TARGET`  | `$HOME/.claude/hooks`           | Mirror into a different tree (tests/install) |
+| `TMPDIR`         | `/tmp`                          | Lock directory location                      |
+
+If `$HOME/.claude/` does not exist (e.g. CI, fresh box without Claude Code
+installed), the deploy step prints a skip message and exits 0 instead of
+failing. Issue #105 tracked the drift that motivated this automation.
 
 ---
 
@@ -52,7 +129,9 @@ Hooks are scripts that run at specific points in Claude's workflow:
 
 **Why it's essential:** This is THE hook that makes skills auto-activate.
 
-**Integration:**
+**Integration** — for embedding these hooks into a separate Claude Code
+project (not the OPC deploy flow described at the top of this file):
+
 ```bash
 # Just copy - no npm install needed!
 cp -r .claude/hooks your-project/.claude/
@@ -142,14 +221,17 @@ To modify hooks:
 # Edit TypeScript source
 vim src/skill-activation-prompt.ts
 
-# Rebuild bundled JS
-./build.sh
+# Rebuild bundled JS and auto-deploy to ~/.claude/hooks/
+cd hooks && npm run build
 
-# Test
-echo '{"prompt": "test"}' | ./skill-activation-prompt.sh
+# Run hook tests
+npm test
 ```
 
-The `build.sh` script will install dev dependencies (esbuild) if needed.
+`npm run build` invokes esbuild, and the `postbuild` script runs
+`../scripts/deploy_hooks.sh` to mirror `src/` and `dist/` into
+`$HOME/.claude/hooks/`. To re-deploy without rebuilding, use
+`npm run deploy`.
 
 ---
 

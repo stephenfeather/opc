@@ -214,6 +214,92 @@ class TestAutoModeWorktreeGuard:
         assert result.returncode == 0, result.stderr
         assert (target / "src" / "sample.ts").exists()
 
+    def test_auto_detects_worktree_when_invoked_from_hooks_cwd(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression for PR #107 Copilot comment: _is_git_worktree used to
+        `cd "$git_dir"` which resolves relative paths against the caller's
+        CWD, not repo_path. When npm runs postbuild from hooks/, relative
+        paths like `.git` would be mis-resolved. Run the script with CWD
+        set to hooks/ and verify worktree detection still fires."""
+        main_repo = tmp_path / "main-repo"
+        main_repo.mkdir()
+        git_env = {
+            "GIT_CONFIG_GLOBAL": str(tmp_path / "gitconfig"),
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+            "HOME": str(tmp_path / "fake-home"),
+            "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
+        }
+        (tmp_path / "fake-home").mkdir()
+        subprocess.run(
+            ["git", "init", "-q", "-b", "main", str(main_repo)],
+            env=git_env,
+            check=True,
+        )
+        for key, value in [("user.email", "test@test"), ("user.name", "test")]:
+            subprocess.run(
+                ["git", "-C", str(main_repo), "config", key, value],
+                env=git_env,
+                check=True,
+            )
+        (main_repo / "README").write_text("test\n")
+        subprocess.run(
+            ["git", "-C", str(main_repo), "add", "."], env=git_env, check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(main_repo), "commit", "-q", "-m", "init"],
+            env=git_env,
+            check=True,
+        )
+        feature = tmp_path / "feature-branch"
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(main_repo),
+                "worktree",
+                "add",
+                "-q",
+                str(feature),
+                "-b",
+                "feature",
+            ],
+            env=git_env,
+            check=True,
+        )
+
+        # Build a hooks/ fixture inside the worktree
+        (feature / "scripts").mkdir()
+        (feature / "hooks" / "src").mkdir(parents=True)
+        (feature / "hooks" / "dist").mkdir(parents=True)
+        script = feature / "scripts" / "deploy_hooks.sh"
+        shutil.copy(REAL_SCRIPT, script)
+        script.chmod(0o755)
+        (feature / "hooks" / "src" / "sample.ts").write_text("x\n")
+        (feature / "hooks" / "dist" / "sample.mjs").write_text("y\n")
+        target_parent = tmp_path / "claude-home"
+        target_parent.mkdir()
+        target = target_parent / "hooks"
+
+        # Critical: run with cwd set to hooks/ so the script inherits
+        # the same CWD as `npm run postbuild` would.
+        result = subprocess.run(
+            ["bash", str(script), "--auto"],
+            cwd=str(feature / "hooks"),
+            env={
+                "DEPLOY_TARGET": str(target),
+                "HOME": "/tmp/nonexistent-home",
+                "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "git worktree" in result.stdout
+        assert not (target / "src" / "sample.ts").exists()
+
     def test_auto_skips_from_real_git_worktree_outside_dot_worktrees(
         self, tmp_path: Path
     ) -> None:

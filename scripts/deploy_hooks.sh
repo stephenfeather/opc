@@ -51,13 +51,25 @@ _is_git_worktree() {
     git_dir="$(git -C "$repo_path" rev-parse --git-dir 2>/dev/null)" || return 1
     git_common_dir="$(git -C "$repo_path" rev-parse --git-common-dir 2>/dev/null)" || return 1
     [ -n "$git_dir" ] && [ -n "$git_common_dir" ] || return 1
-    # Resolve both to absolute paths for a reliable string compare, since
-    # git may return relative paths (e.g. ".git") in the main checkout.
+    # Git may return relative paths (e.g. ".git" in the main checkout).
+    # Relative paths are relative to repo_path, NOT the script's CWD, so
+    # canonicalize explicitly against repo_path before comparing. Without
+    # this, running the script from a subdirectory like hooks/ (as npm
+    # postbuild does) would make `cd "$git_dir"` resolve against hooks/
+    # and mis-detect worktree status.
+    case "$git_dir" in
+        /*) ;;
+        *) git_dir="$repo_path/$git_dir" ;;
+    esac
+    case "$git_common_dir" in
+        /*) ;;
+        *) git_common_dir="$repo_path/$git_common_dir" ;;
+    esac
     if [ -d "$git_dir" ]; then
-        git_dir="$(cd "$git_dir" && pwd)"
+        git_dir="$(cd -P "$git_dir" && pwd -P)"
     fi
     if [ -d "$git_common_dir" ]; then
-        git_common_dir="$(cd "$git_common_dir" && pwd)"
+        git_common_dir="$(cd -P "$git_common_dir" && pwd -P)"
     fi
     [ "$git_dir" != "$git_common_dir" ]
 }

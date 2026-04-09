@@ -13,6 +13,7 @@
 import { readFileSync } from 'fs';
 import { checkFileClaim, claimFile } from './shared/db-utils-pg.js';
 import { getProject } from './shared/session-id.js';
+import { isValidId } from './shared/db-utils-pg.js';
 import type { PreToolUseInput, HookOutput } from './shared/types.js';
 
 /**

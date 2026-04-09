@@ -1,16 +1,25 @@
 /**
- * Tests for Phase 2c: main() checks handoffs FIRST for embedded Ledger sections
+ * Tests for main() handoff-first behavior.
  *
  * These tests verify that:
- * 1. When handoff has Ledger section, use it (not legacy ledger)
- * 2. When handoff lacks Ledger section, fall back to legacy ledger
- * 3. When no handoff exists, use legacy ledger
+ * 1. When a handoff for the current workstream has a Ledger section, use it
+ *    (not legacy ledger).
+ * 2. When the matching handoff lacks a Ledger section, fall back to legacy.
+ * 3. When no handoff exists, use legacy ledger.
+ * 4. Issue #86 regression: cross-stream handoffs with newer mtime must NOT
+ *    be loaded into the current workstream.
+ * 5. `source: 'startup'` must not inject handoff content regardless of which
+ *    handoffs exist on disk.
  *
- * Run with: npx tsx --test src/__tests__/mainHandoffFirst.test.ts
+ * Each test's tempdir is initialized as a git repo so the workstream resolver
+ * in session-start-continuity.ts can find a branch. Tests that expect a
+ * specific workstream use `git branch -M <name>` to align the branch with
+ * the handoff directory name.
+ *
+ * Run with: npx vitest run src/__tests__/mainHandoffFirst.test.ts
  */
 
-import { describe, it, beforeEach, afterEach } from 'node:test';
-import * as assert from 'node:assert';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -28,6 +37,12 @@ describe('main() handoff-first behavior', () => {
   beforeEach(() => {
     // Create a temp directory for each test
     testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mainHandoffFirst-test-'));
+
+    // Initialize as a git repo so the workstream resolver in the hook finds
+    // a branch. Default to `main` — individual tests that need a different
+    // branch name call `git branch -M <name>` after creating their handoff
+    // dir.
+    execSync('git init -b main', { cwd: testDir, stdio: 'ignore' });
 
     // Save and override CLAUDE_PROJECT_DIR
     originalProjectDir = process.env.CLAUDE_PROJECT_DIR;
@@ -69,6 +84,7 @@ describe('main() handoff-first behavior', () => {
     it('should use handoff Ledger section instead of legacy ledger', () => {
       // Create handoff with Ledger section
       const sessionName = 'test-session';
+      execSync(`git branch -M ${sessionName}`, { cwd: testDir, stdio: 'ignore' });
       const handoffDir = path.join(testDir, 'thoughts', 'shared', 'handoffs', sessionName);
       fs.mkdirSync(handoffDir, { recursive: true });
 
@@ -117,80 +133,94 @@ Legacy ledger goal (OLD - should not be used)
       const output = JSON.parse(result.stdout);
 
       // Should load from handoff, not legacy ledger
-      assert.strictEqual(output.result, 'continue', 'Hook should continue');
+      expect(output.result).toBe('continue');
 
       // The message or additionalContext should reference handoff content
       const fullOutput = JSON.stringify(output);
-      assert.ok(
+      expect(
         fullOutput.includes('Handoff goal') || fullOutput.includes('Working from handoff'),
-        'Should include content from handoff Ledger, not legacy ledger'
-      );
-      assert.ok(
+      ).toBe(true);
+      expect(
         !fullOutput.includes('Legacy ledger goal') && !fullOutput.includes('Legacy focus'),
-        'Should NOT include content from legacy ledger'
-      );
+      ).toBe(true);
     });
 
-    it('should select most recent handoff when multiple sessions have Ledger sections', async () => {
-      // Create two session handoffs with Ledger sections
-      const session1Dir = path.join(testDir, 'thoughts', 'shared', 'handoffs', 'session-old');
-      const session2Dir = path.join(testDir, 'thoughts', 'shared', 'handoffs', 'session-new');
-      fs.mkdirSync(session1Dir, { recursive: true });
-      fs.mkdirSync(session2Dir, { recursive: true });
+    it('should return current-workstream handoff even when another stream has a newer one (regression #86)', async () => {
+      // This is the regression test for issue #86. Before the fix, the hook
+      // scanned all handoff subdirectories, picked the newest file by mtime
+      // across streams, and injected it — regardless of which workstream the
+      // session belonged to. After the fix, the hook resolves the current
+      // workstream from git state and loads ONLY that stream's handoff.
+      const currentStream = 'current-work';
+      const otherStream = 'other-work';
 
-      // Create older handoff first
-      const oldHandoff = `# Work Stream: session-old
+      // Put the tempdir on the `current-work` branch. The hook's workstream
+      // resolver will pick this up and look in `handoffs/current-work/`.
+      execSync(`git branch -M ${currentStream}`, { cwd: testDir, stdio: 'ignore' });
+
+      const currentDir = path.join(testDir, 'thoughts', 'shared', 'handoffs', currentStream);
+      const otherDir = path.join(testDir, 'thoughts', 'shared', 'handoffs', otherStream);
+      fs.mkdirSync(currentDir, { recursive: true });
+      fs.mkdirSync(otherDir, { recursive: true });
+
+      // Current stream handoff written FIRST (older mtime).
+      const currentHandoff = `# Work Stream: ${currentStream}
 
 ## Ledger
 **Updated:** 2025-12-29T00:00:00Z
-**Goal:** Old session goal
-**Branch:** old-branch
+**Goal:** Current stream goal
+**Branch:** ${currentStream}
 
 ### Now
-[->] Old session focus
+[->] Current stream focus
 
 ---
 
 ## Context
-Old context.
+Current context.
 `;
-      fs.writeFileSync(path.join(session1Dir, 'current.md'), oldHandoff);
+      fs.writeFileSync(path.join(currentDir, 'current.md'), currentHandoff);
 
-      // Wait for different mtime
+      // Wait for different mtime.
       await new Promise(resolve => setTimeout(resolve, 50));
 
-      // Create newer handoff
-      const newHandoff = `# Work Stream: session-new
+      // Other stream handoff written LATER (newer mtime). Under the old
+      // buggy logic this would be selected because it has the newest mtime
+      // across all streams. Under the fix it must be ignored.
+      const otherHandoff = `# Work Stream: ${otherStream}
 
 ## Ledger
 **Updated:** 2025-12-30T12:00:00Z
-**Goal:** New session goal
-**Branch:** new-branch
+**Goal:** Other stream goal (WRONG)
+**Branch:** ${otherStream}
 
 ### Now
-[->] New session focus
+[->] Other stream focus (WRONG)
 
 ---
 
 ## Context
-New context.
+Other context.
 `;
-      fs.writeFileSync(path.join(session2Dir, 'current.md'), newHandoff);
+      fs.writeFileSync(path.join(otherDir, 'current.md'), otherHandoff);
 
       // Create legacy ledgers directory (should exist but be fallback)
       const ledgerDir = path.join(testDir, 'thoughts', 'ledgers');
       fs.mkdirSync(ledgerDir, { recursive: true });
 
-      // Run hook
-      const result = runHook({ source: 'resume', session_id: 'test-123' });
+      // Run hook with source=resume and a session_id that validates.
+      const result = runHook({ source: 'resume', session_id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' });
       const output = JSON.parse(result.stdout);
-
-      // Should use the more recent handoff
       const fullOutput = JSON.stringify(output);
-      assert.ok(
-        fullOutput.includes('New session goal') || fullOutput.includes('New session focus'),
-        'Should include content from most recent handoff'
-      );
+
+      // Must load CURRENT stream's content...
+      expect(
+        fullOutput.includes('Current stream goal') || fullOutput.includes('Current stream focus'),
+      ).toBe(true);
+      // ...and must NOT load OTHER stream's content, even though its mtime is newer.
+      expect(
+        !fullOutput.includes('Other stream goal') && !fullOutput.includes('Other stream focus'),
+      ).toBe(true);
     });
   });
 
@@ -198,6 +228,7 @@ New context.
     it('should fall back to legacy ledger', () => {
       // Create handoff WITHOUT Ledger section
       const sessionName = 'no-ledger-session';
+      execSync(`git branch -M ${sessionName}`, { cwd: testDir, stdio: 'ignore' });
       const handoffDir = path.join(testDir, 'thoughts', 'shared', 'handoffs', sessionName);
       fs.mkdirSync(handoffDir, { recursive: true });
 
@@ -236,10 +267,9 @@ Fallback legacy goal
 
       // Should fall back to legacy ledger
       const fullOutput = JSON.stringify(output);
-      assert.ok(
+      expect(
         fullOutput.includes('Fallback legacy goal') || fullOutput.includes('Legacy fallback focus'),
-        'Should fall back to legacy ledger when handoff has no Ledger section'
-      );
+      ).toBe(true);
     });
   });
 
@@ -273,10 +303,9 @@ Pure legacy goal
 
       // Should use legacy ledger
       const fullOutput = JSON.stringify(output);
-      assert.ok(
+      expect(
         fullOutput.includes('Pure legacy goal') || fullOutput.includes('Pure legacy focus'),
-        'Should use legacy ledger when no handoffs exist'
-      );
+      ).toBe(true);
     });
 
     it('should return continue with no message when no ledger or handoff exists', () => {
@@ -289,7 +318,7 @@ Pure legacy goal
       const result = runHook({ source: 'resume', session_id: 'test-123' });
       const output = JSON.parse(result.stdout);
 
-      assert.strictEqual(output.result, 'continue', 'Should continue even with no state');
+      expect(output.result).toBe('continue');
     });
   });
 
@@ -318,12 +347,11 @@ Test goal
       const result = runHook({ source: 'resume', session_id: 'test-123' });
       const output = JSON.parse(result.stdout);
 
-      assert.strictEqual(output.result, 'continue', 'Should continue gracefully');
+      expect(output.result).toBe('continue');
       const fullOutput = JSON.stringify(output);
-      assert.ok(
+      expect(
         fullOutput.includes('Test goal') || fullOutput.includes('Test focus'),
-        'Should fall back to legacy ledger'
-      );
+      ).toBe(true);
     });
 
     it('should handle empty handoffs directory', () => {
@@ -354,14 +382,18 @@ Empty handoffs test
       const result = runHook({ source: 'resume', session_id: 'test-123' });
       const output = JSON.parse(result.stdout);
 
-      assert.strictEqual(output.result, 'continue', 'Should continue gracefully');
+      expect(output.result).toBe('continue');
     });
   });
 
   describe('startup vs resume behavior', () => {
-    it('should show brief notification on startup when handoff Ledger available', () => {
-      // Create handoff with Ledger
+    it('should NOT inject handoff content on source=startup even if a matching handoff exists', () => {
+      // After issue #86, fresh `startup` sessions always have a brand-new
+      // session_id that cannot match any prior handoff by UUID. The hook
+      // must stay silent about handoffs on startup rather than guessing
+      // based on mtime. The legacy ledger fallback still applies.
       const sessionName = 'startup-test';
+      execSync(`git branch -M ${sessionName}`, { cwd: testDir, stdio: 'ignore' });
       const handoffDir = path.join(testDir, 'thoughts', 'shared', 'handoffs', sessionName);
       fs.mkdirSync(handoffDir, { recursive: true });
 
@@ -369,38 +401,71 @@ Empty handoffs test
 
 ## Ledger
 **Updated:** 2025-12-30T12:00:00Z
-**Goal:** Startup test goal
-**Branch:** main
+**Goal:** Startup handoff goal (MUST NOT APPEAR)
+**Branch:** ${sessionName}
 
 ### Now
-[->] Current startup task
+[->] Startup handoff focus (MUST NOT APPEAR)
 
 ---
 
 ## Context
-Context details.
+Context details that must not be injected on startup.
 `;
       fs.writeFileSync(path.join(handoffDir, 'current.md'), handoffContent);
 
-      // Create ledger dir (required for hook to not exit early)
-      const ledgerDir = path.join(testDir, 'thoughts', 'ledgers');
-      fs.mkdirSync(ledgerDir, { recursive: true });
-      fs.writeFileSync(path.join(ledgerDir, `CONTINUITY_CLAUDE-${sessionName}.md`), '# Ledger\n## Goal\nTest');
-
-      // Run hook with startup
-      const result = runHook({ source: 'startup', session_id: 'test-123' });
+      // Run hook with startup. No legacy ledger dir, so the fallback is a no-op.
+      const result = runHook({ source: 'startup', session_id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' });
       const output = JSON.parse(result.stdout);
+      const fullOutput = JSON.stringify(output);
 
-      assert.strictEqual(output.result, 'continue', 'Should continue');
-      // Startup should have brief message, not full content
-      if (output.message) {
-        assert.ok(output.message.length < 500, 'Startup message should be brief');
-      }
+      expect(output.result).toBe('continue');
+      expect(
+        !fullOutput.includes('Startup handoff goal') && !fullOutput.includes('Startup handoff focus'),
+      ).toBe(true);
+    });
+
+    it('should silently skip handoff lookup when tempdir is not a git repo', () => {
+      // resolveWorkstreamName returns null for non-git directories. The hook
+      // must silently skip the handoff block and fall through to the legacy
+      // ledger path without throwing or injecting the wrong content.
+      const sessionName = 'non-git-stream';
+      const handoffDir = path.join(testDir, 'thoughts', 'shared', 'handoffs', sessionName);
+      fs.mkdirSync(handoffDir, { recursive: true });
+
+      const handoffContent = `# Work Stream: ${sessionName}
+
+## Ledger
+**Updated:** 2025-12-30T12:00:00Z
+**Goal:** Non-git handoff goal (MUST NOT APPEAR)
+
+### Now
+[->] Non-git handoff focus (MUST NOT APPEAR)
+
+---
+
+## Context
+Context for a handoff that must not be loaded when git resolution fails.
+`;
+      fs.writeFileSync(path.join(handoffDir, 'current.md'), handoffContent);
+
+      // Remove the .git directory to simulate a non-git project.
+      fs.rmSync(path.join(testDir, '.git'), { recursive: true, force: true });
+
+      const result = runHook({ source: 'resume', session_id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' });
+      const output = JSON.parse(result.stdout);
+      const fullOutput = JSON.stringify(output);
+
+      expect(output.result).toBe('continue');
+      expect(
+        !fullOutput.includes('Non-git handoff goal') && !fullOutput.includes('Non-git handoff focus'),
+      ).toBe(true);
     });
 
     it('should load full Ledger content on resume/clear/compact', () => {
       // Create handoff with Ledger
       const sessionName = 'resume-test';
+      execSync(`git branch -M ${sessionName}`, { cwd: testDir, stdio: 'ignore' });
       const handoffDir = path.join(testDir, 'thoughts', 'shared', 'handoffs', sessionName);
       fs.mkdirSync(handoffDir, { recursive: true });
 
@@ -441,13 +506,12 @@ Full context that should be available on resume.
       const result = runHook({ source: 'resume', session_id: 'test-123' });
       const output = JSON.parse(result.stdout);
 
-      assert.strictEqual(output.result, 'continue', 'Should continue');
+      expect(output.result).toBe('continue');
       // Resume should have more detailed content
       const fullOutput = JSON.stringify(output);
-      assert.ok(
+      expect(
         fullOutput.includes('Resume test goal') || fullOutput.includes('Working on resume'),
-        'Resume should include handoff Ledger content'
-      );
+      ).toBe(true);
     });
   });
 });

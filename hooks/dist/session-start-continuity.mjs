@@ -47,6 +47,12 @@ function getOpcDir() {
   return null;
 }
 
+// src/shared/pattern-router.ts
+var SAFE_ID_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
+function isValidId(id) {
+  return SAFE_ID_PATTERN.test(id);
+}
+
 // src/session-start-continuity.ts
 var MS_PER_HOUR = 36e5;
 /*!
@@ -122,16 +128,34 @@ function extractLedgerSection(handoffContent) {
   return match ? `## Ledger
 ${match[1].trim()}` : null;
 }
-function findSessionHandoff(sessionName) {
-  const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
-  const handoffDir = path.join(projectDir, "thoughts", "shared", "handoffs", sessionName);
-  if (!fs.existsSync(handoffDir)) return null;
-  const handoffFiles = fs.readdirSync(handoffDir).filter((f) => isHandoffFile(f)).sort((a, b) => {
-    const statA = fs.statSync(path.join(handoffDir, a));
-    const statB = fs.statSync(path.join(handoffDir, b));
-    return statB.mtime.getTime() - statA.mtime.getTime();
-  });
-  return handoffFiles.length > 0 ? path.join(handoffDir, handoffFiles[0]) : null;
+function resolveWorkstreamName(projectDir) {
+  try {
+    const branch = execSync("git branch --show-current", {
+      cwd: projectDir,
+      encoding: "utf-8",
+      timeout: 5e3,
+      stdio: ["pipe", "pipe", "pipe"]
+    }).trim();
+    if (branch) {
+      const sanitized = branch.replace(/\//g, "-");
+      if (isValidId(sanitized)) return sanitized;
+    }
+  } catch {
+  }
+  try {
+    const topLevel = execSync("git rev-parse --show-toplevel", {
+      cwd: projectDir,
+      encoding: "utf-8",
+      timeout: 5e3,
+      stdio: ["pipe", "pipe", "pipe"]
+    }).trim();
+    if (topLevel) {
+      const name = path.basename(topLevel);
+      if (isValidId(name)) return name;
+    }
+  } catch {
+  }
+  return null;
 }
 function pruneLedger(ledgerPath) {
   let content = fs.readFileSync(ledgerPath, "utf-8");
@@ -260,18 +284,14 @@ async function main() {
   let additionalContext = "";
   let usedHandoffLedger = false;
   const handoffsDir = path.join(projectDir, "thoughts", "shared", "handoffs");
-  if (fs.existsSync(handoffsDir)) {
+  if (fs.existsSync(handoffsDir) && sessionType && sessionType !== "startup" && input.session_id && isValidId(input.session_id)) {
     try {
-      const sessionDirs = fs.readdirSync(handoffsDir).filter((d) => {
-        const stat = fs.statSync(path.join(handoffsDir, d));
-        return stat.isDirectory();
-      });
-      let mostRecentLedger = null;
-      for (const sessionName of sessionDirs) {
-        const handoffPath = findSessionHandoff(sessionName);
-        if (handoffPath) {
-          const content = fs.readFileSync(handoffPath, "utf-8");
-          const isYaml = handoffPath.endsWith(".yaml") || handoffPath.endsWith(".yml");
+      const workstreamName = resolveWorkstreamName(projectDir);
+      if (workstreamName) {
+        const selectedPath = findSessionHandoffWithUUID(workstreamName, input.session_id);
+        if (selectedPath) {
+          const content = fs.readFileSync(selectedPath, "utf-8");
+          const isYaml = selectedPath.endsWith(".yaml") || selectedPath.endsWith(".yml");
           let goalSummary = "No goal found";
           let currentFocus = "Unknown";
           let ledgerContent = "";
@@ -292,78 +312,53 @@ async function main() {
               ledgerContent = ledgerSection;
             }
           }
-          if (ledgerContent || isYaml && (goalSummary !== "No goal found" || currentFocus !== "Unknown")) {
-            const mtime = fs.statSync(handoffPath).mtime.getTime();
-            if (!mostRecentLedger || mtime > mostRecentLedger.mtime) {
-              mostRecentLedger = {
-                content: ledgerContent || content,
-                sessionName,
-                handoffPath,
-                mtime,
-                goalSummary: goalSummary.substring(0, 100),
-                currentFocus
-              };
-            }
-          }
-        }
-      }
-      if (mostRecentLedger) {
-        usedHandoffLedger = true;
-        const { sessionName, goalSummary, currentFocus, content: ledgerSection, handoffPath } = mostRecentLedger;
-        const handoffFilename = path.basename(handoffPath);
-        if (sessionType === "startup") {
-          message = `\u{1F4CB} Handoff Ledger: ${sessionName} \u2192 ${currentFocus} (run /resume-handoff for full context)`;
-          const ageMs = Date.now() - mostRecentLedger.mtime;
-          const ageHours = Math.round(ageMs / MS_PER_HOUR);
-          const ageStr = ageHours < 1 ? "less than 1h ago" : `${ageHours}h ago`;
-          additionalContext = `Last session context:
-Goal: ${goalSummary}
-Focus: ${currentFocus}
-Handoff: ${handoffFilename} (${ageStr})
-Run /resume-handoff for full context.`;
-        } else {
-          console.error(`\u2713 Handoff Ledger loaded: ${sessionName} \u2192 ${currentFocus}`);
-          message = `[${sessionType}] Loaded from handoff: ${handoffFilename} | Goal: ${goalSummary} | Focus: ${currentFocus}`;
-          if (sessionType === "clear" || sessionType === "compact") {
-            additionalContext = `Handoff Ledger loaded from ${handoffFilename}:
+          const hasContent = ledgerContent || isYaml && (goalSummary !== "No goal found" || currentFocus !== "Unknown");
+          if (hasContent) {
+            usedHandoffLedger = true;
+            const handoffFilename = path.basename(selectedPath);
+            console.error(`\u2713 Handoff Ledger loaded: ${workstreamName} \u2192 ${currentFocus}`);
+            message = `[${sessionType}] Loaded from handoff: ${handoffFilename} | Goal: ${goalSummary.substring(0, 100)} | Focus: ${currentFocus}`;
+            if (sessionType === "clear" || sessionType === "compact") {
+              additionalContext = `Handoff Ledger loaded from ${handoffFilename}:
 
-${ledgerSection}`;
-            const unmarkedHandoffs = getUnmarkedHandoffs();
-            if (unmarkedHandoffs.length > 0) {
-              additionalContext += `
+${ledgerContent || content}`;
+              const unmarkedHandoffs = getUnmarkedHandoffs();
+              if (unmarkedHandoffs.length > 0) {
+                additionalContext += `
 
 ---
 
 ## Unmarked Session Outcomes
 
 `;
-              additionalContext += `The following handoffs have no outcome marked. Consider marking them to improve future session recommendations:
+                additionalContext += `The following handoffs have no outcome marked. Consider marking them to improve future session recommendations:
 
 `;
-              for (const h of unmarkedHandoffs) {
-                const taskLabel = h.task_number ? `task-${h.task_number}` : "handoff";
-                const summaryPreview = h.task_summary ? h.task_summary.substring(0, 60) + "..." : "(no summary)";
-                additionalContext += `- **${h.session_name}/${taskLabel}** (ID: \`${h.id.substring(0, 8)}\`): ${summaryPreview}
+                for (const h of unmarkedHandoffs) {
+                  const taskLabel = h.task_number ? `task-${h.task_number}` : "handoff";
+                  const summaryPreview = h.task_summary ? h.task_summary.substring(0, 60) + "..." : "(no summary)";
+                  additionalContext += `- **${h.session_name}/${taskLabel}** (ID: \`${h.id.substring(0, 8)}\`): ${summaryPreview}
 `;
-              }
-              additionalContext += `
+                }
+                additionalContext += `
 To mark an outcome:
 \`\`\`bash
 cd ~/.claude && uv run python scripts/core/artifact_mark.py --handoff <ID> --outcome SUCCEEDED|PARTIAL_PLUS|PARTIAL_MINUS|FAILED
 \`\`\`
 `;
-            }
-            additionalContext += `
+              }
+              additionalContext += `
 
 ---
 
-Full handoff available at: ${handoffPath}
+Full handoff available at: ${selectedPath}
 `;
+            }
           }
         }
       }
     } catch (error) {
-      console.error(`Warning: Error scanning handoffs: ${error}`);
+      console.error(`Warning: Error resolving handoff: ${error}`);
     }
   }
   if (!usedHandoffLedger) {
@@ -522,7 +517,7 @@ export {
   buildHandoffDirName,
   extractLedgerSection,
   extractYamlFields,
-  findSessionHandoff,
   findSessionHandoffWithUUID,
-  parseHandoffDirName
+  parseHandoffDirName,
+  resolveWorkstreamName
 };

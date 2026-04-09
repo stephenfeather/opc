@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { execSync, spawn } from 'child_process';
 import { getOpcDir } from './shared/opc-path.js';
+import { isValidId } from './shared/pattern-router.js';
 
 interface SessionStartInput {
   type?: 'startup' | 'resume' | 'clear' | 'compact';  // Legacy field
@@ -148,25 +149,53 @@ export function extractLedgerSection(handoffContent: string): string | null {
 }
 
 /**
- * Find the most recent handoff file for a given session.
- * Looks in thoughts/shared/handoffs/{sessionName}/ directory.
- * Returns absolute path to the most recent handoff file (.md, .yaml, .yml) by mtime, or null if not found.
+ * Resolve the current workstream name from git state, deterministically.
+ *
+ * Fallback chain:
+ *   1. `git branch --show-current` — the authoritative workstream identifier
+ *      for any attached HEAD.
+ *   2. `basename $(git rev-parse --show-toplevel)` — worktree directory name.
+ *      Covers detached-HEAD checkouts and worktree layouts where the branch
+ *      is empty (e.g. mid-rebase).
+ *   3. `null` — silent fallback. No handoff injection. Intentionally does
+ *      NOT fall through to `path.basename(projectDir)` or to an mtime
+ *      heuristic across handoff dirs, because both can silently return the
+ *      wrong stream (issue #86).
+ *
+ * Sanitizes path-unsafe characters: `/` in branch names (e.g. `feature/auth`)
+ * becomes `-` to match how handoff directories are actually named on disk.
+ * After sanitization the result must pass `isValidId`; if not, returns null.
  */
-export function findSessionHandoff(sessionName: string): string | null {
-  const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
-  const handoffDir = path.join(projectDir, 'thoughts', 'shared', 'handoffs', sessionName);
+export function resolveWorkstreamName(projectDir: string): string | null {
+  // Priority 1: git branch name
+  try {
+    const branch = execSync('git branch --show-current', {
+      cwd: projectDir,
+      encoding: 'utf-8',
+      timeout: 5000,
+      stdio: ['pipe', 'pipe', 'pipe']
+    }).trim();
+    if (branch) {
+      const sanitized = branch.replace(/\//g, '-');
+      if (isValidId(sanitized)) return sanitized;
+    }
+  } catch { /* continue */ }
 
-  if (!fs.existsSync(handoffDir)) return null;
+  // Priority 2: worktree top basename
+  try {
+    const topLevel = execSync('git rev-parse --show-toplevel', {
+      cwd: projectDir,
+      encoding: 'utf-8',
+      timeout: 5000,
+      stdio: ['pipe', 'pipe', 'pipe']
+    }).trim();
+    if (topLevel) {
+      const name = path.basename(topLevel);
+      if (isValidId(name)) return name;
+    }
+  } catch { /* continue */ }
 
-  const handoffFiles = fs.readdirSync(handoffDir)
-    .filter(f => isHandoffFile(f))
-    .sort((a, b) => {
-      const statA = fs.statSync(path.join(handoffDir, a));
-      const statB = fs.statSync(path.join(handoffDir, b));
-      return statB.mtime.getTime() - statA.mtime.getTime();
-    });
-
-  return handoffFiles.length > 0 ? path.join(handoffDir, handoffFiles[0]) : null;
+  return null;
 }
 
 interface HandoffSummary {
@@ -378,48 +407,47 @@ async function main() {
   let usedHandoffLedger = false;
 
   // ============================================
-  // NEW: Check handoffs for embedded Ledger sections FIRST
+  // Scoped handoff lookup: fix for issue #86.
+  //
+  // Resolve the current workstream name from git state, then ask
+  // findSessionHandoffWithUUID for the handoff belonging to THIS stream and
+  // THIS session_id. No global mtime scan. No cross-stream leakage.
+  //
+  // Gate: only attempt lookup on resume/compact/clear. A fresh `startup` has
+  // a brand-new UUID that cannot match any prior handoff — if we looked it
+  // up anyway, findSessionHandoffWithUUID's Priority 2 (legacy unscoped dir)
+  // would return the most recent file in the workstream dir regardless of
+  // who wrote it, which is how #86 originally manifested. Stay silent on
+  // startup and let the legacy ledger fallback handle it.
   // ============================================
   const handoffsDir = path.join(projectDir, 'thoughts', 'shared', 'handoffs');
-  if (fs.existsSync(handoffsDir)) {
+  if (
+    fs.existsSync(handoffsDir) &&
+    sessionType &&
+    sessionType !== 'startup' &&
+    input.session_id &&
+    isValidId(input.session_id)
+  ) {
     try {
-      const sessionDirs = fs.readdirSync(handoffsDir)
-        .filter(d => {
-          const stat = fs.statSync(path.join(handoffsDir, d));
-          return stat.isDirectory();
-        });
+      const workstreamName = resolveWorkstreamName(projectDir);
+      if (workstreamName) {
+        const selectedPath = findSessionHandoffWithUUID(workstreamName, input.session_id);
+        if (selectedPath) {
+          const content = fs.readFileSync(selectedPath, 'utf-8');
+          const isYaml = selectedPath.endsWith('.yaml') || selectedPath.endsWith('.yml');
 
-      // Find most recent handoff with Ledger section
-      let mostRecentLedger: {
-        content: string;
-        sessionName: string;
-        handoffPath: string;
-        mtime: number;
-        goalSummary: string;
-        currentFocus: string;
-      } | null = null;
-
-      for (const sessionName of sessionDirs) {
-        const handoffPath = findSessionHandoff(sessionName);
-        if (handoffPath) {
-          const content = fs.readFileSync(handoffPath, 'utf-8');
-          const isYaml = handoffPath.endsWith('.yaml') || handoffPath.endsWith('.yml');
-
-          // Try YAML format first for .yaml/.yml files, then markdown format
           let goalSummary = 'No goal found';
           let currentFocus = 'Unknown';
           let ledgerContent = '';
 
           if (isYaml) {
-            // YAML format: extract goal: and now: fields directly
             const yamlFields = extractYamlFields(content);
             if (yamlFields) {
               goalSummary = yamlFields.goal || 'No goal found';
               currentFocus = yamlFields.now || 'Unknown';
-              ledgerContent = content; // Use full YAML content as context
+              ledgerContent = content;
             }
           } else {
-            // Markdown format: look for ## Ledger section
             const ledgerSection = extractLedgerSection(content);
             if (ledgerSection) {
               const goalMatch = ledgerSection.match(/\*\*Goal:\*\*\s*([^\n]+)/);
@@ -430,64 +458,40 @@ async function main() {
             }
           }
 
-          // Only process if we found content
-          if (ledgerContent || (isYaml && (goalSummary !== 'No goal found' || currentFocus !== 'Unknown'))) {
-            const mtime = fs.statSync(handoffPath).mtime.getTime();
-            if (!mostRecentLedger || mtime > mostRecentLedger.mtime) {
-              mostRecentLedger = {
-                content: ledgerContent || content,
-                sessionName,
-                handoffPath,
-                mtime,
-                goalSummary: goalSummary.substring(0, 100),
-                currentFocus
-              };
-            }
-          }
-        }
-      }
+          const hasContent = ledgerContent ||
+            (isYaml && (goalSummary !== 'No goal found' || currentFocus !== 'Unknown'));
 
-      if (mostRecentLedger) {
-        usedHandoffLedger = true;
-        const { sessionName, goalSummary, currentFocus, content: ledgerSection, handoffPath } = mostRecentLedger;
-        const handoffFilename = path.basename(handoffPath);
+          if (hasContent) {
+            usedHandoffLedger = true;
+            const handoffFilename = path.basename(selectedPath);
+            console.error(`✓ Handoff Ledger loaded: ${workstreamName} → ${currentFocus}`);
+            message = `[${sessionType}] Loaded from handoff: ${handoffFilename} | Goal: ${goalSummary.substring(0, 100)} | Focus: ${currentFocus}`;
 
-        if (sessionType === 'startup') {
-          // Fresh startup: inject goal + focus so Claude has context without needing /resume-handoff
-          message = `📋 Handoff Ledger: ${sessionName} → ${currentFocus} (run /resume-handoff for full context)`;
-          const ageMs = Date.now() - mostRecentLedger.mtime;
-          const ageHours = Math.round(ageMs / MS_PER_HOUR);
-          const ageStr = ageHours < 1 ? 'less than 1h ago' : `${ageHours}h ago`;
-          additionalContext = `Last session context:\nGoal: ${goalSummary}\nFocus: ${currentFocus}\nHandoff: ${handoffFilename} (${ageStr})\nRun /resume-handoff for full context.`;
-        } else {
-          // resume/clear/compact: load full Ledger section
-          console.error(`✓ Handoff Ledger loaded: ${sessionName} → ${currentFocus}`);
-          message = `[${sessionType}] Loaded from handoff: ${handoffFilename} | Goal: ${goalSummary} | Focus: ${currentFocus}`;
+            if (sessionType === 'clear' || sessionType === 'compact') {
+              additionalContext = `Handoff Ledger loaded from ${handoffFilename}:\n\n${ledgerContent || content}`;
 
-          if (sessionType === 'clear' || sessionType === 'compact') {
-            additionalContext = `Handoff Ledger loaded from ${handoffFilename}:\n\n${ledgerSection}`;
-
-            // Check for unmarked handoffs
-            const unmarkedHandoffs = getUnmarkedHandoffs();
-            if (unmarkedHandoffs.length > 0) {
-              additionalContext += `\n\n---\n\n## Unmarked Session Outcomes\n\n`;
-              additionalContext += `The following handoffs have no outcome marked. Consider marking them to improve future session recommendations:\n\n`;
-              for (const h of unmarkedHandoffs) {
-                const taskLabel = h.task_number ? `task-${h.task_number}` : 'handoff';
-                const summaryPreview = h.task_summary ? h.task_summary.substring(0, 60) + '...' : '(no summary)';
-                additionalContext += `- **${h.session_name}/${taskLabel}** (ID: \`${h.id.substring(0, 8)}\`): ${summaryPreview}\n`;
+              // Check for unmarked handoffs
+              const unmarkedHandoffs = getUnmarkedHandoffs();
+              if (unmarkedHandoffs.length > 0) {
+                additionalContext += `\n\n---\n\n## Unmarked Session Outcomes\n\n`;
+                additionalContext += `The following handoffs have no outcome marked. Consider marking them to improve future session recommendations:\n\n`;
+                for (const h of unmarkedHandoffs) {
+                  const taskLabel = h.task_number ? `task-${h.task_number}` : 'handoff';
+                  const summaryPreview = h.task_summary ? h.task_summary.substring(0, 60) + '...' : '(no summary)';
+                  additionalContext += `- **${h.session_name}/${taskLabel}** (ID: \`${h.id.substring(0, 8)}\`): ${summaryPreview}\n`;
+                }
+                additionalContext += `\nTo mark an outcome:\n\`\`\`bash\ncd ~/.claude && uv run python scripts/core/artifact_mark.py --handoff <ID> --outcome SUCCEEDED|PARTIAL_PLUS|PARTIAL_MINUS|FAILED\n\`\`\`\n`;
               }
-              additionalContext += `\nTo mark an outcome:\n\`\`\`bash\ncd ~/.claude && uv run python scripts/core/artifact_mark.py --handoff <ID> --outcome SUCCEEDED|PARTIAL_PLUS|PARTIAL_MINUS|FAILED\n\`\`\`\n`;
-            }
 
-            // Add full handoff path for reference
-            additionalContext += `\n\n---\n\nFull handoff available at: ${handoffPath}\n`;
+              // Add full handoff path for reference
+              additionalContext += `\n\n---\n\nFull handoff available at: ${selectedPath}\n`;
+            }
           }
         }
       }
     } catch (error) {
-      // Gracefully handle errors scanning handoffs directory
-      console.error(`Warning: Error scanning handoffs: ${error}`);
+      // Gracefully handle errors during handoff lookup
+      console.error(`Warning: Error resolving handoff: ${error}`);
     }
   }
 

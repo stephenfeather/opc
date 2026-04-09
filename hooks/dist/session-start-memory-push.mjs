@@ -59,6 +59,15 @@ function getOpcDir() {
  * Calls push_learnings.py via subprocess (mirrors memory-awareness.ts pattern).
  * Injects results via hookSpecificOutput.additionalContext.
  */
+function normalizeProjectName(projectDir) {
+  const cleaned = projectDir.replace(/[\\/]+$/, "");
+  const parts = cleaned.split(/[\\/]/);
+  const worktreeIdx = parts.indexOf(".worktrees");
+  if (worktreeIdx > 0) {
+    return parts[worktreeIdx - 1] ?? "";
+  }
+  return parts.pop() ?? "";
+}
 function main() {
   let input;
   try {
@@ -92,7 +101,7 @@ function main() {
     console.log(JSON.stringify({ result: "continue" }));
     return;
   }
-  const projectName = projectDir.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? "";
+  const projectName = normalizeProjectName(projectDir);
   if (!projectName || projectName.startsWith("-")) {
     console.log(JSON.stringify({ result: "continue" }));
     return;

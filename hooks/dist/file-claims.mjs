@@ -222,7 +222,7 @@ function main() {
     return;
   }
   const sessionId = input.session_id;
-  if (!sessionId) {
+  if (typeof sessionId !== "string" || !sessionId) {
     console.log(JSON.stringify({ result: "continue" }));
     return;
   }

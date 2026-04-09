@@ -42,7 +42,9 @@ export function getSessionId(options: { debug?: boolean } = {}): string {
 
   // Fallback - log if debug enabled
   if (options.debug) {
-    console.error('[session-id] WARNING: No COORDINATION_SESSION_ID env var, generating new one');
+    console.error(
+      '[session-id] WARNING: No COORDINATION_SESSION_ID env var, falling back to BRAINTRUST_SPAN_ID or generating a new one',
+    );
   }
 
   // Fallback to Braintrust span ID or generate new

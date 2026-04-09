@@ -58,7 +58,7 @@ describe('peer-awareness hook', () => {
     const output = consoleSpy.mock.calls.map(c => c[0]).join('');
     // Should show peer but not self
     expect(output).toContain('s-peer-1');
-    expect(output).not.toContain('"s-my-session"');
+    expect(output).not.toContain('s-my-session');
   });
 
   it('outputs empty when stdin has no session_id (no file fallback)', async () => {

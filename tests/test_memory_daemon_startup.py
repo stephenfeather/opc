@@ -399,6 +399,91 @@ class TestSecurityHardening:
         # Mode check: owner-only read/write.
         assert path.stat().st_mode & 0o777 == 0o600
 
+    def test_open_log_file_secure_tolerates_missing_o_nofollow(self, monkeypatch, tmp_path):
+        """PR #106 Copilot P1/P3: os.O_NOFOLLOW is POSIX-only. On Windows
+        the constant does not exist and any code that references it at
+        runtime raises AttributeError. _open_log_file_secure must fall
+        back gracefully via getattr so Windows daemon startup works.
+        """
+        import scripts.core.memory_daemon as mod
+
+        # Simulate a platform where O_NOFOLLOW does not exist.
+        if hasattr(os, "O_NOFOLLOW"):
+            monkeypatch.delattr(os, "O_NOFOLLOW")
+
+        # Must not raise AttributeError on O_NOFOLLOW lookup.
+        handle = mod._open_log_file_secure(tmp_path / "nofollow_absent.log", mode="ab")
+        try:
+            assert (tmp_path / "nofollow_absent.log").exists()
+        finally:
+            handle.close()
+
+    def test_open_log_file_secure_fchmods_existing_files(self, monkeypatch, tmp_path):
+        """PR #106 Copilot P2: os.open's mode arg only applies on create.
+        If the log file already exists with broader permissions, the
+        helper must call os.fchmod(fd, 0o600) on a best-effort basis to
+        enforce owner-only mode on upgrade paths.
+        """
+        import scripts.core.memory_daemon as mod
+
+        target = tmp_path / "preexisting.log"
+        target.write_text("old data")
+        target.chmod(0o644)  # simulate loose permissions from old version
+        assert target.stat().st_mode & 0o777 == 0o644
+
+        handle = mod._open_log_file_secure(target, mode="ab")
+        try:
+            mode = target.stat().st_mode & 0o777
+            assert mode == 0o600, f"expected 0o600, got 0o{mode:o}"
+        finally:
+            handle.close()
+
+    def test_open_log_file_secure_survives_fchmod_failure(self, monkeypatch, tmp_path):
+        """os.fchmod can fail on read-only filesystems or some network
+        mounts. Best-effort: a failing fchmod must not prevent opening
+        the file.
+        """
+        import scripts.core.memory_daemon as mod
+
+        def raising_fchmod(_fd, _mode):
+            raise PermissionError("read-only fs")
+
+        monkeypatch.setattr(os, "fchmod", raising_fchmod)
+
+        handle = mod._open_log_file_secure(tmp_path / "ro_mount.log", mode="ab")
+        try:
+            assert (tmp_path / "ro_mount.log").exists()
+        finally:
+            handle.close()
+
+    def test_log_emits_one_time_stderr_warning_on_setup_failure(self, monkeypatch, capsys):
+        """PR #106 CodeRabbit CR2: when _setup_logging() fails, log() should
+        emit a one-time diagnostic warning to stderr so operators running
+        CLI commands (status, stop) see the configuration error. In the
+        daemon itself stderr is /dev/null after _setup_daemon_fds, so the
+        warning is silently discarded — but the CLI paths benefit.
+        """
+        import scripts.core.memory_daemon as mod
+
+        monkeypatch.setattr(mod, "_logger", None)
+        monkeypatch.setattr(mod, "_log_setup_warning_emitted", False, raising=False)
+
+        def failing_setup():
+            raise OSError(13, "Permission denied: ~/.claude/memory-daemon.log")
+
+        monkeypatch.setattr(mod, "_setup_logging", failing_setup)
+
+        # First call: should emit the warning.
+        mod.log("first message")
+        err = capsys.readouterr().err
+        assert "memory_daemon" in err.lower() or "log" in err.lower()
+        assert "Permission denied" in err or "log setup failed" in err.lower()
+
+        # Second call: should NOT emit again (once-only).
+        mod.log("second message")
+        err2 = capsys.readouterr().err
+        assert err2 == "", f"warning should be one-time, got: {err2!r}"
+
     def test_setup_daemon_fds_survives_fd_exhaustion(self, monkeypatch):
         """Aegis LOW-4: if os.open raises OSError (fd exhaustion), the
         function must return gracefully rather than propagating the
@@ -591,7 +676,11 @@ class TestFaulthandlerGating:
             if handle is not None:
                 try:
                     handle.close()
-                except Exception:
+                except (OSError, ValueError):
+                    # OSError: close() syscall failure during teardown.
+                    # ValueError: "I/O operation on closed file" if
+                    # something else closed it first. Narrowed per
+                    # CodeRabbit CR1 on PR #106.
                     pass
 
 

@@ -52,26 +52,53 @@ import faulthandler
 def _open_log_file_secure(path, mode: str = "ab"):
     """Open a log file with symlink-TOCTOU hardening and owner-only mode.
 
-    Uses O_NOFOLLOW so a symlink at ``path`` causes ``OSError`` (ELOOP)
-    instead of silently redirecting writes to an attacker-controlled
-    target. Mode 0o600 keeps the file unreadable to other UIDs regardless
-    of the caller's umask — faulthandler tracebacks and pattern-batch
-    verbose logs can leak local-variable snippets.
+    Uses O_NOFOLLOW (where available) so a symlink at ``path`` causes
+    ``OSError`` (ELOOP) instead of silently redirecting writes to an
+    attacker-controlled target. Mode 0o600 keeps the file unreadable to
+    other UIDs regardless of the caller's umask — faulthandler tracebacks
+    and pattern-batch verbose logs can leak local-variable snippets.
 
-    Addresses aegis LOW-1 / LOW-2 findings from the /security audit of #99.
+    Addresses aegis LOW-1 / LOW-2 findings from the /security audit of #99
+    and Copilot P1/P2/P3 from the PR #106 cycle-1 review.
+
+    Portability notes:
+      - ``os.O_NOFOLLOW`` is POSIX-only. On Windows the constant is not
+        defined, so we fall back via ``getattr`` to 0 (no-op flag). Windows
+        has different symlink semantics — symlink creation requires
+        developer mode or admin — so degraded hardening is acceptable.
+      - ``mode`` in ``os.open()`` only applies to newly-created files. If
+        ``path`` already exists (upgrade path from pre-hardening versions),
+        its existing permissions are retained, so we also call
+        ``os.fchmod(fd, 0o600)`` on a best-effort basis. ``fchmod`` can
+        fail on read-only filesystems or some network mounts; failure is
+        tolerated.
 
     ``mode`` accepts ``"ab"``/``"a"`` for append, ``"wb"``/``"w"`` for
     truncate. Binary/text is inferred from presence of ``"b"``.
     """
-    os_flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
+    o_nofollow = getattr(os, "O_NOFOLLOW", 0)
+    os_flags = os.O_WRONLY | os.O_CREAT | o_nofollow
     if "a" in mode:
         os_flags |= os.O_APPEND
     else:
         os_flags |= os.O_TRUNC
     fd = os.open(path, os_flags, 0o600)
     try:
+        # Enforce 0o600 on existing files — os.open()'s mode param is
+        # ignored when the file already exists, so an upgrade path from
+        # an old 0o644 crash log would otherwise keep the loose mode.
+        try:
+            os.fchmod(fd, 0o600)
+        except (OSError, NotImplementedError):
+            # Read-only filesystem, unsupported platform, etc. —
+            # best effort, the open itself still succeeds.
+            pass
         return os.fdopen(fd, mode)
-    except Exception:
+    except (OSError, ValueError):
+        # os.fdopen raises OSError on a bad fd and ValueError on an
+        # invalid mode string. In either case we own the fd and must
+        # release it before re-raising. Narrower than `except Exception`
+        # per Gemini M1 feedback on PR #106.
         os.close(fd)
         raise
 
@@ -81,6 +108,13 @@ def _open_log_file_secure(path, mode: str = "ab"):
 # track the refactor that removed module-level faulthandler.enable() calls
 # across the codebase to stop leaking an fd per import.
 _faulthandler_log_file = None
+
+# Once-per-process guard for the "log setup failed" stderr warning.
+# CodeRabbit CR2 on PR #106: operators running CLI commands (status, stop)
+# should see a diagnostic when the rotating log file cannot be opened, even
+# though the daemon itself has stderr redirected to /dev/null after
+# _setup_daemon_fds() and will silently discard the warning.
+_log_setup_warning_emitted = False
 
 
 def _enable_faulthandler() -> None:
@@ -341,17 +375,48 @@ def log(msg: str):
     Lazy-initializes the rotating logger on first call. This replaces the
     previous module-scope ``_logger = _setup_logging()`` assignment which
     touched the filesystem on every import (Codex Round 3 Finding 3).
+
+    Error handling is intentionally broad (``except Exception``) in both
+    branches. log() must never crash the daemon:
+      - Setup failure can surface as OSError (can't create log dir),
+        PermissionError, AttributeError (malformed _daemon_cfg), or
+        TypeError (bad config types). Bootstrap must tolerate all of
+        them and continue.
+      - _logger.info() failure can surface as OSError (disk full,
+        rotation race), ValueError (bad format string), UnicodeError
+        (encoding), or AttributeError (half-initialized handler). A
+        corrupted log path must never propagate out and kill the
+        daemon loop.
+    Narrowing to OSError alone would let non-I/O failures crash the
+    daemon, which is the exact scenario we want to survive. (Gemini M2
+    / M5 on PR #106 suggested narrowing; defending the broad except
+    as intentional defensive design.)
     """
-    global _logger
+    global _logger, _log_setup_warning_emitted
     if _logger is None:
         try:
             _logger = _setup_logging()
-        except Exception:
+        except Exception as e:
+            # CodeRabbit CR2: emit a one-time stderr warning so CLI
+            # callers (status/stop commands) see the configuration
+            # error. In the daemon itself stderr points at /dev/null
+            # after _setup_daemon_fds so this is a no-op there, which
+            # is the correct behavior.
+            if not _log_setup_warning_emitted:
+                _log_setup_warning_emitted = True
+                try:
+                    sys.stderr.write(
+                        f"[memory_daemon] Warning: log setup failed ({e}); "
+                        f"logging disabled.\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass  # stderr itself broken — nothing we can do
             return  # Best effort: no logger available, silently drop
     try:
         _logger.info(msg)
     except Exception:
-        pass  # Don't crash on log failures
+        pass  # Don't crash on log failures — see docstring.
 
 
 # Debug mode: off by default, enabled via --debug CLI flag or
@@ -684,7 +749,10 @@ def _run_pattern_detection_batch():
             if not spawn_succeeded and debug_stderr_handle is not None:
                 try:
                     debug_stderr_handle.close()
-                except Exception:
+                except (OSError, ValueError):
+                    # OSError: underlying close(2) failure (disk full, EIO).
+                    # ValueError: file already closed. Narrowed per Gemini
+                    # M3 on PR #106.
                     pass
         # Stash the verbose-log file handle on the proc object so
         # _check_pattern_detection can close it when reaping. Using an
@@ -743,7 +811,10 @@ def _check_pattern_detection():
         if debug_stderr is not None:
             try:
                 debug_stderr.close()
-            except Exception:
+            except (OSError, ValueError):
+                # OSError: underlying close(2) failure.
+                # ValueError: file already closed. Narrowed per Gemini M4
+                # on PR #106.
                 pass
         state.pattern_proc = None
 

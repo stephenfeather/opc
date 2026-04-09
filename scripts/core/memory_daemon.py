@@ -435,10 +435,13 @@ def process_pending_queue():
     spawned = 0
     while pq and len(ae) < _max_concurrent():
         session_id, project, transcript_path = pq.pop(0)
+        # Skip sessions already being extracted (avoids duplicates)
+        if any(ex[0] == session_id for ex in ae.values()):
+            continue
         log(f"Dequeuing {session_id} (project={project or 'unknown'}, "
             f"queue remaining: {len(pq)})")
-        mark_extracting(session_id)
-        extract_memories(session_id, project, transcript_path)
+        if extract_memories(session_id, project, transcript_path):
+            mark_extracting(session_id)
         spawned += 1
     return spawned
 
@@ -451,13 +454,20 @@ def queue_or_extract(
     """Queue extraction if at limit, otherwise extract immediately."""
     ae = get_active_extractions()
     pq = get_pending_queue()
+
+    # Dedup guard: skip if already queued or actively extracting
+    queued_ids = {item[0] for item in pq}
+    active_ids = {ex[0] for ex in ae.values()}
+    if session_id in queued_ids or session_id in active_ids:
+        return
+
     if len(ae) >= _max_concurrent():
         pq.append((session_id, project, transcript_path))
         log(f"Queued {session_id} (active={len(ae)}, "
             f"queue={len(pq)})")
     else:
-        mark_extracting(session_id)
-        extract_memories(session_id, project, transcript_path)
+        if extract_memories(session_id, project, transcript_path):
+            mark_extracting(session_id)
 
 
 # ---------------------------------------------------------------------------

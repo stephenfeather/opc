@@ -84,6 +84,101 @@ class TestQueueOrExtractMarkTiming:
         mock_extract.assert_called_once_with("sess-pending", "proj", "/t.jsonl")
 
 
+class TestMarkExtractingConditional:
+    """mark_extracting must NOT be called when extract_memories returns False."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_state(self):
+        import scripts.core.memory_daemon as mod
+
+        self.mod = mod
+        self.state = mod.create_daemon_state()
+        self.original = mod._daemon_state
+        mod._daemon_state = self.state
+        yield
+        mod._daemon_state = self.original
+
+    @patch("scripts.core.memory_daemon.extract_memories", return_value=False)
+    @patch("scripts.core.memory_daemon.mark_extracting")
+    @patch("scripts.core.memory_daemon.log")
+    def test_mark_extracting_not_called_when_extract_returns_false_immediate(
+        self, mock_log, mock_mark, mock_extract
+    ):
+        """queue_or_extract: mark_extracting must NOT fire when extract_memories returns False."""
+        assert len(self.state.active_extractions) == 0
+
+        self.mod.queue_or_extract("sess-fail", "proj", "/t.jsonl")
+
+        mock_extract.assert_called_once_with("sess-fail", "proj", "/t.jsonl")
+        mock_mark.assert_not_called()
+
+    @patch("scripts.core.memory_daemon.extract_memories", return_value=False)
+    @patch("scripts.core.memory_daemon.mark_extracting")
+    @patch("scripts.core.memory_daemon.log")
+    def test_mark_extracting_not_called_when_dequeue_extract_returns_false(
+        self, mock_log, mock_mark, mock_extract
+    ):
+        """process_pending_queue: mark_extracting must NOT fire when extract_memories returns False."""
+        self.state.pending_queue.append(("sess-fail-dequeue", "proj", "/t.jsonl"))
+        assert len(self.state.active_extractions) == 0
+
+        self.mod.process_pending_queue()
+
+        mock_extract.assert_called_once_with("sess-fail-dequeue", "proj", "/t.jsonl")
+        mock_mark.assert_not_called()
+
+
+class TestDedupGuard:
+    """queue_or_extract must not add duplicate entries to pending_queue."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_state(self):
+        import scripts.core.memory_daemon as mod
+
+        self.mod = mod
+        self.state = mod.create_daemon_state()
+        self.original = mod._daemon_state
+        mod._daemon_state = self.state
+        yield
+        mod._daemon_state = self.original
+
+    @patch("scripts.core.memory_daemon.extract_memories")
+    @patch("scripts.core.memory_daemon.mark_extracting")
+    @patch("scripts.core.memory_daemon.log")
+    def test_no_duplicate_in_pending_queue(self, mock_log, mock_mark, mock_extract):
+        """Multiple daemon_tick calls at concurrency limit must not duplicate queue entries."""
+        # Fill active_extractions to max_concurrent
+        for i in range(self.mod._max_concurrent()):
+            self.state.active_extractions[i] = (
+                f"busy-{i}", MagicMock(), Path("/t.jsonl"), "proj", 0
+            )
+
+        # Call queue_or_extract twice for the same session (simulates two ticks)
+        self.mod.queue_or_extract("sess-dup", "proj", "/t.jsonl")
+        self.mod.queue_or_extract("sess-dup", "proj", "/t.jsonl")
+
+        # Should appear only once in queue
+        queued = [item[0] for item in self.state.pending_queue]
+        assert queued.count("sess-dup") == 1
+
+    @patch("scripts.core.memory_daemon.extract_memories")
+    @patch("scripts.core.memory_daemon.mark_extracting")
+    @patch("scripts.core.memory_daemon.log")
+    def test_no_duplicate_when_already_active(self, mock_log, mock_mark, mock_extract):
+        """queue_or_extract skips session already in active_extractions."""
+        # Put sess-active in active_extractions (under concurrency limit)
+        self.state.active_extractions[999] = (
+            "sess-active", MagicMock(), Path("/t.jsonl"), "proj", 0
+        )
+        # active count is 1, below max_concurrent -- but should still skip
+
+        self.mod.queue_or_extract("sess-active", "proj", "/t.jsonl")
+
+        # Should not be queued and extract_memories should not be called again
+        mock_extract.assert_not_called()
+        assert len(self.state.pending_queue) == 0
+
+
 class TestDaemonTickNoEarlyMark:
     """daemon_tick must not call mark_extracting directly -- it delegates."""
 

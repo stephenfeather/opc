@@ -1,8 +1,9 @@
 /**
- * Tests for the heartbeat hook and updateHeartbeat function.
+ * Tests for the heartbeat hook and updateHeartbeat / updateHeartbeatDetached functions.
  *
  * Covers:
- * - updateHeartbeat(): SQL update via runPgQuery
+ * - updateHeartbeat(): SQL update via runPgQuery (synchronous, returns result)
+ * - updateHeartbeatDetached(): fire-and-forget via runPgQueryDetached (spawn+unref)
  * - heartbeat hook main(): PostToolUse handler that refreshes session heartbeat
  */
 
@@ -110,6 +111,96 @@ describe('updateHeartbeat', () => {
 });
 
 // ---------------------------------------------------------------------------
+// updateHeartbeatDetached (unit tests via mocked child_process.spawn)
+// ---------------------------------------------------------------------------
+
+describe('updateHeartbeatDetached', () => {
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('spawns a detached process with sessionId and project as args', async () => {
+    let capturedArgs: string[] = [];
+    const mockUnref = vi.fn();
+
+    vi.doMock('../shared/opc-path.js', () => ({
+      requireOpcDir: () => '/tmp/opc',
+    }));
+    vi.doMock('child_process', () => ({
+      spawnSync: vi.fn(),
+      spawn: (_cmd: string, args: string[]) => {
+        capturedArgs = args;
+        return { unref: mockUnref };
+      },
+    }));
+
+    const { updateHeartbeatDetached } = await import('../shared/db-utils-pg.js');
+    updateHeartbeatDetached('s-det42', '/home/user/project');
+
+    expect(capturedArgs).toContain('s-det42');
+    expect(capturedArgs).toContain('/home/user/project');
+    expect(mockUnref).toHaveBeenCalled();
+  });
+
+  it('calls unref() so the parent process does not wait', async () => {
+    const mockUnref = vi.fn();
+
+    vi.doMock('../shared/opc-path.js', () => ({
+      requireOpcDir: () => '/tmp/opc',
+    }));
+    vi.doMock('child_process', () => ({
+      spawnSync: vi.fn(),
+      spawn: () => ({ unref: mockUnref }),
+    }));
+
+    const { updateHeartbeatDetached } = await import('../shared/db-utils-pg.js');
+    updateHeartbeatDetached('s-unref', '/project');
+
+    expect(mockUnref).toHaveBeenCalledOnce();
+  });
+
+  it('does not throw when spawn fails', async () => {
+    vi.doMock('../shared/opc-path.js', () => ({
+      requireOpcDir: () => '/tmp/opc',
+    }));
+    vi.doMock('child_process', () => ({
+      spawnSync: vi.fn(),
+      spawn: () => { throw new Error('spawn failed'); },
+    }));
+
+    const { updateHeartbeatDetached } = await import('../shared/db-utils-pg.js');
+    expect(() => updateHeartbeatDetached('s-fail', '/project')).not.toThrow();
+  });
+
+  it('includes UPDATE SQL targeting last_heartbeat', async () => {
+    let capturedArgs: string[] = [];
+
+    vi.doMock('../shared/opc-path.js', () => ({
+      requireOpcDir: () => '/tmp/opc',
+    }));
+    vi.doMock('child_process', () => ({
+      spawnSync: vi.fn(),
+      spawn: (_cmd: string, args: string[]) => {
+        capturedArgs = args;
+        return { unref: vi.fn() };
+      },
+    }));
+
+    const { updateHeartbeatDetached } = await import('../shared/db-utils-pg.js');
+    updateHeartbeatDetached('s-sql', '/project');
+
+    const pythonCode = capturedArgs.find(a => a.includes('UPDATE sessions')) ?? '';
+    expect(pythonCode).toContain('UPDATE sessions');
+    expect(pythonCode).toContain('last_heartbeat');
+    expect(pythonCode).toContain('NOW()');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // heartbeat hook main()
 // ---------------------------------------------------------------------------
 
@@ -137,7 +228,7 @@ describe('heartbeat hook', () => {
       };
     });
     vi.doMock('../shared/db-utils-pg.js', () => ({
-      updateHeartbeat: vi.fn().mockReturnValue({ success: true }),
+      updateHeartbeatDetached: vi.fn(),
       isValidId: (id: string) => /^[a-zA-Z0-9_-]+$/.test(id),
       SAFE_ID_PATTERN: /^[a-zA-Z0-9_-]+$/,
     }));
@@ -153,8 +244,8 @@ describe('heartbeat hook', () => {
     expect(output).toContain('"result":"continue"');
   });
 
-  it('calls updateHeartbeat when session ID is available from file', async () => {
-    const mockUpdate = vi.fn().mockReturnValue({ success: true });
+  it('calls updateHeartbeatDetached when session ID is available from file', async () => {
+    const mockUpdate = vi.fn();
 
     vi.doMock('fs', async () => {
       const actual = await vi.importActual<typeof import('fs')>('fs');
@@ -167,7 +258,7 @@ describe('heartbeat hook', () => {
       };
     });
     vi.doMock('../shared/db-utils-pg.js', () => ({
-      updateHeartbeat: mockUpdate,
+      updateHeartbeatDetached: mockUpdate,
       isValidId: (id: string) => /^[a-zA-Z0-9_-]+$/.test(id),
       SAFE_ID_PATTERN: /^[a-zA-Z0-9_-]+$/,
     }));
@@ -183,7 +274,7 @@ describe('heartbeat hook', () => {
   });
 
   it('prefers stdin session_id over file-based session ID', async () => {
-    const mockUpdate = vi.fn().mockReturnValue({ success: true });
+    const mockUpdate = vi.fn();
 
     vi.doMock('fs', async () => {
       const actual = await vi.importActual<typeof import('fs')>('fs');
@@ -196,7 +287,7 @@ describe('heartbeat hook', () => {
       };
     });
     vi.doMock('../shared/db-utils-pg.js', () => ({
-      updateHeartbeat: mockUpdate,
+      updateHeartbeatDetached: mockUpdate,
       isValidId: (id: string) => /^[a-zA-Z0-9_-]+$/.test(id),
       SAFE_ID_PATTERN: /^[a-zA-Z0-9_-]+$/,
     }));
@@ -211,7 +302,7 @@ describe('heartbeat hook', () => {
     expect(mockUpdate).toHaveBeenCalledWith('s-fromstdin', '/project');
   });
 
-  it('always outputs continue even when updateHeartbeat fails', async () => {
+  it('always outputs continue even when updateHeartbeatDetached throws', async () => {
     vi.doMock('fs', async () => {
       const actual = await vi.importActual<typeof import('fs')>('fs');
       return {
@@ -223,7 +314,7 @@ describe('heartbeat hook', () => {
       };
     });
     vi.doMock('../shared/db-utils-pg.js', () => ({
-      updateHeartbeat: vi.fn().mockReturnValue({ success: false, error: 'db down' }),
+      updateHeartbeatDetached: vi.fn(),
       isValidId: (id: string) => /^[a-zA-Z0-9_-]+$/.test(id),
       SAFE_ID_PATTERN: /^[a-zA-Z0-9_-]+$/,
     }));

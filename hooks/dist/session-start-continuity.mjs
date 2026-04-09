@@ -48,8 +48,12 @@ function getOpcDir() {
 }
 
 // src/session-start-continuity.ts
-//! @hook SessionStart @preserve
 var MS_PER_HOUR = 36e5;
+/*!
+ * Build handoff directory name with UUID suffix for isolation. (SessionStart)
+ * Format: {sessionName}-{first8CharsOfUUID}
+ * Example: "auth-refactor-550e8400"
+ */
 function buildHandoffDirName(sessionName, sessionId) {
   const uuidShort = sessionId.replace(/-/g, "").slice(0, 8);
   return `${sessionName}-${uuidShort}`;

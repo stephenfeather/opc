@@ -3,7 +3,7 @@ import { readFileSync as readFileSync4 } from "fs";
 import { join as join3 } from "path";
 
 // src/shared/db-utils-pg.ts
-import { spawnSync } from "child_process";
+import { spawn, spawnSync } from "child_process";
 
 // src/shared/opc-path.ts
 import { existsSync, readFileSync } from "fs";
@@ -251,7 +251,15 @@ function getPendingTasksSummary(tasksFilePath) {
 }
 
 // src/session-register.ts
-//! @hook SessionStart @preserve
+/*!
+ * SessionStart Hook - Registers session in coordination layer.
+ *
+ * This hook:
+ * 1. Registers the session in PostgreSQL for cross-session awareness
+ * 2. Injects session ID, memory system health, and pending tasks summary
+ *
+ * Peer session awareness is handled by peer-awareness.ts (UserPromptSubmit).
+ */
 function main() {
   if (process.env.CLAUDE_MEMORY_EXTRACTION) {
     console.log(JSON.stringify({ result: "continue" }));

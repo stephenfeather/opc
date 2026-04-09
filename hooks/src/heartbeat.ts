@@ -9,7 +9,7 @@
  */
 
 import { readFileSync } from 'fs';
-import { updateHeartbeat, isValidId } from './shared/db-utils-pg.js';
+import { updateHeartbeatDetached, isValidId } from './shared/db-utils-pg.js';
 import { readSessionId, getProject } from './shared/session-id.js';
 
 export function main(): void {
@@ -41,8 +41,9 @@ export function main(): void {
 
   const project = getProject();
 
-  // Fire and forget — never block on heartbeat failure
-  updateHeartbeat(sessionId, project);
+  // Truly fire-and-forget — spawns a detached process and unrefs it
+  // so the parent exits immediately without waiting for the DB update.
+  updateHeartbeatDetached(sessionId, project);
 
   console.log(JSON.stringify({ result: 'continue' }));
 }

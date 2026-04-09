@@ -2,7 +2,7 @@
 import { readFileSync as readFileSync3 } from "fs";
 
 // src/shared/db-utils-pg.ts
-import { spawnSync } from "child_process";
+import { spawn, spawnSync } from "child_process";
 
 // src/shared/opc-path.ts
 import { existsSync, readFileSync } from "fs";
@@ -66,9 +66,10 @@ function isValidId(id) {
 function getPgConnectionString() {
   return process.env.CONTINUOUS_CLAUDE_DB_URL || process.env.DATABASE_URL || process.env.OPC_POSTGRES_URL || "postgresql://claude:claude_dev@localhost:5432/continuous_claude";
 }
-function runPgQuery(pythonCode, args = []) {
-  const opcDir = requireOpcDir();
-  const wrappedCode = `
+function runPgQueryDetached(pythonCode, args = []) {
+  try {
+    const opcDir = requireOpcDir();
+    const wrappedCode = `
 import sys
 import os
 import asyncio
@@ -80,32 +81,20 @@ os.chdir('${opcDir}')
 
 ${pythonCode}
 `;
-  try {
-    const result = spawnSync("uv", ["run", "python", "-c", wrappedCode, ...args], {
-      encoding: "utf-8",
-      maxBuffer: 1024 * 1024,
-      timeout: 5e3,
-      // 5 second timeout - fail gracefully if DB unreachable
+    const child = spawn("uv", ["run", "python", "-c", wrappedCode, ...args], {
+      detached: true,
+      stdio: "ignore",
       cwd: opcDir,
       env: {
         ...process.env,
         CONTINUOUS_CLAUDE_DB_URL: getPgConnectionString()
       }
     });
-    return {
-      success: result.status === 0,
-      stdout: result.stdout?.trim() || "",
-      stderr: result.stderr || ""
-    };
-  } catch (err) {
-    return {
-      success: false,
-      stdout: "",
-      stderr: String(err)
-    };
+    child.unref();
+  } catch {
   }
 }
-function updateHeartbeat(sessionId, project) {
+function updateHeartbeatDetached(sessionId, project) {
   const pythonCode = `
 import asyncpg
 import os
@@ -121,20 +110,12 @@ async def main():
             UPDATE sessions SET last_heartbeat = NOW()
             WHERE id = $1 AND project = $2
         ''', session_id, project)
-        print('ok')
     finally:
         await conn.close()
 
 asyncio.run(main())
 `;
-  const result = runPgQuery(pythonCode, [sessionId, project]);
-  if (!result.success || result.stdout !== "ok") {
-    return {
-      success: false,
-      error: result.stderr || result.stdout || "Unknown error"
-    };
-  }
-  return { success: true };
+  runPgQueryDetached(pythonCode, [sessionId, project]);
 }
 
 // src/shared/session-id.ts
@@ -186,10 +167,12 @@ function main() {
     return;
   }
   const project = getProject();
-  updateHeartbeat(sessionId, project);
+  updateHeartbeatDetached(sessionId, project);
   console.log(JSON.stringify({ result: "continue" }));
 }
-main();
+if (typeof process !== "undefined" && process.argv[1] && (process.argv[1].endsWith("heartbeat.ts") || process.argv[1].endsWith("heartbeat.js") || process.argv[1].endsWith("heartbeat.mjs"))) {
+  main();
+}
 export {
   main
 };

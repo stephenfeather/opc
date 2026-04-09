@@ -1,7 +1,12 @@
-#!/usr/bin/env node
-
 // src/tldr-search-sanitizer.ts
 import { readFileSync } from "fs";
+/*!
+ * PreToolUse Hook: TLDR Search Sanitizer
+ *
+ * Removes unsupported "--project" flag from `tldr search` Bash commands.
+ * This prevents invalid argument errors like:
+ *   tldr search "pattern" /path --project /path
+ */
 function tokenizeCommand(command) {
   const tokens = [];
   const regex = /"([^"\\]*(\\.[^"\\]*)*)"|'([^'\\]*(\\.[^'\\]*)*)'|`[^`]*`|\\\S+|\S+/g;

@@ -270,6 +270,16 @@ function trackHookActivitySync(hookName, projectDir, success = true, metrics = {
 }
 
 // src/tldr-read-enforcer.ts
+/*!
+ * TLDR Read Enforcer Hook - BLOCKING VERSION (DAEMON)
+ *
+ * Intercepts Read tool calls for code files and BLOCKS with TLDR context.
+ * Instead of reading 1000+ line files, returns structured L1 AST context.
+ *
+ * Uses TLDR daemon for fast cached responses (50ms vs 500ms CLI).
+ *
+ * Result: 95% token savings (50-500 tokens vs 3000-20000 raw)
+ */
 var CONTEXT_DIR = "/tmp/claude-search-context";
 var CONTEXT_MAX_AGE_MS = 3e4;
 function getSearchContext(sessionId) {

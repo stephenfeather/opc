@@ -2,6 +2,12 @@
 import { execSync } from "child_process";
 import * as path from "path";
 import * as fs from "fs";
+/*!
+ * PostToolUse Hook: TypeScript Pre-flight Check
+ *
+ * Runs tsc + qlty after Edit/Write on .ts/.tsx files to catch errors immediately.
+ * Returns errors as system reminder so Claude can fix before moving on.
+ */
 function readStdin() {
   return new Promise((resolve) => {
     let data = "";

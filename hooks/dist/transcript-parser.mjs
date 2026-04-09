@@ -1,6 +1,11 @@
 // src/transcript-parser.ts
 import * as fs from "fs";
-//! @hook none (shared library) @preserve
+/*!
+ * Transcript Parser Module
+ *
+ * Parses JSONL transcript files from Claude Code sessions and extracts
+ * high-signal data for use by PreCompact hooks and auto-handoff generation.
+ */
 function parseTranscript(transcriptPath) {
   const summary = {
     lastTodos: [],

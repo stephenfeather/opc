@@ -443,6 +443,13 @@ def sqlite_mark_extraction_failed(
             "last_error = ? WHERE id = ?",
             (last_error, session_id),
         )
+        suffix = f" (last error: {last_error})" if last_error else ""
+        logger.info(
+            "Extraction permanently failed for %s after %d attempts%s",
+            session_id,
+            attempts,
+            suffix,
+        )
     conn.commit()
     conn.close()
 

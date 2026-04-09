@@ -135,13 +135,9 @@ def test_reap_passes_last_error_to_mark_failed(tmp_jsonl):
         reap_completed_extractions()
 
     mock_fail.assert_called_once()
-    _, kwargs = mock_fail.call_args
-    assert "last_error" in kwargs or (
-        len(mock_fail.call_args[0]) > 1
-    ), "mark_extraction_failed must receive last_error"
-    # Check actual value
-    if "last_error" in kwargs:
-        assert stderr_msg in kwargs["last_error"]
+    kwargs = mock_fail.call_args[1]
+    assert "last_error" in kwargs, "mark_extraction_failed must receive last_error kwarg"
+    assert stderr_msg in kwargs["last_error"]
 
 
 def test_reap_truncates_stderr_to_500_chars(tmp_jsonl):

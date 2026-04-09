@@ -437,6 +437,7 @@ def process_pending_queue():
         session_id, project, transcript_path = pq.pop(0)
         log(f"Dequeuing {session_id} (project={project or 'unknown'}, "
             f"queue remaining: {len(pq)})")
+        mark_extracting(session_id)
         extract_memories(session_id, project, transcript_path)
         spawned += 1
     return spawned
@@ -455,6 +456,7 @@ def queue_or_extract(
         log(f"Queued {session_id} (active={len(ae)}, "
             f"queue={len(pq)})")
     else:
+        mark_extracting(session_id)
         extract_memories(session_id, project, transcript_path)
 
 
@@ -569,7 +571,6 @@ def daemon_tick() -> None:
             log(f"Found {len(truly_stale)} stale sessions: "
                 f"{summary}")
             for s in truly_stale:
-                mark_extracting(s.id)
                 queue_or_extract(
                     s.id, s.project or "", s.transcript_path
                 )

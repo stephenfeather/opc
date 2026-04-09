@@ -243,8 +243,13 @@ class TestExtractMemoriesImplDebugWiring:
         monkeypatch.setenv("MEMORY_DAEMON_DEBUG", "1")
 
         # Tripwire: a fake secret env var that os.environ.copy() would
-        # pull into the extraction env. The DEBUG log must list the KEY
-        # ("OPC_TRIPWIRE_SECRET") but must NOT emit the VALUE.
+        # pull into the extraction env. Under the Round 3 tightened
+        # format, DEBUG logging must NOT emit the VALUE and must NOT
+        # enumerate parent-process env keys such as 'OPC_TRIPWIRE_SECRET'
+        # — env logging is daemon-owned only (CLAUDE_MEMORY_EXTRACTION,
+        # CLAUDE_PROJECT_DIR presence, env_var_count). Both the key
+        # name and the value are checked absent by the assertion at
+        # the bottom of this test.
         tripwire_value = "zAbC123DO-NOT-LOG"
         monkeypatch.setenv("OPC_TRIPWIRE_SECRET", tripwire_value)
 
@@ -314,11 +319,20 @@ class TestExtractMemoriesImplDebugWiring:
             f"env messages: {env_msgs}"
         )
 
-        # Tripwire: the secret VALUE must NEVER appear in any log line.
-        # Env logging is KEY-ONLY by design (R5 / C8 in the plan).
-        leaked = [m for m in messages if tripwire_value in m]
+        # Tripwire: under the Round 3 tightened format, NEITHER the
+        # parent-env KEY NAME ('OPC_TRIPWIRE_SECRET') NOR its VALUE
+        # may appear in the DEBUG log. Env logging is daemon-owned
+        # ONLY (CLAUDE_MEMORY_EXTRACTION=1, CLAUDE_PROJECT_DIR presence,
+        # env_var_count=N) — enumerating parent-env key names was the
+        # reconnaissance risk Codex flagged in Round 3. This assertion
+        # guards both halves of that contract (PR #110 Cycle 1 T1).
+        leaked = [
+            m for m in messages
+            if "OPC_TRIPWIRE_SECRET" in m or tripwire_value in m
+        ]
         assert not leaked, (
-            f"SECURITY VIOLATION: tripwire env value {tripwire_value!r} "
-            f"leaked into DEBUG log. Env logging must be KEY-ONLY. "
+            f"SECURITY VIOLATION: parent env key or value leaked into "
+            f"DEBUG log. Env logging must stay daemon-owned only "
+            f"(no parent-env KEY NAMES, no parent-env VALUES). "
             f"Leaked messages: {leaked}"
         )

@@ -1,10 +1,20 @@
 """Pure functions and data types for the memory daemon.
 
-All functions in this module are side-effect-free: they take data in
-and return new data out without I/O, mutation, or global state.
+Most functions in this module are pure and side-effect-free: they
+take data in and return new data out without I/O, mutation, or
+global state. Where I/O is needed (e.g., process-alive checks), it
+is injected as a predicate parameter — the core function itself
+remains pure.
 
-Where I/O is needed (e.g., process-alive checks), it is injected as
-a predicate parameter — the core function itself remains pure.
+Intentional side-effect surface (Issue #96): the DEBUG-gated
+``debug()`` helper and the two ``build_extraction_*`` functions
+emit logging side effects when ``MEMORY_DAEMON_DEBUG`` is truthy.
+``debug()`` reads ``os.environ`` on every call (read-only) and may
+invoke ``memory_daemon.log`` via a lazy import. ``build_extraction_command``
+and ``build_extraction_env`` call ``debug()`` with a thunk that
+emits diagnostic signal for hung-extractor triage. When DEBUG is
+off, all three are pure in practice (early-return before any log
+call). All OTHER functions in this module remain side-effect-free.
 
 Issue #96: DEBUG-gated diagnostic logging.
 
@@ -85,7 +95,7 @@ def _debug_enabled() -> bool:
     )
 
 
-def debug(msg_fn) -> None:
+def debug(msg_fn: str | Callable[[], str]) -> None:
     """Emit a diagnostic log line when DEBUG mode is enabled.
 
     Accepts either a plain string or a zero-argument callable (thunk).
@@ -207,9 +217,25 @@ def build_extraction_env(base_env: dict, project_dir: str | None) -> dict:
     """Build environment dict for extraction subprocess.
 
     Returns a new dict — does not mutate base_env.
+
+    PR #110 M1 (CodeRabbit): an inherited ``CLAUDE_PROJECT_DIR`` in
+    ``base_env`` is explicitly dropped. Callers are the authoritative
+    source for the child subprocess's project dir; if the caller has
+    nothing to supply (``project_dir`` is None or empty), the child
+    must see no ``CLAUDE_PROJECT_DIR`` at all rather than silently
+    inheriting a stale parent-shell value. Production path:
+    ``memory_daemon.queue_or_extract`` passes ``s.project or ""`` for
+    stale sessions without a recorded project — before this fix, any
+    ``CLAUDE_PROJECT_DIR`` already present in the daemon's
+    ``os.environ`` would leak through unchanged while the debug log
+    claimed ``CLAUDE_PROJECT_DIR=unset``.
     """
     env = dict(base_env)
     env["CLAUDE_MEMORY_EXTRACTION"] = "1"
+    # M1: drop any inherited value first, then set iff the caller
+    # gave us one. This prevents silent inheritance AND keeps the
+    # debug log below in sync with the returned dict.
+    env.pop("CLAUDE_PROJECT_DIR", None)
     if project_dir:
         env["CLAUDE_PROJECT_DIR"] = project_dir
     # Issue #96 + Codex Round 3: DEBUG-gated diagnostic log.
@@ -229,10 +255,17 @@ def build_extraction_env(base_env: dict, project_dir: str | None) -> dict:
     # NOTE: the parent-env clone behavior itself is deferred to
     # Issue #108 (allowlist). Do NOT change this log to dump ``env``,
     # ``repr(env)``, or ``sorted(env.keys())``.
+    #
+    # M1: use ``"CLAUDE_PROJECT_DIR" in env`` as the presence signal
+    # rather than the truthiness of the parameter. They agree now
+    # (because the pop() above + the conditional set establish the
+    # invariant), but reading from the dict keeps the log and the
+    # returned value impossible to desynchronize.
     debug(
         lambda: (
             f"build_extraction_env: CLAUDE_MEMORY_EXTRACTION=1 "
-            f"CLAUDE_PROJECT_DIR={'set' if project_dir else 'unset'} "
+            f"CLAUDE_PROJECT_DIR="
+            f"{'set' if 'CLAUDE_PROJECT_DIR' in env else 'unset'} "
             f"env_var_count={len(env)}"
         )
     )

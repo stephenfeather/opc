@@ -22,18 +22,25 @@ Module docstring notes (for future reviewers — Learning #5 / R8):
   the correct response is "see PR #106 defense of M2/M5 — log-path
   broad catches are defensive".
 
-Hermeticity notes (Learning #3 / F3 / R3):
+Hermeticity notes (Learning #3 / F3 / R3; updated Round 3):
 
-- Every test that calls production code which might invoke `log()`
-  MUST monkeypatch both `scripts.core.memory_daemon_core.log` (if it
-  exists) and `scripts.core.memory_daemon.log` to a list-appender,
-  BEFORE the call. An autouse module-scope fixture
-  (`no_real_log_file`) additionally asserts that
-  `~/.claude/memory-daemon.log` byte count did not change across the
-  module run, as belt-and-suspenders. This fixture is known to
-  false-positive on shared dev boxes if another Claude Code session
-  writes concurrently — it is marked as a known-flake mitigation in
-  its docstring.
+- Every test in this module is protected by the autouse
+  function-scoped ``_hermetic_log`` fixture, which stubs
+  ``memory_daemon.log`` (and defensively ``memory_daemon_core.log``
+  if it exists) to a no-op lambda for the duration of each test.
+  This is ACTIVE hermeticity (replace the I/O sink) rather than
+  OBSERVATIONAL (watch a file size), and it replaces the earlier
+  module-scope ``no_real_log_file`` fixture. Round 3 eliminated
+  ``no_real_log_file`` because it had two failure modes: silent
+  pass on clean machines (the pre-test byte-count check was
+  skipped when the log file did not exist) and false positives on
+  shared dev boxes (a concurrent Claude session writing during the
+  test run would trigger the check).
+
+- Tests that need to inspect captured log messages inject the
+  ``log_spy`` fixture explicitly. ``log_spy`` reinstalls a
+  list-appender on top of ``_hermetic_log``'s no-op stub; pytest's
+  function-scoped fixture ordering means the later ``setattr`` wins.
 
 - Do NOT monkeypatch `builtins.open` (Learning #4). The core module
   avoids I/O, so there is no open call to intercept anyway. For the
@@ -243,13 +250,24 @@ class TestImportHygiene:
         """Test 2: _open_log_file_secure is not invoked during core import.
 
         Learning #4: patch the HIGH-LEVEL helper, not builtins.open.
+
+        PR #110 Cycle 1 C1 (Copilot + CodeRabbit): the tripwire raises
+        immediately rather than delegating to the real helper. An
+        earlier iteration called ``original(*args, **kwargs)`` from
+        inside the tripwire, which meant a regression that actually
+        tripped this path would perform real filesystem I/O against
+        ``~/.claude/memory-daemon.log`` — undermining the hermeticity
+        guarantee the test is supposed to enforce. Raising ensures
+        the failure mode is loud and I/O-free.
         """
         calls: list[tuple] = []
-        original = memory_daemon._open_log_file_secure
 
         def _tripwire(*args, **kwargs):
             calls.append((args, kwargs))
-            return original(*args, **kwargs)
+            raise RuntimeError(
+                "IMPORT HYGIENE VIOLATION: _open_log_file_secure was "
+                "invoked during core module import"
+            )
 
         monkeypatch.setattr(memory_daemon, "_open_log_file_secure", _tripwire)
         importlib.reload(memory_daemon_core)
@@ -938,6 +956,118 @@ class TestBuildExtractionEnvLogging:
         assert base == snapshot, (
             f"build_extraction_env mutated base_env. "
             f"before={snapshot} after={base}"
+        )
+
+    # ------------------------------------------------------------------
+    # PR #110 Cycle 1 M1 — inherited CLAUDE_PROJECT_DIR must not leak
+    # ------------------------------------------------------------------
+    #
+    # CodeRabbit MAJOR (outside-diff) finding. Production call chain:
+    #   memory_daemon.queue_or_extract(s.id, s.project or "", ...)
+    #   → extract_memories → _extract_memories_impl
+    #   → build_extraction_env(os.environ, project_dir)
+    # When a stale session's project is None, the caller passes ""
+    # (empty string, falsy). The old ``if project_dir:`` branch was
+    # skipped, so any ``CLAUDE_PROJECT_DIR`` already present in the
+    # daemon's ``os.environ`` (inherited from the launching shell)
+    # silently propagated to the child extraction subprocess. The
+    # DEBUG log ALSO lied — it reported ``CLAUDE_PROJECT_DIR=unset``
+    # while the returned env dict actually contained a stale value.
+    #
+    # These three tests lock in the post-fix contract:
+    #   1. An inherited key is removed when caller supplies no project.
+    #   2. An inherited value does NOT override the caller's explicit
+    #      project_dir (existing behavior — regression guard).
+    #   3. The DEBUG log presence-marker matches the env dict after
+    #      the fix (no more log/reality mismatch).
+
+    def test_build_extraction_env_does_not_inherit_parent_claude_project_dir(
+        self,
+    ):
+        """Test 25a (M1): inherited CLAUDE_PROJECT_DIR is dropped on None.
+
+        Arrangement: base_env has a stale ``CLAUDE_PROJECT_DIR`` from
+        the parent process environment. Caller passes ``project_dir=None``
+        (production equivalent: stale session with no project).
+
+        Expected (post-fix): the returned env dict does NOT contain
+        ``CLAUDE_PROJECT_DIR`` at all. The stale parent value is
+        discarded so the extraction subprocess does not silently
+        inherit it.
+
+        Before the fix, the key remained in the returned dict because
+        ``env = dict(base_env)`` copied it and the ``if project_dir:``
+        branch was skipped.
+        """
+        base_env = {"CLAUDE_PROJECT_DIR": "/parent-leaked"}
+        result_env = memory_daemon_core.build_extraction_env(
+            base_env, None
+        )
+        assert "CLAUDE_PROJECT_DIR" not in result_env, (
+            f"CLAUDE_PROJECT_DIR from parent env leaked into child env "
+            f"even though caller passed project_dir=None. "
+            f"Got result_env['CLAUDE_PROJECT_DIR']="
+            f"{result_env.get('CLAUDE_PROJECT_DIR')!r}"
+        )
+
+    def test_build_extraction_env_caller_project_dir_wins_over_inherited(
+        self,
+    ):
+        """Test 25b (M1): explicit project_dir overrides inherited value.
+
+        Regression guard for the existing behavior: when the caller
+        passes an explicit project_dir AND the parent env also has
+        one, the caller's value must win. This test should pass both
+        before and after the fix — it is included to prevent the
+        M1 fix from accidentally swinging the pendulum the other way.
+        """
+        base_env = {"CLAUDE_PROJECT_DIR": "/parent-leaked"}
+        result_env = memory_daemon_core.build_extraction_env(
+            base_env, "/explicit"
+        )
+        assert result_env["CLAUDE_PROJECT_DIR"] == "/explicit", (
+            f"Caller-supplied project_dir='/explicit' should win over "
+            f"inherited '/parent-leaked'. "
+            f"Got: {result_env.get('CLAUDE_PROJECT_DIR')!r}"
+        )
+
+    def test_build_extraction_env_log_matches_env_when_parent_had_project_dir(
+        self, debug_on, log_spy
+    ):
+        """Test 25c (M1): log and returned env agree when parent leaked.
+
+        Before the fix, two failures occurred simultaneously:
+          (a) result_env contained the parent's stale value, AND
+          (b) the DEBUG log said ``CLAUDE_PROJECT_DIR=unset``.
+        The log was lying about the subprocess environment.
+
+        After the fix, both the log AND the dict agree: neither
+        contains CLAUDE_PROJECT_DIR when the caller passes None, even
+        if base_env had one inherited. This test asserts both halves
+        of the contract in one place.
+        """
+        base_env = {"CLAUDE_PROJECT_DIR": "/parent-leaked"}
+        result_env = memory_daemon_core.build_extraction_env(
+            base_env, None
+        )
+
+        # Contract half 1: the returned dict is consistent with "unset".
+        assert "CLAUDE_PROJECT_DIR" not in result_env, (
+            f"result_env still contains stale parent CLAUDE_PROJECT_DIR: "
+            f"{result_env.get('CLAUDE_PROJECT_DIR')!r}"
+        )
+
+        # Contract half 2: the DEBUG log agrees — it reports "unset"
+        # AND it is not lying about what the subprocess will see.
+        joined = " ".join(str(m) for m in log_spy)
+        assert "CLAUDE_PROJECT_DIR=unset" in joined, (
+            f"Expected 'CLAUDE_PROJECT_DIR=unset' in DEBUG log when "
+            f"caller passes project_dir=None, got: {log_spy}"
+        )
+        # And the log must NOT have leaked the stale parent value.
+        assert "/parent-leaked" not in joined, (
+            f"SECURITY VIOLATION: stale parent CLAUDE_PROJECT_DIR value "
+            f"'/parent-leaked' leaked into DEBUG log: {log_spy}"
         )
 
 

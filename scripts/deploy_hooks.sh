@@ -87,6 +87,15 @@ if [ "$AUTO_MODE" = "1" ]; then
     esac
 fi
 
+# PR #107 Gemini review follow-up: if DEPLOY_TARGET is unset and HOME is
+# also unset, the ${HOME:-}/.claude/hooks fallback expands to /.claude/hooks
+# — a root-level path that would pass later guards if /.claude happens to
+# exist. Abort explicitly to avoid surprising root-level deploys.
+if [ -z "${DEPLOY_TARGET:-}" ] && [ -z "${HOME:-}" ]; then
+    echo "deploy_hooks: neither DEPLOY_TARGET nor HOME is set - aborting" >&2
+    exit 4
+fi
+
 TARGET="${DEPLOY_TARGET:-$HOME/.claude/hooks}"
 
 # Finding #2 (round 1): Validate DEPLOY_TARGET before any rsync --delete call.

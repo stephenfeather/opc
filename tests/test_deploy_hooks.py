@@ -441,6 +441,29 @@ class TestTargetValidation:
         assert result.returncode == 4
         assert "unsafe target" in result.stderr
 
+    def test_rejects_when_home_and_deploy_target_both_unset(
+        self, tmp_path: Path
+    ) -> None:
+        """PR #107 Gemini regression: if DEPLOY_TARGET is unset and HOME is
+        also unset, the default expansion produces '/.claude/hooks' — a
+        root-level path. Abort explicitly so a misconfigured shell cannot
+        aim rsync --delete at /."""
+        opc_root, script, _target = _build_fixture(tmp_path)
+
+        # Unset both HOME and DEPLOY_TARGET in the child env.
+        result = subprocess.run(
+            ["bash", str(script)],
+            env={
+                "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 4
+        assert "neither DEPLOY_TARGET nor HOME is set" in result.stderr
+
     def test_rejects_symlinked_target(self, tmp_path: Path) -> None:
         """Round-2 regression: a symlink named 'hooks' pointing elsewhere
         must be refused, not followed, to prevent rsync --delete from

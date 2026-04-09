@@ -10,16 +10,44 @@ Claude Code hooks that enable skill auto-activation, file tracking, and validati
 
 ```
 hooks/
-├── src/              # TypeScript source (for development)
-├── dist/             # Pre-bundled JS (committed, ready to run)
-├── *.sh              # Shell wrappers (call node dist/*.mjs)
-├── build.sh          # Rebuild dist/ after modifying src/
-└── package.json      # Dev dependencies only (esbuild)
+├── src/              # TypeScript source (source of truth)
+├── dist/             # Bundled *.mjs artifacts (built by esbuild)
+└── package.json      # Build + dev dependencies (esbuild, vitest)
+
+scripts/
+└── deploy_hooks.sh   # Mirrors hooks/{src,dist} → $HOME/.claude/hooks/
 ```
 
-**For users:** Just clone the repo. Hooks work immediately.
+**For users:** Clone the repo, then `cd hooks && npm install && npm run build`.
+The `postbuild` step automatically mirrors `src/` and `dist/` into
+`$HOME/.claude/hooks/` via `../scripts/deploy_hooks.sh`, which is where
+Claude Code's `settings.json` loads hooks from. No manual `cp` required.
 
-**For developers:** Edit `src/*.ts`, then run `./build.sh` to rebuild.
+**For developers:** Edit `src/*.ts`, then `npm run build`. The mirror runs
+automatically after every successful build.
+
+> `~/.claude/hooks/src/` and `~/.claude/hooks/dist/` are **mirrors** of this
+> tree — do not edit them directly. The deploy script uses `rsync --delete`,
+> so any files there that do not exist in `opc/hooks/{src,dist}/` will be
+> removed on the next build.
+
+### Deploy entry points
+
+| Command (from `hooks/`)  | What it does                                    |
+|--------------------------|-------------------------------------------------|
+| `npm run build`          | Build + auto-deploy (via `postbuild`)           |
+| `npm run deploy`         | Re-sync without rebuilding                      |
+| `../scripts/deploy_hooks.sh` | Standalone shell entry point (same behavior)   |
+
+### Environment overrides
+
+| Variable         | Default              | Purpose                                      |
+|------------------|----------------------|----------------------------------------------|
+| `DEPLOY_TARGET`  | `$HOME/.claude/hooks`| Mirror into a different tree (tests/install) |
+
+If `$HOME/.claude/` does not exist (e.g. CI, fresh box without Claude Code
+installed), the deploy step prints a skip message and exits 0 instead of
+failing. Issue #105 tracked the drift that motivated this automation.
 
 ---
 
@@ -142,14 +170,17 @@ To modify hooks:
 # Edit TypeScript source
 vim src/skill-activation-prompt.ts
 
-# Rebuild bundled JS
-./build.sh
+# Rebuild bundled JS and auto-deploy to ~/.claude/hooks/
+cd hooks && npm run build
 
-# Test
-echo '{"prompt": "test"}' | ./skill-activation-prompt.sh
+# Run hook tests
+npm test
 ```
 
-The `build.sh` script will install dev dependencies (esbuild) if needed.
+`npm run build` invokes esbuild, and the `postbuild` script runs
+`../scripts/deploy_hooks.sh` to mirror `src/` and `dist/` into
+`$HOME/.claude/hooks/`. To re-deploy without rebuilding, use
+`npm run deploy`.
 
 ---
 

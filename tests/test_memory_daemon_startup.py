@@ -314,6 +314,118 @@ class TestReserveLowFds:
         assert mod._logger is fake_logger
 
 
+class TestSecurityHardening:
+    """Aegis audit findings LOW-1, LOW-2, LOW-4 from the /security review of #99.
+
+    Symlink TOCTOU hardening for log file opens, and graceful degradation
+    when the kernel fd table is exhausted at daemonization time.
+    """
+
+    def test_open_log_file_secure_uses_nofollow_and_restrictive_mode(self, monkeypatch, tmp_path):
+        """_open_log_file_secure must use O_NOFOLLOW (defeats symlink redirect)
+        and mode 0o600 (not world-readable). Verifies the syscall signature
+        via a mocked os.open.
+        """
+        from scripts.core.memory_daemon import _open_log_file_secure
+
+        # Capture the real os.open BEFORE patching. The fake must NOT
+        # call anything that goes through os.open indirectly (e.g.
+        # ``Path.touch`` internally calls ``os.open`` and would recurse
+        # into the monkeypatch). Doing the file creation via real_os_open
+        # with O_CREAT in one shot avoids the recursion entirely.
+        real_os_open = os.open
+        real_path = str(tmp_path / "real.log")
+
+        captured: dict = {}
+
+        def fake_os_open(path, flags, mode=0o777):
+            captured["path"] = path
+            captured["flags"] = flags
+            captured["mode"] = mode
+            return real_os_open(
+                real_path,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                0o600,
+            )
+
+        monkeypatch.setattr(os, "open", fake_os_open)
+
+        handle = _open_log_file_secure(tmp_path / "target.log", mode="ab")
+        try:
+            # O_NOFOLLOW defeats symlink TOCTOU.
+            assert captured["flags"] & os.O_NOFOLLOW, "must use O_NOFOLLOW"
+            # O_APPEND because we asked for "ab".
+            assert captured["flags"] & os.O_APPEND
+            assert captured["flags"] & os.O_CREAT
+            assert captured["flags"] & os.O_WRONLY
+            # Umask-free restrictive mode.
+            assert captured["mode"] == 0o600
+        finally:
+            handle.close()
+
+    def test_open_log_file_secure_refuses_to_follow_symlink(self, tmp_path):
+        """End-to-end: if the target is a symlink to a file the attacker
+        controls, _open_log_file_secure must raise rather than follow it.
+        """
+        from scripts.core.memory_daemon import _open_log_file_secure
+
+        target = tmp_path / "real.log"
+        target.write_text("attacker-controlled")
+        link = tmp_path / "link.log"
+        link.symlink_to(target)
+
+        import pytest
+
+        with pytest.raises(OSError):
+            _open_log_file_secure(link, mode="ab")
+
+        # The attacker-controlled file was NOT appended to.
+        assert target.read_text() == "attacker-controlled"
+
+    def test_open_log_file_secure_creates_new_file(self, tmp_path):
+        """Happy path: the helper creates and opens a new log file."""
+        from scripts.core.memory_daemon import _open_log_file_secure
+
+        path = tmp_path / "new.log"
+        handle = _open_log_file_secure(path, mode="ab")
+        try:
+            handle.write(b"hello\n")
+            handle.flush()
+        finally:
+            handle.close()
+
+        assert path.exists()
+        assert path.read_bytes() == b"hello\n"
+        # Mode check: owner-only read/write.
+        assert path.stat().st_mode & 0o777 == 0o600
+
+    def test_setup_daemon_fds_survives_fd_exhaustion(self, monkeypatch):
+        """Aegis LOW-4: if os.open raises OSError (fd exhaustion), the
+        function must return gracefully rather than propagating the
+        exception out of _run_as_daemon and killing the daemon with an
+        unlogged traceback.
+        """
+        from scripts.core.memory_daemon import _setup_daemon_fds
+
+        def raising_open(path, flags):
+            raise OSError(24, "Too many open files")
+
+        dup2_calls: list = []
+
+        def fake_dup2(src, dst):
+            dup2_calls.append((src, dst))
+
+        # Must not raise.
+        _setup_daemon_fds(
+            os_open_fn=raising_open,
+            os_dup2_fn=fake_dup2,
+            os_close_fn=lambda _fd: None,
+        )
+
+        # And must not have attempted dup2 with an invalid fd.
+        assert dup2_calls == []
+
+
 class TestDebugFlag:
     """--debug flag + DEBUG module state + debug() helper.
 
@@ -798,16 +910,17 @@ class TestPatternDetectionSpawn:
                 return 99
 
         tracked: list[_TrackedFile] = []
-        real_open = open
 
-        def tracking_open(path, *args, **kwargs):
-            if "pattern_batch_verbose.log" in str(path):
-                h = _TrackedFile()
-                tracked.append(h)
-                return h
-            return real_open(path, *args, **kwargs)
+        # _run_pattern_detection_batch calls _open_log_file_secure (which
+        # internally uses os.open + os.fdopen) to open the verbose log.
+        # Intercept that helper directly so the test does not depend on
+        # the specific fd plumbing inside.
+        def fake_secure_open(path, mode="ab"):
+            h = _TrackedFile()
+            tracked.append(h)
+            return h
 
-        monkeypatch.setattr("builtins.open", tracking_open)
+        monkeypatch.setattr(mod, "_open_log_file_secure", fake_secure_open)
 
         # Force Popen to raise AFTER the verbose log file is opened.
         def fake_popen(*args, **kwargs):

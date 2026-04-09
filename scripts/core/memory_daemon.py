@@ -48,6 +48,34 @@ if _project_root not in sys.path:
 
 import faulthandler
 
+
+def _open_log_file_secure(path, mode: str = "ab"):
+    """Open a log file with symlink-TOCTOU hardening and owner-only mode.
+
+    Uses O_NOFOLLOW so a symlink at ``path`` causes ``OSError`` (ELOOP)
+    instead of silently redirecting writes to an attacker-controlled
+    target. Mode 0o600 keeps the file unreadable to other UIDs regardless
+    of the caller's umask — faulthandler tracebacks and pattern-batch
+    verbose logs can leak local-variable snippets.
+
+    Addresses aegis LOW-1 / LOW-2 findings from the /security audit of #99.
+
+    ``mode`` accepts ``"ab"``/``"a"`` for append, ``"wb"``/``"w"`` for
+    truncate. Binary/text is inferred from presence of ``"b"``.
+    """
+    os_flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
+    if "a" in mode:
+        os_flags |= os.O_APPEND
+    else:
+        os_flags |= os.O_TRUNC
+    fd = os.open(path, os_flags, 0o600)
+    try:
+        return os.fdopen(fd, mode)
+    except Exception:
+        os.close(fd)
+        raise
+
+
 # Module-level handle kept alive for faulthandler's lifetime. Populated by
 # _enable_faulthandler() at main() entry — NOT at import time. Issue #55/#57
 # track the refactor that removed module-level faulthandler.enable() calls
@@ -69,11 +97,14 @@ def _enable_faulthandler() -> None:
     try:
         log_path = Path.home() / ".claude" / "logs" / "opc_crash.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        _faulthandler_log_file = open(log_path, "a")  # noqa: SIM115
+        # Use the O_NOFOLLOW-hardened opener (aegis LOW-1) to resist
+        # symlink redirect attacks on the crash log path.
+        _faulthandler_log_file = _open_log_file_secure(log_path, mode="a")
         faulthandler.enable(file=_faulthandler_log_file, all_threads=True)
     except OSError:
-        # Best effort: if we cannot open the crash log, still enable
-        # faulthandler against stderr so crashes produce *some* diagnostic.
+        # Best effort: if we cannot open the crash log (symlink refused,
+        # fd exhaustion, permission denied), still enable faulthandler
+        # against stderr so crashes produce *some* diagnostic.
         faulthandler.enable(all_threads=True)
 
 
@@ -623,10 +654,14 @@ def _run_pattern_detection_batch():
             try:
                 verbose_log = Path.home() / ".claude" / "logs" / "pattern_batch_verbose.log"
                 verbose_log.parent.mkdir(parents=True, exist_ok=True)
-                debug_stderr_handle = open(verbose_log, "ab")  # noqa: SIM115
+                # O_NOFOLLOW-hardened open (aegis LOW-2): refuses to follow
+                # a symlink at the verbose log path, which would otherwise
+                # redirect pattern_batch stderr to an attacker-controlled file.
+                debug_stderr_handle = _open_log_file_secure(verbose_log, mode="ab")
                 pb_stderr = debug_stderr_handle
             except OSError as e:
-                # If we cannot open the log file, fall back to DEVNULL —
+                # If we cannot open the log file (symlink refused, fd
+                # exhaustion, permission denied), fall back to DEVNULL —
                 # discarding verbose output is safer than deadlocking.
                 log(f"Pattern detection verbose log open failed: {e}")
                 pb_stderr = subprocess.DEVNULL
@@ -853,11 +888,23 @@ def _setup_daemon_fds(
     observed in pattern_batch children because ``pipe()`` during Popen setup
     reused the closed fd 0/1 slots, leaving the child with a dangling std fd.
 
+    Aegis LOW-4: tolerant of ``OSError`` on the initial ``os.open`` call
+    (fd exhaustion, permission denied, /dev/null unavailable). Returns
+    gracefully rather than propagating an unlogged traceback out of
+    ``_run_as_daemon`` and killing the daemon.
+
     The os.* functions are injected for testability — callers in production
     use the real syscalls; tests pass mocks to verify the syscall sequence
     without touching real file descriptors.
     """
-    devnull_fd = os_open_fn(os.devnull, os.O_RDWR)
+    try:
+        devnull_fd = os_open_fn(os.devnull, os.O_RDWR)
+    except OSError:
+        # fd exhausted or /dev/null unavailable — cannot normalize stdio.
+        # Graceful degradation: the daemon keeps running with whatever
+        # the inherited fds point at, which is strictly better than
+        # crashing mid-daemonization with no log message.
+        return
     os_dup2_fn(devnull_fd, 0)
     os_dup2_fn(devnull_fd, 1)
     os_dup2_fn(devnull_fd, 2)

@@ -46,7 +46,7 @@ export function main(): void {
 
   // Session ID from stdin — required for coordination
   const sessionId = input.session_id;
-  if (!sessionId) {
+  if (typeof sessionId !== 'string' || !sessionId) {
     console.log(JSON.stringify({ result: 'continue' }));
     return;
   }

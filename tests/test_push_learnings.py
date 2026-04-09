@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import asyncpg
 import pytest
 
+from scripts.core.memory_daemon_core import _normalize_project
 from scripts.core.push_learnings import (
     _row_to_dict,
     build_cli_output,
@@ -33,6 +34,7 @@ from scripts.core.push_learnings import (
     merge_candidates,
     parse_args,
     parse_pattern_row,
+    record_push,
     truncate_content,
     write_cache_file,
 )
@@ -230,11 +232,13 @@ class TestBuildStaleQueryParams:
 
 
 class TestBuildPatternQueryParams:
-    def test_returns_k(self):
-        sql, params = build_pattern_query_params(3)
+    def test_returns_project_and_k(self):
+        sql, params = build_pattern_query_params("opc", 3)
+        assert "opc" in params
         assert 3 in params
         assert "detected_patterns" in sql
         assert "recall_count = 0" in sql
+        assert "a.project" in sql
 
 
 # ---------------------------------------------------------------------------
@@ -574,3 +578,152 @@ class TestGetPushCandidates:
             result = await get_push_candidates("opc", k=5)
 
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# Item 1: Worktree project name normalization
+# ---------------------------------------------------------------------------
+
+
+class TestWorktreeProjectNormalization:
+    """Test that worktree paths resolve to the real project name."""
+
+    def test_normal_path_returns_leaf(self):
+        assert _normalize_project("/Users/test/opc") == "opc"
+
+    def test_worktree_path_returns_parent_project(self):
+        assert _normalize_project("/Users/test/opc/.worktrees/tdd-fp-push") == "opc"
+
+    def test_worktree_nested_returns_parent_project(self):
+        assert _normalize_project("/home/user/myproject/.worktrees/feature-branch") == "myproject"
+
+    def test_none_returns_none(self):
+        assert _normalize_project(None) is None
+
+    def test_empty_returns_none(self):
+        assert _normalize_project("") is None
+
+    def test_parse_args_uses_normalize_project(self, monkeypatch):
+        """parse_args should use _normalize_project for worktree-safe names."""
+        monkeypatch.setenv(
+            "CLAUDE_PROJECT_DIR", "/Users/test/opc/.worktrees/tdd-fp-push"
+        )
+        config = parse_args([])
+        assert config["project"] == "opc"
+
+
+# ---------------------------------------------------------------------------
+# Item 2: Pattern query project filter
+# ---------------------------------------------------------------------------
+
+
+class TestPatternQueryProjectFilter:
+    """Test that pattern query filters by project."""
+
+    def test_pattern_query_includes_project_param(self):
+        sql, params = build_pattern_query_params("opc", 3)
+        assert "opc" in params
+        assert 3 in params
+        assert "a.project" in sql
+
+    def test_pattern_query_different_project(self):
+        sql, params = build_pattern_query_params("myproject", 5)
+        assert "myproject" in params
+        assert 5 in params
+
+    def test_get_pattern_representatives_passes_project(self):
+        """get_pattern_representatives should accept and forward project."""
+        import inspect
+
+        from scripts.core.push_learnings import get_pattern_representatives
+
+        sig = inspect.signature(get_pattern_representatives)
+        assert "project" in sig.parameters
+
+    @pytest.mark.asyncio
+    async def test_get_push_candidates_passes_project_to_patterns(self):
+        """get_push_candidates should pass project to pattern query."""
+        mock_get_patterns = AsyncMock(return_value=[])
+
+        with (
+            patch("scripts.core.push_learnings.get_backend", return_value="postgres"),
+            patch(
+                "scripts.core.push_learnings.get_stale_learnings",
+                new_callable=AsyncMock, return_value=[],
+            ),
+            patch(
+                "scripts.core.push_learnings.get_pattern_representatives",
+                mock_get_patterns,
+            ),
+            patch(
+                "scripts.core.push_learnings.get_pool",
+                new_callable=AsyncMock, return_value=_make_pool_mock(),
+            ),
+        ):
+            await get_push_candidates("opc", k=5)
+
+        mock_get_patterns.assert_called_once()
+        call_args = mock_get_patterns.call_args
+        all_args = list(call_args.args) + list(call_args.kwargs.values())
+        assert "opc" in [a for a in all_args if isinstance(a, str)]
+
+
+# ---------------------------------------------------------------------------
+# Item 3: record_push (separate from record_recall)
+# ---------------------------------------------------------------------------
+
+
+class TestRecordPush:
+    """Test that record_push updates push_count/last_pushed_at, not recall_count."""
+
+    @pytest.mark.asyncio
+    async def test_record_push_empty_ids_noop(self):
+        """record_push with empty list should return without DB call."""
+        await record_push([])
+
+    @pytest.mark.asyncio
+    async def test_record_push_non_postgres_noop(self):
+        """record_push should be a no-op for non-postgres backends."""
+        with patch(
+            "scripts.core.push_learnings.get_backend", return_value="sqlite"
+        ):
+            await record_push(["some-id"])
+
+    @pytest.mark.asyncio
+    async def test_record_push_executes_push_update(self):
+        """record_push should update push_count and last_pushed_at."""
+        mock_conn = MagicMock()
+        mock_conn.execute = AsyncMock()
+        acquire_cm = MagicMock()
+        acquire_cm.__aenter__ = AsyncMock(return_value=mock_conn)
+        acquire_cm.__aexit__ = AsyncMock(return_value=False)
+        mock_pool = AsyncMock()
+        mock_pool.acquire = MagicMock(return_value=acquire_cm)
+
+        with (
+            patch("scripts.core.push_learnings.get_backend", return_value="postgres"),
+            patch(
+                "scripts.core.push_learnings.get_pool",
+                new_callable=AsyncMock, return_value=mock_pool,
+            ),
+        ):
+            await record_push(["id-1", "id-2"])
+
+        mock_conn.execute.assert_called_once()
+        sql = mock_conn.execute.call_args[0][0]
+        assert "push_count" in sql
+        assert "last_pushed_at" in sql
+        assert "recall_count" not in sql
+
+    @pytest.mark.asyncio
+    async def test_record_push_fails_silently(self):
+        """record_push should not raise on DB errors."""
+        with (
+            patch("scripts.core.push_learnings.get_backend", return_value="postgres"),
+            patch(
+                "scripts.core.push_learnings.get_pool",
+                new_callable=AsyncMock,
+                side_effect=Exception("connection failed"),
+            ),
+        ):
+            await record_push(["id-1"])

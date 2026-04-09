@@ -70,6 +70,10 @@ CREATE TABLE IF NOT EXISTS archival_memory (
     last_recalled TIMESTAMPTZ,
     recall_count INTEGER NOT NULL DEFAULT 0,
 
+    -- OPC: Push tracking (separate from recall to avoid metric pollution)
+    push_count INTEGER NOT NULL DEFAULT 0,
+    last_pushed_at TIMESTAMPTZ,
+
     -- OPC: Learning chains (superseded learnings)
     superseded_by UUID REFERENCES archival_memory(id),
     superseded_at TIMESTAMPTZ,

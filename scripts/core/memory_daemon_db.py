@@ -87,6 +87,15 @@ def pg_ensure_column():
             ALTER TABLE sessions
             ADD COLUMN IF NOT EXISTS {col} {typedef}
         """)
+    # Ensure push tracking columns on archival_memory
+    for col, typedef in [
+        ("push_count", "INTEGER DEFAULT 0"),
+        ("last_pushed_at", "TIMESTAMPTZ"),
+    ]:
+        cur.execute(f"""
+            ALTER TABLE archival_memory
+            ADD COLUMN IF NOT EXISTS {col} {typedef}
+        """)
     conn.commit()
     conn.close()
 

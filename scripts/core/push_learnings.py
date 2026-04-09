@@ -33,6 +33,7 @@ from typing import Any
 import asyncpg
 
 from scripts.core.db.postgres_pool import get_pool
+from scripts.core.memory_daemon_core import _normalize_project
 from scripts.core.recall_formatters import get_api_version
 from scripts.core.recall_learnings import get_backend
 
@@ -62,7 +63,7 @@ def build_stale_query_params(project: str, k: int) -> tuple[str, list[Any]]:
     return sql, [project, k]
 
 
-def build_pattern_query_params(k: int) -> tuple[str, list[Any]]:
+def build_pattern_query_params(project: str, k: int) -> tuple[str, list[Any]]:
     """Build SQL and params for fetching pattern representatives."""
     sql = """
         SELECT a.id, a.content, a.metadata, a.created_at, a.recall_count,
@@ -74,10 +75,11 @@ def build_pattern_query_params(k: int) -> tuple[str, list[Any]]:
           AND dp.pattern_type IN ('anti_pattern', 'problem_solution')
           AND a.recall_count = 0
           AND a.superseded_by IS NULL
+          AND a.project = $1
         ORDER BY dp.confidence DESC, a.created_at DESC
-        LIMIT $1
+        LIMIT $2
     """
-    return sql, [k]
+    return sql, [project, k]
 
 
 # ---------------------------------------------------------------------------
@@ -192,9 +194,7 @@ def parse_args(argv: list[str] | None = None) -> dict[str, Any]:
     parser.add_argument(
         "--project",
         default=(
-            Path(os.environ["CLAUDE_PROJECT_DIR"]).name
-            if os.environ.get("CLAUDE_PROJECT_DIR")
-            else None
+            _normalize_project(os.environ.get("CLAUDE_PROJECT_DIR"))
         ),
         help="Project name to filter by (default: auto-detect from CLAUDE_PROJECT_DIR)",
     )
@@ -269,6 +269,35 @@ def write_cache_file(output: dict[str, Any]) -> None:
     cache_file.write_text(json.dumps(output, default=str))
 
 
+async def record_push(result_ids: list[str]) -> None:
+    """Update push_count and last_pushed_at for pushed learnings.
+
+    Similar to record_recall() but tracks push events separately so that
+    push activity doesn't inflate recall_count used by reranker/metrics.
+    Fails silently to avoid breaking push if columns don't exist yet.
+    """
+    if not result_ids:
+        return
+
+    if get_backend() != "postgres":
+        return
+
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE archival_memory
+                SET last_pushed_at = NOW(),
+                    push_count = push_count + 1
+                WHERE id = ANY($1::uuid[])
+                """,
+                result_ids,
+            )
+    except Exception:
+        pass
+
+
 async def get_stale_learnings(
     project: str, k: int, *, conn: Any = None
 ) -> list[dict[str, Any]]:
@@ -283,14 +312,14 @@ async def get_stale_learnings(
 
 
 async def get_pattern_representatives(
-    k: int, *, conn: Any = None
+    project: str, k: int, *, conn: Any = None
 ) -> list[dict[str, Any]]:
     """Fetch never-recalled pattern representatives from high-value clusters."""
     if conn is None:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            return await get_pattern_representatives(k, conn=conn)
-    sql, params = build_pattern_query_params(k)
+            return await get_pattern_representatives(project, k, conn=conn)
+    sql, params = build_pattern_query_params(project, k)
     rows = await conn.fetch(sql, *params)
     return [parse_pattern_row(row) for row in rows]
 
@@ -306,7 +335,7 @@ async def get_push_candidates(
     async with pool.acquire() as conn:
         stale = await get_stale_learnings(project, k, conn=conn)
         try:
-            patterns = await get_pattern_representatives(k, conn=conn)
+            patterns = await get_pattern_representatives(project, k, conn=conn)
         except asyncpg.exceptions.UndefinedTableError:
             logger.debug("detected_patterns table not available", exc_info=True)
             patterns = []
@@ -345,13 +374,12 @@ async def main() -> int:
             print(f"Error: {type(e).__name__}: see logs for details", file=sys.stderr)
         return 1
 
-    # Record recall BEFORE writing cache to prevent duplicate pushes on crash.
-    # If record_recall succeeds but cache write fails, worst case is a missed
-    # push (safe). If cache writes first but record_recall crashes, the same
+    # Record push BEFORE writing cache to prevent duplicate pushes on crash.
+    # If record_push succeeds but cache write fails, worst case is a missed
+    # push (safe). If cache writes first but record_push crashes, the same
     # learnings get re-pushed indefinitely (the death spiral this script prevents).
     if candidates and not config["no_record"]:
-        from scripts.core.recall_learnings import record_recall
-        await record_recall([c["id"] for c in candidates])
+        await record_push([c["id"] for c in candidates])
 
     # Build and persist cache data (always, even when empty)
     if not candidates:

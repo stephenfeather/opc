@@ -69,7 +69,9 @@ import asyncio
 import json
 
 # Add opc to path for imports (read from env to avoid code injection)
-_opc_dir = os.environ['_OPC_DIR']
+_opc_dir = os.environ.get('_OPC_DIR')
+if not _opc_dir:
+    raise RuntimeError('_OPC_DIR environment variable not set - must be called via runPgQuery()')
 sys.path.insert(0, _opc_dir)
 os.chdir(_opc_dir)
 

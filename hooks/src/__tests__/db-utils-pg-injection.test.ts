@@ -88,7 +88,7 @@ describe('runPgQuery opcDir injection protection (Issue #88)', () => {
     const pythonArgs = callArgs[1] as string[];
     const cIndex = pythonArgs.indexOf('-c');
     const pythonCode = pythonArgs[cIndex + 1];
-    expect(pythonCode).toContain("os.environ['_OPC_DIR']");
+    expect(pythonCode).toContain("os.environ.get('_OPC_DIR')");
   });
 
   it('should handle opcDir with backticks and dollar signs safely', () => {

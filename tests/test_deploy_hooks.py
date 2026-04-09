@@ -773,11 +773,20 @@ class TestLockSerialization:
             )
             for _ in range(2)
         ]
-        results = [p.wait() for p in procs]
-        outputs = [
-            (p.stdout.read() if p.stdout else "", p.stderr.read() if p.stderr else "")
-            for p in procs
-        ]
+        # Use communicate() instead of wait() + read() to drain stdout/stderr
+        # concurrently. With PIPE and wait(), a child that writes enough
+        # output to fill the ~64KB pipe buffer before exiting will block
+        # waiting for the parent to drain, and the parent will block in
+        # wait() waiting for the child to exit — classic deadlock.
+        # deploy_hooks.sh currently writes <1KB so this is theoretical,
+        # but the pattern is a known OPC failure mode (memory 3adde1e6)
+        # and future changes could silently cross the threshold.
+        results: list[int] = []
+        outputs: list[tuple[str, str]] = []
+        for p in procs:
+            out, err = p.communicate()
+            results.append(p.returncode)
+            outputs.append((out, err))
 
         # At least one process must succeed (exit 0).
         assert 0 in results, f"neither process succeeded: {results} {outputs}"

@@ -754,11 +754,17 @@ def _run_pattern_detection_batch():
                     # ValueError: file already closed. Narrowed per Gemini
                     # M3 on PR #106.
                     pass
-        # Stash the verbose-log file handle on the proc object so
-        # _check_pattern_detection can close it when reaping. Using an
-        # attribute on the proc ties the handle's lifetime to the process.
+        # Stash the verbose-log file handle AND its path on the proc
+        # object. _check_pattern_detection closes the handle on reap and
+        # uses the path to build an accurate failure-log hint. The path
+        # is only stashed when the file was actually opened — on the
+        # DEVNULL-fallback path (verbose log open failed), no path is
+        # stashed, and _check_pattern_detection reports "stderr discarded"
+        # instead of falsely promising a log file that does not exist.
+        # (Copilot CP-N2 on PR #106 cycle 2.)
         if debug_stderr_handle is not None:
             state.pattern_proc._debug_stderr_handle = debug_stderr_handle
+            state.pattern_proc._debug_stderr_path = str(verbose_log)
         state.last_pattern_run = time.time()
         # Gate .pid access behind DEBUG so test mocks without a .pid
         # attribute don't explode, and so release-mode callers pay nothing
@@ -796,15 +802,25 @@ def _check_pattern_detection():
             except (_json.JSONDecodeError, KeyError):
                 log(f"Pattern detection completed: {stdout[:200]}")
         else:
-            # Guard against stderr being None, which happens when the child
-            # was spawned in DEBUG mode with stderr redirected to a file
-            # (rather than subprocess.PIPE). The operator can tail
-            # ~/.claude/logs/pattern_batch_verbose.log for the full output.
+            # stderr can be None in two cases:
+            #   1. DEBUG mode successfully opened a verbose log file and
+            #      redirected the child's stderr there → use the stashed
+            #      _debug_stderr_path to point operators at the actual file.
+            #   2. DEBUG mode's verbose-log open failed and fell back to
+            #      subprocess.DEVNULL → no path was stashed, and the output
+            #      was discarded. Must NOT claim the pattern_batch_verbose.log
+            #      file exists in this case.
+            # (Copilot CP-N2 on PR #106 cycle 2 — the previous hardcoded
+            # hint was misleading under the DEVNULL fallback.)
             stderr_stream = state.pattern_proc.stderr
             if stderr_stream is not None:
                 stderr = stderr_stream.read().decode()[:200]
             else:
-                stderr = "(see ~/.claude/logs/pattern_batch_verbose.log)"
+                stashed_path = getattr(state.pattern_proc, "_debug_stderr_path", None)
+                if stashed_path:
+                    stderr = f"(see {stashed_path})"
+                else:
+                    stderr = "(stderr not captured — output was discarded)"
             log(f"Pattern detection failed (rc={rc}): {stderr}")
         # Close the DEBUG-mode stderr log handle if we stashed one at spawn.
         debug_stderr = getattr(state.pattern_proc, "_debug_stderr_handle", None)
@@ -1149,8 +1165,17 @@ def status_daemon():
 
 
 def main():
-    # Enable crash diagnostics before doing anything else so even an early
-    # import-time failure in a dependency still produces a traceback.
+    # Reserve fds 0/1/2 BEFORE opening any long-lived file handle, so the
+    # crash log (opened next by _enable_faulthandler) cannot land at fd 0/1/2
+    # and be silently clobbered when _setup_daemon_fds() dup2s /dev/null
+    # onto those slots in the daemonized child. Same bug class as Codex
+    # Round 3 Finding 3 (module-scope _logger ordering) — Copilot CP-N1 on
+    # PR #106 cycle 2 caught that I had only fixed it for the rotating
+    # logger, not the faulthandler crash log.
+    _reserve_low_fds()
+
+    # Enable crash diagnostics as early as possible once low fds are safe,
+    # so even very early failures still produce a traceback.
     _enable_faulthandler()
 
     parser = argparse.ArgumentParser(description="Global Memory Extraction Daemon")

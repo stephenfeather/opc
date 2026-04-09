@@ -17,6 +17,8 @@ import os
 import sys
 from unittest.mock import MagicMock
 
+import pytest
+
 
 class TestSetupDaemonFds:
     """_setup_daemon_fds redirects fd 0/1/2 to /dev/null for daemonization.
@@ -352,8 +354,13 @@ class TestSecurityHardening:
 
         handle = _open_log_file_secure(tmp_path / "target.log", mode="ab")
         try:
-            # O_NOFOLLOW defeats symlink TOCTOU.
-            assert captured["flags"] & os.O_NOFOLLOW, "must use O_NOFOLLOW"
+            # O_NOFOLLOW defeats symlink TOCTOU. Use getattr fallback so
+            # the assertion does not crash on platforms where the
+            # constant is undefined (Windows) — CodeRabbit CR-N1 on
+            # PR #106 cycle 2.
+            o_nofollow = getattr(os, "O_NOFOLLOW", 0)
+            if o_nofollow:
+                assert captured["flags"] & o_nofollow, "must use O_NOFOLLOW"
             # O_APPEND because we asked for "ab".
             assert captured["flags"] & os.O_APPEND
             assert captured["flags"] & os.O_CREAT
@@ -363,9 +370,16 @@ class TestSecurityHardening:
         finally:
             handle.close()
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Symlink creation on Windows requires Developer Mode or admin",
+    )
     def test_open_log_file_secure_refuses_to_follow_symlink(self, tmp_path):
         """End-to-end: if the target is a symlink to a file the attacker
         controls, _open_log_file_secure must raise rather than follow it.
+
+        Skipped on Windows where Path.symlink_to() requires elevated
+        privileges — CodeRabbit CR-N2 on PR #106 cycle 2.
         """
         from scripts.core.memory_daemon import _open_log_file_secure
 
@@ -373,8 +387,6 @@ class TestSecurityHardening:
         target.write_text("attacker-controlled")
         link = tmp_path / "link.log"
         link.symlink_to(target)
-
-        import pytest
 
         with pytest.raises(OSError):
             _open_log_file_secure(link, mode="ab")
@@ -455,6 +467,53 @@ class TestSecurityHardening:
             assert (tmp_path / "ro_mount.log").exists()
         finally:
             handle.close()
+
+    def test_main_reserves_low_fds_before_enable_faulthandler(self):
+        """PR #106 Copilot CP-N1 (HIGH): main() must call _reserve_low_fds()
+        before _enable_faulthandler(). Otherwise on degraded-stdio startup
+        (fd 0/1/2 closed), the crash log file can land at fd 0/1/2 and be
+        silently clobbered by _setup_daemon_fds() in _run_as_daemon. This
+        is the same bug class as Round 3 Finding 3 (module-scope logger
+        ordering) but applied to the faulthandler path.
+
+        AST walk: inside main(), the first _reserve_low_fds() call must
+        precede the first _enable_faulthandler() call.
+        """
+        import ast
+        from pathlib import Path
+
+        import scripts.core.memory_daemon as mod
+
+        tree = ast.parse(Path(mod.__file__).read_text())
+
+        main_fn = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "main":
+                main_fn = node
+                break
+
+        assert main_fn is not None, "main() function not found"
+
+        reserve_line: int | None = None
+        faulthandler_line: int | None = None
+        for subnode in ast.walk(main_fn):
+            if isinstance(subnode, ast.Call) and isinstance(subnode.func, ast.Name):
+                if subnode.func.id == "_reserve_low_fds" and reserve_line is None:
+                    reserve_line = subnode.lineno
+                if subnode.func.id == "_enable_faulthandler" and faulthandler_line is None:
+                    faulthandler_line = subnode.lineno
+
+        assert reserve_line is not None, (
+            "main() must call _reserve_low_fds() to guard the crash log open "
+            "against degraded-stdio startup"
+        )
+        assert (
+            faulthandler_line is not None
+        ), "main() must call _enable_faulthandler() for crash diagnostics"
+        assert reserve_line < faulthandler_line, (
+            f"_reserve_low_fds must run BEFORE _enable_faulthandler in main(). "
+            f"Got reserve at line {reserve_line}, faulthandler at line {faulthandler_line}."
+        )
 
     def test_log_emits_one_time_stderr_warning_on_setup_failure(self, monkeypatch, capsys):
         """PR #106 CodeRabbit CR2: when _setup_logging() fails, log() should
@@ -1057,6 +1116,78 @@ class TestPatternDetectionSpawn:
         assert any(
             "failed" in m.lower() for m in log_calls
         ), f"Expected failure log, got: {log_calls}"
+
+    def test_check_pattern_detection_hint_uses_stashed_verbose_log_path(self, monkeypatch):
+        """PR #106 Copilot CP-N2: when stderr is None AND the proc has a
+        stashed _debug_stderr_path, the failure log must reference the
+        actual file path (which could be anywhere) rather than hardcoding
+        the default location. Covers the happy DEBUG-redirect path.
+        """
+        import io
+
+        import scripts.core.memory_daemon as mod
+
+        monkeypatch.setattr(mod, "_daemon_state", self._fresh_state(mod))
+
+        log_calls: list[str] = []
+        monkeypatch.setattr(mod, "log", lambda m: log_calls.append(m))
+
+        class _FakeProc:
+            stdout = io.BytesIO(b"")
+            stderr = None  # redirected to a file
+            _debug_stderr_path = "/custom/path/verbose.log"
+
+            def poll(self):
+                return 1
+
+        state = mod._ensure_daemon_state()
+        state.pattern_proc = _FakeProc()
+
+        mod._check_pattern_detection()
+
+        # The failure log should mention the stashed path, not a hardcoded one.
+        assert any(
+            "/custom/path/verbose.log" in m for m in log_calls
+        ), f"Expected stashed path in failure log, got: {log_calls}"
+
+    def test_check_pattern_detection_hint_when_stderr_discarded(self, monkeypatch):
+        """PR #106 Copilot CP-N2: when stderr is None AND there is NO
+        stashed _debug_stderr_path (verbose log open failed, fallback was
+        DEVNULL), the failure log must NOT falsely point operators at
+        the pattern_batch_verbose.log file (which does not exist in that
+        case). Instead it should say the output was discarded.
+        """
+        import io
+
+        import scripts.core.memory_daemon as mod
+
+        monkeypatch.setattr(mod, "_daemon_state", self._fresh_state(mod))
+
+        log_calls: list[str] = []
+        monkeypatch.setattr(mod, "log", lambda m: log_calls.append(m))
+
+        class _FakeProc:
+            stdout = io.BytesIO(b"")
+            stderr = None  # discarded via DEVNULL
+            # NO _debug_stderr_path attribute
+
+            def poll(self):
+                return 1
+
+        state = mod._ensure_daemon_state()
+        state.pattern_proc = _FakeProc()
+
+        mod._check_pattern_detection()
+
+        # Must not falsely promise a log file that does not exist.
+        assert not any("pattern_batch_verbose.log" in m for m in log_calls), (
+            f"Must not hardcode verbose log path when DEVNULL fallback was used, "
+            f"got: {log_calls}"
+        )
+        # Should communicate that stderr was not captured.
+        assert any(
+            "not captured" in m.lower() or "discarded" in m.lower() for m in log_calls
+        ), f"Expected 'not captured'/'discarded' in failure log, got: {log_calls}"
 
     def test_spawn_happy_path_does_not_log_errors(self, monkeypatch):
         """Regression guard: the original implementation eagerly evaluated

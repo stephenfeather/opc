@@ -76,6 +76,7 @@ def build_pattern_query_params(project: str, k: int) -> tuple[str, list[Any]]:
           AND a.recall_count = 0
           AND a.superseded_by IS NULL
           AND a.project = $1
+          AND a.push_count = 0
         ORDER BY dp.confidence DESC, a.created_at DESC
         LIMIT $2
     """

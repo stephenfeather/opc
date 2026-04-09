@@ -16,6 +16,7 @@ backups/*.sql.gz
 # Caches
 .ruff_cache/
 .tldr/
+.tldrignore
 
 # Claude Code
 .claude/

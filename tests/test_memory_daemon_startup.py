@@ -193,11 +193,12 @@ class TestReserveLowFds:
             os_close_fn=lambda fd: closed.append(fd),
         )
 
-    def test_reserve_low_fds_is_called_before_setup_logging_at_module_scope(self):
-        """AST walk: _reserve_low_fds() must execute before _logger assignment.
-
-        If _logger = _setup_logging() runs before the reservation, the log
-        handler can land at fd 0/1/2 and get clobbered by daemonization.
+    def test_reserve_low_fds_not_called_at_module_scope(self):
+        """Codex Round 3 Finding 3: _reserve_low_fds() must not run at import
+        time. Any process that imports memory_daemon for its helpers would
+        otherwise have its fd table silently mutated, which is especially
+        damaging for fork-after-import callers that expect the original
+        stdio semantics.
         """
         import ast
         from pathlib import Path
@@ -206,8 +207,6 @@ class TestReserveLowFds:
 
         tree = ast.parse(Path(mod.__file__).read_text())
 
-        reserve_line: int | None = None
-        logger_line: int | None = None
         for node in tree.body:
             if (
                 isinstance(node, ast.Expr)
@@ -215,23 +214,108 @@ class TestReserveLowFds:
                 and isinstance(node.value.func, ast.Name)
                 and node.value.func.id == "_reserve_low_fds"
             ):
-                reserve_line = node.lineno
+                raise AssertionError(
+                    f"_reserve_low_fds() must not be called at module scope "
+                    f"(found at line {node.lineno}). Call it from _run_as_daemon()."
+                )
+
+    def test_logger_is_none_at_module_scope_not_setup_eagerly(self):
+        """Codex Round 3 Finding 3: module scope must not call
+        _setup_logging() and must not hold an open log file handle. The
+        binding ``_logger = None`` is the only acceptable module-level
+        initialization; the real logger is lazy-initialized on first log()
+        call or explicitly from _run_as_daemon().
+        """
+        import ast
+        from pathlib import Path
+
+        import scripts.core.memory_daemon as mod
+
+        tree = ast.parse(Path(mod.__file__).read_text())
+
+        for node in tree.body:
+            if not (isinstance(node, (ast.Assign, ast.AnnAssign))):
+                continue
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+                value = node.value
+            else:
+                targets = [node.target]
+                value = node.value
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id == "_logger":
+                    # _logger = <something> at module scope — must be None.
+                    assert isinstance(value, ast.Constant) and value.value is None, (
+                        f"Module-scope _logger must be initialized to None "
+                        f"(at line {node.lineno}), not _setup_logging() or any "
+                        f"other eager call. Lazy-init from log() instead."
+                    )
+                    return
+
+        raise AssertionError("Module-scope _logger = None binding not found")
+
+    def test_run_as_daemon_reserves_fds_before_setup_daemon_fds(self):
+        """The daemon bootstrap path must reserve low fds BEFORE
+        _setup_daemon_fds() runs. If _setup_daemon_fds runs first and
+        happens to land /dev/null at a fd the log handler already holds,
+        the log file gets silently clobbered.
+        """
+        import ast
+        from pathlib import Path
+
+        import scripts.core.memory_daemon as mod
+
+        tree = ast.parse(Path(mod.__file__).read_text())
+
+        run_as_daemon_fn = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_run_as_daemon":
+                run_as_daemon_fn = node
+                break
+
+        assert run_as_daemon_fn is not None, "_run_as_daemon function not found"
+
+        reserve_line: int | None = None
+        setup_fds_line: int | None = None
+        for subnode in ast.walk(run_as_daemon_fn):
             if (
-                isinstance(node, ast.Assign)
-                and len(node.targets) == 1
-                and isinstance(node.targets[0], ast.Name)
-                and node.targets[0].id == "_logger"
+                isinstance(subnode, ast.Call)
+                and isinstance(subnode.func, ast.Name)
             ):
-                logger_line = node.lineno
+                if subnode.func.id == "_reserve_low_fds" and reserve_line is None:
+                    reserve_line = subnode.lineno
+                if subnode.func.id == "_setup_daemon_fds" and setup_fds_line is None:
+                    setup_fds_line = subnode.lineno
 
         assert reserve_line is not None, (
-            "_reserve_low_fds() must be called at module scope before _setup_logging"
+            "_run_as_daemon must call _reserve_low_fds() to guard against "
+            "degraded-stdio startup"
         )
-        assert logger_line is not None, "_logger = _setup_logging() not found at module scope"
-        assert reserve_line < logger_line, (
-            f"_reserve_low_fds must run BEFORE _logger assignment. "
-            f"Got reserve at line {reserve_line}, _logger at line {logger_line}."
+        assert setup_fds_line is not None, (
+            "_run_as_daemon must call _setup_daemon_fds() for daemonization"
         )
+        assert reserve_line < setup_fds_line, (
+            f"_reserve_low_fds must run BEFORE _setup_daemon_fds in _run_as_daemon. "
+            f"Got reserve at line {reserve_line}, setup_fds at line {setup_fds_line}."
+        )
+
+    def test_log_lazy_initializes_logger_when_none(self, monkeypatch):
+        """log() must lazy-initialize _logger if the module-scope binding
+        is still None — otherwise non-daemon callers cannot log.
+        """
+        import scripts.core.memory_daemon as mod
+
+        monkeypatch.setattr(mod, "_logger", None)
+
+        fake_logger = MagicMock()
+        fake_setup = MagicMock(return_value=fake_logger)
+        monkeypatch.setattr(mod, "_setup_logging", fake_setup)
+
+        mod.log("hello lazy")
+
+        fake_setup.assert_called_once()
+        fake_logger.info.assert_called_once_with("hello lazy")
+        assert mod._logger is fake_logger
 
 
 class TestDebugFlag:
@@ -688,6 +772,62 @@ class TestPatternDetectionSpawn:
 
         assert closed == [True], "_check_pattern_detection must close _debug_stderr_handle"
         assert state.pattern_proc is None
+
+    def test_spawn_closes_debug_stderr_handle_on_popen_failure(self, monkeypatch, tmp_path):
+        """Codex Round 3 Finding 2: if Popen raises after the verbose log is
+        opened, the file handle must be closed. Otherwise repeated launch
+        failures accumulate fds until the daemon hits its limit — most
+        damaging in exactly the degraded environments where --debug is
+        needed.
+        """
+        import scripts.core.memory_daemon as mod
+
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(mod, "_daemon_state", self._fresh_state(mod))
+        monkeypatch.setattr(mod, "DEBUG", True)
+        monkeypatch.setattr(mod, "log", lambda _m: None)
+
+        # Track calls to close() on the verbose log handle.
+        class _TrackedFile:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+            def write(self, _data):
+                return 0
+
+            def fileno(self):
+                return 99
+
+        tracked: list[_TrackedFile] = []
+        real_open = open
+
+        def tracking_open(path, *args, **kwargs):
+            if "pattern_batch_verbose.log" in str(path):
+                h = _TrackedFile()
+                tracked.append(h)
+                return h
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", tracking_open)
+
+        # Force Popen to raise AFTER the verbose log file is opened.
+        def fake_popen(*args, **kwargs):
+            raise OSError("simulated spawn failure")
+
+        monkeypatch.setattr(mod.subprocess, "Popen", fake_popen)
+
+        mod._run_pattern_detection_batch()
+
+        # Spawn failed → state.pattern_proc must not hold anything
+        assert mod._ensure_daemon_state().pattern_proc is None
+
+        # Exactly one verbose log handle was opened, and it was closed
+        # before the function returned (no fd leak).
+        assert len(tracked) == 1, f"Expected 1 verbose log open, got {len(tracked)}"
+        assert tracked[0].closed, "Verbose log handle must be closed after Popen failure"
 
     def test_check_pattern_detection_survives_null_stderr_on_failure(self, monkeypatch):
         """When stderr was redirected to a file (proc.stderr is None), the

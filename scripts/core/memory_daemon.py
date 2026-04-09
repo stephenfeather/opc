@@ -243,23 +243,21 @@ def _reserve_low_fds(
 ) -> None:
     """Reserve fds 0/1/2 with /dev/null before any long-lived file handle opens.
 
-    Addresses Issue #99 Round 1 HIGH finding: the rotating log file handler
-    is opened at module import via ``_logger = _setup_logging()``. If the
-    process is launched with any of fd 0/1/2 already closed, the kernel
-    assigns that slot to the log file. ``_setup_daemon_fds()`` later dup2s
-    ``/dev/null`` onto 0/1/2, which would silently redirect the log handle
-    to ``/dev/null`` in exactly the degraded-stdio scenario this patch
-    exists to harden.
+    Called from ``_run_as_daemon()`` immediately before the logger is
+    initialized, so the rotating log file handler cannot land on fd 0/1/2
+    and get silently clobbered by ``_setup_daemon_fds()`` later. This must
+    not run at module import time — doing so would mutate every importer's
+    fd table, which is unsafe for fork-after-import callers (Codex Round 3
+    Finding 3).
 
-    This function opens ``/dev/null`` until it is handed back an fd > 2, at
-    which point it knows 0/1/2 are all held (either by whatever they were
-    before, or by fresh ``/dev/null`` handles we just installed). The low
-    fds returned are intentionally NOT closed — they stay alive as guards
-    until ``_setup_daemon_fds()`` dup2s over them, which implicitly closes
-    them.
+    Opens ``/dev/null`` until it is handed back an fd > 2, at which point
+    0/1/2 are all held (either by whatever they were before or by fresh
+    ``/dev/null`` handles we just installed). The low fds returned are
+    intentionally NOT closed — they stay alive as guards until
+    ``_setup_daemon_fds()`` dup2s over them, which implicitly closes them.
 
-    Tolerant of ``OSError`` so a fd-exhausted process still imports
-    successfully.
+    Tolerant of ``OSError`` so a fd-exhausted process still returns
+    gracefully.
     """
     while True:
         try:
@@ -270,9 +268,6 @@ def _reserve_low_fds(
             os_close_fn(fd)
             return
         # fd in (0, 1, 2): leave it open as a guard; loop to fill remaining slots.
-
-
-_reserve_low_fds()
 
 
 def _setup_logging() -> logging.Logger:
@@ -297,7 +292,11 @@ def _setup_logging() -> logging.Logger:
     return logger
 
 
-_logger = _setup_logging()
+# Module-scope logger placeholder. Lazy-initialized by log() or force-
+# initialized by _run_as_daemon() after _reserve_low_fds(). Never opened
+# at import time — that would touch the filesystem on every import of
+# memory_daemon for its helpers (Codex Round 3 Finding 3).
+_logger: logging.Logger | None = None
 
 
 def _seed_last_pattern_run() -> float:
@@ -306,7 +305,18 @@ def _seed_last_pattern_run() -> float:
 
 
 def log(msg: str):
-    """Write timestamped log message via rotating file handler."""
+    """Write timestamped log message via rotating file handler.
+
+    Lazy-initializes the rotating logger on first call. This replaces the
+    previous module-scope ``_logger = _setup_logging()`` assignment which
+    touched the filesystem on every import (Codex Round 3 Finding 3).
+    """
+    global _logger
+    if _logger is None:
+        try:
+            _logger = _setup_logging()
+        except Exception:
+            return  # Best effort: no logger available, silently drop
     try:
         _logger.info(msg)
     except Exception:
@@ -620,13 +630,27 @@ def _run_pattern_detection_batch():
                 # discarding verbose output is safer than deadlocking.
                 log(f"Pattern detection verbose log open failed: {e}")
                 pb_stderr = subprocess.DEVNULL
-        state.pattern_proc = subprocess.Popen(
-            pb_argv,
-            cwd=str(project_root),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=pb_stderr,
-        )
+        # Round 3 Codex Finding 2: if Popen raises after debug_stderr_handle
+        # is opened, the handle must be closed before the exception
+        # propagates. Otherwise repeated launch failures in DEBUG mode
+        # accumulate fds until the daemon hits the limit — worst in the
+        # exact degraded environments where --debug is enabled.
+        spawn_succeeded = False
+        try:
+            state.pattern_proc = subprocess.Popen(
+                pb_argv,
+                cwd=str(project_root),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=pb_stderr,
+            )
+            spawn_succeeded = True
+        finally:
+            if not spawn_succeeded and debug_stderr_handle is not None:
+                try:
+                    debug_stderr_handle.close()
+                except Exception:
+                    pass
         # Stash the verbose-log file handle on the proc object so
         # _check_pattern_detection can close it when reaping. Using an
         # attribute on the proc ties the handle's lifetime to the process.
@@ -850,9 +874,21 @@ def _run_as_daemon():
     PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(str(os.getpid()))
 
-    # Redirect standard fds to /dev/null. Must NOT sys.std*.close() — that
-    # leaves kernel fd-table holes which corrupt child subprocess stdio
-    # (observed as pattern_batch init_sys_streams crashes, Issue #99).
+    # Daemon bootstrap ordering is critical:
+    #   1. _reserve_low_fds(): guards fd 0/1/2 with /dev/null so the logger
+    #      handler cannot land there and be silently clobbered in step 3.
+    #   2. _setup_logging(): opens the rotating log file, guaranteed at
+    #      fd >= 3 because low fds are now held.
+    #   3. _setup_daemon_fds(): dup2s /dev/null onto 0/1/2, implicitly
+    #      closing the reservation fds. The logger at fd >= 3 is unaffected.
+    # (Codex Round 3 Finding 3.)
+    _reserve_low_fds()
+    global _logger
+    if _logger is None:
+        try:
+            _logger = _setup_logging()
+        except Exception:
+            pass  # daemon can still run, log() lazy-init may retry
     _setup_daemon_fds()
 
     # Run daemon

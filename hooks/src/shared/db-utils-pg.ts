@@ -941,6 +941,51 @@ asyncio.run(main())
   }
 }
 
+/**
+ * Update the heartbeat timestamp for an active session.
+ *
+ * @param sessionId - Session identifier to refresh
+ * @param project - Project directory path
+ * @returns Object with success boolean and any error message
+ */
+export function updateHeartbeat(
+  sessionId: string,
+  project: string,
+): { success: boolean; error?: string } {
+  const pythonCode = `
+import asyncpg
+import os
+
+session_id = sys.argv[1]
+project = sys.argv[2]
+pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL', 'postgresql://claude:claude_dev@localhost:5432/continuous_claude')
+
+async def main():
+    conn = await asyncpg.connect(pg_url)
+    try:
+        await conn.execute('''
+            UPDATE sessions SET last_heartbeat = NOW()
+            WHERE id = $1 AND project = $2
+        ''', session_id, project)
+        print('ok')
+    finally:
+        await conn.close()
+
+asyncio.run(main())
+`;
+
+  const result = runPgQuery(pythonCode, [sessionId, project]);
+
+  if (!result.success || result.stdout !== 'ok') {
+    return {
+      success: false,
+      error: result.stderr || result.stdout || 'Unknown error',
+    };
+  }
+
+  return { success: true };
+}
+
 // Type definitions for sessions
 export interface SessionInfo {
   id: string;

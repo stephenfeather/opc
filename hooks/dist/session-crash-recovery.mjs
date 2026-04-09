@@ -6,7 +6,12 @@ import * as path from "path";
 
 // src/transcript-parser.ts
 import * as fs from "fs";
-//! @hook none (shared library) @preserve
+/*!
+ * Transcript Parser Module
+ *
+ * Parses JSONL transcript files from Claude Code sessions and extracts
+ * high-signal data for use by PreCompact hooks and auto-handoff generation.
+ */
 function parseTranscript(transcriptPath) {
   const summary = {
     lastTodos: [],
@@ -274,7 +279,7 @@ if (isMainModule) {
 }
 
 // src/shared/db-utils-pg.ts
-import { spawnSync } from "child_process";
+import { spawn, spawnSync } from "child_process";
 
 // src/shared/opc-path.ts
 import { existsSync as existsSync2, readFileSync as readFileSync2 } from "fs";
@@ -450,7 +455,20 @@ asyncio.run(main())
 }
 
 // src/session-crash-recovery.ts
-//! @hook SessionStart @preserve
+/*!
+ * Session Crash Recovery Hook (SessionStart)
+ *
+ * Detects when a previous session crashed (no clean exit recorded in DB)
+ * and creates a recovery handoff from the old transcript.
+ *
+ * Flow:
+ * 1. Query PostgreSQL sessions table for crashed sessions on this project
+ *    (exited_at IS NULL AND last_heartbeat is stale)
+ * 2. If found → parse the old transcript using transcript-parser
+ * 3. Create a recovery handoff YAML in the standard format
+ * 4. Mark crashed sessions as acknowledged in DB
+ * 5. Inform the user via system message
+ */
 function getSessionName(projectDir) {
   try {
     const handoffsDir = path.join(projectDir, "thoughts", "shared", "handoffs");

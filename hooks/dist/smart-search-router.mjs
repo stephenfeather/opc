@@ -271,6 +271,16 @@ function trackHookActivitySync(hookName, projectDir, success = true, metrics = {
 }
 
 // src/smart-search-router.ts
+/*!
+ * PreToolUse Hook: Smart Search Router
+ *
+ * Routes Grep calls to the most token-efficient tool:
+ * 1. AST-grep - structural code queries (most efficient)
+ * 2. LEANN - semantic/conceptual queries
+ * 3. Grep - literal patterns (fallback)
+ *
+ * Uses TLDR daemon for fast symbol lookups when available.
+ */
 var CONTEXT_DIR = "/tmp/claude-search-context";
 function storeSearchContext(sessionId, context) {
   try {

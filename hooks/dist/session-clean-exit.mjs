@@ -2,7 +2,7 @@
 import { readFileSync as readFileSync2 } from "fs";
 
 // src/shared/db-utils-pg.ts
-import { spawnSync } from "child_process";
+import { spawn, spawnSync } from "child_process";
 
 // src/shared/opc-path.ts
 import { existsSync, readFileSync } from "fs";
@@ -131,7 +131,14 @@ asyncio.run(main())
 }
 
 // src/session-clean-exit.ts
-//! @hook Stop @preserve
+/*!
+ * Session Clean Exit Hook (SessionEnd)
+ *
+ * Marks the session as cleanly exited in PostgreSQL.
+ * If this hook doesn't fire (crash/hang), the session remains without
+ * an exited_at timestamp and session-crash-recovery.ts will detect it
+ * on next startup.
+ */
 async function main() {
   let input;
   try {

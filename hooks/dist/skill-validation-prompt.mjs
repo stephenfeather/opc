@@ -1,4 +1,17 @@
 // src/skill-validation-prompt.ts
+/*!
+ * Prompt-Based Skill Validation
+ *
+ * Reduces false-positive skill activations by using LLM validation to
+ * distinguish between:
+ * - "mentions keyword" (e.g., "commit" in "I need to commit to this approach")
+ * - "actually needs this skill" (e.g., "commit these changes to git")
+ *
+ * This module provides:
+ * 1. Heuristics to determine when LLM validation is needed
+ * 2. Prompt templates for validation
+ * 3. Response parsing utilities
+ */
 var AMBIGUOUS_KEYWORDS = /* @__PURE__ */ new Set([
   "commit",
   "push",

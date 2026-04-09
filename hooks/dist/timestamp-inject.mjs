@@ -1,6 +1,15 @@
 // src/timestamp-inject.ts
 import { readFileSync } from "fs";
-//! @hook UserPromptSubmit @preserve
+/*!
+ * Timestamp Injection Hook (UserPromptSubmit)
+ *
+ * Injects the current local time into every prompt as additionalContext,
+ * enabling time-aware capabilities:
+ * - Session pacing alerts
+ * - Elapsed-time diagnostics
+ * - Calendar awareness
+ * - Rate-of-progress tracking
+ */
 function readStdin() {
   return readFileSync(0, "utf-8");
 }

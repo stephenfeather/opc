@@ -269,6 +269,14 @@ function trackHookActivitySync(hookName, projectDir, success = true, metrics = {
 }
 
 // src/session-start-dead-code.ts
+/*!
+ * SessionStart Hook: Dead Code Detection
+ *
+ * On session startup/resume, runs `tldr dead` to detect unused functions
+ * and emits a warning if dead code is found.
+ *
+ * This helps developers identify cleanup opportunities at the start of work.
+ */
 function readStdin() {
   return readFileSync2(0, "utf-8");
 }

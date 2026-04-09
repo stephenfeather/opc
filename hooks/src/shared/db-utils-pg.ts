@@ -12,7 +12,7 @@
  * - queryPipelineArtifacts(): Query pipeline artifacts for upstream context
  */
 
-import { spawnSync } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import type { QueryResult } from './types.js';
 import { requireOpcDir } from './opc-path.js';
 
@@ -939,6 +939,133 @@ asyncio.run(main())
   } catch {
     return { success: false, findings: [] };
   }
+}
+
+/**
+ * Update the heartbeat timestamp for an active session.
+ *
+ * @param sessionId - Session identifier to refresh
+ * @param project - Project directory path
+ * @returns Object with success boolean and any error message
+ */
+export function updateHeartbeat(
+  sessionId: string,
+  project: string,
+): { success: boolean; error?: string } {
+  const pythonCode = `
+import asyncpg
+import os
+
+session_id = sys.argv[1]
+project = sys.argv[2]
+pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL', 'postgresql://claude:claude_dev@localhost:5432/continuous_claude')
+
+async def main():
+    conn = await asyncpg.connect(pg_url)
+    try:
+        status = await conn.execute('''
+            UPDATE sessions SET last_heartbeat = NOW()
+            WHERE id = $1 AND project = $2
+        ''', session_id, project)
+        if status == 'UPDATE 1':
+            print('ok')
+        else:
+            print('not found')
+    finally:
+        await conn.close()
+
+asyncio.run(main())
+`;
+
+  const result = runPgQuery(pythonCode, [sessionId, project]);
+
+  if (!result.success || result.stdout !== 'ok') {
+    return {
+      success: false,
+      error: result.stderr || result.stdout || 'Unknown error',
+    };
+  }
+
+  return { success: true };
+}
+
+/**
+ * Execute a PostgreSQL query in a detached background process.
+ *
+ * Spawns the uv/Python subprocess as detached and calls unref() so the
+ * parent process never waits for it. Errors are silently swallowed because
+ * callers that use this path have explicitly opted into fire-and-forget
+ * semantics (e.g., heartbeat refreshes).
+ *
+ * @param pythonCode - Python code to execute (receives args via sys.argv)
+ * @param args - Arguments passed to Python (sys.argv[1], sys.argv[2], ...)
+ */
+export function runPgQueryDetached(pythonCode: string, args: string[] = []): void {
+  try {
+    const opcDir = requireOpcDir();
+
+    const wrappedCode = `
+import sys
+import os
+import asyncio
+import json
+
+# Add opc to path for imports
+sys.path.insert(0, '${opcDir}')
+os.chdir('${opcDir}')
+
+${pythonCode}
+`;
+
+    const child = spawn('uv', ['run', 'python', '-c', wrappedCode, ...args], {
+      detached: true,
+      stdio: 'ignore',
+      cwd: opcDir,
+      env: {
+        ...process.env,
+        CONTINUOUS_CLAUDE_DB_URL: getPgConnectionString(),
+      },
+    });
+
+    child.unref();
+  } catch {
+    // Fire-and-forget: swallow all errors so the hook never blocks
+  }
+}
+
+/**
+ * Update the heartbeat timestamp in a detached background process.
+ *
+ * Unlike updateHeartbeat(), this function returns immediately and never
+ * blocks the caller. Use this in PostToolUse hooks where adding latency
+ * on every tool call is unacceptable.
+ *
+ * @param sessionId - Session identifier to refresh
+ * @param project - Project directory path
+ */
+export function updateHeartbeatDetached(sessionId: string, project: string): void {
+  const pythonCode = `
+import asyncpg
+import os
+
+session_id = sys.argv[1]
+project = sys.argv[2]
+pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL', 'postgresql://claude:claude_dev@localhost:5432/continuous_claude')
+
+async def main():
+    conn = await asyncpg.connect(pg_url)
+    try:
+        await conn.execute('''
+            UPDATE sessions SET last_heartbeat = NOW()
+            WHERE id = $1 AND project = $2
+        ''', session_id, project)
+    finally:
+        await conn.close()
+
+asyncio.run(main())
+`;
+
+  runPgQueryDetached(pythonCode, [sessionId, project]);
 }
 
 // Type definitions for sessions

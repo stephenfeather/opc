@@ -2,6 +2,13 @@
 import { readFileSync, existsSync } from "fs";
 import { execSync } from "child_process";
 import * as path from "path";
+/*!
+ * Pytest Runner Hook (PostToolUse)
+ *
+ * Runs pytest after Edit/Write of Python source files.
+ * Skips venv, .venv, vendor, node_modules, and non-Python files.
+ * Reports test results as additional context.
+ */
 function hasPytestConfig(projectDir) {
   return existsSync(path.join(projectDir, "pytest.ini")) || existsSync(path.join(projectDir, "pyproject.toml")) || existsSync(path.join(projectDir, "setup.cfg")) || existsSync(path.join(projectDir, "conftest.py")) || existsSync(path.join(projectDir, "tests", "conftest.py"));
 }

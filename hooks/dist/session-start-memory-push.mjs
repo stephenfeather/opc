@@ -48,7 +48,17 @@ function getOpcDir() {
 }
 
 // src/session-start-memory-push.ts
-//! @hook SessionStart @preserve
+/*!
+ * Session Start Memory Push Hook (SessionStart, type=startup)
+ *
+ * Proactively surfaces high-value, never-recalled learnings at session start.
+ * Targets two pools:
+ *   1. Stale high-confidence learnings for the current project
+ *   2. Pattern representatives from anti_pattern / problem_solution clusters
+ *
+ * Calls push_learnings.py via subprocess (mirrors memory-awareness.ts pattern).
+ * Injects results via hookSpecificOutput.additionalContext.
+ */
 function main() {
   let input;
   try {

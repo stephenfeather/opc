@@ -2,6 +2,14 @@
 import { readFileSync, existsSync } from "fs";
 import { execSync } from "child_process";
 import * as path from "path";
+/*!
+ * PHP Test Runner Hook (PostToolUse)
+ *
+ * Runs composer-defined test scripts after Edit/Write of PHP source files.
+ * Detects available scripts from composer.json (test, phpcs, phpstan).
+ * Skips vendor, node_modules, and non-PHP files.
+ * Reports test results as additional context.
+ */
 function getComposerScripts(projectDir) {
   const composerPath = path.join(projectDir, "composer.json");
   if (!existsSync(composerPath)) return /* @__PURE__ */ new Set();

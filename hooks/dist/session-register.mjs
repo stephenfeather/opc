@@ -3,7 +3,7 @@ import { readFileSync as readFileSync3 } from "fs";
 import { join as join2 } from "path";
 
 // src/shared/db-utils-pg.ts
-import { spawnSync } from "child_process";
+import { spawn, spawnSync } from "child_process";
 
 // src/shared/opc-path.ts
 import { existsSync, readFileSync } from "fs";

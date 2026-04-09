@@ -269,6 +269,12 @@ function trackHookActivitySync(hookName, projectDir, success = true, metrics = {
 }
 
 // src/post-edit-notify.ts
+/*!
+ * Post-Edit Notification Hook
+ *
+ * Notifies TLDR daemon after file edits for dirty-count tracking.
+ * Triggers automatic semantic re-indexing when threshold is reached.
+ */
 async function main() {
   const input = JSON.parse(readFileSync2(0, "utf-8"));
   if (input.tool_name !== "Edit" && input.tool_name !== "Write") {

@@ -270,6 +270,18 @@ function trackHookActivitySync(hookName, projectDir, success = true, metrics = {
 }
 
 // src/tldr-context-inject.ts
+/*!
+ * TLDR Context Injection Hook - Intent-Aware Version (DAEMON)
+ *
+ * Routes to different TLDR layers based on detected intent:
+ * - "debug/investigate X" → Call Graph + CFG (what it calls, complexity)
+ * - "where does Y come from" → DFG (data flow)
+ * - "what affects line Z" → PDG (program slicing)
+ * - "show structure" → AST only
+ * - Default → Call Graph (navigation)
+ *
+ * Uses TLDR daemon for fast cached responses (50ms vs 500ms CLI).
+ */
 var INTENT_PATTERNS = [
   {
     // Data flow questions

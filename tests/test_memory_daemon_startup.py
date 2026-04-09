@@ -541,6 +541,185 @@ class TestPatternDetectionSpawn:
         argv = captured["argv"]
         assert "--verbose" in argv, f"Expected --verbose in argv, got: {argv}"
 
+    def test_spawn_with_debug_redirects_stderr_to_log_file(self, monkeypatch, tmp_path):
+        """Codex Round 2 Finding: DEBUG mode enables --verbose in the child,
+        which floods stderr with DEBUG-level logging. With stderr=PIPE, the
+        pipe buffer (64KB) can fill up and deadlock the child on write.
+
+        Fix: when DEBUG is on, redirect stderr to an append-mode log file
+        instead of piping it. The daemon does not need to read it; operators
+        can tail ~/.claude/logs/pattern_batch_verbose.log.
+        """
+        import scripts.core.memory_daemon as mod
+
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(mod, "_daemon_state", self._fresh_state(mod))
+        monkeypatch.setattr(mod, "DEBUG", True)
+        monkeypatch.setattr(mod, "log", lambda _m: None)
+
+        captured: dict = {}
+
+        class _FakeProc:
+            pid = 12345
+
+            def poll(self):
+                return None
+
+        def fake_popen(*args, **kwargs):
+            captured["argv"] = args[0] if args else kwargs.get("args")
+            captured["kwargs"] = kwargs
+            return _FakeProc()
+
+        monkeypatch.setattr(mod.subprocess, "Popen", fake_popen)
+
+        mod._run_pattern_detection_batch()
+
+        stderr_arg = captured["kwargs"].get("stderr")
+        assert stderr_arg is not mod.subprocess.PIPE, (
+            "stderr must not be PIPE in DEBUG mode — would deadlock on verbose child"
+        )
+        # The stderr arg must be a writable file-like object.
+        assert hasattr(stderr_arg, "write"), (
+            f"stderr should be a file object in DEBUG mode, got {type(stderr_arg).__name__}"
+        )
+        # The verbose log file should have been created under tmp_path
+        verbose_log = tmp_path / ".claude" / "logs" / "pattern_batch_verbose.log"
+        assert verbose_log.exists(), f"{verbose_log} should be created"
+
+    def test_spawn_without_debug_keeps_stderr_pipe(self, monkeypatch):
+        """Release mode keeps stderr=PIPE for backward compatibility with
+        the existing error-reporting path in _check_pattern_detection.
+        """
+        import scripts.core.memory_daemon as mod
+
+        monkeypatch.setattr(mod, "_daemon_state", self._fresh_state(mod))
+        monkeypatch.setattr(mod, "DEBUG", False)
+        monkeypatch.setattr(mod, "log", lambda _m: None)
+
+        captured: dict = {}
+
+        class _FakeProc:
+            pid = 12345
+
+            def poll(self):
+                return None
+
+        def fake_popen(*args, **kwargs):
+            captured["kwargs"] = kwargs
+            return _FakeProc()
+
+        monkeypatch.setattr(mod.subprocess, "Popen", fake_popen)
+
+        mod._run_pattern_detection_batch()
+
+        assert captured["kwargs"].get("stderr") is mod.subprocess.PIPE
+
+    def test_debug_stderr_handle_stashed_on_pattern_proc(self, monkeypatch, tmp_path):
+        """The file handle used for stderr must be reachable for later
+        cleanup via state.pattern_proc._debug_stderr_handle.
+        """
+        import scripts.core.memory_daemon as mod
+
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(mod, "_daemon_state", self._fresh_state(mod))
+        monkeypatch.setattr(mod, "DEBUG", True)
+        monkeypatch.setattr(mod, "log", lambda _m: None)
+
+        captured: dict = {}
+
+        class _FakeProc:
+            pid = 12345
+
+            def poll(self):
+                return None
+
+        def fake_popen(*args, **kwargs):
+            captured["kwargs"] = kwargs
+            return _FakeProc()
+
+        monkeypatch.setattr(mod.subprocess, "Popen", fake_popen)
+
+        mod._run_pattern_detection_batch()
+
+        proc = mod._ensure_daemon_state().pattern_proc
+        handle = getattr(proc, "_debug_stderr_handle", None)
+        assert handle is not None
+        assert handle is captured["kwargs"]["stderr"]
+
+        # Cleanup so the tmp_path file can be removed
+        handle.close()
+
+    def test_check_pattern_detection_closes_debug_stderr_handle(self, monkeypatch, tmp_path):
+        """When _check_pattern_detection reaps a DEBUG-spawned process, it
+        must close the stashed stderr file handle so we do not leak fds.
+        """
+        import io
+
+        import scripts.core.memory_daemon as mod
+
+        monkeypatch.setattr(mod, "_daemon_state", self._fresh_state(mod))
+        monkeypatch.setattr(mod, "log", lambda _m: None)
+
+        # Simulate a completed debug spawn: pattern_proc exists with a
+        # closeable stderr handle attached and poll() returning 0.
+        closed = []
+
+        class _FakeHandle(io.BytesIO):
+            def close(self):
+                closed.append(True)
+                super().close()
+
+        handle = _FakeHandle()
+
+        class _FakeProc:
+            stdout = io.BytesIO(b'{"patterns_detected": 0, "learnings_analyzed": 0, "patterns_by_type": {}}')
+            stderr = None  # redirected to file, not a pipe
+
+            def poll(self):
+                return 0
+
+        proc = _FakeProc()
+        proc._debug_stderr_handle = handle
+
+        state = mod._ensure_daemon_state()
+        state.pattern_proc = proc
+
+        mod._check_pattern_detection()
+
+        assert closed == [True], "_check_pattern_detection must close _debug_stderr_handle"
+        assert state.pattern_proc is None
+
+    def test_check_pattern_detection_survives_null_stderr_on_failure(self, monkeypatch):
+        """When stderr was redirected to a file (proc.stderr is None), the
+        failure path must not crash with AttributeError on None.read().
+        """
+        import io
+
+        import scripts.core.memory_daemon as mod
+
+        monkeypatch.setattr(mod, "_daemon_state", self._fresh_state(mod))
+
+        log_calls: list[str] = []
+        monkeypatch.setattr(mod, "log", lambda m: log_calls.append(m))
+
+        class _FakeProc:
+            stdout = io.BytesIO(b"")
+            stderr = None  # redirected, no pipe
+
+            def poll(self):
+                return 1  # non-zero → failure path
+
+        state = mod._ensure_daemon_state()
+        state.pattern_proc = _FakeProc()
+
+        # Must not raise.
+        mod._check_pattern_detection()
+
+        # Should have logged a failure message (content format is flexible).
+        assert any("failed" in m.lower() for m in log_calls), (
+            f"Expected failure log, got: {log_calls}"
+        )
+
     def test_spawn_happy_path_does_not_log_errors(self, monkeypatch):
         """Regression guard: the original implementation eagerly evaluated
         ``f"...pid={state.pattern_proc.pid}"`` inside a ``debug()`` call, which

@@ -598,15 +598,40 @@ def _run_pattern_detection_batch():
         # --verbose, so we also inject that flag when DEBUG is on to make
         # --debug materially affect child verbosity (not just env cosmetics).
         pb_argv = [sys.executable, "-m", "scripts.core.pattern_batch"]
+        pb_stderr = subprocess.PIPE
+        debug_stderr_handle = None
         if DEBUG:
             pb_argv.append("--verbose")
+            # Round 2 Codex finding: verbose pattern_batch writes DEBUG-level
+            # logs to stderr via logging.basicConfig. With stderr=PIPE, the
+            # pipe buffer (~64KB) can fill up and deadlock the child on
+            # write — poll() stays stuck at None, state.pattern_proc is
+            # permanently occupied, and future pattern runs are suppressed.
+            # Mitigation: redirect stderr to an append-mode log file so the
+            # child can write freely. Operators tail the file; the daemon
+            # does not read it.
+            try:
+                verbose_log = Path.home() / ".claude" / "logs" / "pattern_batch_verbose.log"
+                verbose_log.parent.mkdir(parents=True, exist_ok=True)
+                debug_stderr_handle = open(verbose_log, "ab")  # noqa: SIM115
+                pb_stderr = debug_stderr_handle
+            except OSError as e:
+                # If we cannot open the log file, fall back to DEVNULL —
+                # discarding verbose output is safer than deadlocking.
+                log(f"Pattern detection verbose log open failed: {e}")
+                pb_stderr = subprocess.DEVNULL
         state.pattern_proc = subprocess.Popen(
             pb_argv,
             cwd=str(project_root),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=pb_stderr,
         )
+        # Stash the verbose-log file handle on the proc object so
+        # _check_pattern_detection can close it when reaping. Using an
+        # attribute on the proc ties the handle's lifetime to the process.
+        if debug_stderr_handle is not None:
+            state.pattern_proc._debug_stderr_handle = debug_stderr_handle
         state.last_pattern_run = time.time()
         # Gate .pid access behind DEBUG so test mocks without a .pid
         # attribute don't explode, and so release-mode callers pay nothing
@@ -628,7 +653,8 @@ def _check_pattern_detection():
     rc = state.pattern_proc.poll()
     if rc is not None:
         if rc == 0:
-            stdout = state.pattern_proc.stdout.read().decode()
+            stdout_stream = state.pattern_proc.stdout
+            stdout = stdout_stream.read().decode() if stdout_stream is not None else ""
             try:
                 import json as _json
                 data = _json.loads(stdout)
@@ -643,8 +669,23 @@ def _check_pattern_detection():
             except (_json.JSONDecodeError, KeyError):
                 log(f"Pattern detection completed: {stdout[:200]}")
         else:
-            stderr = state.pattern_proc.stderr.read().decode()[:200]
+            # Guard against stderr being None, which happens when the child
+            # was spawned in DEBUG mode with stderr redirected to a file
+            # (rather than subprocess.PIPE). The operator can tail
+            # ~/.claude/logs/pattern_batch_verbose.log for the full output.
+            stderr_stream = state.pattern_proc.stderr
+            if stderr_stream is not None:
+                stderr = stderr_stream.read().decode()[:200]
+            else:
+                stderr = "(see ~/.claude/logs/pattern_batch_verbose.log)"
             log(f"Pattern detection failed (rc={rc}): {stderr}")
+        # Close the DEBUG-mode stderr log handle if we stashed one at spawn.
+        debug_stderr = getattr(state.pattern_proc, "_debug_stderr_handle", None)
+        if debug_stderr is not None:
+            try:
+                debug_stderr.close()
+            except Exception:
+                pass
         state.pattern_proc = None
 
 

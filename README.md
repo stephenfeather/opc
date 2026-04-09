@@ -87,7 +87,10 @@ cp .env.example .env
 docker compose -f docker/docker-compose.yml up -d
 
 # Run the memory daemon
-uv run python scripts/core/memory_daemon.py
+uv run python scripts/core/memory_daemon.py start
+
+# Run with verbose diagnostic logging (Issue #99)
+uv run python scripts/core/memory_daemon.py start --debug
 ```
 
 ## Embedding Providers

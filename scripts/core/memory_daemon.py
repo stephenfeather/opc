@@ -48,7 +48,34 @@ if _project_root not in sys.path:
 
 import faulthandler
 
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+# Module-level handle kept alive for faulthandler's lifetime. Populated by
+# _enable_faulthandler() at main() entry — NOT at import time. Issue #55/#57
+# track the refactor that removed module-level faulthandler.enable() calls
+# across the codebase to stop leaking an fd per import.
+_faulthandler_log_file = None
+
+
+def _enable_faulthandler() -> None:
+    """Enable faulthandler with best-effort crash logging.
+
+    Idempotent — safe to call multiple times. Falls back to stderr if the
+    crash log path cannot be created. Called only from main() / CLI entry
+    points, never at module import, to avoid fd leaks when other scripts
+    import memory_daemon for its helpers.
+    """
+    global _faulthandler_log_file  # noqa: PLW0603
+    if _faulthandler_log_file is not None:
+        return
+    try:
+        log_path = Path.home() / ".claude" / "logs" / "opc_crash.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        _faulthandler_log_file = open(log_path, "a")  # noqa: SIM115
+        faulthandler.enable(file=_faulthandler_log_file, all_threads=True)
+    except OSError:
+        # Best effort: if we cannot open the crash log, still enable
+        # faulthandler against stderr so crashes produce *some* diagnostic.
+        faulthandler.enable(all_threads=True)
+
 
 # Load .env files for DATABASE_URL (cross-platform)
 # 1. Local opc/.env first (relative to script location)
@@ -245,6 +272,29 @@ def log(msg: str):
         _logger.info(msg)
     except Exception:
         pass  # Don't crash on log failures
+
+
+# Debug mode: off by default, enabled via --debug CLI flag or
+# MEMORY_DAEMON_DEBUG=1 env var. main() also exports the env var when the
+# CLI flag is set so child subprocesses (pattern_batch, claude -p extraction)
+# inherit the setting through os.environ.
+DEBUG: bool = os.environ.get("MEMORY_DAEMON_DEBUG", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+
+def debug(msg: str) -> None:
+    """Log a diagnostic message when DEBUG mode is enabled.
+
+    No-op when DEBUG is False so gated call sites cost nothing in normal
+    operation. Output is prefixed with ``[DEBUG]`` and routed through the
+    same rotating log file as ``log()``.
+    """
+    if DEBUG:
+        log(f"[DEBUG] {msg}")
 
 
 # Database operations - PostgreSQL
@@ -493,18 +543,31 @@ def _run_pattern_detection_batch():
     state = _ensure_daemon_state()
     # Don't start if already running
     if state.pattern_proc is not None and state.pattern_proc.poll() is None:
-        log("Pattern detection already running, skipping")
+        debug("Pattern detection already running, skipping tick")
         return
     try:
         project_root = Path(__file__).parent.parent.parent
         log("Starting pattern detection batch...")
+        # stdin=DEVNULL is defense-in-depth against fd-0 corruption from
+        # broken daemonization (Issue #99). The primary fix is
+        # _setup_daemon_fds, but explicit DEVNULL here prevents any future
+        # regression in the parent's fd handling from cascading into a
+        # pattern_batch init_sys_streams EBADF crash.
+        # Popen inherits os.environ by default, so MEMORY_DAEMON_DEBUG
+        # propagates to the child automatically when set.
         state.pattern_proc = subprocess.Popen(
             [sys.executable, "-m", "scripts.core.pattern_batch"],
             cwd=str(project_root),
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
         state.last_pattern_run = time.time()
+        # Gate .pid access behind DEBUG so test mocks without a .pid
+        # attribute don't explode, and so release-mode callers pay nothing
+        # for the attribute lookup.
+        if DEBUG:
+            debug(f"pattern_batch spawned pid={state.pattern_proc.pid}")
     except Exception as e:
         log(f"Pattern detection launch error: {e}")
 
@@ -572,9 +635,9 @@ def daemon_tick() -> None:
             stale_sessions, is_alive=_is_process_alive
         )
 
-        # Log still-alive sessions
+        # Log still-alive sessions — noisy per-iteration, gated to debug.
         for s in still_alive:
-            log(f"Skipping {s.id}: process {s.pid} still alive")
+            debug(f"Skipping {s.id}: process {s.pid} still alive")
 
         # Mark newly-dead sessions (grace period starts)
         for sid in newly_dead_ids:
@@ -615,9 +678,19 @@ def daemon_loop():
     ensure_schema()
     recover_stalled_extractions()
 
-    # Reuse existing DaemonState if lazily initialized, else create (D14)
+    # Reuse existing DaemonState if lazily initialized, else create (D14).
+    # Prior bug: daemon_loop() replaced a lazily-created state, losing
+    # pre-loop extractions — log the branch taken so future regressions
+    # are visible in --debug runs.
     if _daemon_state is None:
+        debug("daemon_loop: creating fresh DaemonState (no pre-loop init)")
         _daemon_state = create_daemon_state()
+    else:
+        debug(
+            f"daemon_loop: reusing lazily-created DaemonState "
+            f"(active={len(_daemon_state.active_extractions)}, "
+            f"queued={len(_daemon_state.pending_queue)})"
+        )
     _daemon_state.last_pattern_run = _seed_last_pattern_run()
     if _daemon_state.last_pattern_run:
         log(f"Seeded last pattern run from DB: "
@@ -628,6 +701,10 @@ def daemon_loop():
             daemon_tick()
         except Exception as e:
             log(f"Error in daemon loop: {e}")
+            if DEBUG:
+                import traceback
+
+                log(f"[DEBUG] traceback:\n{traceback.format_exc()}")
         time.sleep(_poll_interval())
 
 
@@ -647,16 +724,50 @@ def is_running() -> tuple[bool, int | None]:
         return False, None
 
 
+def _setup_daemon_fds(
+    *,
+    os_open_fn=os.open,
+    os_dup2_fn=os.dup2,
+    os_close_fn=os.close,
+) -> None:
+    """Redirect kernel fds 0/1/2 to /dev/null for safe daemonization.
+
+    Correct replacement for the previous ``sys.std*.close()`` pattern, which
+    left kernel fd-table holes at 0/1/2 and corrupted any subsequent
+    ``subprocess.Popen()`` that did not pass ``stdin=subprocess.DEVNULL``.
+
+    Bug fingerprint (see Issue #99):
+        Fatal Python error: init_sys_streams: can't initialize sys standard streams
+        OSError: [Errno 9] Bad file descriptor
+
+    observed in pattern_batch children because ``pipe()`` during Popen setup
+    reused the closed fd 0/1 slots, leaving the child with a dangling std fd.
+
+    The os.* functions are injected for testability — callers in production
+    use the real syscalls; tests pass mocks to verify the syscall sequence
+    without touching real file descriptors.
+    """
+    devnull_fd = os_open_fn(os.devnull, os.O_RDWR)
+    os_dup2_fn(devnull_fd, 0)
+    os_dup2_fn(devnull_fd, 1)
+    os_dup2_fn(devnull_fd, 2)
+    # Only close if /dev/null landed above fd 2. If it landed at 0/1/2
+    # (because those fds were already closed pre-call), closing would
+    # re-open the hole we are trying to fix.
+    if devnull_fd > 2:
+        os_close_fn(devnull_fd)
+
+
 def _run_as_daemon():
     """Run the daemon loop (called by subprocess on Windows, directly after fork on Unix)."""
     # Write PID file
     PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(str(os.getpid()))
 
-    # Close standard file descriptors
-    sys.stdin.close()
-    sys.stdout.close()
-    sys.stderr.close()
+    # Redirect standard fds to /dev/null. Must NOT sys.std*.close() — that
+    # leaves kernel fd-table holes which corrupt child subprocess stdio
+    # (observed as pattern_batch init_sys_streams crashes, Issue #99).
+    _setup_daemon_fds()
 
     # Run daemon
     try:
@@ -798,11 +909,26 @@ def status_daemon():
 
 
 def main():
+    # Enable crash diagnostics before doing anything else so even an early
+    # import-time failure in a dependency still produces a traceback.
+    _enable_faulthandler()
+
     parser = argparse.ArgumentParser(description="Global Memory Extraction Daemon")
     parser.add_argument("command", nargs="?", choices=["start", "stop", "status"], help="Command")
     parser.add_argument("--daemon-subprocess", action="store_true",
                         help="Internal: run as daemon subprocess (Windows)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable verbose diagnostic logging. Also exports "
+                             "MEMORY_DAEMON_DEBUG=1 so child subprocesses "
+                             "(pattern_batch, claude -p extraction) inherit it.")
     args = parser.parse_args()
+
+    # Honour --debug before anything else so all subsequent log calls and
+    # spawned children see the elevated verbosity.
+    if args.debug:
+        global DEBUG
+        DEBUG = True
+        os.environ["MEMORY_DAEMON_DEBUG"] = "1"
 
     # Windows subprocess entry point
     if args.daemon_subprocess:

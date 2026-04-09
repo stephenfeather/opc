@@ -34,6 +34,21 @@ interface PushOutput {
   project?: string;
 }
 
+/**
+ * Normalize project directory to short name, handling worktree paths.
+ * For paths containing .worktrees (e.g. /opc/.worktrees/branch-name),
+ * returns the parent project name instead of the branch name.
+ */
+function normalizeProjectName(projectDir: string): string {
+  const cleaned = projectDir.replace(/[\\/]+$/, '');
+  const parts = cleaned.split(/[\\/]/);
+  const worktreeIdx = parts.indexOf('.worktrees');
+  if (worktreeIdx > 0) {
+    return parts[worktreeIdx - 1] ?? '';
+  }
+  return parts.pop() ?? '';
+}
+
 function main(): void {
   let input: SessionStartInput;
   try {
@@ -77,11 +92,8 @@ function main(): void {
     return;
   }
 
-  // Derive project name from CLAUDE_PROJECT_DIR
-  const projectName = projectDir
-    .replace(/[\\/]+$/, '')
-    .split(/[\\/]/)
-    .pop() ?? '';
+  // Derive project name from CLAUDE_PROJECT_DIR (worktree-safe)
+  const projectName = normalizeProjectName(projectDir);
 
   if (!projectName || projectName.startsWith('-')) {
     console.log(JSON.stringify({ result: 'continue' }));

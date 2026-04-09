@@ -48,7 +48,99 @@ if _project_root not in sys.path:
 
 import faulthandler
 
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+
+def _open_log_file_secure(path, mode: str = "ab"):
+    """Open a log file with symlink-TOCTOU hardening and owner-only mode.
+
+    Uses O_NOFOLLOW (where available) so a symlink at ``path`` causes
+    ``OSError`` (ELOOP) instead of silently redirecting writes to an
+    attacker-controlled target. Mode 0o600 keeps the file unreadable to
+    other UIDs regardless of the caller's umask — faulthandler tracebacks
+    and pattern-batch verbose logs can leak local-variable snippets.
+
+    Addresses aegis LOW-1 / LOW-2 findings from the /security audit of #99
+    and Copilot P1/P2/P3 from the PR #106 cycle-1 review.
+
+    Portability notes:
+      - ``os.O_NOFOLLOW`` is POSIX-only. On Windows the constant is not
+        defined, so we fall back via ``getattr`` to 0 (no-op flag). Windows
+        has different symlink semantics — symlink creation requires
+        developer mode or admin — so degraded hardening is acceptable.
+      - ``mode`` in ``os.open()`` only applies to newly-created files. If
+        ``path`` already exists (upgrade path from pre-hardening versions),
+        its existing permissions are retained, so we also call
+        ``os.fchmod(fd, 0o600)`` on a best-effort basis. ``fchmod`` can
+        fail on read-only filesystems or some network mounts; failure is
+        tolerated.
+
+    ``mode`` accepts ``"ab"``/``"a"`` for append, ``"wb"``/``"w"`` for
+    truncate. Binary/text is inferred from presence of ``"b"``.
+    """
+    o_nofollow = getattr(os, "O_NOFOLLOW", 0)
+    os_flags = os.O_WRONLY | os.O_CREAT | o_nofollow
+    if "a" in mode:
+        os_flags |= os.O_APPEND
+    else:
+        os_flags |= os.O_TRUNC
+    fd = os.open(path, os_flags, 0o600)
+    try:
+        # Enforce 0o600 on existing files — os.open()'s mode param is
+        # ignored when the file already exists, so an upgrade path from
+        # an old 0o644 crash log would otherwise keep the loose mode.
+        try:
+            os.fchmod(fd, 0o600)
+        except (OSError, NotImplementedError):
+            # Read-only filesystem, unsupported platform, etc. —
+            # best effort, the open itself still succeeds.
+            pass
+        return os.fdopen(fd, mode)
+    except (OSError, ValueError):
+        # os.fdopen raises OSError on a bad fd and ValueError on an
+        # invalid mode string. In either case we own the fd and must
+        # release it before re-raising. Narrower than `except Exception`
+        # per Gemini M1 feedback on PR #106.
+        os.close(fd)
+        raise
+
+
+# Module-level handle kept alive for faulthandler's lifetime. Populated by
+# _enable_faulthandler() at main() entry — NOT at import time. Issue #55/#57
+# track the refactor that removed module-level faulthandler.enable() calls
+# across the codebase to stop leaking an fd per import.
+_faulthandler_log_file = None
+
+# Once-per-process guard for the "log setup failed" stderr warning.
+# CodeRabbit CR2 on PR #106: operators running CLI commands (status, stop)
+# should see a diagnostic when the rotating log file cannot be opened, even
+# though the daemon itself has stderr redirected to /dev/null after
+# _setup_daemon_fds() and will silently discard the warning.
+_log_setup_warning_emitted = False
+
+
+def _enable_faulthandler() -> None:
+    """Enable faulthandler with best-effort crash logging.
+
+    Idempotent — safe to call multiple times. Falls back to stderr if the
+    crash log path cannot be created. Called only from main() / CLI entry
+    points, never at module import, to avoid fd leaks when other scripts
+    import memory_daemon for its helpers.
+    """
+    global _faulthandler_log_file  # noqa: PLW0603
+    if _faulthandler_log_file is not None:
+        return
+    try:
+        log_path = Path.home() / ".claude" / "logs" / "opc_crash.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        # Use the O_NOFOLLOW-hardened opener (aegis LOW-1) to resist
+        # symlink redirect attacks on the crash log path.
+        _faulthandler_log_file = _open_log_file_secure(log_path, mode="a")
+        faulthandler.enable(file=_faulthandler_log_file, all_threads=True)
+    except OSError:
+        # Best effort: if we cannot open the crash log (symlink refused,
+        # fd exhaustion, permission denied), still enable faulthandler
+        # against stderr so crashes produce *some* diagnostic.
+        faulthandler.enable(all_threads=True)
+
 
 # Load .env files for DATABASE_URL (cross-platform)
 # 1. Local opc/.env first (relative to script location)
@@ -209,6 +301,40 @@ def get_pending_queue() -> list:
 
 
 
+def _reserve_low_fds(
+    *,
+    os_open_fn=os.open,
+    os_close_fn=os.close,
+) -> None:
+    """Reserve fds 0/1/2 with /dev/null before any long-lived file handle opens.
+
+    Called from ``_run_as_daemon()`` immediately before the logger is
+    initialized, so the rotating log file handler cannot land on fd 0/1/2
+    and get silently clobbered by ``_setup_daemon_fds()`` later. This must
+    not run at module import time — doing so would mutate every importer's
+    fd table, which is unsafe for fork-after-import callers (Codex Round 3
+    Finding 3).
+
+    Opens ``/dev/null`` until it is handed back an fd > 2, at which point
+    0/1/2 are all held (either by whatever they were before or by fresh
+    ``/dev/null`` handles we just installed). The low fds returned are
+    intentionally NOT closed — they stay alive as guards until
+    ``_setup_daemon_fds()`` dup2s over them, which implicitly closes them.
+
+    Tolerant of ``OSError`` so a fd-exhausted process still returns
+    gracefully.
+    """
+    while True:
+        try:
+            fd = os_open_fn(os.devnull, os.O_RDWR)
+        except OSError:
+            return
+        if fd > 2:
+            os_close_fn(fd)
+            return
+        # fd in (0, 1, 2): leave it open as a guard; loop to fill remaining slots.
+
+
 def _setup_logging() -> logging.Logger:
     """Configure rotating logger for the daemon.
 
@@ -231,7 +357,11 @@ def _setup_logging() -> logging.Logger:
     return logger
 
 
-_logger = _setup_logging()
+# Module-scope logger placeholder. Lazy-initialized by log() or force-
+# initialized by _run_as_daemon() after _reserve_low_fds(). Never opened
+# at import time — that would touch the filesystem on every import of
+# memory_daemon for its helpers (Codex Round 3 Finding 3).
+_logger: logging.Logger | None = None
 
 
 def _seed_last_pattern_run() -> float:
@@ -240,11 +370,76 @@ def _seed_last_pattern_run() -> float:
 
 
 def log(msg: str):
-    """Write timestamped log message via rotating file handler."""
+    """Write timestamped log message via rotating file handler.
+
+    Lazy-initializes the rotating logger on first call. This replaces the
+    previous module-scope ``_logger = _setup_logging()`` assignment which
+    touched the filesystem on every import (Codex Round 3 Finding 3).
+
+    Error handling is intentionally broad (``except Exception``) in both
+    branches. log() must never crash the daemon:
+      - Setup failure can surface as OSError (can't create log dir),
+        PermissionError, AttributeError (malformed _daemon_cfg), or
+        TypeError (bad config types). Bootstrap must tolerate all of
+        them and continue.
+      - _logger.info() failure can surface as OSError (disk full,
+        rotation race), ValueError (bad format string), UnicodeError
+        (encoding), or AttributeError (half-initialized handler). A
+        corrupted log path must never propagate out and kill the
+        daemon loop.
+    Narrowing to OSError alone would let non-I/O failures crash the
+    daemon, which is the exact scenario we want to survive. (Gemini M2
+    / M5 on PR #106 suggested narrowing; defending the broad except
+    as intentional defensive design.)
+    """
+    global _logger, _log_setup_warning_emitted
+    if _logger is None:
+        try:
+            _logger = _setup_logging()
+        except Exception as e:
+            # CodeRabbit CR2: emit a one-time stderr warning so CLI
+            # callers (status/stop commands) see the configuration
+            # error. In the daemon itself stderr points at /dev/null
+            # after _setup_daemon_fds so this is a no-op there, which
+            # is the correct behavior.
+            if not _log_setup_warning_emitted:
+                _log_setup_warning_emitted = True
+                try:
+                    sys.stderr.write(
+                        f"[memory_daemon] Warning: log setup failed ({e}); "
+                        f"logging disabled.\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass  # stderr itself broken — nothing we can do
+            return  # Best effort: no logger available, silently drop
     try:
         _logger.info(msg)
     except Exception:
-        pass  # Don't crash on log failures
+        pass  # Don't crash on log failures — see docstring.
+
+
+# Debug mode: off by default, enabled via --debug CLI flag or
+# MEMORY_DAEMON_DEBUG=1 env var. main() also exports the env var when the
+# CLI flag is set so child subprocesses (pattern_batch, claude -p extraction)
+# inherit the setting through os.environ.
+DEBUG: bool = os.environ.get("MEMORY_DAEMON_DEBUG", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+
+def debug(msg: str) -> None:
+    """Log a diagnostic message when DEBUG mode is enabled.
+
+    No-op when DEBUG is False so gated call sites cost nothing in normal
+    operation. Output is prefixed with ``[DEBUG]`` and routed through the
+    same rotating log file as ``log()``.
+    """
+    if DEBUG:
+        log(f"[DEBUG] {msg}")
 
 
 # Database operations - PostgreSQL
@@ -505,18 +700,89 @@ def _run_pattern_detection_batch():
     state = _ensure_daemon_state()
     # Don't start if already running
     if state.pattern_proc is not None and state.pattern_proc.poll() is None:
-        log("Pattern detection already running, skipping")
+        debug("Pattern detection already running, skipping tick")
         return
     try:
         project_root = Path(__file__).parent.parent.parent
         log("Starting pattern detection batch...")
-        state.pattern_proc = subprocess.Popen(
-            [sys.executable, "-m", "scripts.core.pattern_batch"],
-            cwd=str(project_root),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        # stdin=DEVNULL is defense-in-depth against fd-0 corruption from
+        # broken daemonization (Issue #99). The primary fix is
+        # _setup_daemon_fds, but explicit DEVNULL here prevents any future
+        # regression in the parent's fd handling from cascading into a
+        # pattern_batch init_sys_streams EBADF crash.
+        # Popen inherits os.environ by default, so MEMORY_DAEMON_DEBUG
+        # propagates to the child for any consumer that reads it. But
+        # pattern_batch.py itself only raises its log level when passed
+        # --verbose, so we also inject that flag when DEBUG is on to make
+        # --debug materially affect child verbosity (not just env cosmetics).
+        pb_argv = [sys.executable, "-m", "scripts.core.pattern_batch"]
+        pb_stderr = subprocess.PIPE
+        debug_stderr_handle = None
+        if DEBUG:
+            pb_argv.append("--verbose")
+            # Round 2 Codex finding: verbose pattern_batch writes DEBUG-level
+            # logs to stderr via logging.basicConfig. With stderr=PIPE, the
+            # pipe buffer (~64KB) can fill up and deadlock the child on
+            # write — poll() stays stuck at None, state.pattern_proc is
+            # permanently occupied, and future pattern runs are suppressed.
+            # Mitigation: redirect stderr to an append-mode log file so the
+            # child can write freely. Operators tail the file; the daemon
+            # does not read it.
+            try:
+                verbose_log = Path.home() / ".claude" / "logs" / "pattern_batch_verbose.log"
+                verbose_log.parent.mkdir(parents=True, exist_ok=True)
+                # O_NOFOLLOW-hardened open (aegis LOW-2): refuses to follow
+                # a symlink at the verbose log path, which would otherwise
+                # redirect pattern_batch stderr to an attacker-controlled file.
+                debug_stderr_handle = _open_log_file_secure(verbose_log, mode="ab")
+                pb_stderr = debug_stderr_handle
+            except OSError as e:
+                # If we cannot open the log file (symlink refused, fd
+                # exhaustion, permission denied), fall back to DEVNULL —
+                # discarding verbose output is safer than deadlocking.
+                log(f"Pattern detection verbose log open failed: {e}")
+                pb_stderr = subprocess.DEVNULL
+        # Round 3 Codex Finding 2: if Popen raises after debug_stderr_handle
+        # is opened, the handle must be closed before the exception
+        # propagates. Otherwise repeated launch failures in DEBUG mode
+        # accumulate fds until the daemon hits the limit — worst in the
+        # exact degraded environments where --debug is enabled.
+        spawn_succeeded = False
+        try:
+            state.pattern_proc = subprocess.Popen(
+                pb_argv,
+                cwd=str(project_root),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=pb_stderr,
+            )
+            spawn_succeeded = True
+        finally:
+            if not spawn_succeeded and debug_stderr_handle is not None:
+                try:
+                    debug_stderr_handle.close()
+                except (OSError, ValueError):
+                    # OSError: underlying close(2) failure (disk full, EIO).
+                    # ValueError: file already closed. Narrowed per Gemini
+                    # M3 on PR #106.
+                    pass
+        # Stash the verbose-log file handle AND its path on the proc
+        # object. _check_pattern_detection closes the handle on reap and
+        # uses the path to build an accurate failure-log hint. The path
+        # is only stashed when the file was actually opened — on the
+        # DEVNULL-fallback path (verbose log open failed), no path is
+        # stashed, and _check_pattern_detection reports "stderr discarded"
+        # instead of falsely promising a log file that does not exist.
+        # (Copilot CP-N2 on PR #106 cycle 2.)
+        if debug_stderr_handle is not None:
+            state.pattern_proc._debug_stderr_handle = debug_stderr_handle
+            state.pattern_proc._debug_stderr_path = str(verbose_log)
         state.last_pattern_run = time.time()
+        # Gate .pid access behind DEBUG so test mocks without a .pid
+        # attribute don't explode, and so release-mode callers pay nothing
+        # for the attribute lookup.
+        if DEBUG:
+            debug(f"pattern_batch spawned pid={state.pattern_proc.pid}")
     except Exception as e:
         log(f"Pattern detection launch error: {e}")
 
@@ -532,7 +798,8 @@ def _check_pattern_detection():
     rc = state.pattern_proc.poll()
     if rc is not None:
         if rc == 0:
-            stdout = state.pattern_proc.stdout.read().decode()
+            stdout_stream = state.pattern_proc.stdout
+            stdout = stdout_stream.read().decode() if stdout_stream is not None else ""
             try:
                 import json as _json
                 data = _json.loads(stdout)
@@ -547,8 +814,36 @@ def _check_pattern_detection():
             except (_json.JSONDecodeError, KeyError):
                 log(f"Pattern detection completed: {stdout[:200]}")
         else:
-            stderr = state.pattern_proc.stderr.read().decode()[:200]
+            # stderr can be None in two cases:
+            #   1. DEBUG mode successfully opened a verbose log file and
+            #      redirected the child's stderr there → use the stashed
+            #      _debug_stderr_path to point operators at the actual file.
+            #   2. DEBUG mode's verbose-log open failed and fell back to
+            #      subprocess.DEVNULL → no path was stashed, and the output
+            #      was discarded. Must NOT claim the pattern_batch_verbose.log
+            #      file exists in this case.
+            # (Copilot CP-N2 on PR #106 cycle 2 — the previous hardcoded
+            # hint was misleading under the DEVNULL fallback.)
+            stderr_stream = state.pattern_proc.stderr
+            if stderr_stream is not None:
+                stderr = stderr_stream.read().decode()[:200]
+            else:
+                stashed_path = getattr(state.pattern_proc, "_debug_stderr_path", None)
+                if stashed_path:
+                    stderr = f"(see {stashed_path})"
+                else:
+                    stderr = "(stderr not captured — output was discarded)"
             log(f"Pattern detection failed (rc={rc}): {stderr}")
+        # Close the DEBUG-mode stderr log handle if we stashed one at spawn.
+        debug_stderr = getattr(state.pattern_proc, "_debug_stderr_handle", None)
+        if debug_stderr is not None:
+            try:
+                debug_stderr.close()
+            except (OSError, ValueError):
+                # OSError: underlying close(2) failure.
+                # ValueError: file already closed. Narrowed per Gemini M4
+                # on PR #106.
+                pass
         state.pattern_proc = None
 
 
@@ -584,9 +879,9 @@ def daemon_tick() -> None:
             stale_sessions, is_alive=_is_process_alive
         )
 
-        # Log still-alive sessions
+        # Log still-alive sessions — noisy per-iteration, gated to debug.
         for s in still_alive:
-            log(f"Skipping {s.id}: process {s.pid} still alive")
+            debug(f"Skipping {s.id}: process {s.pid} still alive")
 
         # Mark newly-dead sessions (grace period starts)
         for sid in newly_dead_ids:
@@ -626,9 +921,19 @@ def daemon_loop():
     ensure_schema()
     recover_stalled_extractions()
 
-    # Reuse existing DaemonState if lazily initialized, else create (D14)
+    # Reuse existing DaemonState if lazily initialized, else create (D14).
+    # Prior bug: daemon_loop() replaced a lazily-created state, losing
+    # pre-loop extractions — log the branch taken so future regressions
+    # are visible in --debug runs.
     if _daemon_state is None:
+        debug("daemon_loop: creating fresh DaemonState (no pre-loop init)")
         _daemon_state = create_daemon_state()
+    else:
+        debug(
+            f"daemon_loop: reusing lazily-created DaemonState "
+            f"(active={len(_daemon_state.active_extractions)}, "
+            f"queued={len(_daemon_state.pending_queue)})"
+        )
     _daemon_state.last_pattern_run = _seed_last_pattern_run()
     if _daemon_state.last_pattern_run:
         log(f"Seeded last pattern run from DB: "
@@ -639,6 +944,10 @@ def daemon_loop():
             daemon_tick()
         except Exception as e:
             log(f"Error in daemon loop: {e}")
+            if DEBUG:
+                import traceback
+
+                log(f"[DEBUG] traceback:\n{traceback.format_exc()}")
         time.sleep(_poll_interval())
 
 
@@ -658,16 +967,74 @@ def is_running() -> tuple[bool, int | None]:
         return False, None
 
 
+def _setup_daemon_fds(
+    *,
+    os_open_fn=os.open,
+    os_dup2_fn=os.dup2,
+    os_close_fn=os.close,
+) -> None:
+    """Redirect kernel fds 0/1/2 to /dev/null for safe daemonization.
+
+    Correct replacement for the previous ``sys.std*.close()`` pattern, which
+    left kernel fd-table holes at 0/1/2 and corrupted any subsequent
+    ``subprocess.Popen()`` that did not pass ``stdin=subprocess.DEVNULL``.
+
+    Bug fingerprint (see Issue #99):
+        Fatal Python error: init_sys_streams: can't initialize sys standard streams
+        OSError: [Errno 9] Bad file descriptor
+
+    observed in pattern_batch children because ``pipe()`` during Popen setup
+    reused the closed fd 0/1 slots, leaving the child with a dangling std fd.
+
+    Aegis LOW-4: tolerant of ``OSError`` on the initial ``os.open`` call
+    (fd exhaustion, permission denied, /dev/null unavailable). Returns
+    gracefully rather than propagating an unlogged traceback out of
+    ``_run_as_daemon`` and killing the daemon.
+
+    The os.* functions are injected for testability — callers in production
+    use the real syscalls; tests pass mocks to verify the syscall sequence
+    without touching real file descriptors.
+    """
+    try:
+        devnull_fd = os_open_fn(os.devnull, os.O_RDWR)
+    except OSError:
+        # fd exhausted or /dev/null unavailable — cannot normalize stdio.
+        # Graceful degradation: the daemon keeps running with whatever
+        # the inherited fds point at, which is strictly better than
+        # crashing mid-daemonization with no log message.
+        return
+    os_dup2_fn(devnull_fd, 0)
+    os_dup2_fn(devnull_fd, 1)
+    os_dup2_fn(devnull_fd, 2)
+    # Only close if /dev/null landed above fd 2. If it landed at 0/1/2
+    # (because those fds were already closed pre-call), closing would
+    # re-open the hole we are trying to fix.
+    if devnull_fd > 2:
+        os_close_fn(devnull_fd)
+
+
 def _run_as_daemon():
     """Run the daemon loop (called by subprocess on Windows, directly after fork on Unix)."""
     # Write PID file
     PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(str(os.getpid()))
 
-    # Close standard file descriptors
-    sys.stdin.close()
-    sys.stdout.close()
-    sys.stderr.close()
+    # Daemon bootstrap ordering is critical:
+    #   1. _reserve_low_fds(): guards fd 0/1/2 with /dev/null so the logger
+    #      handler cannot land there and be silently clobbered in step 3.
+    #   2. _setup_logging(): opens the rotating log file, guaranteed at
+    #      fd >= 3 because low fds are now held.
+    #   3. _setup_daemon_fds(): dup2s /dev/null onto 0/1/2, implicitly
+    #      closing the reservation fds. The logger at fd >= 3 is unaffected.
+    # (Codex Round 3 Finding 3.)
+    _reserve_low_fds()
+    global _logger
+    if _logger is None:
+        try:
+            _logger = _setup_logging()
+        except Exception:
+            pass  # daemon can still run, log() lazy-init may retry
+    _setup_daemon_fds()
 
     # Run daemon
     try:
@@ -809,11 +1176,35 @@ def status_daemon():
 
 
 def main():
+    # Reserve fds 0/1/2 BEFORE opening any long-lived file handle, so the
+    # crash log (opened next by _enable_faulthandler) cannot land at fd 0/1/2
+    # and be silently clobbered when _setup_daemon_fds() dup2s /dev/null
+    # onto those slots in the daemonized child. Same bug class as Codex
+    # Round 3 Finding 3 (module-scope _logger ordering) — Copilot CP-N1 on
+    # PR #106 cycle 2 caught that I had only fixed it for the rotating
+    # logger, not the faulthandler crash log.
+    _reserve_low_fds()
+
+    # Enable crash diagnostics as early as possible once low fds are safe,
+    # so even very early failures still produce a traceback.
+    _enable_faulthandler()
+
     parser = argparse.ArgumentParser(description="Global Memory Extraction Daemon")
     parser.add_argument("command", nargs="?", choices=["start", "stop", "status"], help="Command")
     parser.add_argument("--daemon-subprocess", action="store_true",
                         help="Internal: run as daemon subprocess (Windows)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable verbose diagnostic logging. Also exports "
+                             "MEMORY_DAEMON_DEBUG=1 so child subprocesses "
+                             "(pattern_batch, claude -p extraction) inherit it.")
     args = parser.parse_args()
+
+    # Honour --debug before anything else so all subsequent log calls and
+    # spawned children see the elevated verbosity.
+    if args.debug:
+        global DEBUG
+        DEBUG = True
+        os.environ["MEMORY_DAEMON_DEBUG"] = "1"
 
     # Windows subprocess entry point
     if args.daemon_subprocess:

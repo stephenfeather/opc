@@ -1,5 +1,5 @@
 // src/heartbeat.ts
-import { readFileSync as readFileSync3 } from "fs";
+import { readFileSync as readFileSync2 } from "fs";
 
 // src/shared/db-utils-pg.ts
 import { spawn, spawnSync } from "child_process";
@@ -119,28 +119,6 @@ asyncio.run(main())
 }
 
 // src/shared/session-id.ts
-import { mkdirSync, readFileSync as readFileSync2, writeFileSync } from "fs";
-import { join as join2 } from "path";
-var SESSION_ID_FILENAME = ".coordination-session-id";
-function getSessionIdFile(options = {}) {
-  const claudeDir = join2(process.env.HOME || "/tmp", ".claude");
-  if (options.createDir) {
-    try {
-      mkdirSync(claudeDir, { recursive: true, mode: 448 });
-    } catch {
-    }
-  }
-  return join2(claudeDir, SESSION_ID_FILENAME);
-}
-function readSessionId() {
-  try {
-    const sessionFile = getSessionIdFile();
-    const id = readFileSync2(sessionFile, "utf-8").trim();
-    return id || null;
-  } catch {
-    return null;
-  }
-}
 function getProject() {
   return process.env.CLAUDE_PROJECT_DIR || process.cwd();
 }
@@ -149,18 +127,12 @@ function getProject() {
 function main() {
   let sessionId = null;
   try {
-    const stdinContent = readFileSync3(0, "utf-8");
+    const stdinContent = readFileSync2(0, "utf-8");
     const input = JSON.parse(stdinContent);
     if (input && typeof input.session_id === "string" && isValidId(input.session_id)) {
       sessionId = input.session_id;
     }
   } catch {
-  }
-  if (!sessionId) {
-    const persisted = readSessionId();
-    if (persisted && isValidId(persisted)) {
-      sessionId = persisted;
-    }
   }
   if (!sessionId) {
     console.log(JSON.stringify({ result: "continue" }));

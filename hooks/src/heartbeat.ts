@@ -10,7 +10,7 @@
 
 import { readFileSync } from 'fs';
 import { updateHeartbeatDetached, isValidId } from './shared/db-utils-pg.js';
-import { readSessionId, getProject } from './shared/session-id.js';
+import { getProject } from './shared/session-id.js';
 
 export function main(): void {
   // Try to get session ID from stdin (PostToolUse input)
@@ -22,15 +22,7 @@ export function main(): void {
       sessionId = input.session_id;
     }
   } catch {
-    // stdin parse failure — fall back to persisted file
-  }
-
-  // Fall back to persisted session ID
-  if (!sessionId) {
-    const persisted = readSessionId();
-    if (persisted && isValidId(persisted)) {
-      sessionId = persisted;
-    }
+    // stdin parse failure — continue silently below
   }
 
   // If no session ID, just continue silently

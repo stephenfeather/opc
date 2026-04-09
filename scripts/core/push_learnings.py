@@ -11,7 +11,7 @@ USAGE:
     # JSON output for hook consumption
     uv run python scripts/core/push_learnings.py --project opc --k 5 --json
 
-    # Dry run (don't update recall_count)
+    # Dry run (don't update push_count)
     uv run python scripts/core/push_learnings.py --project opc --json --no-record
 
     # Custom truncation length
@@ -209,7 +209,7 @@ def parse_args(argv: list[str] | None = None) -> dict[str, Any]:
     )
     parser.add_argument(
         "--no-record", action="store_true",
-        help="Don't update recall_count (dry run / testing)",
+        help="Don't update push_count (dry run / testing)",
     )
     parser.add_argument(
         "--max-chars", type=int, default=150,

@@ -18,13 +18,18 @@ scripts/
 └── deploy_hooks.sh   # Mirrors hooks/{src,dist} → $HOME/.claude/hooks/
 ```
 
-**For users:** Clone the repo, then `cd hooks && npm install && npm run build`.
-The `postbuild` step automatically mirrors `src/` and `dist/` into
-`$HOME/.claude/hooks/` via `../scripts/deploy_hooks.sh`, which is where
-Claude Code's `settings.json` loads hooks from. No manual `cp` required.
+**For users** (using the committed pre-bundled artifacts):
+Clone the repo and run `cd hooks && npm run deploy`, or from the
+project root `./scripts/deploy_hooks.sh`. No `npm install`, no build
+step — the deploy script just mirrors the committed `src/` and
+`dist/` into `$HOME/.claude/hooks/` via `rsync`. That's where Claude
+Code's `settings.json` loads hooks from.
 
-**For developers:** Edit `src/*.ts`, then `npm run build`. The mirror runs
-automatically after every successful build.
+**For developers** (editing the TypeScript source):
+Run `cd hooks && npm install && npm run build`. `npm install` pulls
+esbuild + vitest; `npm run build` compiles `src/*.ts` to `dist/*.mjs`,
+and the `postbuild` step automatically mirrors `src/` and `dist/`
+into `$HOME/.claude/hooks/`. Edit → `npm run build` → done.
 
 > `~/.claude/hooks/src/` and `~/.claude/hooks/dist/` are **mirrors** of this
 > tree — do not edit them directly. The deploy script uses `rsync --delete`,
@@ -124,7 +129,9 @@ Hooks are scripts that run at specific points in Claude's workflow:
 
 **Why it's essential:** This is THE hook that makes skills auto-activate.
 
-**Integration:**
+**Integration** — for embedding these hooks into a separate Claude Code
+project (not the OPC deploy flow described at the top of this file):
+
 ```bash
 # Just copy - no npm install needed!
 cp -r .claude/hooks your-project/.claude/

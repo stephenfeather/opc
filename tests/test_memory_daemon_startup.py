@@ -278,22 +278,18 @@ class TestReserveLowFds:
         reserve_line: int | None = None
         setup_fds_line: int | None = None
         for subnode in ast.walk(run_as_daemon_fn):
-            if (
-                isinstance(subnode, ast.Call)
-                and isinstance(subnode.func, ast.Name)
-            ):
+            if isinstance(subnode, ast.Call) and isinstance(subnode.func, ast.Name):
                 if subnode.func.id == "_reserve_low_fds" and reserve_line is None:
                     reserve_line = subnode.lineno
                 if subnode.func.id == "_setup_daemon_fds" and setup_fds_line is None:
                     setup_fds_line = subnode.lineno
 
         assert reserve_line is not None, (
-            "_run_as_daemon must call _reserve_low_fds() to guard against "
-            "degraded-stdio startup"
+            "_run_as_daemon must call _reserve_low_fds() to guard against " "degraded-stdio startup"
         )
-        assert setup_fds_line is not None, (
-            "_run_as_daemon must call _setup_daemon_fds() for daemonization"
-        )
+        assert (
+            setup_fds_line is not None
+        ), "_run_as_daemon must call _setup_daemon_fds() for daemonization"
         assert reserve_line < setup_fds_line, (
             f"_reserve_low_fds must run BEFORE _setup_daemon_fds in _run_as_daemon. "
             f"Got reserve at line {reserve_line}, setup_fds at line {setup_fds_line}."
@@ -659,13 +655,13 @@ class TestPatternDetectionSpawn:
         mod._run_pattern_detection_batch()
 
         stderr_arg = captured["kwargs"].get("stderr")
-        assert stderr_arg is not mod.subprocess.PIPE, (
-            "stderr must not be PIPE in DEBUG mode — would deadlock on verbose child"
-        )
+        assert (
+            stderr_arg is not mod.subprocess.PIPE
+        ), "stderr must not be PIPE in DEBUG mode — would deadlock on verbose child"
         # The stderr arg must be a writable file-like object.
-        assert hasattr(stderr_arg, "write"), (
-            f"stderr should be a file object in DEBUG mode, got {type(stderr_arg).__name__}"
-        )
+        assert hasattr(
+            stderr_arg, "write"
+        ), f"stderr should be a file object in DEBUG mode, got {type(stderr_arg).__name__}"
         # The verbose log file should have been created under tmp_path
         verbose_log = tmp_path / ".claude" / "logs" / "pattern_batch_verbose.log"
         assert verbose_log.exists(), f"{verbose_log} should be created"
@@ -756,7 +752,7 @@ class TestPatternDetectionSpawn:
         handle = _FakeHandle()
 
         class _FakeProc:
-            stdout = io.BytesIO(b'{"patterns_detected": 0, "learnings_analyzed": 0, "patterns_by_type": {}}')
+            stdout = io.BytesIO(b'{"patterns_detected": 0}')
             stderr = None  # redirected to file, not a pipe
 
             def poll(self):
@@ -856,9 +852,9 @@ class TestPatternDetectionSpawn:
         mod._check_pattern_detection()
 
         # Should have logged a failure message (content format is flexible).
-        assert any("failed" in m.lower() for m in log_calls), (
-            f"Expected failure log, got: {log_calls}"
-        )
+        assert any(
+            "failed" in m.lower() for m in log_calls
+        ), f"Expected failure log, got: {log_calls}"
 
     def test_spawn_happy_path_does_not_log_errors(self, monkeypatch):
         """Regression guard: the original implementation eagerly evaluated

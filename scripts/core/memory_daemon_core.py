@@ -212,12 +212,30 @@ def build_extraction_env(base_env: dict, project_dir: str | None) -> dict:
     env["CLAUDE_MEMORY_EXTRACTION"] = "1"
     if project_dir:
         env["CLAUDE_PROJECT_DIR"] = project_dir
-    # Issue #96: DEBUG-gated env-key dump. SECURITY-LOAD-BEARING —
-    # keys only, NEVER values. Logging values would leak secrets
-    # like AWS_SECRET_ACCESS_KEY. The test suite uses tripwire
-    # strings to enforce this invariant (C8 / R5 in the plan).
-    # Do NOT change this to log env itself or repr(env).
-    debug(lambda: f"build_extraction_env keys: {sorted(env.keys())}")
+    # Issue #96 + Codex Round 3: DEBUG-gated diagnostic log.
+    # SECURITY-LOAD-BEARING — reveals daemon-owned information only.
+    # The previous iteration dumped ``sorted(env.keys())`` which was
+    # reconnaissance value even with values redacted: it enumerated
+    # every parent-process env var name. The tightened format below
+    # exposes only:
+    #   - CLAUDE_MEMORY_EXTRACTION=1       (daemon-set constant)
+    #   - CLAUDE_PROJECT_DIR=set/unset     (presence, never the value)
+    #   - env_var_count=N                  (sanity signal for the
+    #                                       cloned dict's total size)
+    # Parent-env key names are NEVER enumerated. This invariant is
+    # enforced by test C8 (TestBuildExtractionEnvLogging) — the
+    # tripwire test uses a unique key ``OPC_KEY_TRIPWIRE_FIND_ME``
+    # as a regression guard against re-introducing enumeration.
+    # NOTE: the parent-env clone behavior itself is deferred to
+    # Issue #108 (allowlist). Do NOT change this log to dump ``env``,
+    # ``repr(env)``, or ``sorted(env.keys())``.
+    debug(
+        lambda: (
+            f"build_extraction_env: CLAUDE_MEMORY_EXTRACTION=1 "
+            f"CLAUDE_PROJECT_DIR={'set' if project_dir else 'unset'} "
+            f"env_var_count={len(env)}"
+        )
+    )
     return env
 
 

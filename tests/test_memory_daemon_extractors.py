@@ -285,7 +285,7 @@ class TestExtractMemoriesImplDebugWiring:
             m for m in messages if "build_extraction_command:" in m
         ]
         env_msgs = [
-            m for m in messages if "build_extraction_env keys" in m
+            m for m in messages if "build_extraction_env:" in m
         ]
 
         assert argv_msgs, (

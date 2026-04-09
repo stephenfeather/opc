@@ -67,7 +67,6 @@ import scripts.core.memory_daemon as memory_daemon
 import scripts.core.memory_daemon_core as memory_daemon_core
 
 CORE_MODULE_PATH = Path(memory_daemon_core.__file__)
-DAEMON_LOG_PATH = Path.home() / ".claude" / "memory-daemon.log"
 
 
 def _require_debug_feature():
@@ -162,28 +161,47 @@ def core_source_ast():
     return ast.parse(source)
 
 
-@pytest.fixture(autouse=True, scope="module")
-def no_real_log_file():
-    """F3: Belt-and-suspenders — fail if the real daemon log file grew.
+@pytest.fixture(autouse=True)
+def _hermetic_log(monkeypatch):
+    """F3: Autouse hermeticity — stub ``log()`` to a no-op for every test.
 
-    Known flake: if another Claude Code session writes to
-    ~/.claude/memory-daemon.log concurrently during this test module's
-    run, this fixture will false-positive. Documented and accepted per
-    R3. If the file does not exist (fresh machine), skip the check.
+    Every test in this module gets ``memory_daemon.log`` (and, defensively,
+    ``memory_daemon_core.log`` if it exists) replaced with a no-op
+    lambda. This prevents any test from accidentally writing to the real
+    ``~/.claude/memory-daemon.log`` file, even if the test forgets to
+    inject the ``log_spy`` fixture.
+
+    Tests that need to inspect captured log messages inject ``log_spy``
+    explicitly. ``log_spy`` reinstalls its own list-appender on top of
+    this no-op stub via ``monkeypatch.setattr``, and pytest's function-
+    scoped fixture ordering means the later setattr wins — so log_spy's
+    capture behavior is preserved.
+
+    Replaces the previous module-scope ``no_real_log_file`` fixture,
+    which had two failure modes (Codex Round 3 MEDIUM finding):
+
+    1. **Silent pass on clean machines.** If ``~/.claude/memory-daemon.log``
+       did not exist pre-test (``before = None``), the post-test check
+       was skipped entirely — a leak that created the file would not be
+       caught.
+
+    2. **False positives on shared dev boxes.** The fixture watched a
+       shared home-directory path, so a concurrent Claude session
+       writing to the log during the test module's run would false-
+       positive the entire module.
+
+    This replacement eliminates both failure modes by making hermeticity
+    active (stub the I/O sink) rather than observational (watch the
+    file size).
     """
-    if DAEMON_LOG_PATH.exists():
-        before = DAEMON_LOG_PATH.stat().st_size
-    else:
-        before = None
-    yield
-    if before is not None and DAEMON_LOG_PATH.exists():
-        after = DAEMON_LOG_PATH.stat().st_size
-        if after != before:
-            pytest.fail(
-                f"HERMETICITY VIOLATION: {DAEMON_LOG_PATH} grew from "
-                f"{before} to {after} bytes during test run. Some test "
-                "failed to monkeypatch `log` before calling production code."
-            )
+    from scripts.core import memory_daemon as _daemon
+
+    monkeypatch.setattr(_daemon, "log", lambda _m: None, raising=True)
+    # Defensive: core module may not bind its own `log` attribute,
+    # so allow the setattr to no-op if the attribute does not exist.
+    monkeypatch.setattr(
+        memory_daemon_core, "log", lambda _m: None, raising=False
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -739,22 +757,67 @@ class TestBuildExtractionEnvLogging:
             "PATH": self.TRIPWIRE_PATH,
         }
 
-    def test_build_extraction_env_logs_keys_when_debug_on(
+    def test_build_extraction_env_logs_daemon_owned_keys_only_when_debug_on(
         self, debug_on, log_spy
     ):
-        """Test 20: DEBUG on → log contains key names."""
+        """Test 20: DEBUG on → log exposes daemon-owned keys only.
+
+        Codex Round 3 HIGH finding: the previous implementation dumped
+        ``sorted(env.keys())`` which enumerated ALL parent-process env
+        var names — reconnaissance value even with values redacted.
+        The tightened format reveals only:
+        - ``CLAUDE_MEMORY_EXTRACTION=1`` (daemon-set constant)
+        - ``CLAUDE_PROJECT_DIR=set``/``unset`` (presence, never value)
+        - ``env_var_count=N`` (sanity signal)
+        Parent-env key names like ``AWS_SECRET_ACCESS_KEY`` or ``PATH``
+        must NEVER appear in the log. This is the security invariant.
+        """
         memory_daemon_core.build_extraction_env(
             self._make_base_env(), self.TRIPWIRE_PROJECT
         )
         joined = " ".join(str(m) for m in log_spy)
-        assert "AWS_SECRET_ACCESS_KEY" in joined, (
-            f"Expected 'AWS_SECRET_ACCESS_KEY' key in log, got: {log_spy}"
+        # Security invariant: parent-env keys must NOT leak.
+        assert "AWS_SECRET_ACCESS_KEY" not in joined, (
+            f"SECURITY VIOLATION: parent-env key 'AWS_SECRET_ACCESS_KEY' "
+            f"leaked into log: {log_spy}"
         )
-        assert "PATH" in joined, (
-            f"Expected 'PATH' key in log, got: {log_spy}"
+        assert "PATH" not in joined, (
+            f"SECURITY VIOLATION: parent-env key 'PATH' leaked into log: "
+            f"{log_spy}"
         )
+        # Daemon-owned signals must be present.
         assert "CLAUDE_MEMORY_EXTRACTION" in joined, (
-            f"Expected 'CLAUDE_MEMORY_EXTRACTION' key in log, got: {log_spy}"
+            f"Expected 'CLAUDE_MEMORY_EXTRACTION' in log, got: {log_spy}"
+        )
+        assert "CLAUDE_PROJECT_DIR" in joined, (
+            f"Expected 'CLAUDE_PROJECT_DIR' in log, got: {log_spy}"
+        )
+        assert "env_var_count=" in joined, (
+            f"Expected 'env_var_count=' sanity signal in log, got: {log_spy}"
+        )
+
+    def test_build_extraction_env_does_not_leak_parent_env_keys(
+        self, debug_on, log_spy
+    ):
+        """Test 20b: tripwire guard against re-introducing enumeration.
+
+        Load-bearing regression guard: if a future refactor re-adds
+        ``sorted(env.keys())`` or ``repr(env)`` to the debug log, this
+        unique tripwire key name will surface in the log and fail the
+        test. The tripwire string is deliberately unique so it cannot
+        collide with legitimate log content.
+        """
+        tripwire_key = "OPC_KEY_TRIPWIRE_FIND_ME"
+        base_env = dict(self._make_base_env())
+        base_env[tripwire_key] = "value-doesnt-matter"
+        memory_daemon_core.build_extraction_env(
+            base_env, self.TRIPWIRE_PROJECT
+        )
+        joined = " ".join(str(m) for m in log_spy)
+        assert tripwire_key not in joined, (
+            f"REGRESSION: tripwire parent-env key {tripwire_key!r} "
+            f"leaked into log — build_extraction_env is enumerating "
+            f"env.keys() again. Got: {log_spy}"
         )
 
     def test_build_extraction_env_does_not_log_values(
@@ -791,16 +854,22 @@ class TestBuildExtractionEnvLogging:
             f"leaked into log: {log_spy}"
         )
 
-    def test_build_extraction_env_logs_claude_project_dir_key_only(
+    def test_build_extraction_env_logs_claude_project_dir_presence_only(
         self, debug_on, log_spy
     ):
-        """Test 22: CLAUDE_PROJECT_DIR key present, value absent."""
+        """Test 22: CLAUDE_PROJECT_DIR reported as presence, never value.
+
+        Under the tightened format, CLAUDE_PROJECT_DIR is logged as
+        ``CLAUDE_PROJECT_DIR=set`` when a project_dir is passed (and
+        ``CLAUDE_PROJECT_DIR=unset`` when it is None). The actual
+        directory path must NEVER appear in the log.
+        """
         memory_daemon_core.build_extraction_env(
             self._make_base_env(), self.TRIPWIRE_PROJECT
         )
         joined = " ".join(str(m) for m in log_spy)
-        assert "CLAUDE_PROJECT_DIR" in joined, (
-            f"Expected 'CLAUDE_PROJECT_DIR' key in log, got: {log_spy}"
+        assert "CLAUDE_PROJECT_DIR=set" in joined, (
+            f"Expected 'CLAUDE_PROJECT_DIR=set' in log, got: {log_spy}"
         )
         assert self.TRIPWIRE_PROJECT not in joined, (
             f"SECURITY VIOLATION: CLAUDE_PROJECT_DIR value "

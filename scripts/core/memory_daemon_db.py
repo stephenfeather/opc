@@ -42,10 +42,14 @@ def pg_connect(max_retries: int = 3, base_delay: float = 2.0):
     """Connect to PostgreSQL with retry logic for transient failures."""
     import psycopg2
 
-    last_error = None
+    url = get_postgres_url()
+    if not url:
+        raise psycopg2.OperationalError("DATABASE_URL not configured")
+
+    last_error: Exception = psycopg2.OperationalError("no connection attempts made")
     for attempt in range(max_retries):
         try:
-            return psycopg2.connect(get_postgres_url())
+            return psycopg2.connect(url)
         except psycopg2.OperationalError as e:
             last_error = e
             if attempt < max_retries - 1:

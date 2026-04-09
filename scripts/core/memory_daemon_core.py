@@ -179,12 +179,27 @@ def build_extraction_command(
         "--append-system-prompt", agent_prompt,
         f"Extract learnings from session {session_id}. JSONL path: {jsonl_path}",
     ]
-    # Issue #96: DEBUG-gated argv dump for hung-extractor triage. The
-    # thunk form is required for eager-eval safety — see debug()
+    # Issue #96: DEBUG-gated structured log for hung-extractor triage.
+    # The thunk form is required for eager-eval safety — see debug()
     # docstring. Paths and session IDs are diagnostic signal here,
     # not secrets, so they appear intentionally (see C6 / R6 in the
     # plan: argv logging is PRESENT, env value logging is ABSENT).
-    debug(lambda: f"build_extraction_command argv: {cmd}")
+    #
+    # Codex Round 2 #3: log STRUCTURED fields only, never the raw
+    # argv. The argv includes the full memory-extractor system prompt
+    # (loaded from CLAUDE_CONFIG_DIR/agents/memory-extractor.md) which
+    # is multi-KB of operator content that would bury triage signal
+    # and persist prompt content as incidental debug output. Emit
+    # only session_id, model, max_turns, jsonl_path, and prompt_len.
+    # Do NOT log the prompt body or a hash — length is sufficient
+    # metadata for triage.
+    debug(
+        lambda: (
+            f"build_extraction_command: session_id={session_id} "
+            f"model={model} max_turns={max_turns} "
+            f"jsonl_path={jsonl_path} prompt_len={len(agent_prompt)}"
+        )
+    )
     return cmd
 
 

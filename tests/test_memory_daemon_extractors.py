@@ -282,7 +282,7 @@ class TestExtractMemoriesImplDebugWiring:
 
         # Assert: the core helpers' DEBUG log lines landed in the spy.
         argv_msgs = [
-            m for m in messages if "build_extraction_command argv" in m
+            m for m in messages if "build_extraction_command:" in m
         ]
         env_msgs = [
             m for m in messages if "build_extraction_env keys" in m

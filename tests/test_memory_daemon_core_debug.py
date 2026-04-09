@@ -649,6 +649,69 @@ class TestBuildExtractionCommandLogging:
             f"{mentions}"
         )
 
+    def test_build_extraction_command_does_not_log_prompt_body(
+        self, debug_on, log_spy
+    ):
+        """Test 19b (Codex Round 2 #3): agent_prompt body must NEVER appear in log.
+
+        SECURITY/NOISE contract: the argv includes the full
+        memory-extractor system prompt (loaded from
+        CLAUDE_CONFIG_DIR/agents/memory-extractor.md at runtime). A
+        naive `argv: {cmd}` dump leaks multi-KB of operator-specific
+        prompt content into the daemon log on every extraction start,
+        burying the useful triage fields.
+
+        Codex recommendation: log only structured diagnostic fields
+        (session_id, model, max_turns, jsonl_path, prompt_len). This
+        test enforces that the prompt BODY — identified by a tripwire
+        substring — is absent from the log, while the triage fields
+        ARE present.
+        """
+        tripwire = "SYSTEM PROMPT BODY — DO NOT LOG zzz-PROMPT-TRIPWIRE-003"
+        memory_daemon_core.build_extraction_command(
+            session_id="sess-test",
+            jsonl_path="/tmp/fake.jsonl",
+            agent_prompt=tripwire,
+            model="sonnet",
+            max_turns=15,
+        )
+        joined = " ".join(str(m) for m in log_spy)
+
+        # Triage fields MUST be present for the log to be useful.
+        assert "sess-test" in joined, (
+            f"Expected 'sess-test' (session_id) in structured debug "
+            f"log, got: {log_spy}"
+        )
+        assert "sonnet" in joined, (
+            f"Expected 'sonnet' (model) in structured debug log, "
+            f"got: {log_spy}"
+        )
+        assert "/tmp/fake.jsonl" in joined, (
+            f"Expected '/tmp/fake.jsonl' (jsonl_path) in structured "
+            f"debug log, got: {log_spy}"
+        )
+        assert "max_turns=15" in joined, (
+            f"Expected 'max_turns=15' in structured debug log, "
+            f"got: {log_spy}"
+        )
+
+        # The prompt BODY must NOT appear in the log, in whole or part.
+        # Defense in depth: check both the full tripwire and a
+        # distinctive substring so any format that echoes any part of
+        # the prompt fails the test.
+        assert "zzz-PROMPT-TRIPWIRE-003" not in joined, (
+            f"NOISE/LEAK VIOLATION: agent_prompt body tripwire "
+            f"'zzz-PROMPT-TRIPWIRE-003' leaked into debug log. The "
+            f"argv dump must log prompt metadata (e.g., prompt_len) "
+            f"only, not the prompt body. Log: {log_spy}"
+        )
+        assert "SYSTEM PROMPT BODY" not in joined, (
+            f"NOISE/LEAK VIOLATION: agent_prompt body substring "
+            f"'SYSTEM PROMPT BODY' leaked into debug log. Even a "
+            f"partial echo is forbidden — log structured metadata "
+            f"only. Log: {log_spy}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # §4.6 build_extraction_env key-only logging (tests 20–25)

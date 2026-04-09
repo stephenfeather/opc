@@ -145,6 +145,13 @@ fi
 # is called again immediately before each filesystem mutation so a process
 # that swaps TARGET_ABS into a symlink after validation still trips the
 # guard before rsync --delete runs.
+#
+# PR #107 Copilot follow-up: $TARGET_ABS itself can be a real directory
+# while $TARGET_ABS/src or $TARGET_ABS/dist is a pre-existing symlink.
+# rsync with trailing slashes follows those subdirectory symlinks and
+# `rsync --delete` would then prune files inside the link destination —
+# reintroducing the blast radius the other symlink guards close. Check
+# the subdirs alongside the parent at every mutation checkpoint.
 _assert_target_not_symlink() {
     if [ -L "$TARGET_ABS" ]; then
         echo "deploy_hooks: refusing to deploy to '$TARGET_ABS' - target is a symlink" >&2
@@ -152,7 +159,19 @@ _assert_target_not_symlink() {
     fi
 }
 
+_assert_target_subdirs_not_symlinks() {
+    if [ -L "$TARGET_ABS/src" ]; then
+        echo "deploy_hooks: refusing - '$TARGET_ABS/src' is a symlink" >&2
+        exit 4
+    fi
+    if [ -L "$TARGET_ABS/dist" ]; then
+        echo "deploy_hooks: refusing - '$TARGET_ABS/dist' is a symlink" >&2
+        exit 4
+    fi
+}
+
 _assert_target_not_symlink
+_assert_target_subdirs_not_symlinks
 
 if [ ! -d "$HOOKS_SRC/src" ] || [ -z "$(ls -A "$HOOKS_SRC/src" 2>/dev/null)" ]; then
     echo "deploy_hooks: $HOOKS_SRC/src is empty or missing - nothing to deploy" >&2
@@ -243,20 +262,23 @@ if ! _acquire_lock; then
 fi
 trap 'rm -rf "$LOCK_DIR" 2>/dev/null || true' EXIT INT TERM
 
-# Defense-in-depth: re-check the target is still not a symlink right
-# before each filesystem mutation. Closes the TOCTOU window flagged by
-# the security audit.
+# Defense-in-depth: re-check the target (and its subdirs) is still not a
+# symlink right before each filesystem mutation. Closes the TOCTOU window
+# flagged by the security audit.
 _assert_target_not_symlink
+_assert_target_subdirs_not_symlinks
 mkdir -p "$TARGET_ABS/src" "$TARGET_ABS/dist"
 
 # Finding #3 (round 1): rsync --delay-updates stages new files into a
 # hidden holding directory and renames them into place at the end of the
 # batch, so readers see the old or new tree - not a half-updated mix.
 _assert_target_not_symlink
+_assert_target_subdirs_not_symlinks
 echo "deploy_hooks: syncing src/  -> $TARGET_ABS/src/"
 rsync -a --delete --delay-updates "$HOOKS_SRC/src/" "$TARGET_ABS/src/"
 
 _assert_target_not_symlink
+_assert_target_subdirs_not_symlinks
 echo "deploy_hooks: syncing dist/ -> $TARGET_ABS/dist/"
 rsync -a --delete --delay-updates "$HOOKS_SRC/dist/" "$TARGET_ABS/dist/"
 

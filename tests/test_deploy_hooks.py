@@ -462,6 +462,43 @@ class TestTargetValidation:
         # not have been touched by rsync.
         assert (real_dir / "precious.txt").read_text() == "must not be deleted\n"
 
+    def test_rejects_symlinked_target_src_subdir(self, tmp_path: Path) -> None:
+        """PR #107 Copilot regression: $TARGET_ABS may be a real directory
+        while $TARGET_ABS/src is a symlink pointing at an unrelated tree.
+        rsync --delete with a trailing slash follows that symlink and
+        deletes files inside the link destination. The script must refuse."""
+        opc_root, script, target = _build_fixture(tmp_path)
+        # $TARGET_ABS exists as a real dir
+        target.mkdir()
+        # Precious files outside the intended deploy path
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "precious.txt").write_text("must not be deleted\n")
+        # $TARGET_ABS/src is a symlink pointing at elsewhere
+        (target / "src").symlink_to(elsewhere)
+
+        result = _run(script, target)
+
+        assert result.returncode == 4
+        assert "src' is a symlink" in result.stderr
+        # Precious file must still exist, unchanged.
+        assert (elsewhere / "precious.txt").read_text() == "must not be deleted\n"
+
+    def test_rejects_symlinked_target_dist_subdir(self, tmp_path: Path) -> None:
+        """Same as src subdir case but for dist."""
+        opc_root, script, target = _build_fixture(tmp_path)
+        target.mkdir()
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "precious.txt").write_text("must not be deleted\n")
+        (target / "dist").symlink_to(elsewhere)
+
+        result = _run(script, target)
+
+        assert result.returncode == 4
+        assert "dist' is a symlink" in result.stderr
+        assert (elsewhere / "precious.txt").read_text() == "must not be deleted\n"
+
 
 # --- Finding #3: lock serialization ------------------------------------------
 

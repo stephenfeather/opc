@@ -43,7 +43,7 @@ def pg_connect(max_retries: int = 3, base_delay: float = 2.0):
     import psycopg2
 
     url = get_postgres_url()
-    if url is None:
+    if not url:
         raise psycopg2.OperationalError("DATABASE_URL not configured")
 
     last_error: Exception = psycopg2.OperationalError("no connection attempts made")

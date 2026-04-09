@@ -157,7 +157,7 @@ class TestPgEnsureColumn:
 
         pg_ensure_column()
 
-        assert mock_cur.execute.call_count == 6
+        assert mock_cur.execute.call_count == 7
         mock_conn.commit.assert_called_once()
         mock_conn.close.assert_called_once()
 
@@ -181,6 +181,7 @@ class TestPgEnsureColumn:
             "transcript_path",
             "archived_at",
             "archive_path",
+            "last_error",
         ]:
             assert col in combined
 
@@ -544,10 +545,11 @@ class TestSqliteMarkExtractionFailedDb:
         conn.execute("""
             CREATE TABLE sessions (
                 id TEXT PRIMARY KEY, extraction_status TEXT,
-                extraction_attempts INTEGER DEFAULT 0
+                extraction_attempts INTEGER DEFAULT 0,
+                last_error TEXT
             )
         """)
-        conn.execute("INSERT INTO sessions VALUES ('s1', 'extracting', 3)")
+        conn.execute("INSERT INTO sessions VALUES ('s1', 'extracting', 3, NULL)")
         conn.commit()
         conn.close()
 
@@ -706,7 +708,7 @@ class TestMarkExtractionFailedDb:
         from scripts.core.memory_daemon_db import mark_extraction_failed
 
         mark_extraction_failed("sess-1", max_retries=3)
-        mock_pg.assert_called_once_with("sess-1", max_retries=3)
+        mock_pg.assert_called_once_with("sess-1", max_retries=3, last_error=None)
 
     @patch("scripts.core.memory_daemon_db.use_postgres", return_value=False)
     @patch("scripts.core.memory_daemon_db.sqlite_mark_extraction_failed")
@@ -714,7 +716,7 @@ class TestMarkExtractionFailedDb:
         from scripts.core.memory_daemon_db import mark_extraction_failed
 
         mark_extraction_failed("sess-1", max_retries=3)
-        mock_sqlite.assert_called_once_with("sess-1", max_retries=3)
+        mock_sqlite.assert_called_once_with("sess-1", max_retries=3, last_error=None)
 
 
 class TestMarkSessionExitedDb:

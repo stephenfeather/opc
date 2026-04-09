@@ -82,6 +82,7 @@ def pg_ensure_column():
         ("transcript_path", "TEXT"),
         ("archived_at", "TIMESTAMP"),
         ("archive_path", "TEXT"),
+        ("last_error", "TEXT"),
     ]:
         cur.execute(f"""
             ALTER TABLE sessions
@@ -112,7 +113,8 @@ def sqlite_ensure_table():
             extraction_attempts INTEGER DEFAULT 0,
             transcript_path TEXT,
             archived_at TIMESTAMP,
-            archive_path TEXT
+            archive_path TEXT,
+            last_error TEXT
         )
     """)
     # Add columns if table already exists without them
@@ -125,6 +127,7 @@ def sqlite_ensure_table():
         ("transcript_path", "TEXT"),
         ("archived_at", "TIMESTAMP"),
         ("archive_path", "TEXT"),
+        ("last_error", "TEXT"),
     ]:
         try:
             conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {typedef}")
@@ -266,7 +269,9 @@ def pg_mark_extracted(session_id: str):
     conn.close()
 
 
-def pg_mark_extraction_failed(session_id: str, max_retries: int):
+def pg_mark_extraction_failed(
+    session_id: str, max_retries: int, last_error: str | None = None
+):
     """Mark extraction as failed; retry if under max_retries, else give up."""
     conn = pg_connect()
     cur = conn.cursor()
@@ -290,13 +295,16 @@ def pg_mark_extraction_failed(session_id: str, max_retries: int):
         )
     else:
         cur.execute(
-            "UPDATE sessions SET extraction_status = 'failed' WHERE id = %s",
-            (session_id,),
+            "UPDATE sessions SET extraction_status = 'failed', "
+            "last_error = %s WHERE id = %s",
+            (last_error, session_id),
         )
+        suffix = f" (last error: {last_error})" if last_error else ""
         logger.info(
-            "Extraction permanently failed for %s after %d attempts",
+            "Extraction permanently failed for %s after %d attempts%s",
             session_id,
             attempts,
+            suffix,
         )
 
     conn.commit()
@@ -410,7 +418,9 @@ def sqlite_mark_extracted(session_id: str):
     conn.close()
 
 
-def sqlite_mark_extraction_failed(session_id: str, max_retries: int):
+def sqlite_mark_extraction_failed(
+    session_id: str, max_retries: int, last_error: str | None = None
+):
     """Mark extraction as failed in SQLite; retry if under max_retries."""
     import sqlite3
 
@@ -429,8 +439,9 @@ def sqlite_mark_extraction_failed(session_id: str, max_retries: int):
         )
     else:
         conn.execute(
-            "UPDATE sessions SET extraction_status = 'failed' WHERE id = ?",
-            (session_id,),
+            "UPDATE sessions SET extraction_status = 'failed', "
+            "last_error = ? WHERE id = ?",
+            (last_error, session_id),
         )
     conn.commit()
     conn.close()
@@ -531,12 +542,18 @@ def mark_extracted(session_id: str):
         sqlite_mark_extracted(session_id)
 
 
-def mark_extraction_failed(session_id: str, max_retries: int):
+def mark_extraction_failed(
+    session_id: str, max_retries: int, last_error: str | None = None
+):
     """Mark extraction as failed (will retry if under max_retries)."""
     if use_postgres():
-        pg_mark_extraction_failed(session_id, max_retries=max_retries)
+        pg_mark_extraction_failed(
+            session_id, max_retries=max_retries, last_error=last_error
+        )
     else:
-        sqlite_mark_extraction_failed(session_id, max_retries=max_retries)
+        sqlite_mark_extraction_failed(
+            session_id, max_retries=max_retries, last_error=last_error
+        )
 
 
 def mark_session_exited(session_id: str):

@@ -283,19 +283,25 @@ def get_stale_sessions() -> list:
     )
 
 
-def pg_mark_extraction_failed(session_id: str):
+def pg_mark_extraction_failed(session_id: str, *, last_error: str | None = None):
     """Wrapper: reads max_retries from live config at call time (D3)."""
-    _pg_mark_extraction_failed_impl(session_id, max_retries=_daemon_cfg.max_retries)
+    _pg_mark_extraction_failed_impl(
+        session_id, max_retries=_daemon_cfg.max_retries, last_error=last_error
+    )
 
 
-def sqlite_mark_extraction_failed(session_id: str):
+def sqlite_mark_extraction_failed(session_id: str, *, last_error: str | None = None):
     """Wrapper: reads max_retries from live config at call time (D3)."""
-    _sqlite_mark_extraction_failed_impl(session_id, max_retries=_daemon_cfg.max_retries)
+    _sqlite_mark_extraction_failed_impl(
+        session_id, max_retries=_daemon_cfg.max_retries, last_error=last_error
+    )
 
 
-def mark_extraction_failed(session_id: str):
+def mark_extraction_failed(session_id: str, *, last_error: str | None = None):
     """Wrapper: reads max_retries from live config at call time (D3)."""
-    _mark_extraction_failed_impl(session_id, max_retries=_daemon_cfg.max_retries)
+    _mark_extraction_failed_impl(
+        session_id, max_retries=_daemon_cfg.max_retries, last_error=last_error
+    )
 
 
 # Unified interface
@@ -384,13 +390,20 @@ def reap_completed_extractions():
                 f"(pid={pid}, project={project}, "
                 f"exit={exit_code}, elapsed={elapsed}s{learnings_info}{rejections_info})")
             if exit_code == 0:
+                proc.stderr.close()
                 mark_extracted(session_id)
                 _calibrate_session_confidence(session_id)
                 _extract_and_store_workflows(session_id, jsonl_path, project)
                 _generate_mini_handoff(session_id, jsonl_path, project)
                 archive_session_jsonl(session_id, jsonl_path)
             else:
-                mark_extraction_failed(session_id)
+                raw = proc.stderr.read()
+                stderr_text = raw.decode("utf-8", errors="replace").strip()[-500:]
+                if stderr_text:
+                    log(f"  stderr: {stderr_text}")
+                mark_extraction_failed(
+                    session_id, last_error=stderr_text or None
+                )
 
     for pid in completed:
         del ae[pid]

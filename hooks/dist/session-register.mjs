@@ -1,6 +1,6 @@
 // src/session-register.ts
-import { readFileSync as readFileSync4 } from "fs";
-import { join as join3 } from "path";
+import { readFileSync as readFileSync3 } from "fs";
+import { join as join2 } from "path";
 
 // src/shared/db-utils-pg.ts
 import { spawnSync } from "child_process";
@@ -180,39 +180,17 @@ asyncio.run(main())
 }
 
 // src/shared/session-id.ts
-import { mkdirSync, readFileSync as readFileSync2, writeFileSync } from "fs";
-import { join as join2 } from "path";
-var SESSION_ID_FILENAME = ".coordination-session-id";
-function getSessionIdFile(options = {}) {
-  const claudeDir = join2(process.env.HOME || "/tmp", ".claude");
-  if (options.createDir) {
-    try {
-      mkdirSync(claudeDir, { recursive: true, mode: 448 });
-    } catch {
-    }
-  }
-  return join2(claudeDir, SESSION_ID_FILENAME);
-}
-function writeSessionId(sessionId) {
-  try {
-    const filePath = getSessionIdFile({ createDir: true });
-    writeFileSync(filePath, sessionId, { encoding: "utf-8", mode: 384 });
-    return true;
-  } catch {
-    return false;
-  }
-}
 function getProject() {
   return process.env.CLAUDE_PROJECT_DIR || process.cwd();
 }
 
 // src/session-context.ts
-import { readFileSync as readFileSync3, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, renameSync } from "fs";
+import { readFileSync as readFileSync2, writeFileSync, mkdirSync, renameSync } from "fs";
 function checkMemoryHealth(pgRegistrationSucceeded, pidFilePath) {
   const pgHealthy = pgRegistrationSucceeded;
   let daemonRunning = false;
   try {
-    const pidContent = readFileSync3(pidFilePath, "utf-8").trim();
+    const pidContent = readFileSync2(pidFilePath, "utf-8").trim();
     const pid = parseInt(pidContent, 10);
     if (!isNaN(pid) && pid > 0) {
       process.kill(pid, 0);
@@ -237,7 +215,7 @@ ${warnings.join("\n")}`;
 }
 function getPendingTasksSummary(tasksFilePath) {
   try {
-    const content = readFileSync3(tasksFilePath, "utf-8");
+    const content = readFileSync2(tasksFilePath, "utf-8");
     if (!content.trim()) return null;
     const titles = content.split("\n").filter((line) => line.startsWith("## ")).map((line) => line.slice(3).trim());
     if (titles.length === 0) return null;
@@ -251,7 +229,15 @@ function getPendingTasksSummary(tasksFilePath) {
 }
 
 // src/session-register.ts
-//! @hook SessionStart @preserve
+/*!
+ * SessionStart Hook - Registers session in coordination layer.
+ *
+ * This hook:
+ * 1. Registers the session in PostgreSQL for cross-session awareness
+ * 2. Injects session ID, memory system health, and pending tasks summary
+ *
+ * Peer session awareness is handled by peer-awareness.ts (UserPromptSubmit).
+ */
 function main() {
   if (process.env.CLAUDE_MEMORY_EXTRACTION) {
     console.log(JSON.stringify({ result: "continue" }));
@@ -259,7 +245,7 @@ function main() {
   }
   let input;
   try {
-    const stdinContent = readFileSync4(0, "utf-8");
+    const stdinContent = readFileSync3(0, "utf-8");
     input = JSON.parse(stdinContent);
   } catch {
     console.log(JSON.stringify({ result: "continue" }));
@@ -273,14 +259,11 @@ function main() {
   const project = getProject();
   const projectName = project.split("/").pop() || "unknown";
   process.env.COORDINATION_SESSION_ID = sessionId;
-  if (!writeSessionId(sessionId)) {
-    console.error(`[session-register] WARNING: Failed to persist session ID ${sessionId} to file`);
-  }
   const registerResult = registerSession(sessionId, project, "", input.session_id, input.transcript_path, process.ppid);
-  const daemonPidPath = join3(process.env.HOME || "/tmp", ".claude", "memory-daemon.pid");
+  const daemonPidPath = join2(process.env.HOME || "/tmp", ".claude", "memory-daemon.pid");
   const health = checkMemoryHealth(registerResult.success, daemonPidPath);
   const healthWarnings = formatHealthWarnings(health);
-  const tasksPath = join3(project, "thoughts", "shared", "Tasks.md");
+  const tasksPath = join2(project, "thoughts", "shared", "Tasks.md");
   const tasksSummary = getPendingTasksSummary(tasksPath);
   let awarenessMessage = `
 <system-reminder>

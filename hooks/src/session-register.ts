@@ -11,13 +11,13 @@
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { registerSession, isValidId } from './shared/db-utils-pg.js';
-import { writeSessionId, getProject } from './shared/session-id.js';
+import { getProject } from './shared/session-id.js';
 import { checkMemoryHealth, formatHealthWarnings, getPendingTasksSummary } from './session-context.js';
 import type { SessionStartInput, HookOutput } from './shared/types.js';
 
 /**
  * Main entry point for the SessionStart hook.
- * Registers the session, persists the ID to file, and injects awareness message.
+ * Registers the session and injects awareness message.
  */
 export function main(): void {
   // Skip registration for daemon-spawned extraction sessions
@@ -46,11 +46,8 @@ export function main(): void {
   const project = getProject();
   const projectName = project.split('/').pop() || 'unknown';
 
-  // Store session ID in environment and file for other hooks
+  // Store session ID in environment for other hooks within this process
   process.env.COORDINATION_SESSION_ID = sessionId;
-  if (!writeSessionId(sessionId)) {
-    console.error(`[session-register] WARNING: Failed to persist session ID ${sessionId} to file`);
-  }
 
   // Register session in PostgreSQL (include Claude's session ID, transcript path, and PID for crash recovery)
   // process.ppid is the Claude CLI process that spawned this hook

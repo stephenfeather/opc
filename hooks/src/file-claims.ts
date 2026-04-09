@@ -6,12 +6,13 @@
  * 2. Warns if file is being edited by another session
  * 3. Claims the file for the current session
  *
+ * Session ID comes from stdin (input.session_id), provided by Claude Code.
  * Part of the coordination layer architecture (Phase 1).
  */
 
 import { readFileSync } from 'fs';
 import { checkFileClaim, claimFile } from './shared/db-utils-pg.js';
-import { getSessionId, getProject } from './shared/session-id.js';
+import { getProject } from './shared/session-id.js';
 import type { PreToolUseInput, HookOutput } from './shared/types.js';
 
 /**
@@ -43,7 +44,13 @@ export function main(): void {
     return;
   }
 
-  const sessionId = getSessionId();
+  // Session ID from stdin — required for coordination
+  const sessionId = input.session_id;
+  if (!sessionId) {
+    console.log(JSON.stringify({ result: 'continue' }));
+    return;
+  }
+
   const project = getProject();
 
   // Check if file is claimed by another session

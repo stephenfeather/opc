@@ -5,12 +5,14 @@
  * Injects active peer sessions into context so Claude knows who else is working.
  * Silent when solo (no peers = no output). Uses file-based caching since each
  * hook invocation is a fresh Node.js process.
+ *
+ * Session ID comes from stdin (input.session_id), provided by Claude Code.
  */
 
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { getActiveSessions, isValidId } from './shared/db-utils-pg.js';
-import { readSessionId, getProject } from './shared/session-id.js';
+import { getProject } from './shared/session-id.js';
 import { readPeerCache, writePeerCache, formatPeerMessage } from './session-context.js';
 
 const CACHE_TTL_SECONDS = 60;
@@ -31,15 +33,7 @@ export function main(): void {
       ownSessionId = input.session_id;
     }
   } catch {
-    // stdin parse failure — fall back to persisted file
-  }
-
-  // Fall back to persisted session ID only if stdin didn't provide one
-  if (!ownSessionId) {
-    const persisted = readSessionId();
-    if (persisted && isValidId(persisted)) {
-      ownSessionId = persisted;
-    }
+    // stdin parse failure — no session ID available
   }
 
   // If we can't determine our own session ID, stay silent to avoid

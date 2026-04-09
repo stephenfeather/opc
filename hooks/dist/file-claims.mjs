@@ -1,5 +1,5 @@
 // src/file-claims.ts
-import { readFileSync as readFileSync3 } from "fs";
+import { readFileSync as readFileSync2 } from "fs";
 
 // src/shared/db-utils-pg.ts
 import { spawnSync } from "child_process";
@@ -183,48 +183,6 @@ asyncio.run(main())
 }
 
 // src/shared/session-id.ts
-import { mkdirSync, readFileSync as readFileSync2, writeFileSync } from "fs";
-import { join as join2 } from "path";
-var SESSION_ID_FILENAME = ".coordination-session-id";
-function getSessionIdFile(options = {}) {
-  const claudeDir = join2(process.env.HOME || "/tmp", ".claude");
-  if (options.createDir) {
-    try {
-      mkdirSync(claudeDir, { recursive: true, mode: 448 });
-    } catch {
-    }
-  }
-  return join2(claudeDir, SESSION_ID_FILENAME);
-}
-function generateSessionId() {
-  const spanId = process.env.BRAINTRUST_SPAN_ID;
-  if (spanId) {
-    return spanId.slice(0, 8);
-  }
-  return `s-${Date.now().toString(36)}`;
-}
-function readSessionId() {
-  try {
-    const sessionFile = getSessionIdFile();
-    const id = readFileSync2(sessionFile, "utf-8").trim();
-    return id || null;
-  } catch {
-    return null;
-  }
-}
-function getSessionId(options = {}) {
-  if (process.env.COORDINATION_SESSION_ID) {
-    return process.env.COORDINATION_SESSION_ID;
-  }
-  const fileId = readSessionId();
-  if (fileId) {
-    return fileId;
-  }
-  if (options.debug) {
-    console.error("[session-id] WARNING: No persisted session ID found, generating new one");
-  }
-  return generateSessionId();
-}
 function getProject() {
   return process.env.CLAUDE_PROJECT_DIR || process.cwd();
 }
@@ -238,12 +196,13 @@ function getProject() {
  * 2. Warns if file is being edited by another session
  * 3. Claims the file for the current session
  *
+ * Session ID comes from stdin (input.session_id), provided by Claude Code.
  * Part of the coordination layer architecture (Phase 1).
  */
 function main() {
   let input;
   try {
-    const stdinContent = readFileSync3(0, "utf-8");
+    const stdinContent = readFileSync2(0, "utf-8");
     input = JSON.parse(stdinContent);
   } catch {
     console.log(JSON.stringify({ result: "continue" }));
@@ -258,7 +217,11 @@ function main() {
     console.log(JSON.stringify({ result: "continue" }));
     return;
   }
-  const sessionId = getSessionId();
+  const sessionId = input.session_id;
+  if (!sessionId) {
+    console.log(JSON.stringify({ result: "continue" }));
+    return;
+  }
   const project = getProject();
   const claimCheck = checkFileClaim(filePath, project, sessionId);
   let output;

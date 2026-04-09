@@ -1,6 +1,6 @@
 // src/peer-awareness.ts
-import { readFileSync as readFileSync4 } from "fs";
-import { join as join4 } from "path";
+import { readFileSync as readFileSync3 } from "fs";
+import { join as join3 } from "path";
 
 // src/shared/db-utils-pg.ts
 import { spawnSync } from "child_process";
@@ -168,34 +168,12 @@ asyncio.run(main())
 }
 
 // src/shared/session-id.ts
-import { mkdirSync, readFileSync as readFileSync2, writeFileSync } from "fs";
-import { join as join2 } from "path";
-var SESSION_ID_FILENAME = ".coordination-session-id";
-function getSessionIdFile(options = {}) {
-  const claudeDir = join2(process.env.HOME || "/tmp", ".claude");
-  if (options.createDir) {
-    try {
-      mkdirSync(claudeDir, { recursive: true, mode: 448 });
-    } catch {
-    }
-  }
-  return join2(claudeDir, SESSION_ID_FILENAME);
-}
-function readSessionId() {
-  try {
-    const sessionFile = getSessionIdFile();
-    const id = readFileSync2(sessionFile, "utf-8").trim();
-    return id || null;
-  } catch {
-    return null;
-  }
-}
 function getProject() {
   return process.env.CLAUDE_PROJECT_DIR || process.cwd();
 }
 
 // src/session-context.ts
-import { readFileSync as readFileSync3, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, renameSync } from "fs";
+import { readFileSync as readFileSync2, writeFileSync, mkdirSync, renameSync } from "fs";
 import { dirname } from "path";
 function formatPeerMessage(peers) {
   if (peers.length === 0) return null;
@@ -207,7 +185,7 @@ ${lines.join("\n")}`;
 }
 function readPeerCache(cachePath, project, ttlSeconds) {
   try {
-    const raw = readFileSync3(cachePath, "utf-8");
+    const raw = readFileSync2(cachePath, "utf-8");
     const data = JSON.parse(raw);
     if (typeof data.cached_at !== "string" || typeof data.project !== "string" || !Array.isArray(data.sessions)) {
       return null;
@@ -225,14 +203,14 @@ function readPeerCache(cachePath, project, ttlSeconds) {
 function writePeerCache(cachePath, project, sessions) {
   try {
     const dir = dirname(cachePath);
-    mkdirSync2(dir, { recursive: true });
+    mkdirSync(dir, { recursive: true });
     const data = {
       cached_at: (/* @__PURE__ */ new Date()).toISOString(),
       project,
       sessions
     };
     const tmpPath = cachePath + ".tmp." + process.pid;
-    writeFileSync2(tmpPath, JSON.stringify(data), { encoding: "utf-8" });
+    writeFileSync(tmpPath, JSON.stringify(data), { encoding: "utf-8" });
     renameSync(tmpPath, cachePath);
   } catch {
   }
@@ -248,7 +226,7 @@ function main() {
   }
   let ownSessionId = null;
   try {
-    const stdinContent = readFileSync4(0, "utf-8");
+    const stdinContent = readFileSync3(0, "utf-8");
     const input = JSON.parse(stdinContent);
     if (input && typeof input.session_id === "string" && isValidId(input.session_id)) {
       ownSessionId = input.session_id;
@@ -256,17 +234,11 @@ function main() {
   } catch {
   }
   if (!ownSessionId) {
-    const persisted = readSessionId();
-    if (persisted && isValidId(persisted)) {
-      ownSessionId = persisted;
-    }
-  }
-  if (!ownSessionId) {
     console.log(JSON.stringify({}));
     return;
   }
   const project = getProject();
-  const cachePath = join4(process.env.HOME || "/tmp", ".claude", "cache", "peer-sessions.json");
+  const cachePath = join3(process.env.HOME || "/tmp", ".claude", "cache", "peer-sessions.json");
   let sessions = readPeerCache(cachePath, project, CACHE_TTL_SECONDS);
   if (sessions === null) {
     const result = getActiveSessions(project);

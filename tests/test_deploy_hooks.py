@@ -83,7 +83,7 @@ def _run(
 
 class TestHappyPath:
     def test_mirrors_src_and_dist(self, tmp_path: Path) -> None:
-        opc_root, script, target = _build_fixture(tmp_path)
+        _opc_root, script, target = _build_fixture(tmp_path)
 
         result = _run(script, target)
 
@@ -94,7 +94,7 @@ class TestHappyPath:
         assert "mirrored src/ and dist/" in result.stdout
 
     def test_idempotent_second_run(self, tmp_path: Path) -> None:
-        opc_root, script, target = _build_fixture(tmp_path)
+        _opc_root, script, target = _build_fixture(tmp_path)
 
         first = _run(script, target)
         second = _run(script, target)
@@ -109,7 +109,7 @@ class TestHappyPath:
 
 class TestDeleteBehavior:
     def test_removes_stale_file_in_target_src(self, tmp_path: Path) -> None:
-        opc_root, script, target = _build_fixture(tmp_path)
+        _opc_root, script, target = _build_fixture(tmp_path)
         (target / "src").mkdir(parents=True, exist_ok=True)
         stale = target / "src" / "old-hook.ts"
         stale.write_text("// should be deleted\n")
@@ -120,7 +120,7 @@ class TestDeleteBehavior:
         assert not stale.exists(), "rsync --delete should have removed the stale file"
 
     def test_removes_stale_file_in_target_dist(self, tmp_path: Path) -> None:
-        opc_root, script, target = _build_fixture(tmp_path)
+        _opc_root, script, target = _build_fixture(tmp_path)
         (target / "dist").mkdir(parents=True, exist_ok=True)
         stale = target / "dist" / "old-hook.js"
         stale.write_text("// stale\n")
@@ -156,7 +156,7 @@ class TestGuards:
         assert "src is empty or missing" in result.stderr
 
     def test_missing_claude_root_skips_cleanly(self, tmp_path: Path) -> None:
-        opc_root, script, _real_target = _build_fixture(tmp_path)
+        _opc_root, script, _real_target = _build_fixture(tmp_path)
         missing = tmp_path / "does-not-exist" / "hooks"
 
         result = _run(script, missing)
@@ -171,7 +171,7 @@ class TestGuards:
 
 class TestAutoModeWorktreeGuard:
     def test_auto_skips_from_dot_worktrees_path(self, tmp_path: Path) -> None:
-        opc_root, script, target = _build_fixture(
+        _opc_root, script, target = _build_fixture(
             tmp_path, opc_subpath="project/.worktrees/experiment"
         )
 
@@ -182,7 +182,7 @@ class TestAutoModeWorktreeGuard:
         assert not (target / "src" / "sample.ts").exists(), "should not have deployed"
 
     def test_auto_skips_from_claude_worktrees_path(self, tmp_path: Path) -> None:
-        opc_root, script, target = _build_fixture(
+        _opc_root, script, target = _build_fixture(
             tmp_path, opc_subpath="project/.claude/worktrees/agent-abc"
         )
 
@@ -193,7 +193,7 @@ class TestAutoModeWorktreeGuard:
         assert not (target / "src" / "sample.ts").exists()
 
     def test_auto_deploys_from_non_worktree_path(self, tmp_path: Path) -> None:
-        opc_root, script, target = _build_fixture(
+        _opc_root, script, target = _build_fixture(
             tmp_path, opc_subpath="home/user/opc"
         )
 
@@ -205,7 +205,7 @@ class TestAutoModeWorktreeGuard:
 
     def test_explicit_deploy_still_runs_from_worktree(self, tmp_path: Path) -> None:
         """Without --auto, the worktree check is bypassed — user opt-in."""
-        opc_root, script, target = _build_fixture(
+        _opc_root, script, target = _build_fixture(
             tmp_path, opc_subpath="project/.worktrees/experiment"
         )
 
@@ -394,7 +394,7 @@ class TestAutoModeWorktreeGuard:
 
 class TestTargetValidation:
     def test_rejects_non_hooks_basename(self, tmp_path: Path) -> None:
-        opc_root, script, _target = _build_fixture(tmp_path)
+        _opc_root, script, _target = _build_fixture(tmp_path)
         bad = tmp_path / "claude-home" / "not-hooks"
 
         result = _run(script, bad)
@@ -404,7 +404,7 @@ class TestTargetValidation:
         assert not bad.exists()
 
     def test_rejects_root(self, tmp_path: Path) -> None:
-        opc_root, script, _target = _build_fixture(tmp_path)
+        _opc_root, script, _target = _build_fixture(tmp_path)
 
         result = _run(script, "/")
 
@@ -413,7 +413,7 @@ class TestTargetValidation:
 
     def test_rejects_home(self, tmp_path: Path) -> None:
         """If DEPLOY_TARGET resolves to $HOME itself, refuse."""
-        opc_root, script, _target = _build_fixture(tmp_path)
+        _opc_root, script, _target = _build_fixture(tmp_path)
         fake_home = tmp_path / "fake-home"
         fake_home.mkdir()
 
@@ -428,7 +428,7 @@ class TestTargetValidation:
 
     def test_rejects_home_dot_claude(self, tmp_path: Path) -> None:
         """If DEPLOY_TARGET resolves to $HOME/.claude (parent of hooks), refuse."""
-        opc_root, script, _target = _build_fixture(tmp_path)
+        _opc_root, script, _target = _build_fixture(tmp_path)
         fake_home = tmp_path / "fake-home"
         (fake_home / ".claude").mkdir(parents=True)
 
@@ -448,7 +448,7 @@ class TestTargetValidation:
         also unset, the default expansion produces '/.claude/hooks' — a
         root-level path. Abort explicitly so a misconfigured shell cannot
         aim rsync --delete at /."""
-        opc_root, script, _target = _build_fixture(tmp_path)
+        _opc_root, script, _target = _build_fixture(tmp_path)
 
         # Unset both HOME and DEPLOY_TARGET in the child env.
         result = subprocess.run(
@@ -468,7 +468,7 @@ class TestTargetValidation:
         """Round-2 regression: a symlink named 'hooks' pointing elsewhere
         must be refused, not followed, to prevent rsync --delete from
         deleting files in the symlink destination."""
-        opc_root, script, _target = _build_fixture(tmp_path)
+        _opc_root, script, _target = _build_fixture(tmp_path)
         # Real directory with a non-'hooks' name
         real_dir = tmp_path / "claude-home" / "not-hooks-real"
         real_dir.mkdir()
@@ -490,7 +490,7 @@ class TestTargetValidation:
         while $TARGET_ABS/src is a symlink pointing at an unrelated tree.
         rsync --delete with a trailing slash follows that symlink and
         deletes files inside the link destination. The script must refuse."""
-        opc_root, script, target = _build_fixture(tmp_path)
+        _opc_root, script, target = _build_fixture(tmp_path)
         # $TARGET_ABS exists as a real dir
         target.mkdir()
         # Precious files outside the intended deploy path
@@ -509,7 +509,7 @@ class TestTargetValidation:
 
     def test_rejects_symlinked_target_dist_subdir(self, tmp_path: Path) -> None:
         """Same as src subdir case but for dist."""
-        opc_root, script, target = _build_fixture(tmp_path)
+        _opc_root, script, target = _build_fixture(tmp_path)
         target.mkdir()
         elsewhere = tmp_path / "elsewhere"
         elsewhere.mkdir()
@@ -532,7 +532,7 @@ class TestLockSerialization:
         the script must exit 5 without reclaiming the lock."""
         import os
 
-        opc_root, script, target = _build_fixture(tmp_path)
+        _opc_root, script, target = _build_fixture(tmp_path)
         lock_parent = tmp_path / "lock-test"
         lock_parent.mkdir()
         lock_dir = lock_parent / "opc-deploy-hooks.lock.d"
@@ -557,7 +557,7 @@ class TestLockSerialization:
         assert (lock_dir / "pid").read_text() == f"{os.getpid()}\n"
 
     def test_lock_released_on_success(self, tmp_path: Path) -> None:
-        opc_root, script, target = _build_fixture(tmp_path)
+        _opc_root, script, target = _build_fixture(tmp_path)
         lock_parent = tmp_path / "lock-test"
         lock_parent.mkdir()
 
@@ -573,7 +573,7 @@ class TestLockSerialization:
 
     def test_lock_released_on_failure(self, tmp_path: Path) -> None:
         """Even when the script exits non-zero, the lock dir is cleaned up."""
-        opc_root, script, _target = _build_fixture(tmp_path)
+        _opc_root, script, _target = _build_fixture(tmp_path)
         lock_parent = tmp_path / "lock-test"
         lock_parent.mkdir()
         bad_target = tmp_path / "claude-home" / "not-hooks"  # triggers exit 4
@@ -593,7 +593,7 @@ class TestLockSerialization:
         """Round-2 regression: a lock left behind by a crashed deploy (dead
         PID) must be reclaimed automatically, not left wedging all future
         runs."""
-        opc_root, script, target = _build_fixture(tmp_path)
+        _opc_root, script, target = _build_fixture(tmp_path)
         lock_parent = tmp_path / "lock-test"
         lock_parent.mkdir()
         lock_dir = lock_parent / "opc-deploy-hooks.lock.d"
@@ -618,7 +618,7 @@ class TestLockSerialization:
     def test_reclaims_stale_lock_with_missing_pid_file(self, tmp_path: Path) -> None:
         """A lock dir without a PID file (e.g. a crash between mkdir and
         echo $$ > pid) must also be reclaimable."""
-        opc_root, script, target = _build_fixture(tmp_path)
+        _opc_root, script, target = _build_fixture(tmp_path)
         lock_parent = tmp_path / "lock-test"
         lock_parent.mkdir()
         lock_dir = lock_parent / "opc-deploy-hooks.lock.d"
@@ -645,7 +645,7 @@ class TestLockSerialization:
         import os
         import time
 
-        opc_root, script, target = _build_fixture(tmp_path)
+        _opc_root, script, target = _build_fixture(tmp_path)
         lock_parent = tmp_path / "lock-test"
         lock_parent.mkdir()
         lock_dir = lock_parent / "opc-deploy-hooks.lock.d"
@@ -684,7 +684,7 @@ class TestLockSerialization:
         be there and contain the original owner's PID file."""
         import os
 
-        opc_root, script, _target = _build_fixture(tmp_path)
+        _opc_root, script, _target = _build_fixture(tmp_path)
         lock_parent = tmp_path / "lock-test"
         lock_parent.mkdir()
         lock_dir = lock_parent / "opc-deploy-hooks.lock.d"
@@ -723,7 +723,7 @@ class TestLockSerialization:
         file is still missing, so reclamation proceeds as expected. This
         mostly exercises the grace-period code path end-to-end; a strict
         timing test would be flaky."""
-        opc_root, script, target = _build_fixture(tmp_path)
+        _opc_root, script, target = _build_fixture(tmp_path)
         lock_parent = tmp_path / "lock-test"
         lock_parent.mkdir()
         lock_dir = lock_parent / "opc-deploy-hooks.lock.d"
@@ -749,7 +749,7 @@ class TestLockSerialization:
         must not both enter the critical section simultaneously. Launch
         them in parallel from a dead-PID stale lock; assert at least one
         succeeds and that no process returns an unexpected error."""
-        opc_root, script, target = _build_fixture(tmp_path)
+        _opc_root, script, target = _build_fixture(tmp_path)
         lock_parent = tmp_path / "lock-test"
         lock_parent.mkdir()
         lock_dir = lock_parent / "opc-deploy-hooks.lock.d"
@@ -798,7 +798,7 @@ class TestLockSerialization:
 
 class TestDeployTargetOverride:
     def test_respects_deploy_target_env(self, tmp_path: Path) -> None:
-        opc_root, script, _default_target = _build_fixture(tmp_path)
+        _opc_root, script, _default_target = _build_fixture(tmp_path)
         alternate_parent = tmp_path / "alternate"
         alternate_parent.mkdir()
         custom = alternate_parent / "hooks"  # basename must be "hooks"
@@ -813,7 +813,7 @@ class TestDeployTargetOverride:
         self, tmp_path: Path
     ) -> None:
         """When DEPLOY_TARGET is unset, script falls back to $HOME/.claude/hooks."""
-        opc_root, script, _target = _build_fixture(tmp_path)
+        _opc_root, script, _target = _build_fixture(tmp_path)
         fake_home = tmp_path / "fake-home"
         (fake_home / ".claude").mkdir(parents=True)
 

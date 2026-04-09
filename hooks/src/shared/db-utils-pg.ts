@@ -50,16 +50,20 @@ export function getPgConnectionString(): string {
 export function runPgQuery(pythonCode: string, args: string[] = []): QueryResult {
   const opcDir = requireOpcDir();
 
-  // Wrap the Python code to use asyncio.run() for async queries
+  // Wrap the Python code to use asyncio.run() for async queries.
+  // SECURITY: opcDir is passed via _OPC_DIR environment variable to avoid
+  // code injection through paths containing quotes or special characters.
+  // See: https://github.com/stephenfeather/opc/issues/88
   const wrappedCode = `
 import sys
 import os
 import asyncio
 import json
 
-# Add opc to path for imports
-sys.path.insert(0, '${opcDir}')
-os.chdir('${opcDir}')
+# Add opc to path for imports (read from env to avoid code injection)
+_opc_dir = os.environ['_OPC_DIR']
+sys.path.insert(0, _opc_dir)
+os.chdir(_opc_dir)
 
 ${pythonCode}
 `;
@@ -73,6 +77,7 @@ ${pythonCode}
       env: {
         ...process.env,
         CONTINUOUS_CLAUDE_DB_URL: getPgConnectionString(),
+        _OPC_DIR: opcDir,
       },
     });
 

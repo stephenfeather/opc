@@ -269,6 +269,13 @@ function trackHookActivitySync(hookName, projectDir, success = true, metrics = {
 }
 
 // src/post-edit-diagnostics.ts
+/*!
+ * Post-Edit Diagnostics Hook
+ *
+ * Runs shift-left diagnostics after file edits.
+ * Queries TLDR daemon for type errors and lint issues immediately after Edit/Write.
+ * Provides early feedback before tests run.
+ */
 async function main() {
   const input = JSON.parse(readFileSync2(0, "utf-8"));
   if (input.tool_name !== "Edit" && input.tool_name !== "Write") {

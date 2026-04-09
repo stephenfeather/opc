@@ -2,6 +2,15 @@
 import { readFileSync, existsSync } from "fs";
 import { join } from "path";
 import { spawn } from "child_process";
+/*!
+ * SessionStart Hook: TLDR Cache Warming (Async)
+ *
+ * On session startup, triggers cache warming in a detached background process.
+ * Returns immediately to avoid blocking startup.
+ *
+ * The daemon will warm the cache asynchronously. First TLDR command
+ * will use the warmed cache or trigger on-demand indexing.
+ */
 function readStdin() {
   return readFileSync(0, "utf-8");
 }

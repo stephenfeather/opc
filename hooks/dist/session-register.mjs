@@ -75,9 +75,10 @@ import os
 import asyncio
 import json
 
-# Add opc to path for imports
-sys.path.insert(0, '${opcDir}')
-os.chdir('${opcDir}')
+# Add opc to path for imports (read from env to avoid code injection)
+_opc_dir = os.environ['_OPC_DIR']
+sys.path.insert(0, _opc_dir)
+os.chdir(_opc_dir)
 
 ${pythonCode}
 `;
@@ -90,7 +91,8 @@ ${pythonCode}
       cwd: opcDir,
       env: {
         ...process.env,
-        CONTINUOUS_CLAUDE_DB_URL: getPgConnectionString()
+        CONTINUOUS_CLAUDE_DB_URL: getPgConnectionString(),
+        _OPC_DIR: opcDir
       }
     });
     return {
@@ -251,7 +253,15 @@ function getPendingTasksSummary(tasksFilePath) {
 }
 
 // src/session-register.ts
-//! @hook SessionStart @preserve
+/*!
+ * SessionStart Hook - Registers session in coordination layer.
+ *
+ * This hook:
+ * 1. Registers the session in PostgreSQL for cross-session awareness
+ * 2. Injects session ID, memory system health, and pending tasks summary
+ *
+ * Peer session awareness is handled by peer-awareness.ts (UserPromptSubmit).
+ */
 function main() {
   if (process.env.CLAUDE_MEMORY_EXTRACTION) {
     console.log(JSON.stringify({ result: "continue" }));

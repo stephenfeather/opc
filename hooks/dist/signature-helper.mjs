@@ -269,6 +269,12 @@ function trackHookActivitySync(hookName, projectDir, success = true, metrics = {
 }
 
 // src/signature-helper.ts
+/*!
+ * Signature Helper Hook (PreToolUse:Edit)
+ *
+ * When Claude edits code containing function calls, inject the function signatures.
+ * Uses TLDR daemon for fast function lookup (replaces CLI spawning).
+ */
 var SKIP_NAMES = /* @__PURE__ */ new Set([
   "if",
   "for",

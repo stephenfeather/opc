@@ -68,9 +68,10 @@ import os
 import asyncio
 import json
 
-# Add opc to path for imports
-sys.path.insert(0, '${opcDir}')
-os.chdir('${opcDir}')
+# Add opc to path for imports (read from env to avoid code injection)
+_opc_dir = os.environ['_OPC_DIR']
+sys.path.insert(0, _opc_dir)
+os.chdir(_opc_dir)
 
 ${pythonCode}
 `;
@@ -83,7 +84,8 @@ ${pythonCode}
       cwd: opcDir,
       env: {
         ...process.env,
-        CONTINUOUS_CLAUDE_DB_URL: getPgConnectionString()
+        CONTINUOUS_CLAUDE_DB_URL: getPgConnectionString(),
+        _OPC_DIR: opcDir
       }
     });
     return {

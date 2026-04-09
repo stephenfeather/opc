@@ -246,7 +246,12 @@ class TestDaemonTickStaleFiltering:
         mock_mark_extracting, mock_queue, mock_reap, mock_watchdog,
         mock_ppq, mock_check, mock_run
     ):
-        """Sessions with exited_at set (past grace) get extracted."""
+        """Sessions with exited_at set (past grace) get queued for extraction.
+
+        Note: mark_extracting is NOT called by daemon_tick -- it is called
+        inside queue_or_extract/process_pending_queue when extraction actually
+        starts (fix for issue #82).
+        """
         from datetime import datetime
 
         from scripts.core.memory_daemon import daemon_tick
@@ -257,7 +262,7 @@ class TestDaemonTickStaleFiltering:
         ]
         daemon_tick()
 
-        mock_mark_extracting.assert_called_once_with("sess-2")
+        mock_mark_extracting.assert_not_called()
         mock_queue.assert_called_once_with("sess-2", "proj", "/t.jsonl")
 
 

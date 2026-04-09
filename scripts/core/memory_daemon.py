@@ -389,18 +389,26 @@ def reap_completed_extractions():
             log(f"Extraction completed for {session_id} "
                 f"(pid={pid}, project={project}, "
                 f"exit={exit_code}, elapsed={elapsed}s{learnings_info}{rejections_info})")
+            # Safe to read(): proc.poll() already returned, so child has exited
+            # and the write end of the pipe is closed. No deadlock risk.
+            stderr_text = ""
+            if proc.stderr:
+                try:
+                    if exit_code != 0:
+                        raw = proc.stderr.read(65536)  # bounded read, ~64KB max
+                        stderr_text = raw.decode("utf-8", errors="replace").strip()[-500:]
+                        if stderr_text:
+                            log(f"  stderr: {stderr_text}")
+                finally:
+                    proc.stderr.close()
+
             if exit_code == 0:
-                proc.stderr.close()
                 mark_extracted(session_id)
                 _calibrate_session_confidence(session_id)
                 _extract_and_store_workflows(session_id, jsonl_path, project)
                 _generate_mini_handoff(session_id, jsonl_path, project)
                 archive_session_jsonl(session_id, jsonl_path)
             else:
-                raw = proc.stderr.read()
-                stderr_text = raw.decode("utf-8", errors="replace").strip()[-500:]
-                if stderr_text:
-                    log(f"  stderr: {stderr_text}")
                 mark_extraction_failed(
                     session_id, last_error=stderr_text or None
                 )

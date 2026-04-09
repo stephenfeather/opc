@@ -7,13 +7,17 @@
 #
 # Usage:
 #   deploy_hooks.sh         # unconditional deploy (manual `npm run deploy`)
-#   deploy_hooks.sh --auto  # skip when running from a .worktrees/ checkout
+#   deploy_hooks.sh --auto  # skip when running from a git worktree
 #                           # (wired into hooks/package.json postbuild)
 #
 # Environment:
 #   DEPLOY_TARGET  override destination (default: $HOME/.claude/hooks).
-#                  Must resolve to an absolute path whose basename is 'hooks'
-#                  and whose parent directory already exists.
+#                  Must resolve to an absolute path whose basename is 'hooks',
+#                  must not be a symlink, and must not equal $HOME or
+#                  $HOME/.claude (logical or physical).
+#   TMPDIR         location for the mkdir-based deploy lock
+#                  (default: /tmp). The lock dir is
+#                  "$TMPDIR/opc-deploy-hooks.lock.d".
 #
 # Exit codes:
 #   0  success (or skipped because Claude Code is not installed / worktree)
@@ -34,10 +38,35 @@ fi
 OPC_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HOOKS_SRC="$OPC_ROOT/hooks"
 
-# Finding #1: Skip auto-mode deploys when running from a git worktree.
-# Worktrees exist for isolated experiments and must not stomp the live
-# ~/.claude/hooks runtime shared by other Claude Code sessions.
+# Finding #1 (round 1+2): Skip auto-mode deploys when running from a git
+# worktree. Prefer git's own worktree detection over pathname heuristics:
+# when --git-dir differs from --git-common-dir, we're inside a linked
+# worktree. The pathname case statement remains as a belt-and-suspenders
+# fallback for environments where git isn't installed or the repo isn't a
+# git checkout.
+_is_git_worktree() {
+    local repo_path="$1"
+    command -v git >/dev/null 2>&1 || return 1
+    local git_dir git_common_dir
+    git_dir="$(git -C "$repo_path" rev-parse --git-dir 2>/dev/null)" || return 1
+    git_common_dir="$(git -C "$repo_path" rev-parse --git-common-dir 2>/dev/null)" || return 1
+    [ -n "$git_dir" ] && [ -n "$git_common_dir" ] || return 1
+    # Resolve both to absolute paths for a reliable string compare, since
+    # git may return relative paths (e.g. ".git") in the main checkout.
+    if [ -d "$git_dir" ]; then
+        git_dir="$(cd "$git_dir" && pwd)"
+    fi
+    if [ -d "$git_common_dir" ]; then
+        git_common_dir="$(cd "$git_common_dir" && pwd)"
+    fi
+    [ "$git_dir" != "$git_common_dir" ]
+}
+
 if [ "$AUTO_MODE" = "1" ]; then
+    if _is_git_worktree "$OPC_ROOT"; then
+        echo "deploy_hooks: running from a git worktree ($OPC_ROOT) - skipping auto-deploy. Run 'npm run deploy' to override."
+        exit 0
+    fi
     case "$OPC_ROOT" in
         */.worktrees/*|*/.claude/worktrees/*)
             echo "deploy_hooks: running from a worktree ($OPC_ROOT) - skipping auto-deploy. Run 'npm run deploy' to override."
@@ -48,7 +77,7 @@ fi
 
 TARGET="${DEPLOY_TARGET:-$HOME/.claude/hooks}"
 
-# Finding #2: Validate DEPLOY_TARGET before any rsync --delete call.
+# Finding #2 (round 1): Validate DEPLOY_TARGET before any rsync --delete call.
 # Early reject obviously-unsafe values before we touch dirname/cd, which
 # would otherwise resolve '/' to '//' and slip past the later checks.
 case "$TARGET" in
@@ -58,29 +87,48 @@ case "$TARGET" in
         ;;
 esac
 
-# Resolve the parent to an absolute path; macOS ships without `realpath -m`,
-# so we build the path manually from the parent directory.
+# Finding #2 (round 2): Physically resolve the target parent so that
+# validation sees what rsync will actually write to. `cd -P && pwd -P`
+# follows symlinks in the parent chain; macOS ships without
+# `realpath -m` so we build TARGET_ABS from the physical parent plus
+# the literal basename.
 TARGET_PARENT_RAW="$(dirname "$TARGET")"
 if [ ! -d "$TARGET_PARENT_RAW" ]; then
     echo "deploy_hooks: $TARGET_PARENT_RAW does not exist - skipping (not a Claude Code install)"
     exit 0
 fi
-TARGET_PARENT_ABS="$(cd "$TARGET_PARENT_RAW" && pwd)"
-TARGET_ABS="$TARGET_PARENT_ABS/$(basename "$TARGET")"
-
-# Reject dangerous targets before any mutation.
-case "$TARGET_ABS" in
-    "" | "/" )
-        echo "deploy_hooks: refusing to deploy to unsafe target '$TARGET_ABS'" >&2
-        exit 4
-        ;;
-esac
-if [ "$TARGET_ABS" = "$HOME" ] || [ "$TARGET_ABS" = "${HOME%/}/.claude" ]; then
-    echo "deploy_hooks: refusing to deploy to unsafe target '$TARGET_ABS'" >&2
+TARGET_PARENT_PHYS="$(cd -P "$TARGET_PARENT_RAW" 2>/dev/null && pwd -P || true)"
+if [ -z "$TARGET_PARENT_PHYS" ]; then
+    echo "deploy_hooks: could not resolve $TARGET_PARENT_RAW physically" >&2
     exit 4
 fi
-if [ "$(basename "$TARGET_ABS")" != "hooks" ]; then
+TARGET_BASENAME="$(basename "$TARGET")"
+TARGET_ABS="$TARGET_PARENT_PHYS/$TARGET_BASENAME"
+
+# Resolve HOME physically too so the "unsafe target" checks work even when
+# HOME itself is a symlink (e.g. ~/.claude -> ~/.dotfiles/claude is common).
+_home_phys=""
+if [ -n "${HOME:-}" ] && [ -d "$HOME" ]; then
+    _home_phys="$(cd -P "$HOME" 2>/dev/null && pwd -P || true)"
+fi
+
+for _forbidden in "/" "${HOME:-}" "${HOME%/}/.claude" "$_home_phys" "${_home_phys%/}/.claude"; do
+    if [ -n "$_forbidden" ] && [ "$TARGET_ABS" = "$_forbidden" ]; then
+        echo "deploy_hooks: refusing to deploy to unsafe target '$TARGET_ABS'" >&2
+        exit 4
+    fi
+done
+
+if [ "$TARGET_BASENAME" != "hooks" ]; then
     echo "deploy_hooks: refusing to deploy to '$TARGET_ABS' - target basename must be 'hooks'" >&2
+    exit 4
+fi
+
+# Finding #2 (round 2): Refuse if TARGET itself is a symlink. Following a
+# symlink into an unrelated tree would let an attacker or a stale config
+# aim rsync --delete at the wrong place.
+if [ -L "$TARGET_ABS" ]; then
+    echo "deploy_hooks: refusing to deploy to '$TARGET_ABS' - target is a symlink" >&2
     exit 4
 fi
 
@@ -94,19 +142,66 @@ if [ ! -d "$HOOKS_SRC/dist" ] || [ -z "$(ls -A "$HOOKS_SRC/dist" 2>/dev/null)" ]
     exit 1
 fi
 
-# Finding #3: Acquire an atomic lock via mkdir so that concurrent deploys
-# from different worktrees can't stomp each other mid-sync. mkdir is atomic
-# on POSIX filesystems and portable across macOS/Linux (unlike flock).
+# Finding #3 (round 1+2): Acquire an atomic lock via mkdir so that concurrent
+# deploys from different worktrees can't stomp each other mid-sync. mkdir
+# is atomic on POSIX filesystems and portable across macOS/Linux (unlike
+# flock). Round 2 adds PID + age-based stale-lock recovery so SIGKILL,
+# crashes, or host reboots do not wedge future deploys forever.
 LOCK_DIR="${TMPDIR:-/tmp}/opc-deploy-hooks.lock.d"
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-    echo "deploy_hooks: another deploy is in progress ($LOCK_DIR exists) - skipping" >&2
+LOCK_PID_FILE="$LOCK_DIR/pid"
+LOCK_MAX_AGE_SEC=300  # 5 minutes
+
+_lock_mtime() {
+    stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null
+}
+
+_acquire_lock() {
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        echo "$$" >"$LOCK_PID_FILE"
+        return 0
+    fi
+    # Lock directory already exists - check for staleness.
+    local owner=""
+    if [ -f "$LOCK_PID_FILE" ]; then
+        owner="$(cat "$LOCK_PID_FILE" 2>/dev/null || true)"
+    fi
+    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+        # Live owner - check age as a secondary signal in case the PID was
+        # reused by an unrelated process after the original deploy died.
+        local now mtime age
+        now="$(date +%s)"
+        mtime="$(_lock_mtime "$LOCK_DIR" || echo "$now")"
+        age=$((now - mtime))
+        if [ "$age" -lt "$LOCK_MAX_AGE_SEC" ]; then
+            return 1  # real contention
+        fi
+        echo "deploy_hooks: reclaiming stale lock (pid $owner, age ${age}s exceeds ${LOCK_MAX_AGE_SEC}s)" >&2
+    else
+        echo "deploy_hooks: reclaiming stale lock (owner=${owner:-unknown}, not alive)" >&2
+    fi
+    # Reclaim: rm -rf then mkdir. The atomicity of the final mkdir ensures
+    # only one racer wins even if two reclaimers compete.
+    rm -rf "$LOCK_DIR" 2>/dev/null || true
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        echo "$$" >"$LOCK_PID_FILE"
+        # Paranoia: verify we actually own the lock (no one raced in between
+        # our rm and our write).
+        if [ "$(cat "$LOCK_PID_FILE" 2>/dev/null || true)" = "$$" ]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+if ! _acquire_lock; then
+    echo "deploy_hooks: another deploy is in progress ($LOCK_DIR) - skipping" >&2
     exit 5
 fi
-trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT INT TERM
+trap 'rm -rf "$LOCK_DIR" 2>/dev/null || true' EXIT INT TERM
 
 mkdir -p "$TARGET_ABS/src" "$TARGET_ABS/dist"
 
-# Finding #3 (continued): rsync --delay-updates stages new files into a
+# Finding #3 (round 1): rsync --delay-updates stages new files into a
 # hidden holding directory and renames them into place at the end of the
 # batch, so readers see the old or new tree - not a half-updated mix.
 echo "deploy_hooks: syncing src/  -> $TARGET_ABS/src/"

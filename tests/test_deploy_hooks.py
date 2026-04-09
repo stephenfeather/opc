@@ -214,6 +214,94 @@ class TestAutoModeWorktreeGuard:
         assert result.returncode == 0, result.stderr
         assert (target / "src" / "sample.ts").exists()
 
+    def test_auto_skips_from_real_git_worktree_outside_dot_worktrees(
+        self, tmp_path: Path
+    ) -> None:
+        """Round-2 regression: a real `git worktree add` outside /.worktrees/
+        must still be detected via git-dir != git-common-dir."""
+        main_repo = tmp_path / "main-repo"
+        main_repo.mkdir()
+        git_env = {
+            "GIT_CONFIG_GLOBAL": str(tmp_path / "gitconfig"),
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+            "HOME": str(tmp_path / "fake-home"),
+            "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
+        }
+        (tmp_path / "fake-home").mkdir()
+        subprocess.run(
+            ["git", "init", "-q", "-b", "main", str(main_repo)],
+            env=git_env,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(main_repo), "config", "user.email", "test@test"],
+            env=git_env,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(main_repo), "config", "user.name", "test"],
+            env=git_env,
+            check=True,
+        )
+        (main_repo / "README").write_text("test\n")
+        subprocess.run(
+            ["git", "-C", str(main_repo), "add", "."], env=git_env, check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(main_repo), "commit", "-q", "-m", "init"],
+            env=git_env,
+            check=True,
+        )
+        # Custom worktree path that is NOT under /.worktrees/ or /.claude/worktrees/
+        feature = tmp_path / "feature-branch"
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(main_repo),
+                "worktree",
+                "add",
+                "-q",
+                str(feature),
+                "-b",
+                "feature",
+            ],
+            env=git_env,
+            check=True,
+        )
+
+        # Build the fixture inside the worktree
+        scripts_dir = feature / "scripts"
+        hooks_src = feature / "hooks" / "src"
+        hooks_dist = feature / "hooks" / "dist"
+        scripts_dir.mkdir(parents=True)
+        hooks_src.mkdir(parents=True)
+        hooks_dist.mkdir(parents=True)
+        script = scripts_dir / "deploy_hooks.sh"
+        shutil.copy(REAL_SCRIPT, script)
+        script.chmod(0o755)
+        (hooks_src / "sample.ts").write_text("x\n")
+        (hooks_dist / "sample.mjs").write_text("y\n")
+        target_parent = tmp_path / "claude-home"
+        target_parent.mkdir()
+        target = target_parent / "hooks"
+
+        result = subprocess.run(
+            ["bash", str(script), "--auto"],
+            env={
+                "DEPLOY_TARGET": str(target),
+                "HOME": "/tmp/nonexistent-home",
+                "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "git worktree" in result.stdout
+        assert not (target / "src" / "sample.ts").exists()
+
 
 # --- Finding #2: DEPLOY_TARGET validation ------------------------------------
 
@@ -267,27 +355,60 @@ class TestTargetValidation:
         assert result.returncode == 4
         assert "unsafe target" in result.stderr
 
+    def test_rejects_symlinked_target(self, tmp_path: Path) -> None:
+        """Round-2 regression: a symlink named 'hooks' pointing elsewhere
+        must be refused, not followed, to prevent rsync --delete from
+        deleting files in the symlink destination."""
+        opc_root, script, _target = _build_fixture(tmp_path)
+        # Real directory with a non-'hooks' name
+        real_dir = tmp_path / "claude-home" / "not-hooks-real"
+        real_dir.mkdir()
+        (real_dir / "precious.txt").write_text("must not be deleted\n")
+        # Symlink 'hooks' -> 'not-hooks-real'
+        link = tmp_path / "claude-home" / "hooks"
+        link.symlink_to(real_dir)
+
+        result = _run(script, link)
+
+        assert result.returncode == 4
+        assert "symlink" in result.stderr
+        # Critical: the pre-existing file inside the symlink target must
+        # not have been touched by rsync.
+        assert (real_dir / "precious.txt").read_text() == "must not be deleted\n"
+
 
 # --- Finding #3: lock serialization ------------------------------------------
 
 
 class TestLockSerialization:
     def test_held_lock_causes_skip(self, tmp_path: Path) -> None:
+        """With a live owner PID and a fresh mtime, contention is real and
+        the script must exit 5 without reclaiming the lock."""
+        import os
+
         opc_root, script, target = _build_fixture(tmp_path)
-        # Pre-create the lock dir so the script sees contention.
-        lock_dir = tmp_path / "opc-deploy-hooks.lock.d"
+        lock_parent = tmp_path / "lock-test"
+        lock_parent.mkdir()
+        lock_dir = lock_parent / "opc-deploy-hooks.lock.d"
         lock_dir.mkdir()
+        # Use the current test process's PID as the "owner" so kill -0
+        # reports the process alive. The lock mtime is fresh (just now),
+        # so the age-based fallback also treats this as real contention.
+        (lock_dir / "pid").write_text(f"{os.getpid()}\n")
 
         result = _run(
             script,
             target,
-            extra_env={"TMPDIR": str(tmp_path)},
+            extra_env={"TMPDIR": str(lock_parent)},
         )
 
         assert result.returncode == 5
         assert "another deploy is in progress" in result.stderr
         # Target should not have been touched.
         assert not (target / "src" / "sample.ts").exists()
+        # The live lock should NOT have been reclaimed.
+        assert lock_dir.exists()
+        assert (lock_dir / "pid").read_text() == f"{os.getpid()}\n"
 
     def test_lock_released_on_success(self, tmp_path: Path) -> None:
         opc_root, script, target = _build_fixture(tmp_path)
@@ -321,6 +442,52 @@ class TestLockSerialization:
         # never have been created.
         assert result.returncode == 4
         assert not (lock_parent / "opc-deploy-hooks.lock.d").exists()
+
+    def test_reclaims_stale_lock_with_dead_pid(self, tmp_path: Path) -> None:
+        """Round-2 regression: a lock left behind by a crashed deploy (dead
+        PID) must be reclaimed automatically, not left wedging all future
+        runs."""
+        opc_root, script, target = _build_fixture(tmp_path)
+        lock_parent = tmp_path / "lock-test"
+        lock_parent.mkdir()
+        lock_dir = lock_parent / "opc-deploy-hooks.lock.d"
+        lock_dir.mkdir()
+        # Write a PID that is guaranteed dead. PID 1 is always init/launchd
+        # on modern systems, so we use a high PID that is extremely unlikely
+        # to exist on any reasonable machine.
+        (lock_dir / "pid").write_text("99999999\n")
+
+        result = _run(
+            script,
+            target,
+            extra_env={"TMPDIR": str(lock_parent)},
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "reclaiming stale lock" in result.stderr
+        assert (target / "src" / "sample.ts").exists()
+        # Lock should be cleaned up on exit.
+        assert not lock_dir.exists()
+
+    def test_reclaims_stale_lock_with_missing_pid_file(self, tmp_path: Path) -> None:
+        """A lock dir without a PID file (e.g. a crash between mkdir and
+        echo $$ > pid) must also be reclaimable."""
+        opc_root, script, target = _build_fixture(tmp_path)
+        lock_parent = tmp_path / "lock-test"
+        lock_parent.mkdir()
+        lock_dir = lock_parent / "opc-deploy-hooks.lock.d"
+        lock_dir.mkdir()
+        # No PID file
+
+        result = _run(
+            script,
+            target,
+            extra_env={"TMPDIR": str(lock_parent)},
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "reclaiming stale lock" in result.stderr
+        assert (target / "src" / "sample.ts").exists()
 
 
 # --- Deploy target override --------------------------------------------------

@@ -40,25 +40,34 @@ automatically after every successful build.
 | `../scripts/deploy_hooks.sh`       | Standalone shell entry (unconditional)             |
 | `../scripts/deploy_hooks.sh --auto`| Standalone shell entry (skips from worktrees)      |
 
-**Worktree guard.** The `postbuild` step passes `--auto`, which inspects
-the resolved `OPC_ROOT` and skips deploy when the path contains
-`/.worktrees/` or `/.claude/worktrees/`. This keeps experimental branches
+**Worktree guard.** The `postbuild` step passes `--auto`, which skips
+deploy when `OPC_ROOT` is inside any git worktree. Detection uses
+`git rev-parse --git-dir` vs `--git-common-dir` — when they differ,
+it's a linked worktree. A pathname check on `/.worktrees/` and
+`/.claude/worktrees/` remains as a belt-and-suspenders fallback for
+environments where git is unavailable. This keeps experimental branches
 from stomping the live `~/.claude/hooks/` tree used by other Claude Code
 sessions. If you *want* to deploy from a worktree, run `npm run deploy`
 (no `--auto`) — that bypass is explicit and opt-in.
 
 **Target validation.** The script refuses to run with `DEPLOY_TARGET`
-pointing at `/`, `$HOME`, or `$HOME/.claude`, and requires the target's
-basename to be `hooks`. These guards exist because `rsync --delete`
-prunes any file in the target that isn't in the source.
+pointing at `/`, `$HOME`, or `$HOME/.claude` (logical or physical path),
+and requires the target's basename to be `hooks`. The parent is resolved
+physically via `cd -P && pwd -P` so symlinks in the parent chain are
+followed, but the target itself must not be a symlink — the script
+refuses to follow one into an unrelated tree. These guards exist because
+`rsync --delete` prunes any file in the target that isn't in the source.
 
 **Lock serialization.** The script acquires an `mkdir`-based lock at
-`$TMPDIR/opc-deploy-hooks.lock.d` before touching the target. Concurrent
-invocations (e.g. two worktrees running `npm run build` at once) print a
-"deploy in progress" warning and exit 5 instead of racing. `rsync
---delay-updates` additionally batches file renames into the final moment
-of each sync, so in-flight Claude Code sessions see either the old or
-new tree — not a half-updated mix.
+`$TMPDIR/opc-deploy-hooks.lock.d` before touching the target. The lock
+dir contains a `pid` file; on contention the script checks whether the
+owning process is still alive via `kill -0`, and reclaims the lock if
+the owner is dead or if the lock is older than 5 minutes (covering PID
+reuse and missing PID files). Concurrent invocations with a live owner
+print a "deploy in progress" warning and exit 5 instead of racing.
+`rsync --delay-updates` additionally batches file renames into the final
+moment of each sync, so in-flight Claude Code sessions see either the
+old or new tree — not a half-updated mix.
 
 ### Environment overrides
 

@@ -33,17 +33,39 @@ automatically after every successful build.
 
 ### Deploy entry points
 
-| Command (from `hooks/`)  | What it does                                    |
-|--------------------------|-------------------------------------------------|
-| `npm run build`          | Build + auto-deploy (via `postbuild`)           |
-| `npm run deploy`         | Re-sync without rebuilding                      |
-| `../scripts/deploy_hooks.sh` | Standalone shell entry point (same behavior)   |
+| Command (from `hooks/`)            | What it does                                       |
+|------------------------------------|----------------------------------------------------|
+| `npm run build`                    | Build + auto-deploy (via `postbuild --auto`)       |
+| `npm run deploy`                   | Deploy unconditionally (works from worktrees)      |
+| `../scripts/deploy_hooks.sh`       | Standalone shell entry (unconditional)             |
+| `../scripts/deploy_hooks.sh --auto`| Standalone shell entry (skips from worktrees)      |
+
+**Worktree guard.** The `postbuild` step passes `--auto`, which inspects
+the resolved `OPC_ROOT` and skips deploy when the path contains
+`/.worktrees/` or `/.claude/worktrees/`. This keeps experimental branches
+from stomping the live `~/.claude/hooks/` tree used by other Claude Code
+sessions. If you *want* to deploy from a worktree, run `npm run deploy`
+(no `--auto`) — that bypass is explicit and opt-in.
+
+**Target validation.** The script refuses to run with `DEPLOY_TARGET`
+pointing at `/`, `$HOME`, or `$HOME/.claude`, and requires the target's
+basename to be `hooks`. These guards exist because `rsync --delete`
+prunes any file in the target that isn't in the source.
+
+**Lock serialization.** The script acquires an `mkdir`-based lock at
+`$TMPDIR/opc-deploy-hooks.lock.d` before touching the target. Concurrent
+invocations (e.g. two worktrees running `npm run build` at once) print a
+"deploy in progress" warning and exit 5 instead of racing. `rsync
+--delay-updates` additionally batches file renames into the final moment
+of each sync, so in-flight Claude Code sessions see either the old or
+new tree — not a half-updated mix.
 
 ### Environment overrides
 
-| Variable         | Default              | Purpose                                      |
-|------------------|----------------------|----------------------------------------------|
-| `DEPLOY_TARGET`  | `$HOME/.claude/hooks`| Mirror into a different tree (tests/install) |
+| Variable         | Default                         | Purpose                                      |
+|------------------|---------------------------------|----------------------------------------------|
+| `DEPLOY_TARGET`  | `$HOME/.claude/hooks`           | Mirror into a different tree (tests/install) |
+| `TMPDIR`         | `/tmp`                          | Lock directory location                      |
 
 If `$HOME/.claude/` does not exist (e.g. CI, fresh box without Claude Code
 installed), the deploy step prints a skip message and exits 0 instead of

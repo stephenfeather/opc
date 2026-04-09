@@ -127,10 +127,20 @@ fi
 # Finding #2 (round 2): Refuse if TARGET itself is a symlink. Following a
 # symlink into an unrelated tree would let an attacker or a stale config
 # aim rsync --delete at the wrong place.
-if [ -L "$TARGET_ABS" ]; then
-    echo "deploy_hooks: refusing to deploy to '$TARGET_ABS' - target is a symlink" >&2
-    exit 4
-fi
+#
+# Security audit follow-up: defense-in-depth against a TOCTOU window
+# between this check and the later mkdir/rsync calls. `_assert_target_not_symlink`
+# is called again immediately before each filesystem mutation so a process
+# that swaps TARGET_ABS into a symlink after validation still trips the
+# guard before rsync --delete runs.
+_assert_target_not_symlink() {
+    if [ -L "$TARGET_ABS" ]; then
+        echo "deploy_hooks: refusing to deploy to '$TARGET_ABS' - target is a symlink" >&2
+        exit 4
+    fi
+}
+
+_assert_target_not_symlink
 
 if [ ! -d "$HOOKS_SRC/src" ] || [ -z "$(ls -A "$HOOKS_SRC/src" 2>/dev/null)" ]; then
     echo "deploy_hooks: $HOOKS_SRC/src is empty or missing - nothing to deploy" >&2
@@ -221,14 +231,20 @@ if ! _acquire_lock; then
 fi
 trap 'rm -rf "$LOCK_DIR" 2>/dev/null || true' EXIT INT TERM
 
+# Defense-in-depth: re-check the target is still not a symlink right
+# before each filesystem mutation. Closes the TOCTOU window flagged by
+# the security audit.
+_assert_target_not_symlink
 mkdir -p "$TARGET_ABS/src" "$TARGET_ABS/dist"
 
 # Finding #3 (round 1): rsync --delay-updates stages new files into a
 # hidden holding directory and renames them into place at the end of the
 # batch, so readers see the old or new tree - not a half-updated mix.
+_assert_target_not_symlink
 echo "deploy_hooks: syncing src/  -> $TARGET_ABS/src/"
 rsync -a --delete --delay-updates "$HOOKS_SRC/src/" "$TARGET_ABS/src/"
 
+_assert_target_not_symlink
 echo "deploy_hooks: syncing dist/ -> $TARGET_ABS/dist/"
 rsync -a --delete --delay-updates "$HOOKS_SRC/dist/" "$TARGET_ABS/dist/"
 

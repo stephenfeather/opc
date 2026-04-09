@@ -48,4 +48,6 @@ export function main(): void {
 }
 
 // Run if executed directly
-main();
+if (typeof process !== 'undefined' && process.argv[1] && (process.argv[1].endsWith('heartbeat.ts') || process.argv[1].endsWith('heartbeat.js') || process.argv[1].endsWith('heartbeat.mjs'))) {
+  main();
+}

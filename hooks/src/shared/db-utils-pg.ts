@@ -963,11 +963,14 @@ pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_
 async def main():
     conn = await asyncpg.connect(pg_url)
     try:
-        await conn.execute('''
+        status = await conn.execute('''
             UPDATE sessions SET last_heartbeat = NOW()
             WHERE id = $1 AND project = $2
         ''', session_id, project)
-        print('ok')
+        if status == 'UPDATE 1':
+            print('ok')
+        else:
+            print('not found')
     finally:
         await conn.close()
 

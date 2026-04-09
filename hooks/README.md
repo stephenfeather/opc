@@ -60,14 +60,27 @@ refuses to follow one into an unrelated tree. These guards exist because
 
 **Lock serialization.** The script acquires an `mkdir`-based lock at
 `$TMPDIR/opc-deploy-hooks.lock.d` before touching the target. The lock
-dir contains a `pid` file; on contention the script checks whether the
-owning process is still alive via `kill -0`, and reclaims the lock if
-the owner is dead or if the lock is older than 5 minutes (covering PID
-reuse and missing PID files). Concurrent invocations with a live owner
-print a "deploy in progress" warning and exit 5 instead of racing.
-`rsync --delay-updates` additionally batches file renames into the final
-moment of each sync, so in-flight Claude Code sessions see either the
-old or new tree — not a half-updated mix.
+dir contains a `pid` file. On contention the script:
+
+1. Checks whether the owning PID is still alive via `kill -0`.
+2. If alive — exits 5 (real contention), **regardless of lock age**.
+   A running deploy is never preempted: stealing its lock would admit
+   concurrent `rsync --delete` runs against the same target, which is
+   exactly the failure this lock exists to prevent.
+3. If dead or the PID file is missing — atomically `mv`s the stale
+   lock to a unique quarantine name (`rename()` is atomic at the POSIX
+   level, so two concurrent reclaimers cannot both win), then retries
+   the acquire.
+
+`rsync --delay-updates` additionally batches file renames into the
+final moment of each sync, so in-flight Claude Code sessions see either
+the old or new tree — not a half-updated mix.
+
+**Wedged deploy recovery.** If a legitimate deploy genuinely hangs
+(e.g. rsync stuck on a dead NFS mount), the lock stays until the user
+manually investigates: `rm -rf $TMPDIR/opc-deploy-hooks.lock.d` after
+confirming no running deploy. This is the intentional tradeoff — a
+recoverable wedge is preferable to silent concurrent writes.
 
 ### Environment overrides
 

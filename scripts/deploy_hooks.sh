@@ -142,54 +142,76 @@ if [ ! -d "$HOOKS_SRC/dist" ] || [ -z "$(ls -A "$HOOKS_SRC/dist" 2>/dev/null)" ]
     exit 1
 fi
 
-# Finding #3 (round 1+2): Acquire an atomic lock via mkdir so that concurrent
-# deploys from different worktrees can't stomp each other mid-sync. mkdir
-# is atomic on POSIX filesystems and portable across macOS/Linux (unlike
-# flock). Round 2 adds PID + age-based stale-lock recovery so SIGKILL,
-# crashes, or host reboots do not wedge future deploys forever.
+# Finding #3 (round 1+2+3): Acquire an atomic lock via mkdir so that
+# concurrent deploys from different worktrees can't stomp each other
+# mid-sync. mkdir is atomic on POSIX filesystems and portable across
+# macOS/Linux (unlike flock). Round 2 added PID-based stale-lock recovery
+# so SIGKILL, crashes, or host reboots do not wedge future deploys forever.
+#
+# Round 3 removes the age-based reclaim of LIVE owners: stealing a lock
+# from a still-running process violates mutual exclusion, even if that
+# process has been running "too long" by some arbitrary threshold. We also
+# replace the rm -rf + mkdir reclaim path with an atomic `mv` to a unique
+# quarantine name so two concurrent reclaimers cannot both win. `mv` /
+# rename() is atomic at the POSIX level — only one racer can successfully
+# rename a given source.
+#
+# If a legitimate deploy genuinely hangs (rsync stuck on a dead NFS mount,
+# etc.), the lock stays until the user manually investigates and removes
+# it: `rm -rf $TMPDIR/opc-deploy-hooks.lock.d`. That is the correct
+# tradeoff — we prefer a recoverable wedge over silent concurrent writes
+# to the shared runtime tree.
+
 LOCK_DIR="${TMPDIR:-/tmp}/opc-deploy-hooks.lock.d"
 LOCK_PID_FILE="$LOCK_DIR/pid"
-LOCK_MAX_AGE_SEC=300  # 5 minutes
-
-_lock_mtime() {
-    stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null
-}
+LOCK_MAX_ATTEMPTS=5
 
 _acquire_lock() {
-    if mkdir "$LOCK_DIR" 2>/dev/null; then
-        echo "$$" >"$LOCK_PID_FILE"
-        return 0
-    fi
-    # Lock directory already exists - check for staleness.
-    local owner=""
-    if [ -f "$LOCK_PID_FILE" ]; then
-        owner="$(cat "$LOCK_PID_FILE" 2>/dev/null || true)"
-    fi
-    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
-        # Live owner - check age as a secondary signal in case the PID was
-        # reused by an unrelated process after the original deploy died.
-        local now mtime age
-        now="$(date +%s)"
-        mtime="$(_lock_mtime "$LOCK_DIR" || echo "$now")"
-        age=$((now - mtime))
-        if [ "$age" -lt "$LOCK_MAX_AGE_SEC" ]; then
-            return 1  # real contention
+    local attempt=0
+    while [ "$attempt" -lt "$LOCK_MAX_ATTEMPTS" ]; do
+        attempt=$((attempt + 1))
+
+        if mkdir "$LOCK_DIR" 2>/dev/null; then
+            echo "$$" >"$LOCK_PID_FILE"
+            # Paranoia: verify the PID file still matches our PID. If
+            # another process raced in via the retry loop and quarantined
+            # our freshly-created lock, cat will return something else
+            # (or nothing), and we should loop back.
+            if [ "$(cat "$LOCK_PID_FILE" 2>/dev/null || true)" = "$$" ]; then
+                return 0
+            fi
+            continue
         fi
-        echo "deploy_hooks: reclaiming stale lock (pid $owner, age ${age}s exceeds ${LOCK_MAX_AGE_SEC}s)" >&2
-    else
-        echo "deploy_hooks: reclaiming stale lock (owner=${owner:-unknown}, not alive)" >&2
-    fi
-    # Reclaim: rm -rf then mkdir. The atomicity of the final mkdir ensures
-    # only one racer wins even if two reclaimers compete.
-    rm -rf "$LOCK_DIR" 2>/dev/null || true
-    if mkdir "$LOCK_DIR" 2>/dev/null; then
-        echo "$$" >"$LOCK_PID_FILE"
-        # Paranoia: verify we actually own the lock (no one raced in between
-        # our rm and our write).
-        if [ "$(cat "$LOCK_PID_FILE" 2>/dev/null || true)" = "$$" ]; then
-            return 0
+
+        # Lock dir already exists. Check liveness of the owning PID.
+        local owner=""
+        if [ -f "$LOCK_PID_FILE" ]; then
+            owner="$(cat "$LOCK_PID_FILE" 2>/dev/null || true)"
         fi
-    fi
+        if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+            # Live owner - real contention, regardless of age. Never steal
+            # a lock from a running process.
+            return 1
+        fi
+
+        # Stale: owner PID is dead or the PID file is missing. Atomically
+        # quarantine the stale lock dir. `mv` on a directory is a rename()
+        # syscall, which is atomic at the POSIX level - only one concurrent
+        # racer can win. The losing racer loops back and re-checks.
+        local quarantine="${LOCK_DIR}.stale.$$.$attempt"
+        if mv "$LOCK_DIR" "$quarantine" 2>/dev/null; then
+            rm -rf "$quarantine" 2>/dev/null || true
+            echo "deploy_hooks: reclaimed stale lock (owner=${owner:-unknown})" >&2
+            # Loop back and try to create a fresh lock. Another reclaimer
+            # may have already created one, in which case we fall through
+            # to the liveness check on the next iteration.
+            continue
+        fi
+
+        # Another reclaimer beat us to the rename. Loop and re-check;
+        # either their fresh lock is now visible (live PID → exit 5) or
+        # the lock is gone and we get to mkdir it.
+    done
     return 1
 }
 

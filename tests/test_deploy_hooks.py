@@ -464,7 +464,7 @@ class TestLockSerialization:
         )
 
         assert result.returncode == 0, result.stderr
-        assert "reclaiming stale lock" in result.stderr
+        assert "stale lock" in result.stderr
         assert (target / "src" / "sample.ts").exists()
         # Lock should be cleaned up on exit.
         assert not lock_dir.exists()
@@ -486,8 +486,93 @@ class TestLockSerialization:
         )
 
         assert result.returncode == 0, result.stderr
-        assert "reclaiming stale lock" in result.stderr
+        assert "stale lock" in result.stderr
         assert (target / "src" / "sample.ts").exists()
+
+    def test_live_owner_is_respected_regardless_of_age(
+        self, tmp_path: Path
+    ) -> None:
+        """Round-3 regression: a legitimately-running deploy that has been
+        running 'too long' must NOT have its lock stolen. Set the lock dir
+        mtime to ~1 hour ago while the PID points at our live test process;
+        the script must still exit 5."""
+        import os
+        import time
+
+        opc_root, script, target = _build_fixture(tmp_path)
+        lock_parent = tmp_path / "lock-test"
+        lock_parent.mkdir()
+        lock_dir = lock_parent / "opc-deploy-hooks.lock.d"
+        lock_dir.mkdir()
+        (lock_dir / "pid").write_text(f"{os.getpid()}\n")
+        # Backdate the lock dir mtime by 1 hour so any age-based logic
+        # would consider it "stale".
+        hour_ago = time.time() - 3600
+        os.utime(lock_dir, (hour_ago, hour_ago))
+
+        result = _run(
+            script,
+            target,
+            extra_env={"TMPDIR": str(lock_parent)},
+        )
+
+        assert result.returncode == 5, result.stderr
+        assert "another deploy is in progress" in result.stderr
+        # Live owner's lock must NOT have been touched.
+        assert lock_dir.exists()
+        assert (lock_dir / "pid").read_text() == f"{os.getpid()}\n"
+        # Target must NOT have been written.
+        assert not (target / "src" / "sample.ts").exists()
+
+    def test_parallel_reclaimers_yield_single_critical_section(
+        self, tmp_path: Path
+    ) -> None:
+        """Round-3 regression: two processes seeing the same stale lock
+        must not both enter the critical section simultaneously. Launch
+        them in parallel from a dead-PID stale lock; assert at least one
+        succeeds and that no process returns an unexpected error."""
+        opc_root, script, target = _build_fixture(tmp_path)
+        lock_parent = tmp_path / "lock-test"
+        lock_parent.mkdir()
+        lock_dir = lock_parent / "opc-deploy-hooks.lock.d"
+        lock_dir.mkdir()
+        (lock_dir / "pid").write_text("99999999\n")  # dead
+
+        env = {
+            "DEPLOY_TARGET": str(target),
+            "HOME": "/tmp/nonexistent-home",
+            "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
+            "TMPDIR": str(lock_parent),
+        }
+
+        procs = [
+            subprocess.Popen(
+                ["bash", str(script)],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for _ in range(2)
+        ]
+        results = [p.wait() for p in procs]
+        outputs = [
+            (p.stdout.read() if p.stdout else "", p.stderr.read() if p.stderr else "")
+            for p in procs
+        ]
+
+        # At least one process must succeed (exit 0).
+        assert 0 in results, f"neither process succeeded: {results} {outputs}"
+        # Every exit code must be either 0 (success) or 5 (contention).
+        # Anything else indicates corruption or unexpected state.
+        for rc in results:
+            assert rc in (0, 5), f"unexpected exit code {rc}: {outputs}"
+        # The target must be fully populated by whichever process won.
+        assert (target / "src" / "sample.ts").exists()
+        assert (target / "src" / "shared" / "util.ts").exists()
+        assert (target / "dist" / "sample.mjs").exists()
+        # The lock dir must be cleaned up after both processes exit.
+        assert not lock_dir.exists()
 
 
 # --- Deploy target override --------------------------------------------------

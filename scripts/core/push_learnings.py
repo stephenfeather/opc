@@ -290,7 +290,7 @@ async def record_push(result_ids: list[str]) -> None:
                 """
                 UPDATE archival_memory
                 SET last_pushed_at = NOW(),
-                    push_count = push_count + 1
+                    push_count = COALESCE(push_count, 0) + 1
                 WHERE id = ANY($1::uuid[])
                 """,
                 result_ids,

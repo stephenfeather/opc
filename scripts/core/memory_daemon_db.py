@@ -89,7 +89,7 @@ def pg_ensure_column():
         """)
     # Ensure push tracking columns on archival_memory
     for col, typedef in [
-        ("push_count", "INTEGER DEFAULT 0"),
+        ("push_count", "INTEGER NOT NULL DEFAULT 0"),
         ("last_pushed_at", "TIMESTAMPTZ"),
     ]:
         cur.execute(f"""

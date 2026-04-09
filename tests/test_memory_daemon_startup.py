@@ -108,6 +108,132 @@ class TestSetupDaemonFds:
         assert not sys.stderr.closed
 
 
+class TestReserveLowFds:
+    """_reserve_low_fds() prevents the rotating log handler from landing on
+    fd 0/1/2 and being silently destroyed by _setup_daemon_fds() later.
+
+    Addresses Codex Round 1 Finding 1 (HIGH): the module-level
+    ``_logger = _setup_logging()`` call opens the rotating log file at
+    import time. If the process is launched with any of fd 0/1/2 already
+    closed, the kernel assigns that slot to the log file. _setup_daemon_fds()
+    then dup2s /dev/null over it, silently nulling out daemon logging in
+    exactly the degraded-stdio scenario this patch is supposed to harden.
+    """
+
+    def test_reserve_low_fds_reserves_all_three_when_closed(self):
+        from scripts.core.memory_daemon import _reserve_low_fds
+
+        # Simulate: fd 0, 1, 2 all closed. os.open returns 0, then 1,
+        # then 2, then 3. _reserve_low_fds keeps 0/1/2 and closes 3.
+        opened: list[int] = []
+        closed: list[int] = []
+        fd_sequence = iter([0, 1, 2, 3])
+
+        def fake_open(path, flags):
+            opened.append(next(fd_sequence))
+            return opened[-1]
+
+        def fake_close(fd):
+            closed.append(fd)
+
+        _reserve_low_fds(os_open_fn=fake_open, os_close_fn=fake_close)
+
+        assert opened == [0, 1, 2, 3]
+        assert closed == [3]
+
+    def test_reserve_low_fds_noop_when_std_fds_already_open(self):
+        from scripts.core.memory_daemon import _reserve_low_fds
+
+        opened: list[int] = []
+        closed: list[int] = []
+
+        def fake_open(path, flags):
+            opened.append(3)  # normal case: lowest free fd is 3
+            return 3
+
+        def fake_close(fd):
+            closed.append(fd)
+
+        _reserve_low_fds(os_open_fn=fake_open, os_close_fn=fake_close)
+
+        # Opened once, got back a high fd, closed it, returned.
+        assert opened == [3]
+        assert closed == [3]
+
+    def test_reserve_low_fds_partial_when_only_fd0_closed(self):
+        from scripts.core.memory_daemon import _reserve_low_fds
+
+        opened: list[int] = []
+        closed: list[int] = []
+        fd_sequence = iter([0, 3])  # fd 0 closed, 1/2 open → os.open gives 0 then 3
+
+        def fake_open(path, flags):
+            opened.append(next(fd_sequence))
+            return opened[-1]
+
+        def fake_close(fd):
+            closed.append(fd)
+
+        _reserve_low_fds(os_open_fn=fake_open, os_close_fn=fake_close)
+
+        assert opened == [0, 3]
+        assert closed == [3]  # 0 is kept; 3 is released
+
+    def test_reserve_low_fds_tolerates_os_error(self):
+        from scripts.core.memory_daemon import _reserve_low_fds
+
+        def raising_open(path, flags):
+            raise OSError("too many fds")
+
+        closed: list[int] = []
+
+        # Must not raise.
+        _reserve_low_fds(
+            os_open_fn=raising_open,
+            os_close_fn=lambda fd: closed.append(fd),
+        )
+
+    def test_reserve_low_fds_is_called_before_setup_logging_at_module_scope(self):
+        """AST walk: _reserve_low_fds() must execute before _logger assignment.
+
+        If _logger = _setup_logging() runs before the reservation, the log
+        handler can land at fd 0/1/2 and get clobbered by daemonization.
+        """
+        import ast
+        from pathlib import Path
+
+        import scripts.core.memory_daemon as mod
+
+        tree = ast.parse(Path(mod.__file__).read_text())
+
+        reserve_line: int | None = None
+        logger_line: int | None = None
+        for node in tree.body:
+            if (
+                isinstance(node, ast.Expr)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id == "_reserve_low_fds"
+            ):
+                reserve_line = node.lineno
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == "_logger"
+            ):
+                logger_line = node.lineno
+
+        assert reserve_line is not None, (
+            "_reserve_low_fds() must be called at module scope before _setup_logging"
+        )
+        assert logger_line is not None, "_logger = _setup_logging() not found at module scope"
+        assert reserve_line < logger_line, (
+            f"_reserve_low_fds must run BEFORE _logger assignment. "
+            f"Got reserve at line {reserve_line}, _logger at line {logger_line}."
+        )
+
+
 class TestDebugFlag:
     """--debug flag + DEBUG module state + debug() helper.
 
@@ -153,11 +279,16 @@ class TestDebugFlag:
     def test_main_debug_flag_sets_module_debug_and_propagates_env(self, monkeypatch):
         """Running main(["start", "--debug"]) must set mod.DEBUG=True and
         export MEMORY_DAEMON_DEBUG=1 so child subprocesses inherit it.
+
+        Hermetic: _enable_faulthandler is monkeypatched to a no-op so
+        main() does not open the real ~/.claude/logs/opc_crash.log file
+        (Codex Round 1 Finding 3).
         """
         import scripts.core.memory_daemon as mod
 
         monkeypatch.setattr(mod, "DEBUG", False)
         monkeypatch.setenv("MEMORY_DAEMON_DEBUG", "0")
+        monkeypatch.setattr(mod, "_enable_faulthandler", lambda: None)
         monkeypatch.setattr(mod, "start_daemon", lambda: 0)
         monkeypatch.setattr(sys, "argv", ["memory_daemon.py", "start", "--debug"])
 
@@ -172,6 +303,7 @@ class TestDebugFlag:
 
         monkeypatch.setattr(mod, "DEBUG", False)
         monkeypatch.delenv("MEMORY_DAEMON_DEBUG", raising=False)
+        monkeypatch.setattr(mod, "_enable_faulthandler", lambda: None)
         monkeypatch.setattr(mod, "start_daemon", lambda: 0)
         monkeypatch.setattr(sys, "argv", ["memory_daemon.py", "start"])
 
@@ -225,9 +357,18 @@ class TestFaulthandlerGating:
             f"only from main() or _run_as_daemon()."
         )
 
-    def test_enable_faulthandler_is_idempotent(self, monkeypatch):
-        """Calling _enable_faulthandler twice must not re-open the log file."""
+    def test_enable_faulthandler_is_idempotent(self, monkeypatch, tmp_path):
+        """Calling _enable_faulthandler twice must not re-open the log file.
+
+        Hermetic: Path.home() is redirected to tmp_path so the real
+        ~/.claude/logs/opc_crash.log is not touched. The real file handle
+        we open is closed in the finally block so nothing leaks across
+        tests (Codex Round 1 Finding 3).
+        """
         import scripts.core.memory_daemon as mod
+
+        # Redirect Path.home() so _enable_faulthandler writes under tmp_path.
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
 
         # Reset the internal handle so the first call does real work.
         monkeypatch.setattr(mod, "_faulthandler_log_file", None, raising=False)
@@ -239,13 +380,27 @@ class TestFaulthandlerGating:
 
         monkeypatch.setattr(mod.faulthandler, "enable", fake_enable)
 
-        mod._enable_faulthandler()
-        first_handle = mod._faulthandler_log_file
-        mod._enable_faulthandler()
-        second_handle = mod._faulthandler_log_file
+        try:
+            mod._enable_faulthandler()
+            first_handle = mod._faulthandler_log_file
+            mod._enable_faulthandler()
+            second_handle = mod._faulthandler_log_file
 
-        assert first_handle is second_handle
-        assert len(enable_calls) == 1
+            assert first_handle is second_handle
+            assert len(enable_calls) == 1
+
+            # Verify the file was created under tmp_path, not real home.
+            crash_log = tmp_path / ".claude" / "logs" / "opc_crash.log"
+            assert crash_log.exists(), f"Expected {crash_log} to be created"
+        finally:
+            # Close the real file handle so it does not leak; monkeypatch
+            # will then restore the module attribute.
+            handle = mod._faulthandler_log_file
+            if handle is not None:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
 
 
 class TestPatternDetectionSpawn:
@@ -324,6 +479,67 @@ class TestPatternDetectionSpawn:
         # When env= is omitted, the child inherits os.environ by default,
         # which we've set via monkeypatch.setenv above.
         assert os.environ.get("MEMORY_DAEMON_DEBUG") == "1"
+
+    def test_spawn_without_debug_does_not_pass_verbose(self, monkeypatch):
+        """Release mode (DEBUG=False): pattern_batch is not invoked with
+        --verbose, so it defaults to INFO level logging.
+        """
+        import scripts.core.memory_daemon as mod
+
+        monkeypatch.setattr(mod, "_daemon_state", self._fresh_state(mod))
+        monkeypatch.setattr(mod, "DEBUG", False)
+        monkeypatch.setattr(mod, "log", lambda _m: None)
+
+        captured: dict = {}
+
+        class _FakeProc:
+            pid = 12345
+
+            def poll(self):
+                return None
+
+        def fake_popen(*args, **kwargs):
+            captured["argv"] = args[0] if args else kwargs.get("args")
+            return _FakeProc()
+
+        monkeypatch.setattr(mod.subprocess, "Popen", fake_popen)
+
+        mod._run_pattern_detection_batch()
+
+        argv = captured["argv"]
+        assert "--verbose" not in argv
+        assert "-v" not in argv
+
+    def test_spawn_with_debug_passes_verbose_to_pattern_batch(self, monkeypatch):
+        """Debug mode (DEBUG=True): pattern_batch is invoked with --verbose so
+        it materially raises its log level. Env-var inheritance alone is
+        insufficient — pattern_batch.py does not read MEMORY_DAEMON_DEBUG.
+        (Codex Round 1 Finding 2.)
+        """
+        import scripts.core.memory_daemon as mod
+
+        monkeypatch.setattr(mod, "_daemon_state", self._fresh_state(mod))
+        monkeypatch.setattr(mod, "DEBUG", True)
+        monkeypatch.setattr(mod, "log", lambda _m: None)
+
+        captured: dict = {}
+
+        class _FakeProc:
+            pid = 12345
+
+            def poll(self):
+                return None
+
+        def fake_popen(*args, **kwargs):
+            captured["argv"] = args[0] if args else kwargs.get("args")
+            return _FakeProc()
+
+        monkeypatch.setattr(mod.subprocess, "Popen", fake_popen)
+
+        mod._run_pattern_detection_batch()
+
+        argv = captured["argv"]
+        assert "--verbose" in argv, f"Expected --verbose in argv, got: {argv}"
 
     def test_spawn_happy_path_does_not_log_errors(self, monkeypatch):
         """Regression guard: the original implementation eagerly evaluated

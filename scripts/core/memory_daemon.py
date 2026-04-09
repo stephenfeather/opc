@@ -236,6 +236,45 @@ def get_pending_queue() -> list:
 
 
 
+def _reserve_low_fds(
+    *,
+    os_open_fn=os.open,
+    os_close_fn=os.close,
+) -> None:
+    """Reserve fds 0/1/2 with /dev/null before any long-lived file handle opens.
+
+    Addresses Issue #99 Round 1 HIGH finding: the rotating log file handler
+    is opened at module import via ``_logger = _setup_logging()``. If the
+    process is launched with any of fd 0/1/2 already closed, the kernel
+    assigns that slot to the log file. ``_setup_daemon_fds()`` later dup2s
+    ``/dev/null`` onto 0/1/2, which would silently redirect the log handle
+    to ``/dev/null`` in exactly the degraded-stdio scenario this patch
+    exists to harden.
+
+    This function opens ``/dev/null`` until it is handed back an fd > 2, at
+    which point it knows 0/1/2 are all held (either by whatever they were
+    before, or by fresh ``/dev/null`` handles we just installed). The low
+    fds returned are intentionally NOT closed — they stay alive as guards
+    until ``_setup_daemon_fds()`` dup2s over them, which implicitly closes
+    them.
+
+    Tolerant of ``OSError`` so a fd-exhausted process still imports
+    successfully.
+    """
+    while True:
+        try:
+            fd = os_open_fn(os.devnull, os.O_RDWR)
+        except OSError:
+            return
+        if fd > 2:
+            os_close_fn(fd)
+            return
+        # fd in (0, 1, 2): leave it open as a guard; loop to fill remaining slots.
+
+
+_reserve_low_fds()
+
+
 def _setup_logging() -> logging.Logger:
     """Configure rotating logger for the daemon.
 
@@ -554,9 +593,15 @@ def _run_pattern_detection_batch():
         # regression in the parent's fd handling from cascading into a
         # pattern_batch init_sys_streams EBADF crash.
         # Popen inherits os.environ by default, so MEMORY_DAEMON_DEBUG
-        # propagates to the child automatically when set.
+        # propagates to the child for any consumer that reads it. But
+        # pattern_batch.py itself only raises its log level when passed
+        # --verbose, so we also inject that flag when DEBUG is on to make
+        # --debug materially affect child verbosity (not just env cosmetics).
+        pb_argv = [sys.executable, "-m", "scripts.core.pattern_batch"]
+        if DEBUG:
+            pb_argv.append("--verbose")
         state.pattern_proc = subprocess.Popen(
-            [sys.executable, "-m", "scripts.core.pattern_batch"],
+            pb_argv,
             cwd=str(project_root),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,

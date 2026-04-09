@@ -133,7 +133,7 @@ def extract_memories_impl(
                 f"Extract learnings from session {session_id}. JSONL path: {jsonl_path}",
             ],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             env=env,
         )
         active_extractions[proc.pid] = (

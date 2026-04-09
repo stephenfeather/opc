@@ -314,9 +314,12 @@ class TestReapCompletedExtractions:
     def test_marks_failed_on_nonzero_exit(
         self, mock_log, mock_count, mock_rej, mock_fail
     ):
+        import io
+
         mock_proc = MagicMock()
         mock_proc.poll.return_value = 1
         mock_proc.pid = 42
+        mock_proc.stderr = io.BytesIO(b"some error")
         self.state.active_extractions[42] = (
             "sess-1", mock_proc, Path("/t.jsonl"), "proj", 0
         )
@@ -326,7 +329,7 @@ class TestReapCompletedExtractions:
         count = reap_completed_extractions()
 
         assert count == 1
-        mock_fail.assert_called_once_with("sess-1")
+        mock_fail.assert_called_once_with("sess-1", last_error="some error")
 
 
 # ---------------------------------------------------------------------------

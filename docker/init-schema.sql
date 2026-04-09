@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     archived_at TIMESTAMP,
     archive_path TEXT,
     extraction_status TEXT DEFAULT 'pending',
-    extraction_attempts INTEGER DEFAULT 0
+    extraction_attempts INTEGER DEFAULT 0,
+    last_error TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_host ON sessions(host_id);

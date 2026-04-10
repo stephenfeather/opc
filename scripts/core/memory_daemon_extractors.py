@@ -20,6 +20,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from scripts.core.memory_daemon_core import (
+    build_extraction_command,
+    build_extraction_env,
+)
+
 logger = logging.getLogger("memory-daemon")
 
 
@@ -112,26 +117,18 @@ def extract_memories_impl(
             mark_failed_fn(session_id)
             return False
 
-        env = os.environ.copy()
-        env["CLAUDE_MEMORY_EXTRACTION"] = "1"
-        if project_dir:
-            env["CLAUDE_PROJECT_DIR"] = project_dir
+        env = build_extraction_env(os.environ, project_dir)
+
+        cmd = build_extraction_command(
+            session_id=session_id,
+            jsonl_path=str(jsonl_path),
+            agent_prompt=agent_prompt,
+            model=daemon_cfg.extraction_model,
+            max_turns=daemon_cfg.extraction_max_turns,
+        )
 
         proc = subprocess_popen(
-            [
-                "claude",
-                "-p",
-                "--model",
-                daemon_cfg.extraction_model,
-                "--dangerously-skip-permissions",
-                "--allowedTools",
-                "Bash,Read",
-                "--max-turns",
-                str(daemon_cfg.extraction_max_turns),
-                "--append-system-prompt",
-                agent_prompt,
-                f"Extract learnings from session {session_id}. JSONL path: {jsonl_path}",
-            ],
+            cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             env=env,

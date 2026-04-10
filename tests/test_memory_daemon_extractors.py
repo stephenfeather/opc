@@ -201,3 +201,138 @@ class TestCountSessionRejections:
         from scripts.core.memory_daemon_extractors import count_session_rejections
 
         assert count_session_rejections("s1") is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #96 Round 1 fix — debug-wiring regression guard
+# ---------------------------------------------------------------------------
+
+
+class TestExtractMemoriesImplDebugWiring:
+    """extract_memories_impl must delegate argv/env construction to the
+    debug-instrumented helpers in memory_daemon_core so that Issue #96's
+    DEBUG-gated diagnostics fire in production.
+
+    Codex adversarial review Round 1 caught that the helpers shipped as
+    dead code — extractors.py built argv/env inline, bypassing them.
+    This test locks in the wiring.
+    """
+
+    def test_debug_logging_fires_via_core_helpers(self, tmp_path, monkeypatch):
+        """When MEMORY_DAEMON_DEBUG=1, starting an extraction must emit
+        the helper DEBUG log lines via memory_daemon.log.
+
+        This proves that extract_memories_impl actually calls
+        build_extraction_command / build_extraction_env (vs. building
+        argv/env inline). Also tripwires env-value leakage.
+        """
+        from scripts.core import memory_daemon, memory_daemon_core
+        from scripts.core.memory_daemon_extractors import extract_memories_impl
+
+        # Spy: capture every log call instead of touching the real daemon
+        # log file. Patch BOTH modules per PR #106 hermeticity learnings.
+        messages: list[str] = []
+
+        def _spy(msg):
+            messages.append(str(msg))
+
+        monkeypatch.setattr(memory_daemon, "log", _spy, raising=True)
+        monkeypatch.setattr(memory_daemon_core, "log", _spy, raising=False)
+
+        # Enable DEBUG so the helper thunks actually fire.
+        monkeypatch.setenv("MEMORY_DAEMON_DEBUG", "1")
+
+        # Tripwire: a fake secret env var that os.environ.copy() would
+        # pull into the extraction env. Under the Round 3 tightened
+        # format, DEBUG logging must NOT emit the VALUE and must NOT
+        # enumerate parent-process env keys such as 'OPC_TRIPWIRE_SECRET'
+        # — env logging is daemon-owned only (CLAUDE_MEMORY_EXTRACTION,
+        # CLAUDE_PROJECT_DIR presence, env_var_count). Both the key
+        # name and the value are checked absent by the assertion at
+        # the bottom of this test.
+        tripwire_value = "zAbC123DO-NOT-LOG"
+        monkeypatch.setenv("OPC_TRIPWIRE_SECRET", tripwire_value)
+
+        # Arrange: a real JSONL file and a mock subprocess that returns
+        # a process handle with a pid. The test does NOT spawn a real
+        # claude subprocess — subprocess_popen is injected.
+        jsonl = tmp_path / "session.jsonl"
+        jsonl.write_text('{"type":"msg"}\n')
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        mock_popen = MagicMock(return_value=mock_proc)
+
+        cfg = MagicMock()
+        cfg.extraction_model = "sonnet"
+        cfg.extraction_max_turns = 10
+
+        # Act
+        result = extract_memories_impl(
+            session_id="sess-test",
+            project_dir=str(tmp_path),
+            transcript_path=str(jsonl),
+            active_extractions={},
+            subprocess_popen=mock_popen,
+            is_blocked_fn=lambda _: False,
+            mark_extracted_fn=MagicMock(),
+            mark_failed_fn=MagicMock(),
+            log_fn=MagicMock(),
+            daemon_cfg=cfg,
+            allowed_models=frozenset({"sonnet", "haiku", "opus"}),
+            strip_frontmatter_fn=lambda c: c,
+        )
+
+        assert result is True, "Extraction should have started successfully"
+
+        # Assert: the core helpers' DEBUG log lines landed in the spy.
+        argv_msgs = [
+            m for m in messages if "build_extraction_command:" in m
+        ]
+        env_msgs = [
+            m for m in messages if "build_extraction_env:" in m
+        ]
+
+        assert argv_msgs, (
+            "Expected at least one DEBUG log line containing "
+            "'build_extraction_command argv' — proves extract_memories_impl "
+            "delegates argv construction to memory_daemon_core. "
+            f"Captured messages: {messages}"
+        )
+        assert any("sess-test" in m for m in argv_msgs), (
+            "argv DEBUG log should contain the session_id. "
+            f"argv messages: {argv_msgs}"
+        )
+
+        assert env_msgs, (
+            "Expected at least one DEBUG log line containing "
+            "'build_extraction_env keys' — proves extract_memories_impl "
+            "delegates env construction to memory_daemon_core. "
+            f"Captured messages: {messages}"
+        )
+        assert any("CLAUDE_MEMORY_EXTRACTION" in m for m in env_msgs), (
+            "env DEBUG log should contain CLAUDE_MEMORY_EXTRACTION key. "
+            f"env messages: {env_msgs}"
+        )
+        assert any("CLAUDE_PROJECT_DIR" in m for m in env_msgs), (
+            "env DEBUG log should contain CLAUDE_PROJECT_DIR key. "
+            f"env messages: {env_msgs}"
+        )
+
+        # Tripwire: under the Round 3 tightened format, NEITHER the
+        # parent-env KEY NAME ('OPC_TRIPWIRE_SECRET') NOR its VALUE
+        # may appear in the DEBUG log. Env logging is daemon-owned
+        # ONLY (CLAUDE_MEMORY_EXTRACTION=1, CLAUDE_PROJECT_DIR presence,
+        # env_var_count=N) — enumerating parent-env key names was the
+        # reconnaissance risk Codex flagged in Round 3. This assertion
+        # guards both halves of that contract (PR #110 Cycle 1 T1).
+        leaked = [
+            m for m in messages
+            if "OPC_TRIPWIRE_SECRET" in m or tripwire_value in m
+        ]
+        assert not leaked, (
+            f"SECURITY VIOLATION: parent env key or value leaked into "
+            f"DEBUG log. Env logging must stay daemon-owned only "
+            f"(no parent-env KEY NAMES, no parent-env VALUES). "
+            f"Leaked messages: {leaked}"
+        )

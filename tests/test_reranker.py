@@ -19,6 +19,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts.core.reranker import (  # noqa: E402
+    KG_TYPE_WEIGHTS,
     RecallContext,
     RerankerConfig,
     _cosine_similarity,
@@ -26,6 +27,7 @@ from scripts.core.reranker import (  # noqa: E402
     compute_type_centroids,
     confidence_score,
     infer_query_type,
+    kg_overlap,
     load_centroids,
     pattern_score,
     project_match,
@@ -664,7 +666,9 @@ class TestRerankerConfigDefaults:
 
     def test_default_total_signal_weight(self):
         config = RerankerConfig()
-        expected = 0.15 + 0.05 + 0.05 + 0.05 + 0.05 + 0.05 + 0.05
+        # project + 7 secondary signals (recency, confidence, recall,
+        # type_affinity, tag_overlap, pattern, kg) -- all at default 0.05.
+        expected = 0.15 + 0.05 * 7
         assert abs(config.total_signal_weight - expected) < 1e-9
 
 
@@ -729,3 +733,150 @@ class TestRecallScoreWithConfig:
         expected = min(1.0, math.log2(1 + 3) / 4.0)
         score = recall_score(result, config=config)
         assert abs(score - expected) < 0.01
+
+
+# ---------------------------------------------------------------------------
+# Signal Function Tests: kg_overlap (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+def _result_with_kg(entities: list[dict]) -> dict:
+    """Build a result dict carrying a kg_context entities list."""
+    result = _make_result()
+    result["kg_context"] = {"entities": entities, "edges": []}
+    return result
+
+
+class TestKGOverlap:
+    def test_zero_when_query_entities_none(self):
+        result = _result_with_kg([{"name": "pytest", "type": "tool"}])
+        ctx = RecallContext(query_entities=None)
+        assert kg_overlap(result, ctx) == 0.0
+
+    def test_zero_when_query_entities_empty(self):
+        result = _result_with_kg([{"name": "pytest", "type": "tool"}])
+        ctx = RecallContext(query_entities=[])
+        assert kg_overlap(result, ctx) == 0.0
+
+    def test_zero_when_result_has_no_kg_context(self):
+        result = _make_result()  # no kg_context key
+        ctx = RecallContext(query_entities=[{"name": "pytest", "type": "tool"}])
+        assert kg_overlap(result, ctx) == 0.0
+
+    def test_one_point_zero_on_identical_sets(self):
+        entities = [
+            {"name": "pytest", "type": "tool"},
+            {"name": "store_learning.py", "type": "file"},
+        ]
+        result = _result_with_kg(entities)
+        ctx = RecallContext(query_entities=list(entities))
+        assert kg_overlap(result, ctx) == 1.0
+
+    def test_partial_overlap_between_zero_and_one(self):
+        result = _result_with_kg([
+            {"name": "pytest", "type": "tool"},
+            {"name": "asyncpg", "type": "library"},
+        ])
+        ctx = RecallContext(query_entities=[{"name": "pytest", "type": "tool"}])
+        score = kg_overlap(result, ctx)
+        assert 0.0 < score < 1.0
+
+    def test_case_insensitive_name_match(self):
+        result = _result_with_kg([{"name": "Pytest", "type": "tool"}])
+        ctx = RecallContext(query_entities=[{"name": "PYTEST", "type": "tool"}])
+        assert kg_overlap(result, ctx) == 1.0
+
+    def test_file_type_overlap_scores_higher_than_language(self):
+        """Type weights: file (1.0) > language (0.4) for equal-size overlap."""
+        file_result = _result_with_kg([{"name": "a.py", "type": "file"}])
+        file_ctx = RecallContext(query_entities=[{"name": "a.py", "type": "file"}])
+        lang_result = _result_with_kg([{"name": "python", "type": "language"}])
+        lang_ctx = RecallContext(query_entities=[{"name": "python", "type": "language"}])
+        # Both are full matches in their own set, so weighted-Jaccard = 1.0 for
+        # each individually. The differentiation appears when mixed with
+        # non-matching entities of the same type. Test a mixed case instead.
+
+        mixed_result = _result_with_kg([
+            {"name": "a.py", "type": "file"},
+            {"name": "b.py", "type": "file"},        # not in query
+            {"name": "python", "type": "language"},
+            {"name": "ruby", "type": "language"},    # not in query
+        ])
+        file_match_ctx = RecallContext(
+            query_entities=[{"name": "a.py", "type": "file"}]
+        )
+        lang_match_ctx = RecallContext(
+            query_entities=[{"name": "python", "type": "language"}]
+        )
+        file_score = kg_overlap(mixed_result, file_match_ctx)
+        lang_score = kg_overlap(mixed_result, lang_match_ctx)
+        # file weight (1.0) >> language weight (0.4), so overlap contributes
+        # relatively more when the matching entity is typed 'file'.
+        assert file_score > lang_score
+        # Sanity: individual full matches are still 1.0
+        assert kg_overlap(file_result, file_ctx) == 1.0
+        assert kg_overlap(lang_result, lang_ctx) == 1.0
+
+    def test_type_weights_table_has_expected_entries(self):
+        """KG_TYPE_WEIGHTS covers the entity types emitted by kg_extractor."""
+        required = {"file", "module", "library", "tool", "language", "concept", "error"}
+        assert required.issubset(set(KG_TYPE_WEIGHTS.keys()))
+        assert KG_TYPE_WEIGHTS["file"] > KG_TYPE_WEIGHTS["language"]
+
+
+class TestRerankKGWeight:
+    def test_rerank_boosts_kg_matches_when_weight_positive(self):
+        """With kg_weight > 0, a matching result ranks above a non-matching one
+        that would otherwise be tied on retrieval."""
+        matching = _result_with_kg([{"name": "pytest", "type": "tool"}])
+        matching["id"] = "matching"
+        non_matching = _result_with_kg([{"name": "other", "type": "tool"}])
+        non_matching["id"] = "non_matching"
+
+        ctx = RecallContext(
+            query_entities=[{"name": "pytest", "type": "tool"}],
+            retrieval_mode="vector",
+        )
+        # Kill all other signal weights to isolate kg_weight effect.
+        config = RerankerConfig(
+            project_weight=0.0,
+            recency_weight=0.0,
+            confidence_weight=0.0,
+            recall_weight=0.0,
+            type_affinity_weight=0.0,
+            tag_overlap_weight=0.0,
+            pattern_weight=0.0,
+            kg_weight=0.2,
+        )
+
+        ranked = rerank([non_matching, matching], ctx, config=config, k=2)
+        assert ranked[0]["id"] == "matching"
+        assert "kg_overlap" in ranked[0]["rerank_details"]
+
+    def test_rerank_zero_kg_weight_is_noop(self):
+        """With kg_weight=0.0, ranking is unchanged from non-KG scoring."""
+        matching = _result_with_kg([{"name": "pytest", "type": "tool"}])
+        matching["id"] = "matching"
+        matching["similarity"] = 0.3  # lower retrieval
+        non_matching = _result_with_kg([{"name": "other", "type": "tool"}])
+        non_matching["id"] = "non_matching"
+        non_matching["similarity"] = 0.9  # higher retrieval
+
+        ctx = RecallContext(
+            query_entities=[{"name": "pytest", "type": "tool"}],
+            retrieval_mode="vector",
+        )
+        config = RerankerConfig(
+            project_weight=0.0,
+            recency_weight=0.0,
+            confidence_weight=0.0,
+            recall_weight=0.0,
+            type_affinity_weight=0.0,
+            tag_overlap_weight=0.0,
+            pattern_weight=0.0,
+            kg_weight=0.0,
+        )
+
+        ranked = rerank([matching, non_matching], ctx, config=config, k=2)
+        # Retrieval dominates: non_matching wins.
+        assert ranked[0]["id"] == "non_matching"

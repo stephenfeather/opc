@@ -37,6 +37,7 @@ class RerankerConfig:
     type_affinity_weight: float = 0.05
     tag_overlap_weight: float = 0.05
     pattern_weight: float = 0.05
+    kg_weight: float = 0.05
     recency_half_life_days: float = 45.0
     recall_log2_normalizer: float = 4.0
     rrf_scale_factor: float = 60.0
@@ -51,6 +52,7 @@ class RerankerConfig:
             + self.type_affinity_weight
             + self.tag_overlap_weight
             + self.pattern_weight
+            + self.kg_weight
         )
 
 

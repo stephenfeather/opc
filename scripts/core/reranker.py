@@ -33,7 +33,26 @@ class RecallContext:
     type_probabilities: dict[str, float] | None = None
     tags_hint: list[str] | None = None
     retrieval_mode: str | None = None  # "vector", "hybrid_rrf", "text", "sqlite"
+    # list[dict] of entities extracted from the query via kg_extractor.
+    # Each dict carries at least {"name": str, "type": str}. Used by
+    # kg_overlap signal.  None or empty -> signal returns 0.
+    query_entities: list[dict] | None = None
     now: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+# Type-salience weights for kg_overlap. Higher weights -> more specific types
+# contribute more evidence to the overlap signal. See plan §3.2 for rationale.
+KG_TYPE_WEIGHTS: dict[str, float] = {
+    "file": 1.0,
+    "module": 1.0,
+    "error": 0.9,
+    "library": 0.8,
+    "config_var": 0.7,
+    "tool": 0.6,
+    "concept": 0.5,
+    "language": 0.4,
+}
+_KG_DEFAULT_TYPE_WEIGHT: float = 0.5
 
 
 # Single source of truth for RerankerConfig lives in config/models.py.
@@ -228,6 +247,49 @@ def pattern_score(result: dict, ctx: RecallContext) -> float:
     return strength * min(1.0, ratio)
 
 
+def kg_overlap(result: dict, ctx: RecallContext) -> float:
+    """Weighted-Jaccard overlap between query entities and result KG entities.
+
+    Each entity is weighted by its type's salience (KG_TYPE_WEIGHTS). Names
+    are compared case-insensitively. Returns 0.0 when either side lacks
+    entities. Returns score in [0, 1].
+    """
+    if not ctx.query_entities:
+        return 0.0
+
+    kg_context = result.get("kg_context")
+    if not kg_context:
+        return 0.0
+
+    result_entities = kg_context.get("entities") or []
+    if not result_entities:
+        return 0.0
+
+    def _key(entity: dict) -> tuple[str, str]:
+        return (str(entity.get("name", "")).lower(), str(entity.get("type", "")))
+
+    def _weight(entity_type: str) -> float:
+        return KG_TYPE_WEIGHTS.get(entity_type, _KG_DEFAULT_TYPE_WEIGHT)
+
+    query_map = {_key(e): e for e in ctx.query_entities}
+    result_map = {_key(e): e for e in result_entities}
+
+    intersection = set(query_map) & set(result_map)
+    union = set(query_map) | set(result_map)
+    if not union:
+        return 0.0
+
+    num = sum(_weight(query_map[k].get("type", "")) for k in intersection)
+    # Use query type for union members on query side, result type on result side.
+    den = sum(
+        _weight((query_map.get(k) or result_map.get(k)).get("type", ""))
+        for k in union
+    )
+    if den <= 0.0:
+        return 0.0
+    return max(0.0, min(1.0, num / den))
+
+
 # ---------------------------------------------------------------------------
 # Embedding Centroid Helpers
 # ---------------------------------------------------------------------------
@@ -371,6 +433,7 @@ def rerank(
         sig_type = type_match(result, ctx)
         sig_tags = tag_overlap(result, ctx)
         sig_pattern = pattern_score(result, ctx)
+        sig_kg = kg_overlap(result, ctx)
 
         # Weighted combination
         final = (
@@ -382,6 +445,7 @@ def rerank(
             + config.type_affinity_weight * sig_type
             + config.tag_overlap_weight * sig_tags
             + config.pattern_weight * sig_pattern
+            + config.kg_weight * sig_kg
         )
 
         # Augment result (shallow copy to avoid mutating input)
@@ -396,6 +460,7 @@ def rerank(
             "type_match": sig_type,
             "tag_overlap": sig_tags,
             "pattern": sig_pattern,
+            "kg_overlap": sig_kg,
         }
         scored.append(augmented)
 

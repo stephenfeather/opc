@@ -57,7 +57,7 @@ class TestRerankerConfig:
 
     def test_total_signal_weight(self):
         cfg = RerankerConfig()
-        expected = 0.15 + 0.05 * 6  # project + 6 others at 0.05
+        expected = 0.15 + 0.05 * 7  # project + 7 others (incl. kg_weight) at 0.05
         assert abs(cfg.total_signal_weight - expected) < 1e-9
 
 

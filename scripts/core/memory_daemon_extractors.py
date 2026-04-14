@@ -20,6 +20,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from scripts.core.log_safety import safe
 from scripts.core.memory_daemon_core import (
     build_extraction_command,
     build_extraction_env,
@@ -63,14 +64,14 @@ def extract_memories_impl(
     subprocess import is used only for subprocess.DEVNULL constants.
     """
     log_fn(
-        f"Extracting memories for session {session_id} "
-        f"(project={project_dir or 'unknown'})"
+        f"Extracting memories for session {safe(session_id)} "
+        f"(project={safe(project_dir or 'unknown')})"
     )
 
     if is_blocked_fn(project_dir):
         log_fn(
             f"Extraction blocked by .claude/no-extract sentinel "
-            f"(project={project_dir}), marking as extracted (skip)"
+            f"(project={safe(project_dir)}), marking as extracted (skip)"
         )
         mark_extracted_fn(session_id)
         return False
@@ -85,8 +86,8 @@ def extract_memories_impl(
     if not jsonl_path:
         reason = "no transcript_path in DB" if not transcript_path else "file missing from disk"
         log_fn(
-            f"No JSONL for session {session_id} "
-            f"(project={project_dir or 'unknown'}, {reason}), "
+            f"No JSONL for session {safe(session_id)} "
+            f"(project={safe(project_dir or 'unknown')}, {reason}), "
             f"marking as extracted (skip)"
         )
         mark_extracted_fn(session_id)
@@ -110,9 +111,9 @@ def extract_memories_impl(
 
         if daemon_cfg.extraction_model not in allowed_models:
             log_fn(
-                f"Invalid extraction_model '{daemon_cfg.extraction_model}', "
+                f"Invalid extraction_model '{safe(daemon_cfg.extraction_model)}', "
                 f"must be one of {sorted(allowed_models)}. "
-                f"Session {session_id} marked failed for retry."
+                f"Session {safe(session_id)} marked failed for retry."
             )
             mark_failed_fn(session_id)
             return False
@@ -141,13 +142,13 @@ def extract_memories_impl(
             time.time(),
         )
         log_fn(
-            f"Started extraction for {session_id} "
-            f"(pid={proc.pid}, file={jsonl_path.name}, "
+            f"Started extraction for {safe(session_id)} "
+            f"(pid={proc.pid}, file={safe(jsonl_path.name)}, "
             f"active={len(active_extractions)})"
         )
         return True
     except Exception as e:
-        log_fn(f"Failed to start extraction: {e}")
+        log_fn(f"Failed to start extraction: {safe(e)}")
         return False
 
 
@@ -169,7 +170,7 @@ def archive_session_jsonl(
         return
 
     if not jsonl_path or not jsonl_path.exists():
-        log_fn(f"Archive skipped for {session_id}: JSONL not found")
+        log_fn(f"Archive skipped for {safe(session_id)}: JSONL not found")
         return
 
     project_name = jsonl_path.parent.name
@@ -183,7 +184,8 @@ def archive_session_jsonl(
             timeout=300,
         )
         if result.returncode != 0:
-            log_fn(f"zstd failed for {session_id}: {result.stderr.decode()}")
+            err = safe(result.stderr.decode(errors="replace"))
+            log_fn(f"zstd failed for {safe(session_id)}: {err}")
             return
 
         result = subprocess.run(
@@ -192,7 +194,8 @@ def archive_session_jsonl(
             timeout=120,
         )
         if result.returncode != 0:
-            log_fn(f"S3 upload failed for {session_id}: {result.stderr.decode()}")
+            err = safe(result.stderr.decode(errors="replace"))
+            log_fn(f"S3 upload failed for {safe(session_id)}: {err}")
             subprocess.run(
                 ["zstd", "-d", "-q", "--rm", str(zst_path)],
                 capture_output=True,
@@ -205,12 +208,15 @@ def archive_session_jsonl(
         try:
             mark_archived_fn(session_id, s3_key)
         except Exception as e:
-            log_fn(f"Archive DB update failed for {session_id} (file already in S3): {e}")
+            log_fn(
+                f"Archive DB update failed for {safe(session_id)} "
+                f"(file already in S3): {safe(e)}"
+            )
 
-        log_fn(f"Archived {session_id} -> {s3_key}")
+        log_fn(f"Archived {safe(session_id)} -> {safe(s3_key)}")
 
     except subprocess.TimeoutExpired:
-        log_fn(f"Archive timeout for {session_id}")
+        log_fn(f"Archive timeout for {safe(session_id)}")
         if zst_path.exists() and not jsonl_path.exists():
             try:
                 subprocess.run(
@@ -219,9 +225,9 @@ def archive_session_jsonl(
                     timeout=300,
                 )
             except (subprocess.TimeoutExpired, OSError) as restore_err:
-                log_fn(f"Archive cleanup failed for {session_id}: {restore_err}")
+                log_fn(f"Archive cleanup failed for {safe(session_id)}: {safe(restore_err)}")
     except Exception as e:
-        log_fn(f"Archive error for {session_id}: {e}")
+        log_fn(f"Archive error for {safe(session_id)}: {safe(e)}")
 
 
 # ---------------------------------------------------------------------------
@@ -239,13 +245,16 @@ def calibrate_session_confidence(session_id: str, log_fn: Callable[[str], None])
         result = asyncio.run(calibrate_session(session_id))
         stats = result["stats"]
         if stats["total"] > 0:
+            # stats values come from calibrate_session which ultimately reads
+            # DB-stored learning content; wrap for defense in depth even
+            # though happy-path values are ints.
             log_fn(
-                f"Confidence calibration for {session_id}: "
-                f"{stats['updated']} updated, "
-                f"{stats['unchanged']} unchanged"
+                f"Confidence calibration for {safe(session_id)}: "
+                f"{safe(stats['updated'])} updated, "
+                f"{safe(stats['unchanged'])} unchanged"
             )
     except Exception as e:
-        log_fn(f"Confidence calibration failed for {session_id}: {e}")
+        log_fn(f"Confidence calibration failed for {safe(session_id)}: {safe(e)}")
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +277,7 @@ def extract_and_store_workflows(
             format_pattern_as_learning,
         )
     except ImportError as e:
-        log_fn(f"Workflow extraction unavailable: {e}")
+        log_fn(f"Workflow extraction unavailable: {safe(e)}")
         return
 
     try:
@@ -277,7 +286,7 @@ def extract_and_store_workflows(
         successful = [p for p in patterns if p.get("success") is True]
 
         if not successful:
-            log_fn(f"No successful workflow patterns for {session_id}")
+            log_fn(f"No successful workflow patterns for {safe(session_id)}")
             return
 
         from scripts.core.store_learning import store_learning_v2
@@ -303,11 +312,11 @@ def extract_and_store_workflows(
                 if result.get("success") and not result.get("skipped"):
                     stored += 1
             except Exception as e:
-                log_fn(f"Failed to store workflow learning: {e}")
+                log_fn(f"Failed to store workflow learning: {safe(e)}")
 
-        log_fn(f"Stored {stored} workflow patterns for {session_id}")
+        log_fn(f"Stored {stored} workflow patterns for {safe(session_id)}")
     except Exception as e:
-        log_fn(f"Workflow extraction failed for {session_id}: {e}")
+        log_fn(f"Workflow extraction failed for {safe(session_id)}: {safe(e)}")
 
 
 # ---------------------------------------------------------------------------
@@ -328,11 +337,11 @@ def generate_mini_handoff(
             write_handoff,
         )
     except ImportError as e:
-        log_fn(f"Mini-handoff generation unavailable: {e}")
+        log_fn(f"Mini-handoff generation unavailable: {safe(e)}")
         return
 
     if not project:
-        log_fn(f"Mini-handoff skipped for {session_id}: no project dir")
+        log_fn(f"Mini-handoff skipped for {safe(session_id)}: no project dir")
         return
 
     state_file = Path(project) / ".claude" / "cache" / "session-state" / f"{session_id}.jsonl"
@@ -347,16 +356,19 @@ def generate_mini_handoff(
         )
         output_path = write_handoff(handoff, Path(project), session_id)
         source = "state_file" if use_state_file else "jsonl"
-        log_fn(f"Mini-handoff written for {session_id} (source={source}): {output_path}")
+        log_fn(
+            f"Mini-handoff written for {safe(session_id)} "
+            f"(source={source}): {safe(output_path)}"
+        )
 
         if use_state_file:
             try:
                 state_file.unlink()
-                log_fn(f"State file cleaned up for {session_id}")
+                log_fn(f"State file cleaned up for {safe(session_id)}")
             except OSError as cleanup_err:
-                log_fn(f"State file cleanup failed for {session_id}: {cleanup_err}")
+                log_fn(f"State file cleanup failed for {safe(session_id)}: {safe(cleanup_err)}")
     except Exception as e:
-        log_fn(f"Mini-handoff generation failed for {session_id}: {e}")
+        log_fn(f"Mini-handoff generation failed for {safe(session_id)}: {safe(e)}")
 
 
 # ---------------------------------------------------------------------------

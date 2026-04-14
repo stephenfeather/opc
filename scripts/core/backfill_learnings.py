@@ -28,6 +28,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from scripts.core.log_safety import safe
+
 # ---------------------------------------------------------------------------
 # Pure functions
 # ---------------------------------------------------------------------------
@@ -269,11 +271,12 @@ def list_s3_keys(bucket: str) -> str | None:
         result = subprocess.run(
             ["aws", "s3", "ls", f"s3://{bucket}/sessions/", "--recursive"],
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=60,
         )
         if result.returncode != 0:
-            _log(f"S3 list failed: {result.stderr}")
+            _log(f"S3 list failed: {safe(result.stderr)}")
             return None
         return result.stdout
     except subprocess.TimeoutExpired:
@@ -295,7 +298,7 @@ def _is_valid_uuid(value: str) -> bool:
 def lookup_session_id(uuid: str, conn) -> str | None:
     """Look up s-* session ID from DB using JSONL UUID from transcript_path."""
     if not _is_valid_uuid(uuid):
-        _log(f"Invalid UUID format, skipping lookup: {uuid[:40]}")
+        _log(f"Invalid UUID format, skipping lookup: {safe(uuid[:40])}")
         return None
     try:
         cur = conn.cursor()
@@ -306,7 +309,7 @@ def lookup_session_id(uuid: str, conn) -> str | None:
         row = cur.fetchone()
         return row[0] if row else None
     except Exception as e:
-        _log(f"DB lookup failed for {uuid}: {e}")
+        _log(f"DB lookup failed for {safe(uuid)}: {safe(e)}")
         conn.rollback()
         return None
 
@@ -353,7 +356,7 @@ def claim_session(uuid: str, session_id: str, project: str, conn) -> bool:
         return claimed
     except Exception as e:
         conn.rollback()
-        _log(f"WARNING: failed to claim {uuid}: {e}")
+        _log(f"WARNING: failed to claim {safe(uuid)}: {safe(e)}")
         return False
 
 
@@ -382,7 +385,7 @@ def log_extraction_result(result: dict, conn) -> None:
         conn.commit()
     except Exception as e:
         conn.rollback()
-        _log(f"WARNING: failed to log result for {result.get('uuid')}: {e}")
+        _log(f"WARNING: failed to log result for {safe(result.get('uuid'))}: {safe(e)}")
 
 
 def download_and_decompress(
@@ -398,7 +401,8 @@ def download_and_decompress(
         timeout=120,
     )
     if dl.returncode != 0:
-        _log(f"Download failed for {uuid}: {dl.stderr.decode()[:200]}")
+        err = safe(dl.stderr.decode(errors="replace")[:200])
+        _log(f"Download failed for {safe(uuid)}: {err}")
         return None
 
     dc = subprocess.run(
@@ -407,7 +411,8 @@ def download_and_decompress(
         timeout=60,
     )
     if dc.returncode != 0:
-        _log(f"Decompress failed for {uuid}: {dc.stderr.decode()[:200]}")
+        err = safe(dc.stderr.decode(errors="replace")[:200])
+        _log(f"Decompress failed for {safe(uuid)}: {err}")
         return None
 
     return jsonl_path
@@ -536,7 +541,7 @@ def main() -> int:
             conn = psycopg2.connect(pg_url)
             _log("Connected to PostgreSQL")
         except Exception as e:
-            _log(f"WARNING: PostgreSQL unavailable: {e}")
+            _log(f"WARNING: PostgreSQL unavailable: {safe(e)}")
 
     if not conn and not args.dry_run:
         _log("ERROR: PostgreSQL required for non-dry runs (session ID resolution + backfill_log)")
@@ -602,7 +607,10 @@ def main() -> int:
         timeout = 300
 
     if model not in allowed_models:
-        _log(f"ERROR: invalid extraction model '{model}', must be one of {sorted(allowed_models)}")
+        _log(
+            f"ERROR: invalid extraction model '{safe(model)}', "
+            f"must be one of {sorted(allowed_models)}"
+        )
         return 1
 
     agent_prompt = load_agent_prompt()
@@ -635,7 +643,7 @@ def main() -> int:
             except Exception as e:
                 result = {
                     "status": "exception",
-                    "error": str(e),
+                    "error": safe(e),
                     "uuid": s.get("uuid", "?"),
                     "session_id": s.get("session_id", "?"),
                     "project": s.get("project", "?"),
@@ -654,12 +662,12 @@ def main() -> int:
             if status != "ok":
                 errors += 1
                 _log(
-                    f"[{i}/{len(claimed_batch)}] FAIL {s.get('session_id', '?')} "
-                    f"status={status} error={result.get('error', '')[:100]}"
+                    f"[{i}/{len(claimed_batch)}] FAIL {safe(s.get('session_id', '?'))} "
+                    f"status={safe(status)} error={safe(result.get('error', '')[:100])}"
                 )
             else:
                 _log(
-                    f"[{i}/{len(claimed_batch)}] OK {s.get('session_id', '?')} "
+                    f"[{i}/{len(claimed_batch)}] OK {safe(s.get('session_id', '?'))} "
                     f"learnings={learned} dupes={dupes}"
                 )
 

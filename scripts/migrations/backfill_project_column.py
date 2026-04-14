@@ -179,7 +179,11 @@ def get_connection() -> psycopg2.extensions.connection:
     if not db_url:
         raise ValueError(
             "Database URL not set. Set CONTINUOUS_CLAUDE_DB_URL (preferred), "
-            "DATABASE_URL, or OPC_POSTGRES_URL before running this migration."
+            "DATABASE_URL, or OPC_POSTGRES_URL. "
+            "For local Docker dev, run "
+            "`docker compose -f docker/docker-compose.yml up -d` "
+            "and export the credentials from docker/.env before "
+            "invoking this migration."
         )
     return psycopg2.connect(db_url)
 

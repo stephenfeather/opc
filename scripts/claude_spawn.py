@@ -205,8 +205,12 @@ class _ProcessMonitor:
             )
             if not db_url:
                 raise RuntimeError(
-                    "Database URL not set. Set CONTINUOUS_CLAUDE_DB_URL, "
-                    "DATABASE_URL, or OPC_POSTGRES_URL before spawning agents."
+                    "Database URL not set. Set CONTINUOUS_CLAUDE_DB_URL "
+                    "(preferred), DATABASE_URL, or OPC_POSTGRES_URL. "
+                    "For local Docker dev, run "
+                    "`docker compose -f docker/docker-compose.yml up -d` "
+                    "and export the credentials from docker/.env before "
+                    "invoking this script."
                 )
             conn = await asyncpg.connect(db_url)
             await conn.execute(

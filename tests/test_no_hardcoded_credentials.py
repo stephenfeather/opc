@@ -91,19 +91,23 @@ _CREDENTIAL_LITERAL = "claude:claude_dev"
 #     are allowed — the "{" character is excluded from both char
 #     classes, so a URL like ``f"postgresql://{user}:{password}@..."``
 #     does not match.
-# Named exemptions below cover legitimate test fixtures that pass the
-# regex as a safe literal (e.g., the log-sanitizer's own input data).
+# Named literal allow-list below covers legitimate test fixtures and
+# placeholders that happen to match the regex shape. Future additions
+# go in _ALLOWED_MATCHES — simpler than extending the regex (cycle-1
+# Gemini R3).
 _CREDENTIAL_REGEX = re.compile(
-    r"postgresql://"
-    r"(?!USER:PASSWORD@)"   # all-caps placeholder
-    r"(?!user:s3cretPass@)"  # test_extract_workflow_patterns.py:567
-    r"(?!u:p@)(?!u2:p2@)"    # test_postgres_pool.py:43 sanitizer fragments
-    r"(?!user:secret@)"      # test_postgres_pool.py:521 sanitizer fragment
-    r"[^:@/\s{]+"             # user — no "{" means not an f-string template
-    r":"
-    r"[^@/\s{]+"              # password — same exclusion
-    r"@"
+    r"postgresql://[^:@/\s{]+:[^@/\s{]+@"
 )
+
+# Literal substrings that are allowed to match the regex. Each is a
+# safe-by-review fixture, placeholder, or sanitizer test input.
+_ALLOWED_MATCHES = frozenset({
+    "postgresql://USER:PASSWORD@",       # .env.example placeholder
+    "postgresql://user:s3cretPass@",      # tests/test_extract_workflow_patterns.py
+    "postgresql://u:p@",                   # tests/test_postgres_pool.py sanitizer
+    "postgresql://u2:p2@",                 # tests/test_postgres_pool.py sanitizer
+    "postgresql://user:secret@",           # tests/test_postgres_pool.py sanitizer
+})
 
 
 def _scan_paths() -> list[Path]:
@@ -143,8 +147,12 @@ def test_no_hardcoded_credential_literal_in_code():
         except OSError:
             continue
         for lineno, line in enumerate(text.splitlines(), start=1):
-            if _CREDENTIAL_REGEX.search(line):
-                offenders.append((path.relative_to(_REPO_ROOT), lineno, line.strip()))
+            match = _CREDENTIAL_REGEX.search(line)
+            if match is None:
+                continue
+            if match.group(0) in _ALLOWED_MATCHES:
+                continue
+            offenders.append((path.relative_to(_REPO_ROOT), lineno, line.strip()))
 
     if offenders:
         lines = [f"  {p}:{n}: {text}" for p, n, text in offenders]
@@ -171,7 +179,9 @@ def test_env_example_uses_placeholder_not_real_credential():
     # Also assert no other credential family leaked in via copy-paste.
     for lineno, line in enumerate(text.splitlines(), start=1):
         match = _CREDENTIAL_REGEX.search(line)
-        assert not match, (
+        if match is None:
+            continue
+        assert match.group(0) in _ALLOWED_MATCHES, (
             f".env.example line {lineno} contains a real-looking "
             f"credential: {line.strip()!r}. Use USER:PASSWORD placeholder "
             "instead."

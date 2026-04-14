@@ -125,11 +125,36 @@ def test_non_ascii_unicode_replaced():
 
 
 def test_emoji_replaced():
-    # Emoji are typically > 0xffff (use surrogate pair when in BMP), but
-    # a BMP emoji like U+2600 ☀ is single code point > 0xff.
+    # Many emoji are > 0xffff (and use surrogate pairs in UTF-16 because
+    # they are outside the BMP), but a BMP symbol like U+2600 ☀ is a
+    # single code point > 0xff.
     out = safe("\u2600 sunny")
     assert "\u2600" not in out
     assert "\\u2600" in out
+
+
+def test_non_bmp_uses_8_digit_escape():
+    # Code points > 0xFFFF must use \U with 8 hex digits (cycle-1 Gemini
+    # + Copilot). Using \u with 5+ digits is non-standard and breaks
+    # downstream JSON/Python parsers that expect fixed-width \uNNNN.
+    out = safe("\U0001f600")  # grinning face U+1F600
+    assert "\U0001f600" not in out
+    assert "\\U0001f600" in out
+    # And \u1f600 (5-digit \u) MUST NOT appear.
+    assert "\\u1f600" not in out
+
+
+def test_bmp_boundary_uses_4_digit_u():
+    # U+FFFF is the last BMP codepoint — must render as \uffff not \U.
+    out = safe("\uffff")
+    assert "\\uffff" in out
+    assert "\\U" not in out
+
+
+def test_supplementary_plane_boundary():
+    # U+10000 is the first non-BMP codepoint — must render as \U00010000.
+    out = safe("\U00010000")
+    assert "\\U00010000" in out
 
 
 def test_unicode_surrogate_replaced():
@@ -198,6 +223,29 @@ def test_str_returning_nonstr_falls_back_to_sentinel():
     assert safe(_StrReturnsNonStr()) == "<unrepresentable>"
 
 
+class _KeyboardInterruptOnStr:
+    def __str__(self) -> str:
+        raise KeyboardInterrupt("ctrl-c during log render")
+
+
+class _SystemExitOnStr:
+    def __str__(self) -> str:
+        raise SystemExit(0)
+
+
+def test_keyboard_interrupt_propagates():
+    # CodeRabbit cycle-1 suggested catching BaseException in _coerce — ARCHITECT
+    # overruled: KeyboardInterrupt MUST propagate so Ctrl-C still works mid-log.
+    with pytest.raises(KeyboardInterrupt):
+        safe(_KeyboardInterruptOnStr())
+
+
+def test_system_exit_propagates():
+    # Same rationale as KeyboardInterrupt — sys.exit() must not be swallowed.
+    with pytest.raises(SystemExit):
+        safe(_SystemExitOnStr())
+
+
 # ---------------------------------------------------------------------------
 # Truncation
 # ---------------------------------------------------------------------------
@@ -227,6 +275,18 @@ def test_custom_max_len():
     out = safe("abcdefghij", max_len=4)
     assert out.startswith("abcd")
     assert out.endswith("...[truncated 6 characters]")
+
+
+def test_max_len_zero_truncates_everything():
+    out = safe("abc", max_len=0)
+    assert out == "...[truncated 3 characters]"
+
+
+def test_negative_max_len_raises_valueerror():
+    # Cycle-1 Copilot: surfaces misconfigured call sites at the boundary.
+    # Only reachable via developer error — max_len is not user-supplied.
+    with pytest.raises(ValueError, match="max_len must be >= 0"):
+        safe("anything", max_len=-1)
 
 
 def test_truncation_happens_before_escaping_length():

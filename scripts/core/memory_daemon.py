@@ -802,7 +802,11 @@ def _check_pattern_detection():
     if rc is not None:
         if rc == 0:
             stdout_stream = state.pattern_proc.stdout
-            stdout = stdout_stream.read().decode() if stdout_stream is not None else ""
+            stdout = (
+                stdout_stream.read().decode("utf-8", errors="replace")
+                if stdout_stream is not None
+                else ""
+            )
             try:
                 import json as _json
                 data = _json.loads(stdout)
@@ -832,7 +836,7 @@ def _check_pattern_detection():
             # hint was misleading under the DEVNULL fallback.)
             stderr_stream = state.pattern_proc.stderr
             if stderr_stream is not None:
-                stderr = stderr_stream.read().decode()[:200]
+                stderr = stderr_stream.read().decode("utf-8", errors="replace")[:200]
             else:
                 stashed_path = getattr(state.pattern_proc, "_debug_stderr_path", None)
                 if stashed_path:
@@ -953,7 +957,13 @@ def daemon_loop():
             if DEBUG:
                 import traceback
 
-                log(f"[DEBUG] traceback:\n{traceback.format_exc()}")
+                # Traceback may include exception messages that transit
+                # DB content (psycopg errors embed query parameters).
+                # Wrap to neutralize control chars — the resulting log
+                # line collapses the traceback to a single line with
+                # \x0a markers, which is noisier for humans but keeps
+                # the injection boundary closed (cycle-1 CodeRabbit).
+                log(f"[DEBUG] traceback: {safe(traceback.format_exc())}")
         time.sleep(_poll_interval())
 
 

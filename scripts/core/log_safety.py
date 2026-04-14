@@ -22,11 +22,15 @@ _UNREPRESENTABLE = "<unrepresentable>"
 
 
 def _coerce(value: object) -> str:
-    """Best-effort ``str()`` conversion that never raises.
+    """Best-effort ``str()`` conversion that never raises a non-system Exception.
 
     Hostile objects may raise from ``__str__`` or return a non-str. We
     do not fall back to ``repr()`` because ``repr()`` can also raise on
     hostile objects; a fixed sentinel is safer.
+
+    ``KeyboardInterrupt`` and ``SystemExit`` (``BaseException`` subclasses
+    outside the ``Exception`` hierarchy) are **not** suppressed — a user
+    hitting Ctrl-C during a log render should still abort the process.
     """
     if value is None:
         return _NONE_MARKER
@@ -34,7 +38,13 @@ def _coerce(value: object) -> str:
         return value
     try:
         result = str(value)
-    except Exception:
+    except Exception:  # noqa: BLE001
+        # Deliberately narrow to Exception, NOT BaseException. KeyboardInterrupt
+        # and SystemExit MUST propagate so Ctrl-C and sys.exit() still work
+        # when a log line is rendering. CodeRabbit cycle-1 suggested
+        # BaseException; ARCHITECT overruled — the "never raises" contract
+        # covers regular exceptions only. The docstring is updated to
+        # "Never raises a non-system Exception" to codify the invariant.
         return _UNREPRESENTABLE
     if not isinstance(result, str):
         return _UNREPRESENTABLE
@@ -62,8 +72,14 @@ def _escape_controls(s: str) -> str:
             out.append(ch)
         elif o <= 0xFF:
             out.append(f"\\x{o:02x}")
-        else:
+        elif o <= 0xFFFF:
             out.append(f"\\u{o:04x}")
+        else:
+            # Non-BMP (> U+FFFF) — emoji and supplementary-plane chars
+            # get the fixed-width \UNNNNNNNN form. Using \uNNNNNN here
+            # would break log parsers expecting 4-hex \u (cycle-1 Gemini
+            # + Copilot).
+            out.append(f"\\U{o:08x}")
     return "".join(out)
 
 
@@ -91,8 +107,12 @@ def safe(value: object, *, max_len: int = _DEFAULT_MAX_LEN) -> str:
       ``\\xNN`` markers. These look "innocent" but UTF-8 terminals
       interpret ``\\x9b`` as an ANSI escape, so allowing them through
       would reopen the injection vector.
-    - Non-ASCII characters ``\\u0100``+ (including emoji and Unicode
-      surrogates) → ``\\uNNNN`` markers.
+    - Non-ASCII BMP characters ``\\u0100``–``\\uffff`` (including most
+      Latin scripts, CJK, lone surrogates) → ``\\uNNNN`` (fixed 4 hex
+      digits).
+    - Non-BMP characters ``\\U00010000``+ (emoji, supplementary planes)
+      → ``\\UNNNNNNNN`` (fixed 8 hex digits). Using 4-digit ``\\u`` for
+      these would produce invalid 5+-digit output.
     - ``\\t`` (``0x09``) preserved — tabs are common in real data and
       harmless for log tailing.
     - Inputs longer than ``max_len`` raw characters are truncated to
@@ -131,6 +151,13 @@ def safe(value: object, *, max_len: int = _DEFAULT_MAX_LEN) -> str:
         stderr_text = result.stderr.decode(errors="replace")
         log(f"zstd failed: {safe(stderr_text)}")
     """
+    if max_len < 0:
+        # Raise on a developer error at call time — better to surface a
+        # misconfigured call site than to silently truncate in ways the
+        # caller didn't expect (cycle-1 Copilot; ARCHITECT: raise not clamp).
+        # A negative max_len is never meaningful and can only come from a
+        # coding mistake, not untrusted input.
+        raise ValueError(f"max_len must be >= 0 (got {max_len})")
     coerced = _coerce(value)
     raw_len = len(coerced)
     if raw_len > max_len:

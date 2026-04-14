@@ -81,9 +81,12 @@ class TestGetPgUrl:
         with patch.dict("os.environ", env, clear=True):
             assert get_pg_url() == "postgresql://b"
 
-    def test_falls_back_to_default(self):
+    def test_raises_when_env_unset(self):
+        # Issue #62: no hardcoded fallback. Scripts must fail fast with an
+        # actionable error listing CONTINUOUS_CLAUDE_DB_URL / DATABASE_URL.
         with patch.dict("os.environ", {}, clear=True):
-            assert get_pg_url() == "postgresql://claude:claude_dev@localhost:5432/continuous_claude"
+            with pytest.raises(ValueError, match="CONTINUOUS_CLAUDE_DB_URL"):
+                get_pg_url()
 
 
 # --- naive_decode_path ---

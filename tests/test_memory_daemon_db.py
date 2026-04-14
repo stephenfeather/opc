@@ -144,10 +144,10 @@ class TestGetSqlitePath:
 
 
 class TestPgEnsureColumn:
-    """pg_ensure_column adds extraction columns to sessions table."""
+    """pg_ensure_column adds extraction columns to sessions and push-tracking columns to archival_memory."""  # noqa: E501
 
     @patch("scripts.core.memory_daemon_db.pg_connect")
-    def test_adds_six_columns(self, mock_pg_connect):
+    def test_adds_all_extraction_and_push_columns(self, mock_pg_connect):
         mock_conn = MagicMock()
         mock_cur = MagicMock()
         mock_conn.cursor.return_value = mock_cur
@@ -157,7 +157,9 @@ class TestPgEnsureColumn:
 
         pg_ensure_column()
 
-        assert mock_cur.execute.call_count == 7
+        # 7 ALTER TABLE on sessions (extraction columns) +
+        # 2 ALTER TABLE on archival_memory (push tracking columns) = 9
+        assert mock_cur.execute.call_count == 9
         mock_conn.commit.assert_called_once()
         mock_conn.close.assert_called_once()
 
@@ -173,7 +175,8 @@ class TestPgEnsureColumn:
         pg_ensure_column()
 
         sql_calls = [c.args[0] for c in mock_cur.execute.call_args_list]
-        combined = " ".join(sql_calls)
+        sessions_sql = " ".join(s for s in sql_calls if "ALTER TABLE sessions" in s)
+        archival_sql = " ".join(s for s in sql_calls if "ALTER TABLE archival_memory" in s)
         for col in [
             "memory_extracted_at",
             "extraction_status",
@@ -183,7 +186,9 @@ class TestPgEnsureColumn:
             "archive_path",
             "last_error",
         ]:
-            assert col in combined
+            assert col in sessions_sql, f"{col} must be ALTERed on sessions"
+        for col in ["push_count", "last_pushed_at"]:
+            assert col in archival_sql, f"{col} must be ALTERed on archival_memory"
 
 
 class TestSqliteEnsureTable:

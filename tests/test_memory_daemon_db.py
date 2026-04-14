@@ -144,7 +144,7 @@ class TestGetSqlitePath:
 
 
 class TestPgEnsureColumn:
-    """pg_ensure_column adds extraction columns to sessions table."""
+    """pg_ensure_column adds extraction columns to sessions and push-tracking columns to archival_memory."""  # noqa: E501
 
     @patch("scripts.core.memory_daemon_db.pg_connect")
     def test_adds_all_extraction_and_push_columns(self, mock_pg_connect):
@@ -175,8 +175,8 @@ class TestPgEnsureColumn:
         pg_ensure_column()
 
         sql_calls = [c.args[0] for c in mock_cur.execute.call_args_list]
-        sessions_sql = " ".join(s for s in sql_calls if "sessions" in s)
-        archival_sql = " ".join(s for s in sql_calls if "archival_memory" in s)
+        sessions_sql = " ".join(s for s in sql_calls if "ALTER TABLE sessions" in s)
+        archival_sql = " ".join(s for s in sql_calls if "ALTER TABLE archival_memory" in s)
         for col in [
             "memory_extracted_at",
             "extraction_status",

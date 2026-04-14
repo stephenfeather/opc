@@ -58,8 +58,7 @@ dev = [
 ]
 agentica = [
     # Agentica SDK for building AI agents
-    # Requires Python 3.13+ - install with: uv sync --extra agentica
-    "symbolica-agentica>=0.1.0; python_version >= '3.13'",
+    # symbolica-agentica is a required dep (see main dependencies); extra pulls in its companion tooling
     "fastapi",
     "uvicorn[standard]",
     "rich>=13.0.0",

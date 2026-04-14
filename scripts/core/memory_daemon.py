@@ -182,6 +182,9 @@ from scripts.core.memory_daemon_core import (  # noqa: E402
     strip_yaml_frontmatter,
 )
 
+# Log-field sanitizer for DB-sourced / subprocess-sourced strings (#104).
+from scripts.core.log_safety import safe  # noqa: E402
+
 # Re-exports from memory_daemon_db (D12: shims per step)
 from scripts.core.memory_daemon_db import (  # noqa: E402
     get_postgres_url,
@@ -581,8 +584,8 @@ def reap_completed_extractions():
             learnings_info = f", learnings={learnings_count}" if learnings_count is not None else ""
             rejections_count = _count_session_rejections(session_id) if exit_code == 0 else None
             rejections_info = f", rejections={rejections_count}" if rejections_count is not None else ""
-            log(f"Extraction completed for {session_id} "
-                f"(pid={pid}, project={project}, "
+            log(f"Extraction completed for {safe(session_id)} "
+                f"(pid={pid}, project={safe(project)}, "
                 f"exit={exit_code}, elapsed={elapsed}s{learnings_info}{rejections_info})")
             # Safe to read(): proc.poll() already returned, so child has exited
             # and the write end of the pipe is closed. No deadlock risk.
@@ -593,7 +596,7 @@ def reap_completed_extractions():
                         raw = proc.stderr.read(65536)  # bounded read, ~64KB max
                         stderr_text = raw.decode("utf-8", errors="replace").strip()[-500:]
                         if stderr_text:
-                            log(f"  stderr: {stderr_text}")
+                            log(f"  stderr: {safe(stderr_text)}")
                 finally:
                     proc.stderr.close()
 
@@ -626,13 +629,13 @@ def watchdog_stuck_extractions():
         if elapsed > _extraction_timeout():
             elapsed_min = int(elapsed / 60)
             log(f"Watchdog: killing stuck extraction "
-                f"{session_id} (pid={pid}, "
+                f"{safe(session_id)} (pid={pid}, "
                 f"running {elapsed_min}m)")
             try:
                 proc.kill()
                 proc.wait(timeout=5)
             except Exception as e:
-                log(f"Watchdog: failed to kill pid {pid}: {e}")
+                log(f"Watchdog: failed to kill pid {pid}: {safe(e)}")
             killed.append(pid)
             mark_extraction_failed(session_id)
 
@@ -654,7 +657,7 @@ def process_pending_queue():
         # Skip sessions already being extracted (avoids duplicates)
         if any(ex[0] == session_id for ex in ae.values()):
             continue
-        log(f"Dequeuing {session_id} (project={project or 'unknown'}, "
+        log(f"Dequeuing {safe(session_id)} (project={safe(project or 'unknown')}, "
             f"queue remaining: {len(pq)})")
         if extract_memories(session_id, project, transcript_path):
             mark_extracting(session_id)
@@ -679,7 +682,7 @@ def queue_or_extract(
 
     if len(ae) >= _max_concurrent():
         pq.append((session_id, project, transcript_path))
-        log(f"Queued {session_id} (active={len(ae)}, "
+        log(f"Queued {safe(session_id)} (active={len(ae)}, "
             f"queue={len(pq)})")
     else:
         if extract_memories(session_id, project, transcript_path):
@@ -740,7 +743,7 @@ def _run_pattern_detection_batch():
                 # If we cannot open the log file (symlink refused, fd
                 # exhaustion, permission denied), fall back to DEVNULL —
                 # discarding verbose output is safer than deadlocking.
-                log(f"Pattern detection verbose log open failed: {e}")
+                log(f"Pattern detection verbose log open failed: {safe(e)}")
                 pb_stderr = subprocess.DEVNULL
         # Round 3 Codex Finding 2: if Popen raises after debug_stderr_handle
         # is opened, the handle must be closed before the exception
@@ -784,7 +787,7 @@ def _run_pattern_detection_batch():
         if DEBUG:
             debug(f"pattern_batch spawned pid={state.pattern_proc.pid}")
     except Exception as e:
-        log(f"Pattern detection launch error: {e}")
+        log(f"Pattern detection launch error: {safe(e)}")
 
 
 def _check_pattern_detection():
@@ -812,7 +815,7 @@ def _check_pattern_detection():
                 log(f"Pattern detection completed: {total} patterns "
                     f"from {analyzed} learnings ({type_summary})")
             except (_json.JSONDecodeError, KeyError):
-                log(f"Pattern detection completed: {stdout[:200]}")
+                log(f"Pattern detection completed: {safe(stdout[:200])}")
         else:
             # stderr can be None in two cases:
             #   1. DEBUG mode successfully opened a verbose log file and
@@ -833,7 +836,7 @@ def _check_pattern_detection():
                     stderr = f"(see {stashed_path})"
                 else:
                     stderr = "(stderr not captured — output was discarded)"
-            log(f"Pattern detection failed (rc={rc}): {stderr}")
+            log(f"Pattern detection failed (rc={rc}): {safe(stderr)}")
         # Close the DEBUG-mode stderr log handle if we stashed one at spawn.
         debug_stderr = getattr(state.pattern_proc, "_debug_stderr_handle", None)
         if debug_stderr is not None:
@@ -881,18 +884,18 @@ def daemon_tick() -> None:
 
         # Log still-alive sessions — noisy per-iteration, gated to debug.
         for s in still_alive:
-            debug(f"Skipping {s.id}: process {s.pid} still alive")
+            debug(f"Skipping {safe(s.id)}: process {s.pid} still alive")
 
         # Mark newly-dead sessions (grace period starts)
         for sid in newly_dead_ids:
             mark_session_exited(sid)
-            log(f"Skipping {sid}: marked exited, "
+            log(f"Skipping {safe(sid)}: marked exited, "
                 f"grace period {_harvest_grace_period()}s")
 
         # Extract truly stale sessions
         if truly_stale:
             summary = ", ".join(
-                f"{s.id}({s.project or '?'})" for s in truly_stale
+                f"{safe(s.id)}({safe(s.project or '?')})" for s in truly_stale
             )
             log(f"Found {len(truly_stale)} stale sessions: "
                 f"{summary}")
@@ -943,7 +946,7 @@ def daemon_loop():
         try:
             daemon_tick()
         except Exception as e:
-            log(f"Error in daemon loop: {e}")
+            log(f"Error in daemon loop: {safe(e)}")
             if DEBUG:
                 import traceback
 

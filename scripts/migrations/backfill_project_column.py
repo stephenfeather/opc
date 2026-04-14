@@ -170,10 +170,17 @@ def infer_from_tags(tags: list[str]) -> str | None:
 
 
 def get_connection() -> psycopg2.extensions.connection:
-    """Get database connection."""
-    db_url = os.environ.get(
-        "DATABASE_URL", "postgresql://claude:claude_dev@localhost:5432/continuous_claude"
+    """Get database connection using env-driven URL (#62)."""
+    db_url = (
+        os.environ.get("CONTINUOUS_CLAUDE_DB_URL")
+        or os.environ.get("DATABASE_URL")
+        or os.environ.get("OPC_POSTGRES_URL")
     )
+    if not db_url:
+        raise ValueError(
+            "Database URL not set. Set CONTINUOUS_CLAUDE_DB_URL (preferred), "
+            "DATABASE_URL, or OPC_POSTGRES_URL before running this migration."
+        )
     return psycopg2.connect(db_url)
 
 

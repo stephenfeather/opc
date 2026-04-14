@@ -26,15 +26,26 @@ export { SAFE_ID_PATTERN, isValidId } from './pattern-router.js';
  * 1. CONTINUOUS_CLAUDE_DB_URL (canonical)
  * 2. DATABASE_URL (backwards compat)
  * 3. OPC_POSTGRES_URL (legacy)
- * 4. Default local development connection
+ *
+ * Issue #62: no hardcoded development fallback. Throws if none set.
  *
  * @returns PostgreSQL connection string
+ * @throws Error when no DB env var is set
  */
 export function getPgConnectionString(): string {
-  return process.env.CONTINUOUS_CLAUDE_DB_URL ||
+  const url =
+    process.env.CONTINUOUS_CLAUDE_DB_URL ||
     process.env.DATABASE_URL ||
-    process.env.OPC_POSTGRES_URL ||
-    'postgresql://claude:claude_dev@localhost:5432/continuous_claude';
+    process.env.OPC_POSTGRES_URL;
+  if (!url) {
+    throw new Error(
+      "Database URL not set. Set CONTINUOUS_CLAUDE_DB_URL (preferred), " +
+        "DATABASE_URL, or OPC_POSTGRES_URL. For local Docker dev, run " +
+        "`docker compose -f docker/docker-compose.yml up -d` and export the " +
+        "credentials from docker/.env before invoking this hook."
+    );
+  }
+  return url;
 }
 
 /**
@@ -178,7 +189,9 @@ import os
 
 pipeline_id = sys.argv[1]
 current_stage = int(sys.argv[2])
-pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL', 'postgresql://claude:claude_dev@localhost:5432/continuous_claude')
+pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL') or os.environ.get('OPC_POSTGRES_URL')
+if not pg_url:
+    sys.exit('ERROR: Database URL not set. Set CONTINUOUS_CLAUDE_DB_URL, DATABASE_URL, or OPC_POSTGRES_URL.')
 
 async def main():
     conn = await asyncpg.connect(pg_url)
@@ -413,7 +426,9 @@ working_on = sys.argv[3] if len(sys.argv) > 3 else ''
 claude_session_id = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] != 'null' else None
 transcript_path = sys.argv[5] if len(sys.argv) > 5 and sys.argv[5] != 'null' else None
 pid = int(sys.argv[6]) if len(sys.argv) > 6 and sys.argv[6] != 'null' else None
-pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL', 'postgresql://claude:claude_dev@localhost:5432/continuous_claude')
+pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL') or os.environ.get('OPC_POSTGRES_URL')
+if not pg_url:
+    sys.exit('ERROR: Database URL not set. Set CONTINUOUS_CLAUDE_DB_URL, DATABASE_URL, or OPC_POSTGRES_URL.')
 
 async def main():
     conn = await asyncpg.connect(pg_url)
@@ -494,7 +509,9 @@ import json
 from datetime import datetime, timedelta
 
 project_filter = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] != 'null' else None
-pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL', 'postgresql://claude:claude_dev@localhost:5432/continuous_claude')
+pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL') or os.environ.get('OPC_POSTGRES_URL')
+if not pg_url:
+    sys.exit('ERROR: Database URL not set. Set CONTINUOUS_CLAUDE_DB_URL, DATABASE_URL, or OPC_POSTGRES_URL.')
 
 async def main():
     conn = await asyncpg.connect(pg_url)
@@ -568,7 +585,9 @@ import asyncpg
 import os
 
 claude_session_id = sys.argv[1]
-pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL', 'postgresql://claude:claude_dev@localhost:5432/continuous_claude')
+pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL') or os.environ.get('OPC_POSTGRES_URL')
+if not pg_url:
+    sys.exit('ERROR: Database URL not set. Set CONTINUOUS_CLAUDE_DB_URL, DATABASE_URL, or OPC_POSTGRES_URL.')
 
 async def main():
     conn = await asyncpg.connect(pg_url)
@@ -615,7 +634,9 @@ import os
 import json
 
 project = sys.argv[1]
-pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL', 'postgresql://claude:claude_dev@localhost:5432/continuous_claude')
+pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL') or os.environ.get('OPC_POSTGRES_URL')
+if not pg_url:
+    sys.exit('ERROR: Database URL not set. Set CONTINUOUS_CLAUDE_DB_URL, DATABASE_URL, or OPC_POSTGRES_URL.')
 
 async def main():
     conn = await asyncpg.connect(pg_url)
@@ -679,7 +700,9 @@ import os
 import json
 
 session_ids = json.loads(sys.argv[1])
-pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL', 'postgresql://claude:claude_dev@localhost:5432/continuous_claude')
+pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL') or os.environ.get('OPC_POSTGRES_URL')
+if not pg_url:
+    sys.exit('ERROR: Database URL not set. Set CONTINUOUS_CLAUDE_DB_URL, DATABASE_URL, or OPC_POSTGRES_URL.')
 
 async def main():
     conn = await asyncpg.connect(pg_url)
@@ -724,7 +747,9 @@ import json
 file_path = sys.argv[1]
 project = sys.argv[2]
 my_session_id = sys.argv[3]
-pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL', 'postgresql://claude:claude_dev@localhost:5432/continuous_claude')
+pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL') or os.environ.get('OPC_POSTGRES_URL')
+if not pg_url:
+    sys.exit('ERROR: Database URL not set. Set CONTINUOUS_CLAUDE_DB_URL, DATABASE_URL, or OPC_POSTGRES_URL.')
 
 async def main():
     conn = await asyncpg.connect(pg_url)
@@ -791,7 +816,9 @@ import os
 file_path = sys.argv[1]
 project = sys.argv[2]
 session_id = sys.argv[3]
-pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL', 'postgresql://claude:claude_dev@localhost:5432/continuous_claude')
+pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL') or os.environ.get('OPC_POSTGRES_URL')
+if not pg_url:
+    sys.exit('ERROR: Database URL not set. Set CONTINUOUS_CLAUDE_DB_URL, DATABASE_URL, or OPC_POSTGRES_URL.')
 
 async def main():
     conn = await asyncpg.connect(pg_url)
@@ -841,7 +868,9 @@ session_id = sys.argv[1]
 topic = sys.argv[2]
 finding = sys.argv[3]
 relevant_to = json.loads(sys.argv[4]) if len(sys.argv) > 4 else []
-pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL', 'postgresql://claude:claude_dev@localhost:5432/continuous_claude')
+pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL') or os.environ.get('OPC_POSTGRES_URL')
+if not pg_url:
+    sys.exit('ERROR: Database URL not set. Set CONTINUOUS_CLAUDE_DB_URL, DATABASE_URL, or OPC_POSTGRES_URL.')
 
 async def main():
     conn = await asyncpg.connect(pg_url)
@@ -898,7 +927,9 @@ import json
 query = sys.argv[1]
 exclude_session = sys.argv[2]
 limit = int(sys.argv[3])
-pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL', 'postgresql://claude:claude_dev@localhost:5432/continuous_claude')
+pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL') or os.environ.get('OPC_POSTGRES_URL')
+if not pg_url:
+    sys.exit('ERROR: Database URL not set. Set CONTINUOUS_CLAUDE_DB_URL, DATABASE_URL, or OPC_POSTGRES_URL.')
 
 async def main():
     conn = await asyncpg.connect(pg_url)
@@ -965,7 +996,9 @@ import os
 
 session_id = sys.argv[1]
 project = sys.argv[2]
-pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL', 'postgresql://claude:claude_dev@localhost:5432/continuous_claude')
+pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL') or os.environ.get('OPC_POSTGRES_URL')
+if not pg_url:
+    sys.exit('ERROR: Database URL not set. Set CONTINUOUS_CLAUDE_DB_URL, DATABASE_URL, or OPC_POSTGRES_URL.')
 
 async def main():
     conn = await asyncpg.connect(pg_url)
@@ -1057,7 +1090,9 @@ import os
 
 session_id = sys.argv[1]
 project = sys.argv[2]
-pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL', 'postgresql://claude:claude_dev@localhost:5432/continuous_claude')
+pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL') or os.environ.get('OPC_POSTGRES_URL')
+if not pg_url:
+    sys.exit('ERROR: Database URL not set. Set CONTINUOUS_CLAUDE_DB_URL, DATABASE_URL, or OPC_POSTGRES_URL.')
 
 async def main():
     conn = await asyncpg.connect(pg_url)

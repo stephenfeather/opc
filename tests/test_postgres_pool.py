@@ -201,7 +201,7 @@ class TestResolveConnectionUrl:
             )
 
     def test_test_env_raises_without_url(self):
-        with pytest.raises(ValueError, match="Database URL must be set"):
+        with pytest.raises(ValueError, match="Database URL not set"):
             resolve_connection_url(
                 continuous_claude_db_url=None,
                 database_url=None,
@@ -210,7 +210,7 @@ class TestResolveConnectionUrl:
             )
 
     def test_production_raises_without_url(self):
-        with pytest.raises(ValueError, match="Database URL must be set"):
+        with pytest.raises(ValueError, match="Database URL not set"):
             resolve_connection_url(
                 continuous_claude_db_url=None,
                 database_url=None,
@@ -219,7 +219,7 @@ class TestResolveConnectionUrl:
             )
 
     def test_staging_raises_without_url(self):
-        with pytest.raises(ValueError, match="Database URL must be set"):
+        with pytest.raises(ValueError, match="Database URL not set"):
             resolve_connection_url(
                 continuous_claude_db_url=None,
                 database_url=None,
@@ -228,7 +228,7 @@ class TestResolveConnectionUrl:
             )
 
     def test_unknown_env_raises_without_url(self):
-        with pytest.raises(ValueError, match="Database URL must be set"):
+        with pytest.raises(ValueError, match="Database URL not set"):
             resolve_connection_url(
                 continuous_claude_db_url=None,
                 database_url=None,

@@ -175,7 +175,8 @@ class TestPgEnsureColumn:
         pg_ensure_column()
 
         sql_calls = [c.args[0] for c in mock_cur.execute.call_args_list]
-        combined = " ".join(sql_calls)
+        sessions_sql = " ".join(s for s in sql_calls if "sessions" in s)
+        archival_sql = " ".join(s for s in sql_calls if "archival_memory" in s)
         for col in [
             "memory_extracted_at",
             "extraction_status",
@@ -184,10 +185,10 @@ class TestPgEnsureColumn:
             "archived_at",
             "archive_path",
             "last_error",
-            "push_count",
-            "last_pushed_at",
         ]:
-            assert col in combined
+            assert col in sessions_sql, f"{col} must be ALTERed on sessions"
+        for col in ["push_count", "last_pushed_at"]:
+            assert col in archival_sql, f"{col} must be ALTERed on archival_memory"
 
 
 class TestSqliteEnsureTable:

@@ -1049,9 +1049,14 @@ asyncio.run(main())
  * @param args - Arguments passed to Python (sys.argv[1], sys.argv[2], ...)
  */
 export function runPgQueryDetached(pythonCode: string, args: string[] = []): void {
+  // Resolve DB URL up-front, BEFORE the try/catch, for the same reason as
+  // runPgQuery: the catch is a fire-and-forget swallower, and an unset
+  // DB env var is a configuration error that must surface loudly rather
+  // than silently stop the heartbeat / detached refresh path (Aegis
+  // round cycle on #62 — companion fix to runPgQuery's earlier hoist).
+  const resolvedDbUrl = getPgConnectionString();
+  const opcDir = requireOpcDir();
   try {
-    const opcDir = requireOpcDir();
-
     const wrappedCode = `
 import sys
 import os
@@ -1071,13 +1076,15 @@ ${pythonCode}
       cwd: opcDir,
       env: {
         ...process.env,
-        CONTINUOUS_CLAUDE_DB_URL: getPgConnectionString(),
+        CONTINUOUS_CLAUDE_DB_URL: resolvedDbUrl,
       },
     });
 
     child.unref();
   } catch {
-    // Fire-and-forget: swallow all errors so the hook never blocks
+    // Fire-and-forget: swallow spawn-path errors so the hook never blocks.
+    // Configuration errors (missing DB URL) have already been raised above
+    // before reaching this try, so they remain loud.
   }
 }
 

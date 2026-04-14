@@ -73,8 +73,9 @@ function getPgConnectionString() {
   return url;
 }
 function runPgQueryDetached(pythonCode, args = []) {
+  const resolvedDbUrl = getPgConnectionString();
+  const opcDir = requireOpcDir();
   try {
-    const opcDir = requireOpcDir();
     const wrappedCode = `
 import sys
 import os
@@ -93,7 +94,7 @@ ${pythonCode}
       cwd: opcDir,
       env: {
         ...process.env,
-        CONTINUOUS_CLAUDE_DB_URL: getPgConnectionString()
+        CONTINUOUS_CLAUDE_DB_URL: resolvedDbUrl
       }
     });
     child.unref();

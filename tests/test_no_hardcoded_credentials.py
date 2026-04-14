@@ -125,15 +125,25 @@ def _scan_paths() -> list[Path]:
             continue
         if any(part in _EXEMPT_DIRS for part in rel.parts):
             continue
-        # Also skip .env.example variants — caught by extension in a moment.
-        if path.suffix and path.suffix not in _SCAN_EXTENSIONS:
-            continue
-        # Unknown extension: only scan .env.example, NOT .env. A developer's
-        # real .env is gitignored and legitimately contains their own
-        # credentials; scanning it would make the invariant test fail in
-        # any local dev environment (cycle-1 Gemini R2).
-        if not path.suffix and path.name != ".env.example":
-            continue
+        # Files named `.env.*` need custom handling — Path.suffix splits
+        # on the last dot, so `.env.local` has suffix=".local" (not in the
+        # scan list by default), which would silently skip a future
+        # `.env.production.example` committed with a real credential
+        # (Aegis cycle on #62). Rule: any file whose name starts with
+        # `.env` is scanned ONLY if it is exactly `.env.example`.
+        # Other `.env*` files (`.env`, `.env.local`, `.env.dev`, etc.)
+        # are either dev-local secrets (gitignored) or covered by this
+        # same rule when their sibling `.env.example` exists.
+        if path.name.startswith(".env"):
+            if path.name != ".env.example":
+                continue
+        else:
+            if path.suffix and path.suffix not in _SCAN_EXTENSIONS:
+                continue
+            # Extensionless files (shell scripts, config) are skipped
+            # unless they match a known filename — none for this project.
+            if not path.suffix:
+                continue
         paths.append(path)
     return paths
 

@@ -33,7 +33,31 @@ class RecallContext:
     type_probabilities: dict[str, float] | None = None
     tags_hint: list[str] | None = None
     retrieval_mode: str | None = None  # "vector", "hybrid_rrf", "text", "sqlite"
+    # list[dict] of entities extracted from the query via kg_extractor.
+    # Each dict carries at least {"name": str, "type": str}. Used by
+    # kg_overlap signal.  None or empty -> signal returns 0.
+    query_entities: list[dict] | None = None
     now: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+# Type-salience weights for kg_overlap. Higher weights -> more specific types
+# contribute more evidence to the overlap signal. See plan §3.2 for rationale.
+KG_TYPE_WEIGHTS: dict[str, float] = {
+    "file": 1.0,
+    "module": 1.0,
+    "error": 0.9,
+    "library": 0.8,
+    # kg_extractor emits entity_type='config' for env/config variables, so
+    # the lookup key must be 'config'. 'config_var' is kept as a harmless
+    # alias so older callers that hand-build entity dicts still hit the
+    # intended salience. Keep both in sync if the weight changes.
+    "config": 0.7,
+    "config_var": 0.7,
+    "tool": 0.6,
+    "concept": 0.5,
+    "language": 0.4,
+}
+_KG_DEFAULT_TYPE_WEIGHT: float = 0.5
 
 
 # Single source of truth for RerankerConfig lives in config/models.py.
@@ -228,6 +252,69 @@ def pattern_score(result: dict, ctx: RecallContext) -> float:
     return strength * min(1.0, ratio)
 
 
+def _kg_entity_key(entity: dict) -> tuple[str, str]:
+    """Canonical (name, type) key for kg_overlap matching.
+
+    Prefers 'canonical' field when present (kg_context entities from
+    _fetch_kg_rows carry both display 'name' and canonical 'canonical';
+    query-side entities from extract_entities put the canonical value
+    in 'name'). Falls back to lowercased name so older callers still
+    match. See plan §3.2 / adversarial-review F1 for rationale.
+    """
+    canonical = entity.get("canonical")
+    key_name = canonical if canonical is not None else entity.get("name", "")
+    return (str(key_name).lower(), str(entity.get("type", "")))
+
+
+def _kg_type_weight(entity_type: str) -> float:
+    return KG_TYPE_WEIGHTS.get(entity_type, _KG_DEFAULT_TYPE_WEIGHT)
+
+
+def _kg_overlap_score(
+    result_entities: list[dict], query_map: dict[tuple[str, str], dict]
+) -> float:
+    """Compute weighted-Jaccard given a pre-built query entity map."""
+    if not query_map or not result_entities:
+        return 0.0
+    result_map = {_kg_entity_key(e): e for e in result_entities}
+    intersection = set(query_map) & set(result_map)
+    union = set(query_map) | set(result_map)
+    if not union:
+        return 0.0
+    num = sum(_kg_type_weight(query_map[k].get("type", "")) for k in intersection)
+    # Use query type for union members on query side, result type on result side.
+    den = sum(
+        _kg_type_weight((query_map.get(k) or result_map.get(k)).get("type", ""))
+        for k in union
+    )
+    if den <= 0.0:
+        return 0.0
+    return max(0.0, min(1.0, num / den))
+
+
+def kg_overlap(result: dict, ctx: RecallContext) -> float:
+    """Weighted-Jaccard overlap between query entities and result KG entities.
+
+    Each entity is weighted by its type's salience (KG_TYPE_WEIGHTS). Returns
+    0.0 when either side lacks entities. Returns score in [0, 1].
+
+    This public signature rebuilds the query entity map per call, which is
+    the right default for one-off scoring but unnecessary work inside
+    rerank()'s per-result loop. rerank() computes the map once and uses
+    _kg_overlap_score(result_entities, query_map) directly.
+    """
+    if not ctx.query_entities:
+        return 0.0
+    kg_context = result.get("kg_context")
+    if not kg_context:
+        return 0.0
+    result_entities = kg_context.get("entities") or []
+    if not result_entities:
+        return 0.0
+    query_map = {_kg_entity_key(e): e for e in ctx.query_entities}
+    return _kg_overlap_score(result_entities, query_map)
+
+
 # ---------------------------------------------------------------------------
 # Embedding Centroid Helpers
 # ---------------------------------------------------------------------------
@@ -337,8 +424,18 @@ def rerank(
     if config is None:
         config = _default_config()
 
-    total_signal_weight = config.total_signal_weight
-    if total_signal_weight <= 0:
+    # KG signal activation: kg_weight contributes only when query entities
+    # are present AND at least one result carries kg_context. Otherwise
+    # kg_weight redirects to retrieval (deterministic redistribution).
+    # Preserves pre-Phase-3 ranking math on sqlite, empty-KG, and
+    # extraction-miss paths. See adversarial-review finding D1.
+    kg_active = bool(ctx.query_entities) and any(
+        isinstance(r.get("kg_context"), dict) and r["kg_context"].get("entities")
+        for r in results
+    )
+
+    effective_signal_weight = config.effective_signal_weight(kg_active=kg_active)
+    if effective_signal_weight <= 0:
         total = len(results)
         scored = [
             {
@@ -347,15 +444,23 @@ def rerank(
                     r.get("similarity", 0.0), ctx.retrieval_mode,
                     rank=i, total=total, config=config,
                 ),
-                "rerank_details": {},
+                "rerank_details": {"kg_active": kg_active},
             }
             for i, r in enumerate(results)
         ]
         scored.sort(key=lambda r: r["final_score"], reverse=True)
         return scored[:k]
 
-    retrieval_weight = 1.0 - total_signal_weight
+    retrieval_weight = 1.0 - effective_signal_weight
     total = len(results)
+    effective_kg_weight = config.kg_weight if kg_active else 0.0
+    # Build the query entity map once per rerank call rather than once
+    # per result. Avoids O(R * Q) key construction.
+    query_map = (
+        {_kg_entity_key(e): e for e in ctx.query_entities}
+        if kg_active and ctx.query_entities
+        else {}
+    )
 
     scored: list[dict] = []
     for rank, result in enumerate(results):
@@ -371,8 +476,15 @@ def rerank(
         sig_type = type_match(result, ctx)
         sig_tags = tag_overlap(result, ctx)
         sig_pattern = pattern_score(result, ctx)
+        if kg_active and query_map:
+            result_entities = (result.get("kg_context") or {}).get("entities") or []
+            sig_kg = _kg_overlap_score(result_entities, query_map)
+        else:
+            sig_kg = 0.0
 
-        # Weighted combination
+        # Weighted combination. When kg_active is false, effective_kg_weight
+        # is 0 and kg_weight's share has already been rolled into
+        # retrieval_weight above.
         final = (
             retrieval_weight * cal
             + config.project_weight * sig_project
@@ -382,6 +494,7 @@ def rerank(
             + config.type_affinity_weight * sig_type
             + config.tag_overlap_weight * sig_tags
             + config.pattern_weight * sig_pattern
+            + effective_kg_weight * sig_kg
         )
 
         # Augment result (shallow copy to avoid mutating input)
@@ -396,6 +509,8 @@ def rerank(
             "type_match": sig_type,
             "tag_overlap": sig_tags,
             "pattern": sig_pattern,
+            "kg_overlap": sig_kg,
+            "kg_active": kg_active,
         }
         scored.append(augmented)
 

@@ -162,18 +162,51 @@ def apply_pattern_enrichment(
     return enriched
 
 
+# Cap on the query string length we will pass to kg_extractor. Extraction
+# uses regex patterns whose worst-case time grows with input size, and the
+# reranker's kg_overlap signal gains nothing from matching against a
+# megabytes-long prompt. 4096 bytes comfortably covers every realistic
+# recall query while bounding regex CPU on hostile/accidental input.
+# See aegis audit finding LOW-1.
+_KG_QUERY_EXTRACTION_MAX_CHARS = 4096
+
+
 def make_recall_context(
     project: str | None,
     tags: list[str] | None,
     retrieval_mode: str,
+    query: str | None = None,
 ) -> Any:
-    """Construct a RecallContext for the reranker."""
+    """Construct a RecallContext for the reranker.
+
+    When ``query`` is provided and backend is postgres, populates
+    ``query_entities`` via ``kg_extractor.extract_entities`` for the
+    ``kg_overlap`` signal. Non-fatal: any extractor failure yields no
+    query entities.
+    """
     from scripts.core.reranker import RecallContext
+
+    query_entities: list[dict] | None = None
+    if query and get_backend() == "postgres":
+        # Cap the input fed to the extractor. This is defense-in-depth against
+        # regex CPU blow-up from oversized queries; no production path in this
+        # codebase sends queries larger than a few hundred chars.
+        extract_input = query[:_KG_QUERY_EXTRACTION_MAX_CHARS]
+        try:
+            from scripts.core.kg_extractor import extract_entities
+
+            extracted = extract_entities(extract_input)
+            query_entities = [
+                {"name": e.name, "type": e.entity_type} for e in extracted
+            ] or None
+        except Exception as e:
+            logger.debug("Query-side entity extraction failed: %s", e)
 
     return RecallContext(
         project=project,
         tags_hint=tags,
         retrieval_mode=retrieval_mode,
+        query_entities=query_entities,
     )
 
 
@@ -352,6 +385,159 @@ async def enrich_with_pattern_strength(
     return results
 
 
+# ---------------------------------------------------------------------------
+# Knowledge graph enrichment (Phase 3, read-side)
+# ---------------------------------------------------------------------------
+
+KG_MAX_EDGES_PER_MEMORY = 50
+"""Safety cap on edges returned per memory in kg_context. Typical usage is
+< 10; the cap prevents pathological payload bloat on high-connectivity
+learnings. When exceeded, the top-N by weight are kept and a warning logs."""
+
+
+async def _fetch_kg_rows(result_ids: list[str]) -> list[dict[str, Any]]:
+    """Fetch entities and edges for each memory_id in one round trip.
+
+    Caller must ensure Postgres backend. Returns rows shaped as:
+    {id: UUID, kg_entities: list[dict], kg_edges: list[dict]}.
+    """
+    from scripts.core.db.postgres_pool import get_pool
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # Edges are capped at the SQL layer via a correlated LATERAL
+        # subquery with ORDER BY + LIMIT so the database only materializes
+        # and transfers up to KG_MAX_EDGES_PER_MEMORY edges per memory.
+        # build_kg_lookup still caps on the Python side as defense-in-depth
+        # (catches SQL ordering drift or callers that bypass this query).
+        # Entity output carries both 'canonical' (matching key) and 'name'
+        # (display_name) so consumers can ID-match without losing casing.
+        rows = await conn.fetch(
+            """
+            SELECT m.memory_id AS id,
+                   ARRAY_AGG(DISTINCT jsonb_build_object(
+                     'id', e.id::text,
+                     'name', e.display_name,
+                     'canonical', e.name,
+                     'type', e.entity_type,
+                     'mention_count', e.mention_count
+                   )) AS kg_entities,
+                   COALESCE((
+                     SELECT ARRAY_AGG(jsonb_build_object(
+                       'source', se.display_name,
+                       'target', te.display_name,
+                       'relation', ed.relation,
+                       'weight', ed.weight
+                     ))
+                     FROM (
+                       SELECT ed.*
+                       FROM kg_edges ed
+                       WHERE ed.memory_id = m.memory_id
+                       ORDER BY ed.weight DESC
+                       LIMIT $2
+                     ) ed
+                     JOIN kg_entities se ON se.id = ed.source_id
+                     JOIN kg_entities te ON te.id = ed.target_id
+                   ), ARRAY[]::jsonb[]) AS kg_edges
+            FROM kg_entity_mentions m
+            JOIN kg_entities e ON e.id = m.entity_id
+            WHERE m.memory_id = ANY($1::uuid[])
+            GROUP BY m.memory_id
+            """,
+            [uuid.UUID(rid) for rid in result_ids],
+            KG_MAX_EDGES_PER_MEMORY,
+        )
+    return [dict(row) for row in rows]
+
+
+def build_kg_lookup(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Build a {memory_id: {entities, edges}} lookup from fetched rows.
+
+    Edges exceeding KG_MAX_EDGES_PER_MEMORY are capped to the top-N by
+    weight (descending) and a warning is logged with the overflow count.
+    """
+    lookup: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        mid = str(row["id"])
+        entities = list(row.get("kg_entities") or [])
+        edges = list(row.get("kg_edges") or [])
+        if len(edges) > KG_MAX_EDGES_PER_MEMORY:
+            total = len(edges)
+            edges = sorted(edges, key=lambda e: e.get("weight", 0.0), reverse=True)
+            edges = edges[:KG_MAX_EDGES_PER_MEMORY]
+            logger.warning(
+                "kg_context edges capped for memory %s: %d edges truncated to %d",
+                mid, total, KG_MAX_EDGES_PER_MEMORY,
+            )
+        else:
+            edges = sorted(edges, key=lambda e: e.get("weight", 0.0), reverse=True)
+        lookup[mid] = {"entities": entities, "edges": edges}
+    return lookup
+
+
+def apply_kg_enrichment(
+    results: list[dict[str, Any]],
+    lookup: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return a new list with kg_context merged in for matching results.
+
+    Does not mutate input. Results with no matching entry in lookup are
+    returned unchanged (no kg_context key set).
+    """
+    enriched: list[dict[str, Any]] = []
+    for result in results:
+        rid = result.get("id")
+        if rid and str(rid) in lookup:
+            enriched.append({**result, "kg_context": lookup[str(rid)]})
+        else:
+            enriched.append(result)
+    return enriched
+
+
+async def enrich_with_kg_context(
+    results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Add kg_context to recall results from kg_entities / kg_edges tables.
+
+    Gracefully degrades only on expected availability failures (missing
+    module, missing DB, network). Genuine defects -- bad SQL, row-shape
+    drift, missing table on a configured-Postgres install -- are allowed
+    to propagate so they surface rather than silently changing ranking.
+    """
+    if not results or get_backend() != "postgres":
+        return results
+
+    result_ids = [str(r["id"]) for r in results if r.get("id")]
+    if not result_ids:
+        return results
+
+    try:
+        import asyncpg.exceptions as _pg_exc
+    except ImportError:
+        _pg_exc = None  # type: ignore[assignment]
+
+    try:
+        rows = await _fetch_kg_rows(result_ids)
+        lookup = build_kg_lookup(rows)
+        return apply_kg_enrichment(results, lookup)
+    except (ImportError, OSError, ConnectionError) as e:
+        logger.debug("KG enrichment unavailable: %s", e)
+        return results
+    except Exception as e:
+        # Re-raise unless the failure is specifically an asyncpg
+        # InterfaceError (connection-state, pool exhaustion, or protocol
+        # issues that indicate a transiently unavailable DB). Broader
+        # asyncpg errors -- SQL syntax errors, UndefinedTableError,
+        # DataError, any PostgresError subclass -- continue to propagate
+        # so real defects surface instead of masquerading as degraded
+        # mode. InterfaceError was chosen narrowly over asyncpg.Error
+        # for exactly that reason.
+        if _pg_exc is not None and isinstance(e, _pg_exc.InterfaceError):
+            logger.debug("KG enrichment unavailable (asyncpg): %s", e)
+            return results
+        raise
+
+
 async def search_learnings(
     query: str,
     k: int = 5,
@@ -501,6 +687,7 @@ async def main() -> int:
     # Pattern enrichment
     if (not args.no_rerank or args.json_full) and backend == "postgres":
         results = await enrich_with_pattern_strength(results)
+        results = await enrich_with_kg_context(results)
 
     # Tag filtering
     results = filter_by_tags(results, args.tags, strict=args.tags_strict)
@@ -516,6 +703,7 @@ async def main() -> int:
             or None,
             tags=args.tags,
             retrieval_mode=retrieval_mode,
+            query=args.query,
         )
         from scripts.core.reranker import rerank
 

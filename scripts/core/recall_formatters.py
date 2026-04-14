@@ -80,6 +80,13 @@ def _build_json_result(result: dict[str, Any]) -> dict[str, Any]:
     }
     if "rerank_details" in result:
         json_result["rerank_details"] = result["rerank_details"]
+    if "kg_context" in result:
+        # kg_context carries display names and edge metadata sourced from the
+        # DB (via _fetch_kg_rows jsonb_build_object). Current consumers are
+        # CLI/JSON only, but treat the contents as untrusted strings at any
+        # future rendering boundary (HTML, markdown with nested templates).
+        # See aegis audit finding LOW-3.
+        json_result["kg_context"] = result["kg_context"]
     return json_result
 
 

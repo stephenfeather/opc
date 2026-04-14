@@ -219,7 +219,7 @@ def archive_jsonl(
             elif db_result == 0:
                 print(f"  Note: No DB row updated for {safe(session_id)} (not tracked or archived)")
 
-        print(f"  Archived {safe(session_id)} -> {s3_key}")
+        print(f"  Archived {safe(session_id)} -> {safe(s3_key)}")
         return True
 
     except subprocess.TimeoutExpired:

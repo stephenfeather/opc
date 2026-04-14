@@ -8,6 +8,7 @@ and GitHub issue #104.
 from __future__ import annotations
 
 import pytest
+
 from scripts.core.log_safety import safe
 
 # ---------------------------------------------------------------------------
@@ -88,6 +89,57 @@ def test_bell_replaced():
 
 
 # ---------------------------------------------------------------------------
+# C1 control sanitization (Gemini Round 1 HIGH)
+# ---------------------------------------------------------------------------
+
+
+def test_c1_csi_replaced():
+    # 0x9b is CSI — UTF-8 terminals interpret it as ESC [, reopening the
+    # ANSI-injection vector if allowed through.
+    assert safe("\x9b[31mRED") == "\\x9b[31mRED"
+
+
+def test_all_c1_controls_replaced():
+    # 0x80-0x9f must all be escaped.
+    for c in range(0x80, 0xA0):
+        raw = chr(c)
+        out = safe(raw)
+        assert raw not in out
+        assert f"\\x{c:02x}" in out
+
+
+def test_high_byte_latin1_replaced():
+    # 0xa0-0xff: e.g. \xa0 NBSP — not a control but not printable ASCII.
+    assert safe("a\xa0b") == "a\\xa0b"
+    assert safe("\xff") == "\\xff"
+
+
+def test_non_ascii_unicode_replaced():
+    # Emoji / non-Latin-1 chars must be escaped as \uNNNN.
+    out = safe("caf\u00e9")  # é
+    assert "\u00e9" not in out
+    assert "\\xe9" in out  # within 0xff, gets \xNN
+    out = safe("hi \u4e2d")  # Chinese char > 0xff
+    assert "\u4e2d" not in out
+    assert "\\u4e2d" in out
+
+
+def test_emoji_replaced():
+    # Emoji are typically > 0xffff (use surrogate pair when in BMP), but
+    # a BMP emoji like U+2600 ☀ is single code point > 0xff.
+    out = safe("\u2600 sunny")
+    assert "\u2600" not in out
+    assert "\\u2600" in out
+
+
+def test_unicode_surrogate_replaced():
+    # Lone surrogate (invalid Unicode but Python can hold it in a str).
+    out = safe("\ud83d")
+    assert "\ud83d" not in out
+    assert "\\ud83d" in out
+
+
+# ---------------------------------------------------------------------------
 # Non-string coercion
 # ---------------------------------------------------------------------------
 
@@ -160,32 +212,44 @@ def test_long_input_truncated_with_ascii_marker():
     s = "x" * 1000
     out = safe(s)
     assert out.startswith("x" * 500)
-    assert out.endswith("...[truncated 500 bytes]")
+    assert out.endswith("...[truncated 500 characters]")
     assert "\u2026" not in out  # ASCII-only per ARCHITECT
 
 
-def test_truncation_marker_reports_remaining_bytes():
+def test_truncation_marker_reports_remaining_characters():
     s = "a" * 750
     out = safe(s)
-    # Default max_len=500 → 250 bytes dropped.
-    assert out.endswith("...[truncated 250 bytes]")
+    # Default max_len=500 → 250 characters dropped.
+    assert out.endswith("...[truncated 250 characters]")
 
 
 def test_custom_max_len():
     out = safe("abcdefghij", max_len=4)
     assert out.startswith("abcd")
-    assert out.endswith("...[truncated 6 bytes]")
+    assert out.endswith("...[truncated 6 characters]")
 
 
 def test_truncation_happens_before_escaping_length():
     # 1000 newlines. Each expands to "\x0a" (4 chars) if escaped first,
-    # which would balloon the log. We must cap at the raw byte count first.
+    # which would balloon the log. We must cap at the raw code-point
+    # count first.
     s = "\n" * 1000
     out = safe(s)
-    # The truncation count refers to raw input bytes dropped, not escaped chars.
-    assert "[truncated 500 bytes]" in out
+    # The truncation count refers to raw input code points dropped,
+    # not escaped chars.
+    assert "[truncated 500 characters]" in out
     # And no raw newline leaked.
     assert "\n" not in out
+
+
+def test_truncation_unit_is_codepoints_not_bytes():
+    # 1000 emoji code points — each is 4 bytes in UTF-8. We truncate at
+    # 500 code points. The marker must say "characters" because that's
+    # the actual unit — saying "bytes" would be off by a factor of 4.
+    s = "\U0001f600" * 1000  # each codepoint is 1 len-unit in Python str
+    out = safe(s)
+    assert "[truncated 500 characters]" in out
+    assert "[truncated 2000 bytes]" not in out
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +269,16 @@ def test_truncation_happens_before_escaping_length():
         b"\x00\x01\x02",
         "x" * 2000,
         _RaisingStr(),
+        # Gemini Round 1 HIGH: extend coverage across Unicode space so
+        # the ASCII-only invariant is genuinely enforced, not coincidence.
+        "\x9b[31m",  # C1 CSI
+        "\x80\x81\x82\x9f",  # C1 block
+        "\xa0\xff",  # Latin-1 supplement (non-control but non-ASCII)
+        "caf\u00e9",  # accented Latin
+        "\u4e2d\u6587",  # CJK
+        "\u2600\u2b50",  # BMP symbols
+        "\U0001f600",  # supplementary-plane emoji
+        "\ud83d",  # lone surrogate
     ],
 )
 def test_output_has_no_raw_control_chars(value):

@@ -213,7 +213,7 @@ def archive_session_jsonl(
                 f"(file already in S3): {safe(e)}"
             )
 
-        log_fn(f"Archived {safe(session_id)} -> {s3_key}")
+        log_fn(f"Archived {safe(session_id)} -> {safe(s3_key)}")
 
     except subprocess.TimeoutExpired:
         log_fn(f"Archive timeout for {safe(session_id)}")

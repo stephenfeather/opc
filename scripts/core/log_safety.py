@@ -42,16 +42,28 @@ def _coerce(value: object) -> str:
 
 
 def _escape_controls(s: str) -> str:
-    """Replace C0 controls and DEL with ``\\xNN`` markers; keep ``\\t``."""
+    """Enforce printable-ASCII-only output; escape everything else.
+
+    The output contract is strict: only ``\\t`` or printable ASCII
+    (``0x20``–``0x7e``) is ever passed through unchanged. C0 controls,
+    DEL (``0x7f``), C1 controls (``0x80``–``0x9f``), and non-ASCII
+    characters (incl. Unicode surrogates and emoji) are all escaped.
+
+    C1 in particular matters for the threat model — a raw ``\\x9b``
+    (CSI) is treated as an ANSI escape by UTF-8 terminals, so allowing
+    it through would reopen the exact ANSI-injection vector this helper
+    exists to close. Allowlisting printable ASCII is simpler and safer
+    than chasing denylists across Unicode categories.
+    """
     out: list[str] = []
     for ch in s:
         o = ord(ch)
-        if ch == "\t":
+        if ch == "\t" or 0x20 <= o <= 0x7E:
             out.append(ch)
-        elif o < 0x20 or o == 0x7F:
+        elif o <= 0xFF:
             out.append(f"\\x{o:02x}")
         else:
-            out.append(ch)
+            out.append(f"\\u{o:04x}")
     return "".join(out)
 
 
@@ -69,13 +81,22 @@ def safe(value: object, *, max_len: int = _DEFAULT_MAX_LEN) -> str:
     - ``\\n``, ``\\r``, ``\\x00``–``\\x08``, ``\\x0b``–``\\x1f``, ``\\x7f``
       → replaced with ``\\xNN`` markers (lowercase hex, reversible for
       forensics).
+    - ``\\x80``–``\\xff`` (includes C1 controls like ``\\x9b`` CSI) →
+      ``\\xNN`` markers. These look "innocent" but UTF-8 terminals
+      interpret ``\\x9b`` as an ANSI escape, so allowing them through
+      would reopen the injection vector.
+    - Non-ASCII characters ``\\u0100``+ (including emoji and Unicode
+      surrogates) → ``\\uNNNN`` markers.
     - ``\\t`` (``0x09``) preserved — tabs are common in real data and
       harmless for log tailing.
     - Inputs longer than ``max_len`` raw characters are truncated to
       ``max_len`` then suffixed with the ASCII marker
-      ``"...[truncated N bytes]"``. Truncation happens on the raw input
-      length (not the escaped output length) to prevent a string of
-      newlines from ballooning the log line.
+      ``"...[truncated N characters]"``. Truncation happens on the raw
+      input length (Python string length = code points), not on the
+      escaped output length, to prevent a string of newlines from
+      ballooning the log line. The unit is characters (code points),
+      not bytes — a truncated 1000-codepoint emoji string would drop
+      far more than N bytes, and the suffix reflects the actual unit.
 
     The return value is always a ``str`` containing only ``\\t`` (``0x09``)
     or printable ASCII (``0x20``–``0x7e``). No other characters can leak
@@ -100,5 +121,5 @@ def safe(value: object, *, max_len: int = _DEFAULT_MAX_LEN) -> str:
     if raw_len > max_len:
         head = coerced[:max_len]
         dropped = raw_len - max_len
-        return _escape_controls(head) + f"...[truncated {dropped} bytes]"
+        return _escape_controls(head) + f"...[truncated {dropped} characters]"
     return _escape_controls(coerced)

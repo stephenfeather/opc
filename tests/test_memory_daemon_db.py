@@ -147,7 +147,7 @@ class TestPgEnsureColumn:
     """pg_ensure_column adds extraction columns to sessions table."""
 
     @patch("scripts.core.memory_daemon_db.pg_connect")
-    def test_adds_six_columns(self, mock_pg_connect):
+    def test_adds_all_extraction_and_push_columns(self, mock_pg_connect):
         mock_conn = MagicMock()
         mock_cur = MagicMock()
         mock_conn.cursor.return_value = mock_cur
@@ -157,7 +157,9 @@ class TestPgEnsureColumn:
 
         pg_ensure_column()
 
-        assert mock_cur.execute.call_count == 7
+        # 7 ALTER TABLE on sessions (extraction columns) +
+        # 2 ALTER TABLE on archival_memory (push tracking columns) = 9
+        assert mock_cur.execute.call_count == 9
         mock_conn.commit.assert_called_once()
         mock_conn.close.assert_called_once()
 
@@ -182,6 +184,8 @@ class TestPgEnsureColumn:
             "archived_at",
             "archive_path",
             "last_error",
+            "push_count",
+            "last_pushed_at",
         ]:
             assert col in combined
 

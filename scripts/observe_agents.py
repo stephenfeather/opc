@@ -43,10 +43,13 @@ from typing import Any
 
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
-# PostgreSQL connection
-POSTGRES_URL = os.environ.get(
-    "AGENTICA_POSTGRES_URL", "postgresql://agentica:agentica_dev@localhost:5433/agentica_memory"
-)
+# PostgreSQL connection (#62: no hardcoded credential fallback).
+POSTGRES_URL = os.environ.get("AGENTICA_POSTGRES_URL")
+if not POSTGRES_URL:
+    raise RuntimeError(
+        "AGENTICA_POSTGRES_URL not set. Export the agentica swarm DB URL "
+        "before running observe_agents.py."
+    )
 
 # Paths - use project-relative paths
 PROJECT_DIR = Path(

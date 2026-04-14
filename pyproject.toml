@@ -168,7 +168,10 @@ dev = [
 [tool.mutmut]
 paths_to_mutate = ["scripts/agentica_patterns/coordination_pg.py"]
 tests_dir = ["tests/unit/test_coordination_pg.py", "tests/unit/test_coordination_pg_integration.py", "tests/unit/conftest.py"]
-runner = "OPC_POSTGRES_URL=postgresql://opc:opc_dev_password@localhost:5432/opc python -m pytest tests/unit/test_coordination_pg.py tests/unit/test_coordination_pg_integration.py -x -q --tb=no"
+# #62: no hardcoded credential. Export OPC_POSTGRES_URL (or
+# CONTINUOUS_CLAUDE_DB_URL / DATABASE_URL) in the shell before running
+# `mutmut`; the subprocess inherits it.
+runner = "python -m pytest tests/unit/test_coordination_pg.py tests/unit/test_coordination_pg_integration.py -x -q --tb=no"
 debug = true
 
 # Performance optimizations

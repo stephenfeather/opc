@@ -61,6 +61,14 @@ export function getPgConnectionString(): string {
 export function runPgQuery(pythonCode: string, args: string[] = []): QueryResult {
   const opcDir = requireOpcDir();
 
+  // Resolve the DB URL up-front — BEFORE the try/catch — so a missing
+  // env-var configuration surfaces as a hard crash with the actionable
+  // message, rather than being swallowed by the generic exception path
+  // below and silently returned as `{success: false, stderr: "Error: ..."}`.
+  // Callers treat `success=false` as "query failed" and often fall back
+  // silently, which would bury the #62 fail-fast contract.
+  const resolvedDbUrl = getPgConnectionString();
+
   // Wrap the Python code to use asyncio.run() for async queries.
   // SECURITY: opcDir is passed via _OPC_DIR environment variable to avoid
   // code injection through paths containing quotes or special characters.
@@ -89,7 +97,7 @@ ${pythonCode}
       cwd: opcDir,
       env: {
         ...process.env,
-        CONTINUOUS_CLAUDE_DB_URL: getPgConnectionString(),
+        CONTINUOUS_CLAUDE_DB_URL: resolvedDbUrl,
         _OPC_DIR: opcDir,
       },
     });

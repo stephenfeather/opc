@@ -75,6 +75,7 @@ function getPgConnectionString() {
 }
 function runPgQuery(pythonCode, args = []) {
   const opcDir = requireOpcDir();
+  const resolvedDbUrl = getPgConnectionString();
   const wrappedCode = `
 import sys
 import os
@@ -99,7 +100,7 @@ ${pythonCode}
       cwd: opcDir,
       env: {
         ...process.env,
-        CONTINUOUS_CLAUDE_DB_URL: getPgConnectionString(),
+        CONTINUOUS_CLAUDE_DB_URL: resolvedDbUrl,
         _OPC_DIR: opcDir
       }
     });

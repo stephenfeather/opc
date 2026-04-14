@@ -250,9 +250,19 @@ def pattern_score(result: dict, ctx: RecallContext) -> float:
 def kg_overlap(result: dict, ctx: RecallContext) -> float:
     """Weighted-Jaccard overlap between query entities and result KG entities.
 
-    Each entity is weighted by its type's salience (KG_TYPE_WEIGHTS). Names
-    are compared case-insensitively. Returns 0.0 when either side lacks
-    entities. Returns score in [0, 1].
+    Each entity is weighted by its type's salience (KG_TYPE_WEIGHTS). Returns
+    0.0 when either side lacks entities. Returns score in [0, 1].
+
+    Canonicalization note:
+      ``kg_extractor.extract_entities()`` exposes two name fields: ``name``
+      (lowercase canonical, used as the KG primary key column) and
+      ``display_name`` (original casing). ``_fetch_kg_rows`` stores
+      ``display_name`` in ``kg_context.entities[*].name`` for human-readable
+      output, while query-side entities carry the canonical lowercase name.
+      We lowercase both on compare here so store-side display casing does
+      not break overlap matching. If that asymmetry is ever closed (e.g. by
+      adding an explicit ``canonical`` field to kg_context entries), the
+      ``.lower()`` calls below can be removed.
     """
     if not ctx.query_entities:
         return 0.0

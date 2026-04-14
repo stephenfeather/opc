@@ -166,14 +166,34 @@ def make_recall_context(
     project: str | None,
     tags: list[str] | None,
     retrieval_mode: str,
+    query: str | None = None,
 ) -> Any:
-    """Construct a RecallContext for the reranker."""
+    """Construct a RecallContext for the reranker.
+
+    When ``query`` is provided and backend is postgres, populates
+    ``query_entities`` via ``kg_extractor.extract_entities`` for the
+    ``kg_overlap`` signal. Non-fatal: any extractor failure yields no
+    query entities.
+    """
     from scripts.core.reranker import RecallContext
+
+    query_entities: list[dict] | None = None
+    if query and get_backend() == "postgres":
+        try:
+            from scripts.core.kg_extractor import extract_entities
+
+            extracted = extract_entities(query)
+            query_entities = [
+                {"name": e.name, "type": e.entity_type} for e in extracted
+            ] or None
+        except Exception as e:
+            logger.debug("Query-side entity extraction failed: %s", e)
 
     return RecallContext(
         project=project,
         tags_hint=tags,
         retrieval_mode=retrieval_mode,
+        query_entities=query_entities,
     )
 
 
@@ -623,6 +643,7 @@ async def main() -> int:
     # Pattern enrichment
     if (not args.no_rerank or args.json_full) and backend == "postgres":
         results = await enrich_with_pattern_strength(results)
+        results = await enrich_with_kg_context(results)
 
     # Tag filtering
     results = filter_by_tags(results, args.tags, strict=args.tags_strict)
@@ -638,6 +659,7 @@ async def main() -> int:
             or None,
             tags=args.tags,
             retrieval_mode=retrieval_mode,
+            query=args.query,
         )
         from scripts.core.reranker import rerank
 

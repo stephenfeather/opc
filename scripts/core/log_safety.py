@@ -42,6 +42,7 @@ def _coerce(value: object) -> str:
 
 
 def _escape_controls(s: str) -> str:
+    """Replace C0 controls and DEL with ``\\xNN`` markers; keep ``\\t``."""
     out: list[str] = []
     for ch in s:
         o = ord(ch)
@@ -79,6 +80,20 @@ def safe(value: object, *, max_len: int = _DEFAULT_MAX_LEN) -> str:
     The return value is always a ``str`` containing only ``\\t`` (``0x09``)
     or printable ASCII (``0x20``–``0x7e``). No other characters can leak
     into the output.
+
+    Usage:
+
+        from scripts.core.log_safety import safe
+
+        log(f"Extracting session {safe(session_id)} "
+            f"(project={safe(project_dir)})")
+
+    For subprocess stderr, decode with ``errors='replace'`` before wrapping
+    so that non-UTF8 bytes become replacement characters rather than a
+    ``"b'...'"`` repr::
+
+        stderr_text = result.stderr.decode(errors="replace")
+        log(f"zstd failed: {safe(stderr_text)}")
     """
     coerced = _coerce(value)
     raw_len = len(coerced)

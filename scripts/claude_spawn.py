@@ -198,9 +198,21 @@ class _ProcessMonitor:
         try:
             import asyncpg
 
-            conn = await asyncpg.connect(
-                "postgresql://opc:opc_dev_password@localhost:5432/opc"
+            db_url = (
+                os.environ.get("CONTINUOUS_CLAUDE_DB_URL")
+                or os.environ.get("DATABASE_URL")
+                or os.environ.get("OPC_POSTGRES_URL")
             )
+            if not db_url:
+                raise RuntimeError(
+                    "Database URL not set. Set CONTINUOUS_CLAUDE_DB_URL "
+                    "(preferred), DATABASE_URL, or OPC_POSTGRES_URL. "
+                    "For local Docker dev, run "
+                    "`docker compose -f docker/docker-compose.yml up -d` "
+                    "and export the credentials from docker/.env before "
+                    "invoking this script."
+                )
+            conn = await asyncpg.connect(db_url)
             await conn.execute(
                 """
                 UPDATE agents

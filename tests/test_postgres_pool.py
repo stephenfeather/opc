@@ -177,26 +177,31 @@ class TestResolveConnectionUrl:
         )
         assert result == "postgresql://legacy"
 
-    def test_dev_default_when_no_url_and_empty_env(self):
-        result = resolve_connection_url(
-            continuous_claude_db_url=None,
-            database_url=None,
-            opc_postgres_url=None,
-            environment="",
-        )
-        assert result == "postgresql://claude:claude_dev@localhost:5432/continuous_claude"
+    def test_empty_env_raises_without_url(self):
+        # Issue #62: no hardcoded dev fallback. Empty AGENTICA_ENV no longer
+        # gates a credentialed default — missing URL always raises, pointing
+        # the operator at CONTINUOUS_CLAUDE_DB_URL / DATABASE_URL.
+        with pytest.raises(ValueError, match="CONTINUOUS_CLAUDE_DB_URL"):
+            resolve_connection_url(
+                continuous_claude_db_url=None,
+                database_url=None,
+                opc_postgres_url=None,
+                environment="",
+            )
 
-    def test_dev_default_when_explicit_development(self):
-        result = resolve_connection_url(
-            continuous_claude_db_url=None,
-            database_url=None,
-            opc_postgres_url=None,
-            environment="development",
-        )
-        assert result == "postgresql://claude:claude_dev@localhost:5432/continuous_claude"
+    def test_development_env_raises_without_url(self):
+        # Previously returned a hardcoded fallback when AGENTICA_ENV=development.
+        # That code path is removed under #62 — fail-fast everywhere.
+        with pytest.raises(ValueError, match="CONTINUOUS_CLAUDE_DB_URL"):
+            resolve_connection_url(
+                continuous_claude_db_url=None,
+                database_url=None,
+                opc_postgres_url=None,
+                environment="development",
+            )
 
     def test_test_env_raises_without_url(self):
-        with pytest.raises(ValueError, match="Database URL must be set"):
+        with pytest.raises(ValueError, match="Database URL not set"):
             resolve_connection_url(
                 continuous_claude_db_url=None,
                 database_url=None,
@@ -205,7 +210,7 @@ class TestResolveConnectionUrl:
             )
 
     def test_production_raises_without_url(self):
-        with pytest.raises(ValueError, match="Database URL must be set"):
+        with pytest.raises(ValueError, match="Database URL not set"):
             resolve_connection_url(
                 continuous_claude_db_url=None,
                 database_url=None,
@@ -214,7 +219,7 @@ class TestResolveConnectionUrl:
             )
 
     def test_staging_raises_without_url(self):
-        with pytest.raises(ValueError, match="Database URL must be set"):
+        with pytest.raises(ValueError, match="Database URL not set"):
             resolve_connection_url(
                 continuous_claude_db_url=None,
                 database_url=None,
@@ -223,7 +228,7 @@ class TestResolveConnectionUrl:
             )
 
     def test_unknown_env_raises_without_url(self):
-        with pytest.raises(ValueError, match="Database URL must be set"):
+        with pytest.raises(ValueError, match="Database URL not set"):
             resolve_connection_url(
                 continuous_claude_db_url=None,
                 database_url=None,
@@ -240,14 +245,34 @@ class TestResolveConnectionUrl:
         )
         assert result == "postgresql://prod"
 
-    def test_empty_string_urls_treated_as_none(self):
-        result = resolve_connection_url(
-            continuous_claude_db_url="",
-            database_url="",
-            opc_postgres_url="",
-            environment="",
-        )
-        assert result == "postgresql://claude:claude_dev@localhost:5432/continuous_claude"
+    def test_empty_string_urls_raise(self):
+        # Empty strings are treated as unset (consistent with previous
+        # behavior) but now raise instead of returning a hardcoded URL.
+        with pytest.raises(ValueError, match="CONTINUOUS_CLAUDE_DB_URL"):
+            resolve_connection_url(
+                continuous_claude_db_url="",
+                database_url="",
+                opc_postgres_url="",
+                environment="",
+            )
+
+    def test_error_message_is_actionable(self):
+        # The failure message must tell the operator exactly which env vars
+        # to set; just saying "not set" is not enough (cycle precedent from
+        # #104 review).
+        with pytest.raises(ValueError) as exc:
+            resolve_connection_url(
+                continuous_claude_db_url=None,
+                database_url=None,
+                opc_postgres_url=None,
+                environment="production",
+            )
+        msg = str(exc.value)
+        assert "CONTINUOUS_CLAUDE_DB_URL" in msg
+        assert "DATABASE_URL" in msg
+        # Must NOT echo a hardcoded dev URL in the error (forensic ambiguity
+        # + confuses operators into thinking the URL is a suggestion).
+        assert "claude:claude_dev" not in msg
 
 
 # ---------------------------------------------------------------------------
@@ -265,14 +290,11 @@ class TestGetConnectionString:
             result = get_connection_string()
             assert result == "postgresql://from-env"
 
-    def test_falls_back_to_dev_default(self):
-        with patch.dict(
-            "os.environ",
-            {},
-            clear=True,
-        ):
-            result = get_connection_string()
-            assert result == "postgresql://claude:claude_dev@localhost:5432/continuous_claude"
+    def test_raises_when_env_empty(self):
+        # Issue #62: no fallback URL anywhere; unset env always raises.
+        with patch.dict("os.environ", {}, clear=True):
+            with pytest.raises(ValueError, match="CONTINUOUS_CLAUDE_DB_URL"):
+                get_connection_string()
 
 
 # ---------------------------------------------------------------------------

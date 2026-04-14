@@ -43,12 +43,25 @@ BASE_PID = 900000
 
 
 def get_pg_url() -> str:
-    """Resolve PostgreSQL URL from environment with fallback chain."""
-    return (
+    """Resolve PostgreSQL URL from environment.
+
+    Precedence: ``CONTINUOUS_CLAUDE_DB_URL`` (preferred) → ``DATABASE_URL``
+    → ``OPC_POSTGRES_URL`` (legacy). Raises ``ValueError`` with an
+    actionable message if none is set — no hardcoded fallback (#62).
+    """
+    url = (
         os.environ.get("CONTINUOUS_CLAUDE_DB_URL")
         or os.environ.get("DATABASE_URL")
-        or "postgresql://claude:claude_dev@localhost:5432/continuous_claude"
+        or os.environ.get("OPC_POSTGRES_URL")
     )
+    if not url:
+        raise ValueError(
+            "Database URL not set. Set CONTINUOUS_CLAUDE_DB_URL (preferred), "
+            "DATABASE_URL, or OPC_POSTGRES_URL. For local Docker dev, run "
+            "`docker compose -f docker/docker-compose.yml up -d` and export "
+            "the credentials from docker/.env before invoking this script."
+        )
+    return url
 
 
 def naive_decode_path(dir_name: str) -> str:

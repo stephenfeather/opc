@@ -41,7 +41,10 @@ from pathlib import Path
 import asyncpg
 from asyncpg import Connection, Pool
 
-_DEV_DEFAULT_URL = "postgresql://claude:claude_dev@localhost:5432/continuous_claude"
+# Issue #62: no hardcoded credentialed fallback. The connection URL must
+# always come from the environment (CONTINUOUS_CLAUDE_DB_URL, DATABASE_URL,
+# or OPC_POSTGRES_URL). For local Docker development, export these from
+# docker/.env after `docker compose up`.
 
 
 def _enable_faulthandler() -> None:
@@ -128,9 +131,6 @@ def build_pool_config(max_size_str: str) -> dict[str, int]:
     }
 
 
-_LOCAL_DEV_ENVS = frozenset({"development", ""})
-
-
 def resolve_connection_url(
     *,
     continuous_claude_db_url: str | None,
@@ -141,39 +141,41 @@ def resolve_connection_url(
     """Resolve the PostgreSQL connection URL from candidates.
 
     Checks candidates in priority order:
-    1. continuous_claude_db_url — canonical name
-    2. database_url — backwards compatible
-    3. opc_postgres_url — legacy (hooks)
-    4. Development default only if environment is explicitly local
+    1. continuous_claude_db_url — canonical name (``CONTINUOUS_CLAUDE_DB_URL``)
+    2. database_url — backwards compatible (``DATABASE_URL``)
+    3. opc_postgres_url — legacy (``OPC_POSTGRES_URL``, hooks)
 
-    The dev default is only used when environment is "development" or ""
-    (unset). Any other environment (production, staging, test, etc.)
-    requires an explicit URL.
+    Issue #62: no hardcoded development fallback. All callers — including
+    local dev — must supply one of the three env vars. For Docker local
+    dev, export the credentials from ``docker/.env`` after
+    ``docker compose -f docker/docker-compose.yml up -d``.
 
     Args:
-        continuous_claude_db_url: Primary URL (CONTINUOUS_CLAUDE_DB_URL).
-        database_url: Fallback URL (DATABASE_URL).
-        opc_postgres_url: Legacy URL (OPC_POSTGRES_URL).
-        environment: Value of AGENTICA_ENV (lowercased by caller).
+        continuous_claude_db_url: Primary URL (``CONTINUOUS_CLAUDE_DB_URL``).
+        database_url: Fallback URL (``DATABASE_URL``).
+        opc_postgres_url: Legacy URL (``OPC_POSTGRES_URL``).
+        environment: Value of ``AGENTICA_ENV`` (lowercased). Retained
+            only so that the error message can reflect the active
+            environment name; it no longer gates any code path.
 
     Returns:
         The resolved connection URL.
 
     Raises:
-        ValueError: If no URL is provided and environment is not local dev.
+        ValueError: If none of the three env-var inputs are set.
     """
     url = continuous_claude_db_url or database_url or opc_postgres_url
     if url:
         return url
 
-    if environment not in _LOCAL_DEV_ENVS:
-        raise ValueError(
-            f"Database URL must be set for environment '{environment}'. "
-            "Set CONTINUOUS_CLAUDE_DB_URL, DATABASE_URL, or OPC_POSTGRES_URL. "
-            "Set AGENTICA_ENV=development for local defaults."
-        )
-
-    return _DEV_DEFAULT_URL
+    env_label = environment or "<unset>"
+    raise ValueError(
+        f"Database URL not set (environment={env_label!r}). "
+        "Set CONTINUOUS_CLAUDE_DB_URL (preferred), DATABASE_URL, or "
+        "OPC_POSTGRES_URL in your shell / launcher. "
+        "For local Docker dev, run `docker compose -f docker/docker-compose.yml up -d` "
+        "and export the credentials from docker/.env before invoking this script."
+    )
 
 
 # ---------------------------------------------------------------------------

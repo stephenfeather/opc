@@ -65,10 +65,17 @@ function isValidId(id) {
 
 // src/shared/db-utils-pg.ts
 function getPgConnectionString() {
-  return process.env.CONTINUOUS_CLAUDE_DB_URL || process.env.DATABASE_URL || process.env.OPC_POSTGRES_URL || "postgresql://claude:claude_dev@localhost:5432/continuous_claude";
+  const url = process.env.CONTINUOUS_CLAUDE_DB_URL || process.env.DATABASE_URL || process.env.OPC_POSTGRES_URL;
+  if (!url) {
+    throw new Error(
+      "Database URL not set. Set CONTINUOUS_CLAUDE_DB_URL (preferred), DATABASE_URL, or OPC_POSTGRES_URL. For local Docker dev, run `docker compose -f docker/docker-compose.yml up -d` and export the credentials from docker/.env before invoking this hook."
+    );
+  }
+  return url;
 }
 function runPgQuery(pythonCode, args = []) {
   const opcDir = requireOpcDir();
+  const resolvedDbUrl = getPgConnectionString();
   const wrappedCode = `
 import sys
 import os
@@ -93,7 +100,7 @@ ${pythonCode}
       cwd: opcDir,
       env: {
         ...process.env,
-        CONTINUOUS_CLAUDE_DB_URL: getPgConnectionString(),
+        CONTINUOUS_CLAUDE_DB_URL: resolvedDbUrl,
         _OPC_DIR: opcDir
       }
     });
@@ -122,7 +129,9 @@ working_on = sys.argv[3] if len(sys.argv) > 3 else ''
 claude_session_id = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] != 'null' else None
 transcript_path = sys.argv[5] if len(sys.argv) > 5 and sys.argv[5] != 'null' else None
 pid = int(sys.argv[6]) if len(sys.argv) > 6 and sys.argv[6] != 'null' else None
-pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL', 'postgresql://claude:claude_dev@localhost:5432/continuous_claude')
+pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL') or os.environ.get('OPC_POSTGRES_URL')
+if not pg_url:
+    sys.exit('ERROR: Database URL not set. Set CONTINUOUS_CLAUDE_DB_URL, DATABASE_URL, or OPC_POSTGRES_URL.')
 
 async def main():
     conn = await asyncpg.connect(pg_url)

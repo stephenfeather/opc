@@ -245,10 +245,13 @@ def calibrate_session_confidence(session_id: str, log_fn: Callable[[str], None])
         result = asyncio.run(calibrate_session(session_id))
         stats = result["stats"]
         if stats["total"] > 0:
+            # stats values come from calibrate_session which ultimately reads
+            # DB-stored learning content; wrap for defense in depth even
+            # though happy-path values are ints.
             log_fn(
                 f"Confidence calibration for {safe(session_id)}: "
-                f"{stats['updated']} updated, "
-                f"{stats['unchanged']} unchanged"
+                f"{safe(stats['updated'])} updated, "
+                f"{safe(stats['unchanged'])} unchanged"
             )
     except Exception as e:
         log_fn(f"Confidence calibration failed for {safe(session_id)}: {safe(e)}")

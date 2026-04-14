@@ -809,11 +809,14 @@ def _check_pattern_detection():
                 total = data.get("patterns_detected", "?")
                 analyzed = data.get("learnings_analyzed", "?")
                 by_type = data.get("patterns_by_type", {})
+                # pattern_batch reads DB-sourced values (learning text, tag
+                # names) — its JSON output can contain attacker-influenced
+                # keys/values. Sanitize each field before interpolation.
                 type_summary = ", ".join(
-                    f"{k}={v}" for k, v in sorted(by_type.items())
+                    f"{safe(k)}={safe(v)}" for k, v in sorted(by_type.items())
                 )
-                log(f"Pattern detection completed: {total} patterns "
-                    f"from {analyzed} learnings ({type_summary})")
+                log(f"Pattern detection completed: {safe(total)} patterns "
+                    f"from {safe(analyzed)} learnings ({type_summary})")
             except (_json.JSONDecodeError, KeyError):
                 log(f"Pattern detection completed: {safe(stdout[:200])}")
         else:

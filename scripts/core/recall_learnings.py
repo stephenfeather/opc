@@ -352,6 +352,128 @@ async def enrich_with_pattern_strength(
     return results
 
 
+# ---------------------------------------------------------------------------
+# Knowledge graph enrichment (Phase 3, read-side)
+# ---------------------------------------------------------------------------
+
+KG_MAX_EDGES_PER_MEMORY = 50
+"""Safety cap on edges returned per memory in kg_context. Typical usage is
+< 10; the cap prevents pathological payload bloat on high-connectivity
+learnings. When exceeded, the top-N by weight are kept and a warning logs."""
+
+
+async def _fetch_kg_rows(result_ids: list[str]) -> list[dict[str, Any]]:
+    """Fetch entities and edges for each memory_id in one round trip.
+
+    Caller must ensure Postgres backend. Returns rows shaped as:
+    {id: UUID, kg_entities: list[dict], kg_edges: list[dict]}.
+    """
+    from scripts.core.db.postgres_pool import get_pool
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT m.memory_id AS id,
+                   ARRAY_AGG(DISTINCT jsonb_build_object(
+                     'id', e.id::text,
+                     'name', e.display_name,
+                     'type', e.entity_type,
+                     'mention_count', e.mention_count
+                   )) AS kg_entities,
+                   COALESCE((
+                     SELECT ARRAY_AGG(jsonb_build_object(
+                       'source', se.display_name,
+                       'target', te.display_name,
+                       'relation', ed.relation,
+                       'weight', ed.weight
+                     ))
+                     FROM kg_edges ed
+                     JOIN kg_entities se ON se.id = ed.source_id
+                     JOIN kg_entities te ON te.id = ed.target_id
+                     WHERE ed.memory_id = m.memory_id
+                   ), ARRAY[]::jsonb[]) AS kg_edges
+            FROM kg_entity_mentions m
+            JOIN kg_entities e ON e.id = m.entity_id
+            WHERE m.memory_id = ANY($1::uuid[])
+            GROUP BY m.memory_id
+            """,
+            [uuid.UUID(rid) for rid in result_ids],
+        )
+    return [dict(row) for row in rows]
+
+
+def build_kg_lookup(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Build a {memory_id: {entities, edges}} lookup from fetched rows.
+
+    Edges exceeding KG_MAX_EDGES_PER_MEMORY are capped to the top-N by
+    weight (descending) and a warning is logged with the overflow count.
+    """
+    lookup: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        mid = str(row["id"])
+        entities = list(row.get("kg_entities") or [])
+        edges = list(row.get("kg_edges") or [])
+        if len(edges) > KG_MAX_EDGES_PER_MEMORY:
+            total = len(edges)
+            edges = sorted(edges, key=lambda e: e.get("weight", 0.0), reverse=True)
+            edges = edges[:KG_MAX_EDGES_PER_MEMORY]
+            logger.warning(
+                "kg_context edges capped for memory %s: %d edges truncated to %d",
+                mid, total, KG_MAX_EDGES_PER_MEMORY,
+            )
+        else:
+            edges = sorted(edges, key=lambda e: e.get("weight", 0.0), reverse=True)
+        lookup[mid] = {"entities": entities, "edges": edges}
+    return lookup
+
+
+def apply_kg_enrichment(
+    results: list[dict[str, Any]],
+    lookup: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return a new list with kg_context merged in for matching results.
+
+    Does not mutate input. Results with no matching entry in lookup are
+    returned unchanged (no kg_context key set).
+    """
+    enriched: list[dict[str, Any]] = []
+    for result in results:
+        rid = result.get("id")
+        if rid and str(rid) in lookup:
+            enriched.append({**result, "kg_context": lookup[str(rid)]})
+        else:
+            enriched.append(result)
+    return enriched
+
+
+async def enrich_with_kg_context(
+    results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Add kg_context to recall results from kg_entities / kg_edges tables.
+
+    Non-fatal: returns results unchanged on sqlite backend, empty input,
+    missing IDs, or any DB error.
+    """
+    if not results or get_backend() != "postgres":
+        return results
+
+    result_ids = [str(r["id"]) for r in results if r.get("id")]
+    if not result_ids:
+        return results
+
+    try:
+        rows = await _fetch_kg_rows(result_ids)
+        lookup = build_kg_lookup(rows)
+        return apply_kg_enrichment(results, lookup)
+    except (ImportError, OSError, ConnectionError) as e:
+        logger.debug("KG enrichment unavailable: %s", e)
+    except Exception as e:
+        logger.warning("KG enrichment error: %s", e, exc_info=True)
+
+    return results
+
+
 async def search_learnings(
     query: str,
     k: int = 5,

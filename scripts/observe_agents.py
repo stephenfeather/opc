@@ -44,12 +44,19 @@ from typing import Any
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
 # PostgreSQL connection (#62: no hardcoded credential fallback).
+# Resolved lazily at call time so importing this module (e.g. for test
+# collection or doc generation) does not require the env var to be set.
+# The first DB call raises a clear RuntimeError if it's missing.
 POSTGRES_URL = os.environ.get("AGENTICA_POSTGRES_URL")
-if not POSTGRES_URL:
-    raise RuntimeError(
-        "AGENTICA_POSTGRES_URL not set. Export the agentica swarm DB URL "
-        "before running observe_agents.py."
-    )
+
+
+def _require_postgres_url() -> str:
+    if not POSTGRES_URL:
+        raise RuntimeError(
+            "AGENTICA_POSTGRES_URL not set. Export the agentica swarm DB URL "
+            "before running observe_agents.py."
+        )
+    return POSTGRES_URL
 
 # Paths - use project-relative paths
 PROJECT_DIR = Path(
@@ -83,7 +90,7 @@ async def query_memory(
         return []
 
     try:
-        conn = await asyncpg.connect(POSTGRES_URL)
+        conn = await asyncpg.connect(_require_postgres_url())
         try:
             sql = """
                 SELECT id, session_id, agent_id, content, created_at

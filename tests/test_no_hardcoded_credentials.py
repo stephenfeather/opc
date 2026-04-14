@@ -124,8 +124,11 @@ def _scan_paths() -> list[Path]:
         # Also skip .env.example variants — caught by extension in a moment.
         if path.suffix and path.suffix not in _SCAN_EXTENSIONS:
             continue
-        # Unknown extension but named .env* or Dockerfile* — scan anyway.
-        if not path.suffix and path.name not in {".env", ".env.example"}:
+        # Unknown extension: only scan .env.example, NOT .env. A developer's
+        # real .env is gitignored and legitimately contains their own
+        # credentials; scanning it would make the invariant test fail in
+        # any local dev environment (cycle-1 Gemini R2).
+        if not path.suffix and path.name != ".env.example":
             continue
         paths.append(path)
     return paths

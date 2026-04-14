@@ -19,7 +19,7 @@
 - Create `.python-version` file at repo root with `3.13` (prevents uv drift back to 3.12)
 - Regenerate `uv.lock` against 3.13 resolver (`uv lock --upgrade`)
 - Update `docker/Dockerfile.sandbox:17` from `python:3.12-slim` to `python:3.13-slim`
-- Update dep marker `symbolica-agentica>=0.1.0; python_version >= '3.12'` (keep marker but update to `>= '3.13'` — it becomes a no-op since requires-python already enforces it, but leaving it correct for discoverability)
+- Update dep marker `symbolica-agentica>=0.1.0; python_version >= '3.12'` → **keep marker, update to `>= '3.13'`** (redundant given `requires-python`, but preserves discoverability; decision documented in PR body per ARCHITECT)
 
 ### Out of scope (explicitly)
 - No runtime code changes unless a 3.13 deprecation surfaces a real failure during full-suite run
@@ -64,7 +64,8 @@ Python 3.13.12 and 3.14.3 are installed locally (verified).
 4. `uv sync` — verify env builds clean
 5. `uv run pytest tests/ -x` — must be green, incl. `test_protocol_is_a_protocol`
 6. Update `docker/Dockerfile.sandbox:17`
-7. Commit atomically:
+7. **Mandatory** sandbox image rebuild check: `docker build -f docker/Dockerfile.sandbox docker/` — catches 3.13-slim tag issues before PR (per ARCHITECT refinement)
+8. Commit atomically:
    - `chore(py): bump Python floor to 3.13 (#113)` — pyproject + .python-version
    - `chore(py): regenerate uv.lock for Python 3.13`
    - `chore(docker): bump sandbox base image to python:3.13-slim`
@@ -101,7 +102,7 @@ After Gemini rounds pass:
 - [ ] `test_protocol_is_a_protocol` passes (no code change to source)
 - [ ] Full suite green (previously 2156 passed + 1 failed + 1 skipped → expected 2157 passed + 1 skipped)
 - [ ] `[tool.black|mypy|ruff]` versions aligned to 3.13
-- [ ] Dockerfile.sandbox bumped
+- [ ] Dockerfile.sandbox bumped AND `docker build` verified locally
 - [ ] 3 Gemini-pro review rounds completed with findings addressed
 - [ ] Aegis audit done; `/security` clean
 - [ ] PR merged after 2+ AI reviewer cycles

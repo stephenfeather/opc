@@ -70,7 +70,7 @@ hooks/                     Claude Code hook scripts
 
 ## Requirements
 
-- Python 3.12+
+- Python 3.13+
 - PostgreSQL with pgvector extension
 - [uv](https://docs.astral.sh/uv/) for dependency management
 

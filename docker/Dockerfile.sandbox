@@ -14,16 +14,16 @@
 #     --memory 512m --cpus 0.5 \
 #     -i claude-sandbox < '{"code": "result = 1 + 1"}'
 
-FROM python:3.12-slim
+FROM python:3.13-slim
 
 # Security: non-root user
 RUN useradd -m -s /bin/bash sandbox
 
-# Install common computation libraries
+# Install common computation libraries (floors aligned with pyproject.toml for Python 3.13)
 RUN pip install --no-cache-dir \
-    numpy>=1.26 \
-    scipy>=1.11 \
-    sympy>=1.12 \
+    numpy>=2.1.0 \
+    scipy>=1.16.3 \
+    sympy>=1.14.0 \
     pandas>=2.0
 
 # Switch to non-root user

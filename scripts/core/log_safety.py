@@ -108,6 +108,15 @@ def safe(value: object, *, max_len: int = _DEFAULT_MAX_LEN) -> str:
     or printable ASCII (``0x20``–``0x7e``). No other characters can leak
     into the output.
 
+    **Accepted trade-off — sentinel ambiguity:** a DB-stored value whose
+    literal text is ``"<none>"`` or ``"<unrepresentable>"`` renders
+    identically to the real sentinel. Operators cannot distinguish a
+    NULL column from an attacker-written literal on log inspection alone.
+    This was accepted during Aegis review (#104) because the alternative
+    — suppressing sentinel output entirely — would lose the forensic
+    field-was-null signal that motivated choosing a marker over empty
+    string in the first place.
+
     Usage:
 
         from scripts.core.log_safety import safe

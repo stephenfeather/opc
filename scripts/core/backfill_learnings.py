@@ -271,7 +271,8 @@ def list_s3_keys(bucket: str) -> str | None:
         result = subprocess.run(
             ["aws", "s3", "ls", f"s3://{bucket}/sessions/", "--recursive"],
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=60,
         )
         if result.returncode != 0:
@@ -642,7 +643,7 @@ def main() -> int:
             except Exception as e:
                 result = {
                     "status": "exception",
-                    "error": str(e),
+                    "error": safe(e),
                     "uuid": s.get("uuid", "?"),
                     "session_id": s.get("session_id", "?"),
                     "project": s.get("project", "?"),
@@ -661,12 +662,12 @@ def main() -> int:
             if status != "ok":
                 errors += 1
                 _log(
-                    f"[{i}/{len(claimed_batch)}] FAIL {s.get('session_id', '?')} "
-                    f"status={status} error={result.get('error', '')[:100]}"
+                    f"[{i}/{len(claimed_batch)}] FAIL {safe(s.get('session_id', '?'))} "
+                    f"status={safe(status)} error={safe(result.get('error', '')[:100])}"
                 )
             else:
                 _log(
-                    f"[{i}/{len(claimed_batch)}] OK {s.get('session_id', '?')} "
+                    f"[{i}/{len(claimed_batch)}] OK {safe(s.get('session_id', '?'))} "
                     f"learnings={learned} dupes={dupes}"
                 )
 

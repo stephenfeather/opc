@@ -40,6 +40,7 @@ def _make_result(
     recall_count: int = 0,
     pattern_strength: float = 0.0,
     pattern_tags: list | None = None,
+    kg_context: dict | None = None,
 ) -> dict:
     """Factory for building result dicts matching the recall pipeline shape."""
     result = {
@@ -57,6 +58,8 @@ def _make_result(
         result["final_score"] = final_score
     if rerank_details is not None:
         result["rerank_details"] = rerank_details
+    if kg_context is not None:
+        result["kg_context"] = kg_context
     return result
 
 
@@ -664,3 +667,45 @@ class TestGroupByType:
         group_by_type(results)
         assert results[0] == original[0]
         assert results[1] == original[1]
+
+
+# ---------------------------------------------------------------------------
+# KG context serialization (Phase 3 fix for D2/E1 finding)
+# ---------------------------------------------------------------------------
+
+
+class TestKGContextSerialization:
+    _KG_CTX = {
+        "entities": [
+            {"id": "e1", "name": "pytest", "type": "tool", "mention_count": 5}
+        ],
+        "edges": [
+            {"source": "pytest", "target": "asyncpg", "relation": "used_with",
+             "weight": 2.0}
+        ],
+    }
+
+    def test_build_json_result_includes_kg_context(self):
+        r = _make_result(kg_context=self._KG_CTX)
+        out = _build_json_result(r)
+        assert out["kg_context"] == self._KG_CTX
+
+    def test_build_json_result_omits_kg_context_when_absent(self):
+        r = _make_result()
+        out = _build_json_result(r)
+        assert "kg_context" not in out
+
+    def test_format_json_output_round_trips_kg_context(self):
+        r = _make_result(kg_context=self._KG_CTX)
+        payload = json.loads(format_json_output([r]))
+        assert payload["results"][0]["kg_context"] == self._KG_CTX
+
+    def test_format_json_full_output_round_trips_kg_context(self):
+        r = _make_result(kg_context=self._KG_CTX)
+        payload = json.loads(format_json_full_output([r]))
+        assert payload["results"][0]["kg_context"] == self._KG_CTX
+
+    def test_format_json_output_no_kg_key_when_absent(self):
+        r = _make_result()
+        payload = json.loads(format_json_output([r]))
+        assert "kg_context" not in payload["results"][0]

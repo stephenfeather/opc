@@ -80,6 +80,8 @@ def _build_json_result(result: dict[str, Any]) -> dict[str, Any]:
     }
     if "rerank_details" in result:
         json_result["rerank_details"] = result["rerank_details"]
+    if "kg_context" in result:
+        json_result["kg_context"] = result["kg_context"]
     return json_result
 
 

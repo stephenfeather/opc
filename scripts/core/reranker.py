@@ -252,64 +252,67 @@ def pattern_score(result: dict, ctx: RecallContext) -> float:
     return strength * min(1.0, ratio)
 
 
+def _kg_entity_key(entity: dict) -> tuple[str, str]:
+    """Canonical (name, type) key for kg_overlap matching.
+
+    Prefers 'canonical' field when present (kg_context entities from
+    _fetch_kg_rows carry both display 'name' and canonical 'canonical';
+    query-side entities from extract_entities put the canonical value
+    in 'name'). Falls back to lowercased name so older callers still
+    match. See plan §3.2 / adversarial-review F1 for rationale.
+    """
+    canonical = entity.get("canonical")
+    key_name = canonical if canonical is not None else entity.get("name", "")
+    return (str(key_name).lower(), str(entity.get("type", "")))
+
+
+def _kg_type_weight(entity_type: str) -> float:
+    return KG_TYPE_WEIGHTS.get(entity_type, _KG_DEFAULT_TYPE_WEIGHT)
+
+
+def _kg_overlap_score(
+    result_entities: list[dict], query_map: dict[tuple[str, str], dict]
+) -> float:
+    """Compute weighted-Jaccard given a pre-built query entity map."""
+    if not query_map or not result_entities:
+        return 0.0
+    result_map = {_kg_entity_key(e): e for e in result_entities}
+    intersection = set(query_map) & set(result_map)
+    union = set(query_map) | set(result_map)
+    if not union:
+        return 0.0
+    num = sum(_kg_type_weight(query_map[k].get("type", "")) for k in intersection)
+    # Use query type for union members on query side, result type on result side.
+    den = sum(
+        _kg_type_weight((query_map.get(k) or result_map.get(k)).get("type", ""))
+        for k in union
+    )
+    if den <= 0.0:
+        return 0.0
+    return max(0.0, min(1.0, num / den))
+
+
 def kg_overlap(result: dict, ctx: RecallContext) -> float:
     """Weighted-Jaccard overlap between query entities and result KG entities.
 
     Each entity is weighted by its type's salience (KG_TYPE_WEIGHTS). Returns
     0.0 when either side lacks entities. Returns score in [0, 1].
 
-    Canonicalization note:
-      ``kg_extractor.extract_entities()`` exposes two name fields: ``name``
-      (lowercase canonical, used as the KG primary key column) and
-      ``display_name`` (original casing). ``_fetch_kg_rows`` stores
-      ``display_name`` in ``kg_context.entities[*].name`` for human-readable
-      output, while query-side entities carry the canonical lowercase name.
-      We lowercase both on compare here so store-side display casing does
-      not break overlap matching. If that asymmetry is ever closed (e.g. by
-      adding an explicit ``canonical`` field to kg_context entries), the
-      ``.lower()`` calls below can be removed.
+    This public signature rebuilds the query entity map per call, which is
+    the right default for one-off scoring but unnecessary work inside
+    rerank()'s per-result loop. rerank() computes the map once and uses
+    _kg_overlap_score(result_entities, query_map) directly.
     """
     if not ctx.query_entities:
         return 0.0
-
     kg_context = result.get("kg_context")
     if not kg_context:
         return 0.0
-
     result_entities = kg_context.get("entities") or []
     if not result_entities:
         return 0.0
-
-    def _key(entity: dict) -> tuple[str, str]:
-        # Prefer 'canonical' when present (kg_context entities from
-        # _fetch_kg_rows carry both display 'name' and canonical 'canonical';
-        # query-side entities from extract_entities put the canonical value
-        # in 'name'). Fall back to lowercased name so older callers still
-        # match. See plan §3.2 / adversarial-review F1 for rationale.
-        canonical = entity.get("canonical")
-        key_name = canonical if canonical is not None else entity.get("name", "")
-        return (str(key_name).lower(), str(entity.get("type", "")))
-
-    def _weight(entity_type: str) -> float:
-        return KG_TYPE_WEIGHTS.get(entity_type, _KG_DEFAULT_TYPE_WEIGHT)
-
-    query_map = {_key(e): e for e in ctx.query_entities}
-    result_map = {_key(e): e for e in result_entities}
-
-    intersection = set(query_map) & set(result_map)
-    union = set(query_map) | set(result_map)
-    if not union:
-        return 0.0
-
-    num = sum(_weight(query_map[k].get("type", "")) for k in intersection)
-    # Use query type for union members on query side, result type on result side.
-    den = sum(
-        _weight((query_map.get(k) or result_map.get(k)).get("type", ""))
-        for k in union
-    )
-    if den <= 0.0:
-        return 0.0
-    return max(0.0, min(1.0, num / den))
+    query_map = {_kg_entity_key(e): e for e in ctx.query_entities}
+    return _kg_overlap_score(result_entities, query_map)
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +454,13 @@ def rerank(
     retrieval_weight = 1.0 - effective_signal_weight
     total = len(results)
     effective_kg_weight = config.kg_weight if kg_active else 0.0
+    # Build the query entity map once per rerank call rather than once
+    # per result. Avoids O(R * Q) key construction.
+    query_map = (
+        {_kg_entity_key(e): e for e in ctx.query_entities}
+        if kg_active and ctx.query_entities
+        else {}
+    )
 
     scored: list[dict] = []
     for rank, result in enumerate(results):
@@ -466,7 +476,11 @@ def rerank(
         sig_type = type_match(result, ctx)
         sig_tags = tag_overlap(result, ctx)
         sig_pattern = pattern_score(result, ctx)
-        sig_kg = kg_overlap(result, ctx) if kg_active else 0.0
+        if kg_active and query_map:
+            result_entities = (result.get("kg_context") or {}).get("entities") or []
+            sig_kg = _kg_overlap_score(result_entities, query_map)
+        else:
+            sig_kg = 0.0
 
         # Weighted combination. When kg_active is false, effective_kg_weight
         # is 0 and kg_weight's share has already been rolled into

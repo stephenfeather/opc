@@ -524,13 +524,14 @@ async def enrich_with_kg_context(
         logger.debug("KG enrichment unavailable: %s", e)
         return results
     except Exception as e:
-        # Re-raise unless it's an asyncpg availability/interface error.
-        # asyncpg.exceptions.Error covers connection state, pool exhaustion,
-        # and protocol-level issues that mean the DB is transiently
-        # unavailable; those should degrade silently. Genuine SQL defects
-        # (UndefinedTableError, DataError, SyntaxError) are subclasses of
-        # PostgresError and must propagate so they surface rather than
-        # masquerading as a degraded-mode response.
+        # Re-raise unless the failure is specifically an asyncpg
+        # InterfaceError (connection-state, pool exhaustion, or protocol
+        # issues that indicate a transiently unavailable DB). Broader
+        # asyncpg errors -- SQL syntax errors, UndefinedTableError,
+        # DataError, any PostgresError subclass -- continue to propagate
+        # so real defects surface instead of masquerading as degraded
+        # mode. InterfaceError was chosen narrowly over asyncpg.Error
+        # for exactly that reason.
         if _pg_exc is not None and isinstance(e, _pg_exc.InterfaceError):
             logger.debug("KG enrichment unavailable (asyncpg): %s", e)
             return results

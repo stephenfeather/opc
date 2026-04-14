@@ -823,6 +823,31 @@ class TestKGOverlap:
         assert required.issubset(set(KG_TYPE_WEIGHTS.keys()))
         assert KG_TYPE_WEIGHTS["file"] > KG_TYPE_WEIGHTS["language"]
 
+    def test_canonical_field_matches_across_case_and_path_norm(self):
+        """Finding F1 fix: when kg_context entities carry a 'canonical' field
+        (added by _fetch_kg_rows), kg_overlap uses it for matching so display
+        casing and un-normalized paths don't break overlap."""
+        # Result has display 'name' preserving the stored form, and the
+        # canonical form the extractor would produce.
+        result = _result_with_kg([
+            {"name": "./scripts/core/reranker.py",
+             "canonical": "scripts/core/reranker.py",
+             "type": "file"},
+        ])
+        # Query-side entity uses the canonical value directly (extract_entities
+        # returns canonical in .name).
+        ctx = RecallContext(
+            query_entities=[{"name": "scripts/core/reranker.py", "type": "file"}]
+        )
+        assert kg_overlap(result, ctx) == 1.0
+
+    def test_config_type_weight_matches_extractor_type_name(self):
+        """Finding F3 fix: kg_extractor emits entity_type='config' for env
+        variables; KG_TYPE_WEIGHTS must key on 'config' (not 'config_var')
+        or the intended salience is silently lost to the default weight."""
+        assert "config" in KG_TYPE_WEIGHTS
+        assert KG_TYPE_WEIGHTS["config"] != 0.5  # not the default fallback
+
 
 class TestRerankKGWeight:
     def test_rerank_boosts_kg_matches_when_weight_positive(self):

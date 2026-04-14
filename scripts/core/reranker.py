@@ -47,6 +47,11 @@ KG_TYPE_WEIGHTS: dict[str, float] = {
     "module": 1.0,
     "error": 0.9,
     "library": 0.8,
+    # kg_extractor emits entity_type='config' for env/config variables, so
+    # the lookup key must be 'config'. 'config_var' is kept as a harmless
+    # alias so older callers that hand-build entity dicts still hit the
+    # intended salience. Keep both in sync if the weight changes.
+    "config": 0.7,
     "config_var": 0.7,
     "tool": 0.6,
     "concept": 0.5,
@@ -276,7 +281,14 @@ def kg_overlap(result: dict, ctx: RecallContext) -> float:
         return 0.0
 
     def _key(entity: dict) -> tuple[str, str]:
-        return (str(entity.get("name", "")).lower(), str(entity.get("type", "")))
+        # Prefer 'canonical' when present (kg_context entities from
+        # _fetch_kg_rows carry both display 'name' and canonical 'canonical';
+        # query-side entities from extract_entities put the canonical value
+        # in 'name'). Fall back to lowercased name so older callers still
+        # match. See plan §3.2 / adversarial-review F1 for rationale.
+        canonical = entity.get("canonical")
+        key_name = canonical if canonical is not None else entity.get("name", "")
+        return (str(key_name).lower(), str(entity.get("type", "")))
 
     def _weight(entity_type: str) -> float:
         return KG_TYPE_WEIGHTS.get(entity_type, _KG_DEFAULT_TYPE_WEIGHT)

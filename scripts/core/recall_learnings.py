@@ -392,12 +392,20 @@ async def _fetch_kg_rows(result_ids: list[str]) -> list[dict[str, Any]]:
 
     pool = await get_pool()
     async with pool.acquire() as conn:
+        # Edges are capped at the SQL layer via a correlated LATERAL
+        # subquery with ORDER BY + LIMIT so the database only materializes
+        # and transfers up to KG_MAX_EDGES_PER_MEMORY edges per memory.
+        # build_kg_lookup still caps on the Python side as defense-in-depth
+        # (catches SQL ordering drift or callers that bypass this query).
+        # Entity output carries both 'canonical' (matching key) and 'name'
+        # (display_name) so consumers can ID-match without losing casing.
         rows = await conn.fetch(
             """
             SELECT m.memory_id AS id,
                    ARRAY_AGG(DISTINCT jsonb_build_object(
                      'id', e.id::text,
                      'name', e.display_name,
+                     'canonical', e.name,
                      'type', e.entity_type,
                      'mention_count', e.mention_count
                    )) AS kg_entities,
@@ -408,10 +416,15 @@ async def _fetch_kg_rows(result_ids: list[str]) -> list[dict[str, Any]]:
                        'relation', ed.relation,
                        'weight', ed.weight
                      ))
-                     FROM kg_edges ed
+                     FROM (
+                       SELECT ed.*
+                       FROM kg_edges ed
+                       WHERE ed.memory_id = m.memory_id
+                       ORDER BY ed.weight DESC
+                       LIMIT $2
+                     ) ed
                      JOIN kg_entities se ON se.id = ed.source_id
                      JOIN kg_entities te ON te.id = ed.target_id
-                     WHERE ed.memory_id = m.memory_id
                    ), ARRAY[]::jsonb[]) AS kg_edges
             FROM kg_entity_mentions m
             JOIN kg_entities e ON e.id = m.entity_id
@@ -419,6 +432,7 @@ async def _fetch_kg_rows(result_ids: list[str]) -> list[dict[str, Any]]:
             GROUP BY m.memory_id
             """,
             [uuid.UUID(rid) for rid in result_ids],
+            KG_MAX_EDGES_PER_MEMORY,
         )
     return [dict(row) for row in rows]
 
@@ -472,8 +486,10 @@ async def enrich_with_kg_context(
 ) -> list[dict[str, Any]]:
     """Add kg_context to recall results from kg_entities / kg_edges tables.
 
-    Non-fatal: returns results unchanged on sqlite backend, empty input,
-    missing IDs, or any DB error.
+    Gracefully degrades only on expected availability failures (missing
+    module, missing DB, network). Genuine defects -- bad SQL, row-shape
+    drift, missing table on a configured-Postgres install -- are allowed
+    to propagate so they surface rather than silently changing ranking.
     """
     if not results or get_backend() != "postgres":
         return results
@@ -483,15 +499,29 @@ async def enrich_with_kg_context(
         return results
 
     try:
+        import asyncpg.exceptions as _pg_exc
+    except ImportError:
+        _pg_exc = None  # type: ignore[assignment]
+
+    try:
         rows = await _fetch_kg_rows(result_ids)
         lookup = build_kg_lookup(rows)
         return apply_kg_enrichment(results, lookup)
     except (ImportError, OSError, ConnectionError) as e:
         logger.debug("KG enrichment unavailable: %s", e)
+        return results
     except Exception as e:
-        logger.warning("KG enrichment error: %s", e, exc_info=True)
-
-    return results
+        # Re-raise unless it's an asyncpg availability/interface error.
+        # asyncpg.exceptions.Error covers connection state, pool exhaustion,
+        # and protocol-level issues that mean the DB is transiently
+        # unavailable; those should degrade silently. Genuine SQL defects
+        # (UndefinedTableError, DataError, SyntaxError) are subclasses of
+        # PostgresError and must propagate so they surface rather than
+        # masquerading as a degraded-mode response.
+        if _pg_exc is not None and isinstance(e, _pg_exc.InterfaceError):
+            logger.debug("KG enrichment unavailable (asyncpg): %s", e)
+            return results
+        raise
 
 
 async def search_learnings(

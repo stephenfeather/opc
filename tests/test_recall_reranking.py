@@ -128,6 +128,8 @@ class TestProjectFlag:
                 return_value=fake_results,
             ),
             patch("scripts.core.recall_learnings.record_recall", new_callable=AsyncMock),
+            patch("scripts.core.recall_learnings.enrich_with_kg_context", new_callable=AsyncMock, side_effect=lambda rs: rs),
+            patch("scripts.core.recall_learnings.enrich_with_pattern_strength", new_callable=AsyncMock, side_effect=lambda rs: rs),
             patch("scripts.core.reranker.rerank", side_effect=spy_rerank),
             patch("sys.argv", ["recall", "--query", "test", "--k", "3", "--project", "my-project", "--json"]),
         ):
@@ -161,6 +163,8 @@ class TestAdaptiveOverfetch:
                 return_value=fake_results,
             ) as mock_search,
             patch("scripts.core.recall_learnings.record_recall", new_callable=AsyncMock),
+            patch("scripts.core.recall_learnings.enrich_with_kg_context", new_callable=AsyncMock, side_effect=lambda rs: rs),
+            patch("scripts.core.recall_learnings.enrich_with_pattern_strength", new_callable=AsyncMock, side_effect=lambda rs: rs),
             patch("sys.argv", ["recall", "--query", "test", "--k", "5", "--json"]),
         ):
             from scripts.core.recall_learnings import main
@@ -190,6 +194,8 @@ class TestAdaptiveOverfetch:
                 return_value=fake_results,
             ) as mock_search,
             patch("scripts.core.recall_learnings.record_recall", new_callable=AsyncMock),
+            patch("scripts.core.recall_learnings.enrich_with_kg_context", new_callable=AsyncMock, side_effect=lambda rs: rs),
+            patch("scripts.core.recall_learnings.enrich_with_pattern_strength", new_callable=AsyncMock, side_effect=lambda rs: rs),
             patch("sys.argv", ["recall", "--query", "test", "--k", "25", "--json"]),
         ):
             from scripts.core.recall_learnings import main
@@ -216,6 +222,8 @@ class TestAdaptiveOverfetch:
                 return_value=fake_results,
             ) as mock_search,
             patch("scripts.core.recall_learnings.record_recall", new_callable=AsyncMock),
+            patch("scripts.core.recall_learnings.enrich_with_kg_context", new_callable=AsyncMock, side_effect=lambda rs: rs),
+            patch("scripts.core.recall_learnings.enrich_with_pattern_strength", new_callable=AsyncMock, side_effect=lambda rs: rs),
             patch("sys.argv", ["recall", "--query", "test", "--k", "5", "--no-rerank", "--json"]),
         ):
             from scripts.core.recall_learnings import main
@@ -304,6 +312,8 @@ class TestJsonOutputWithRerank:
                 return_value=fake_results,
             ),
             patch("scripts.core.recall_learnings.record_recall", new_callable=AsyncMock),
+            patch("scripts.core.recall_learnings.enrich_with_kg_context", new_callable=AsyncMock, side_effect=lambda rs: rs),
+            patch("scripts.core.recall_learnings.enrich_with_pattern_strength", new_callable=AsyncMock, side_effect=lambda rs: rs),
             patch("sys.argv", ["recall", "--query", "test", "--k", "3", "--json"]),
         ):
             from scripts.core.recall_learnings import main
@@ -348,6 +358,8 @@ class TestRetrievalModeDetection:
                 return_value=fake_results,
             ),
             patch("scripts.core.recall_learnings.record_recall", new_callable=AsyncMock),
+            patch("scripts.core.recall_learnings.enrich_with_kg_context", new_callable=AsyncMock, side_effect=lambda rs: rs),
+            patch("scripts.core.recall_learnings.enrich_with_pattern_strength", new_callable=AsyncMock, side_effect=lambda rs: rs),
             patch("sys.argv", ["recall", "--query", "test", "--k", "3", "--text-only", "--json"]),
         ):
             # Patch the reranker module-level function so the lazy import picks it up
@@ -379,6 +391,8 @@ class TestRetrievalModeDetection:
                 return_value=fake_results,
             ),
             patch("scripts.core.recall_learnings.record_recall", new_callable=AsyncMock),
+            patch("scripts.core.recall_learnings.enrich_with_kg_context", new_callable=AsyncMock, side_effect=lambda rs: rs),
+            patch("scripts.core.recall_learnings.enrich_with_pattern_strength", new_callable=AsyncMock, side_effect=lambda rs: rs),
             patch("sys.argv", ["recall", "--query", "test", "--k", "3", "--json"]),
         ):
             with patch("scripts.core.reranker.rerank", side_effect=spy_rerank):
@@ -409,6 +423,8 @@ class TestRetrievalModeDetection:
                 return_value=fake_results,
             ),
             patch("scripts.core.recall_learnings.record_recall", new_callable=AsyncMock),
+            patch("scripts.core.recall_learnings.enrich_with_kg_context", new_callable=AsyncMock, side_effect=lambda rs: rs),
+            patch("scripts.core.recall_learnings.enrich_with_pattern_strength", new_callable=AsyncMock, side_effect=lambda rs: rs),
             patch("sys.argv", ["recall", "--query", "test", "--k", "3", "--json"]),
         ):
             with patch("scripts.core.reranker.rerank", side_effect=spy_rerank):

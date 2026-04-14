@@ -173,6 +173,45 @@ async def test_enrich_with_kg_context_connection_error_non_fatal():
 
 
 @pytest.mark.asyncio
+async def test_enrich_with_kg_context_propagates_unexpected_exception():
+    """Narrowed catch: a SQL defect like UndefinedTable must propagate,
+    not masquerade as silent degradation. Only availability failures
+    (Import/OS/Connection/asyncpg.InterfaceError) are swallowed."""
+    from scripts.core.recall_learnings import enrich_with_kg_context
+
+    class _FakeTableError(Exception):
+        """Stands in for a real asyncpg.exceptions.UndefinedTableError."""
+
+    results = [{"id": str(uuid.uuid4()), "content": "x"}]
+
+    with (
+        patch("scripts.core.recall_learnings.get_backend", return_value="postgres"),
+        patch(
+            "scripts.core.recall_learnings._fetch_kg_rows",
+            new_callable=AsyncMock,
+            side_effect=_FakeTableError("relation kg_entity_mentions does not exist"),
+        ),
+    ):
+        with pytest.raises(_FakeTableError):
+            await enrich_with_kg_context(results)
+
+
+def test_fetch_kg_rows_query_shape_exposes_canonical_field():
+    """SQL query must return both display 'name' and canonical 'canonical'
+    so kg_overlap can match case- and path-canonicalized entity names."""
+    import inspect
+    from scripts.core import recall_learnings
+
+    src = inspect.getsource(recall_learnings._fetch_kg_rows)
+    # Both 'name' (display_name) and 'canonical' (normalized name) must be in SELECT.
+    assert "'name', e.display_name" in src
+    assert "'canonical', e.name" in src
+    # Edge cap is now SQL-side via LATERAL / subquery LIMIT.
+    assert "LIMIT $2" in src
+    assert "ORDER BY ed.weight DESC" in src
+
+
+@pytest.mark.asyncio
 async def test_enrich_with_kg_context_populates_matching_results():
     from scripts.core.recall_learnings import enrich_with_kg_context
 

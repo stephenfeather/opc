@@ -60,6 +60,52 @@ class TestRerankerConfig:
         expected = 0.15 + 0.05 * 7  # project + 7 others (incl. kg_weight) at 0.05
         assert abs(cfg.total_signal_weight - expected) < 1e-9
 
+    def test_rejects_overweight_config(self):
+        """Finding F2 fix: operators upgrading from pre-Phase-3 may have an
+        opc.toml whose pre-existing weights already sum to 1.0. Adding the
+        new default kg_weight=0.05 would push total above 1.0 and flip
+        retrieval_weight negative. __post_init__ must reject that config."""
+        import pytest
+        with pytest.raises(ValueError, match="sum to <= 1.0"):
+            # Pre-Phase-3 weights summed to 1.0 plus new kg_weight=0.05.
+            RerankerConfig(
+                project_weight=0.15,
+                recency_weight=0.10,
+                confidence_weight=0.10,
+                recall_weight=0.10,
+                type_affinity_weight=0.15,
+                tag_overlap_weight=0.20,
+                pattern_weight=0.20,
+                # kg_weight defaults to 0.05 -> total = 1.05.
+            )
+
+    def test_rejects_negative_total(self):
+        import pytest
+        with pytest.raises(ValueError, match="sum to <= 1.0"):
+            RerankerConfig(project_weight=-1.0)
+
+    def test_accepts_exactly_one(self):
+        # Boundary: total_signal_weight == 1.0 is allowed (retrieval_weight=0).
+        cfg = RerankerConfig(
+            project_weight=0.20,
+            recency_weight=0.15,
+            confidence_weight=0.10,
+            recall_weight=0.10,
+            type_affinity_weight=0.10,
+            tag_overlap_weight=0.15,
+            pattern_weight=0.15,
+            kg_weight=0.05,
+        )
+        assert abs(cfg.total_signal_weight - 1.0) < 1e-9
+
+    def test_effective_signal_weight_redistributes_kg_when_inactive(self):
+        cfg = RerankerConfig()
+        assert cfg.effective_signal_weight(kg_active=True) == cfg.total_signal_weight
+        assert (
+            cfg.effective_signal_weight(kg_active=False)
+            == cfg.total_signal_weight - cfg.kg_weight
+        )
+
 
 class TestRecallConfig:
     def test_defaults(self):

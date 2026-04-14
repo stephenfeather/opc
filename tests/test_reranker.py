@@ -878,6 +878,60 @@ class TestRerankKGWeight:
         assert ranked[0]["id"] == "matching"
         assert "kg_overlap" in ranked[0]["rerank_details"]
 
+    def test_kg_inactive_scores_match_pre_phase3_exactly(self):
+        """Finding D1 fix: when KG is inactive (no query entities OR no
+        result carries kg_context), final_score must be byte-identical to
+        the pre-Phase-3 reranker with kg_weight=0. Proves kg_weight is
+        redirected to retrieval, not deducted. Load-bearing invariant."""
+        # Two results, no kg_context attached, no query entities.
+        results = [
+            {"id": "a", "session_id": "s", "content": "x",
+             "metadata": {"learning_type": "WORKING_SOLUTION"}, "similarity": 0.5},
+            {"id": "b", "session_id": "s", "content": "y",
+             "metadata": {"learning_type": "ERROR_FIX"}, "similarity": 0.3},
+        ]
+        ctx_active_but_empty = RecallContext(
+            query_entities=None, retrieval_mode="vector",
+        )
+        # Reference: pre-Phase-3 behavior simulated by kg_weight=0.
+        ref_config = RerankerConfig(kg_weight=0.0)
+        # Current config: kg_weight=0.05 default.
+        current_config = RerankerConfig()
+
+        ref_ranked = rerank(
+            [dict(r) for r in results], ctx_active_but_empty,
+            config=ref_config, k=2,
+        )
+        cur_ranked = rerank(
+            [dict(r) for r in results], ctx_active_but_empty,
+            config=current_config, k=2,
+        )
+        # Byte-identical final_score, byte-identical order.
+        assert [r["id"] for r in ref_ranked] == [r["id"] for r in cur_ranked]
+        for ref_r, cur_r in zip(ref_ranked, cur_ranked):
+            assert ref_r["final_score"] == cur_r["final_score"], (
+                f"Score drift on {ref_r['id']}: "
+                f"ref={ref_r['final_score']} vs cur={cur_r['final_score']}"
+            )
+
+    def test_kg_active_flag_reported_in_rerank_details(self):
+        """Operators need to tell which mode was used. kg_active lands in
+        rerank_details."""
+        active_result = _result_with_kg([{"name": "pytest", "type": "tool"}])
+        active_result["id"] = "active"
+        ctx_active = RecallContext(
+            query_entities=[{"name": "pytest", "type": "tool"}],
+            retrieval_mode="vector",
+        )
+        ranked_active = rerank([active_result], ctx_active, k=1)
+        assert ranked_active[0]["rerank_details"]["kg_active"] is True
+
+        inactive_result = dict(active_result)
+        inactive_result.pop("kg_context")
+        ctx_inactive = RecallContext(retrieval_mode="vector")
+        ranked_inactive = rerank([inactive_result], ctx_inactive, k=1)
+        assert ranked_inactive[0]["rerank_details"]["kg_active"] is False
+
     def test_rerank_zero_kg_weight_is_noop(self):
         """With kg_weight=0.0, ranking is unchanged from non-KG scoring."""
         matching = _result_with_kg([{"name": "pytest", "type": "tool"}])

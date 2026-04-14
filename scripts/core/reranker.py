@@ -421,8 +421,18 @@ def rerank(
     if config is None:
         config = _default_config()
 
-    total_signal_weight = config.total_signal_weight
-    if total_signal_weight <= 0:
+    # KG signal activation: kg_weight contributes only when query entities
+    # are present AND at least one result carries kg_context. Otherwise
+    # kg_weight redirects to retrieval (deterministic redistribution).
+    # Preserves pre-Phase-3 ranking math on sqlite, empty-KG, and
+    # extraction-miss paths. See adversarial-review finding D1.
+    kg_active = bool(ctx.query_entities) and any(
+        isinstance(r.get("kg_context"), dict) and r["kg_context"].get("entities")
+        for r in results
+    )
+
+    effective_signal_weight = config.effective_signal_weight(kg_active=kg_active)
+    if effective_signal_weight <= 0:
         total = len(results)
         scored = [
             {
@@ -431,15 +441,16 @@ def rerank(
                     r.get("similarity", 0.0), ctx.retrieval_mode,
                     rank=i, total=total, config=config,
                 ),
-                "rerank_details": {},
+                "rerank_details": {"kg_active": kg_active},
             }
             for i, r in enumerate(results)
         ]
         scored.sort(key=lambda r: r["final_score"], reverse=True)
         return scored[:k]
 
-    retrieval_weight = 1.0 - total_signal_weight
+    retrieval_weight = 1.0 - effective_signal_weight
     total = len(results)
+    effective_kg_weight = config.kg_weight if kg_active else 0.0
 
     scored: list[dict] = []
     for rank, result in enumerate(results):
@@ -455,9 +466,11 @@ def rerank(
         sig_type = type_match(result, ctx)
         sig_tags = tag_overlap(result, ctx)
         sig_pattern = pattern_score(result, ctx)
-        sig_kg = kg_overlap(result, ctx)
+        sig_kg = kg_overlap(result, ctx) if kg_active else 0.0
 
-        # Weighted combination
+        # Weighted combination. When kg_active is false, effective_kg_weight
+        # is 0 and kg_weight's share has already been rolled into
+        # retrieval_weight above.
         final = (
             retrieval_weight * cal
             + config.project_weight * sig_project
@@ -467,7 +480,7 @@ def rerank(
             + config.type_affinity_weight * sig_type
             + config.tag_overlap_weight * sig_tags
             + config.pattern_weight * sig_pattern
-            + config.kg_weight * sig_kg
+            + effective_kg_weight * sig_kg
         )
 
         # Augment result (shallow copy to avoid mutating input)
@@ -483,6 +496,7 @@ def rerank(
             "tag_overlap": sig_tags,
             "pattern": sig_pattern,
             "kg_overlap": sig_kg,
+            "kg_active": kg_active,
         }
         scored.append(augmented)
 

@@ -37,10 +37,40 @@ class RerankerConfig:
     type_affinity_weight: float = 0.05
     tag_overlap_weight: float = 0.05
     pattern_weight: float = 0.05
+    # kg_weight is conditionally redistributed to the retrieval term when KG
+    # data is inactive for a given rerank call (no query entities, sqlite
+    # backend, or no result carries kg_context). That preserves pre-Phase-3
+    # ranking math exactly on KG-absent paths. See rerank() and
+    # effective_signal_weight() for the redistribution logic. Changing or
+    # removing that redirection requires fresh adversarial review.
     kg_weight: float = 0.05
     recency_half_life_days: float = 45.0
     recall_log2_normalizer: float = 4.0
     rrf_scale_factor: float = 60.0
+
+    def __post_init__(self) -> None:
+        """Enforce the ranking-math invariant: retrieval_weight >= 0.
+
+        The reranker derives retrieval_weight as 1 - effective_signal_weight.
+        If operators tune signal weights whose sum exceeds 1.0 (e.g. upgrading
+        a pre-Phase-3 opc.toml that summed to 1.0, then adding kg_weight=0.05),
+        retrieval_weight goes negative and high-similarity hits get actively
+        penalized. Validate at construction time so bad configs fail loudly
+        instead of silently mis-ranking. See adversarial-review finding F2.
+        """
+        total = self.total_signal_weight
+        if total < 0.0 or total > 1.0:
+            raise ValueError(
+                f"RerankerConfig signal weights must sum to <= 1.0, "
+                f"got total_signal_weight={total:.4f}. Individual weights: "
+                f"project={self.project_weight}, recency={self.recency_weight}, "
+                f"confidence={self.confidence_weight}, recall={self.recall_weight}, "
+                f"type_affinity={self.type_affinity_weight}, "
+                f"tag_overlap={self.tag_overlap_weight}, "
+                f"pattern={self.pattern_weight}, kg={self.kg_weight}. "
+                f"Lower one or more weights, or reduce kg_weight to restore "
+                f"a non-negative retrieval_weight."
+            )
 
     @property
     def total_signal_weight(self) -> float:
@@ -54,6 +84,20 @@ class RerankerConfig:
             + self.pattern_weight
             + self.kg_weight
         )
+
+    def effective_signal_weight(self, *, kg_active: bool) -> float:
+        """Signal weight actually applied in this rerank call.
+
+        Invariant: retrieval_weight + effective_signal_weight(kg_active) == 1.0
+
+        When kg_active is False (no query entities, sqlite backend, or no
+        result carries kg_context), kg_weight is redirected to retrieval
+        so the scoring reduces exactly to the pre-Phase-3 math. Deterministic
+        -- same inputs always yield the same redistribution.
+        """
+        if kg_active:
+            return self.total_signal_weight
+        return self.total_signal_weight - self.kg_weight
 
 
 @dataclass(frozen=True)

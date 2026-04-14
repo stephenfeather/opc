@@ -127,6 +127,38 @@ async def test_kg_weight_zero_produces_no_boost():
 
 
 @pytest.mark.asyncio
+async def test_make_recall_context_caps_query_for_extraction():
+    """Aegis LOW-1 fix: make_recall_context must not feed unbounded queries
+    to kg_extractor (regex CPU blowup). The cap is applied before extraction
+    so the extractor only ever sees up to _KG_QUERY_EXTRACTION_MAX_CHARS."""
+    from unittest.mock import MagicMock
+    from scripts.core.recall_learnings import (
+        _KG_QUERY_EXTRACTION_MAX_CHARS,
+        make_recall_context,
+    )
+
+    giant_query = "x" * (_KG_QUERY_EXTRACTION_MAX_CHARS * 4) + " pytest"
+
+    fake_extract = MagicMock(return_value=[])
+    with (
+        patch("scripts.core.recall_learnings.get_backend", return_value="postgres"),
+        patch(
+            "scripts.core.kg_extractor.extract_entities",
+            fake_extract,
+        ),
+    ):
+        make_recall_context(
+            project=None, tags=None, retrieval_mode="vector", query=giant_query,
+        )
+
+    fake_extract.assert_called_once()
+    call_arg = fake_extract.call_args[0][0]
+    assert len(call_arg) == _KG_QUERY_EXTRACTION_MAX_CHARS
+    # The cap truncates from the end, so the tail ("pytest") is dropped.
+    assert call_arg == "x" * _KG_QUERY_EXTRACTION_MAX_CHARS
+
+
+@pytest.mark.asyncio
 async def test_sqlite_backend_skips_kg_path_end_to_end():
     """sqlite backend: no query entities extracted, no kg_context attached."""
     mid = str(uuid.uuid4())

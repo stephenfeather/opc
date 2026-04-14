@@ -162,6 +162,15 @@ def apply_pattern_enrichment(
     return enriched
 
 
+# Cap on the query string length we will pass to kg_extractor. Extraction
+# uses regex patterns whose worst-case time grows with input size, and the
+# reranker's kg_overlap signal gains nothing from matching against a
+# megabytes-long prompt. 4096 bytes comfortably covers every realistic
+# recall query while bounding regex CPU on hostile/accidental input.
+# See aegis audit finding LOW-1.
+_KG_QUERY_EXTRACTION_MAX_CHARS = 4096
+
+
 def make_recall_context(
     project: str | None,
     tags: list[str] | None,
@@ -179,10 +188,14 @@ def make_recall_context(
 
     query_entities: list[dict] | None = None
     if query and get_backend() == "postgres":
+        # Cap the input fed to the extractor. This is defense-in-depth against
+        # regex CPU blow-up from oversized queries; no production path in this
+        # codebase sends queries larger than a few hundred chars.
+        extract_input = query[:_KG_QUERY_EXTRACTION_MAX_CHARS]
         try:
             from scripts.core.kg_extractor import extract_entities
 
-            extracted = extract_entities(query)
+            extracted = extract_entities(extract_input)
             query_entities = [
                 {"name": e.name, "type": e.entity_type} for e in extracted
             ] or None

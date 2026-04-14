@@ -28,6 +28,7 @@ if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
 from scripts.core.config.models import ArchivalConfig  # noqa: E402
+from scripts.core.log_safety import safe  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Pure functions
@@ -170,11 +171,11 @@ def _safe_restore(zst_path: Path, timeout: int) -> bool:
     try:
         result = decompress_file(zst_path, timeout)
         if result.returncode != 0:
-            print(f"  WARNING: Failed to restore {zst_path} — file may be orphaned")
+            print(f"  WARNING: Failed to restore {safe(zst_path)} — file may be orphaned")
             return False
         return True
     except Exception as e:
-        print(f"  WARNING: Restore error for {zst_path}: {e}")
+        print(f"  WARNING: Restore error for {safe(zst_path)}: {safe(e)}")
         return False
 
 
@@ -199,12 +200,12 @@ def archive_jsonl(
     try:
         result = compress_file(jsonl_path, cfg.compress_timeout)
         if result.returncode != 0:
-            print(f"  zstd failed: {result.stderr.decode(errors='replace')}")
+            print(f"  zstd failed: {safe(result.stderr.decode(errors='replace'))}")
             return False
 
         result = upload_to_s3(zst_path, s3_key, cfg.upload_timeout)
         if result.returncode != 0:
-            print(f"  S3 upload failed: {result.stderr.decode(errors='replace')}")
+            print(f"  S3 upload failed: {safe(result.stderr.decode(errors='replace'))}")
             _safe_restore(zst_path, cfg.compress_timeout)
             return False
 
@@ -214,20 +215,20 @@ def archive_jsonl(
         if db_url:
             db_result = mark_archived_in_db(session_id, s3_key, db_url)
             if db_result is None:
-                print(f"  Warning: DB error for {session_id} (S3 upload succeeded)")
+                print(f"  Warning: DB error for {safe(session_id)} (S3 upload succeeded)")
             elif db_result == 0:
-                print(f"  Note: No DB row updated for {session_id} (not tracked or archived)")
+                print(f"  Note: No DB row updated for {safe(session_id)} (not tracked or archived)")
 
-        print(f"  Archived {session_id} -> {s3_key}")
+        print(f"  Archived {safe(session_id)} -> {s3_key}")
         return True
 
     except subprocess.TimeoutExpired:
-        print(f"  Timeout for {session_id}")
+        print(f"  Timeout for {safe(session_id)}")
         if zst_path.exists() and not jsonl_path.exists():
             _safe_restore(zst_path, cfg.compress_timeout)
         return False
     except Exception as e:
-        print(f"  Error: {e}")
+        print(f"  Error: {safe(e)}")
         return False
 
 

@@ -70,6 +70,12 @@ def _escape_controls(s: str) -> str:
 def safe(value: object, *, max_len: int = _DEFAULT_MAX_LEN) -> str:
     """Render an arbitrary value as a single-line, control-char-free log field.
 
+    **Stability:** the behavioral contract below is covered by
+    ``tests/test_log_safety.py`` and is intended to remain stable so call
+    sites can rely on the output invariant. The escape format
+    (``\\xNN`` / ``\\uNNNN``) and truncation marker text are considered
+    part of the contract — log-parsing tools may grep for them.
+
     Contract (see ``tests/test_log_safety.py``):
 
     - ``None`` → ``"<none>"`` (preserves field-was-null forensic signal)

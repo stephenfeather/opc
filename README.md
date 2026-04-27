@@ -17,6 +17,7 @@ This project began as a fork of [Continuous-Claude-v3](https://github.com/parcad
 - **Multi-provider embeddings** - Pluggable embedding service supporting Voyage AI, OpenAI, local sentence-transformers, and Ollama
 - **Contextual reranking** - Adaptive reranker that reorders recall results using recency, tag relevance, type inference, and per-mode calibration
 - **Cross-session pattern detection** - Identifies recurring patterns across sessions (repeated errors, tool preferences, architectural decisions) and boosts them in recall
+- **Knowledge graph** - A structured layer over `archival_memory` that extracts typed entities (files, tools, errors, languages, etc.) and relationships (`solves`, `uses`, `supersedes`, ...) from each learning at store time, then enriches recall results with shared entity context and a `kg_overlap` reranker signal. See [docs/knowledge-graph.md](docs/knowledge-graph.md) for details.
 - **Learning chains** - Learnings can supersede previous entries, keeping the knowledge base current without duplication
 - **Temporal decay tracking** - Tracks when learnings are recalled and decays stale entries that haven't been useful recently
 - **Semantic deduplication** - Prevents storing near-duplicate learnings using embedding similarity checks across sessions, with per-session rejection tracking

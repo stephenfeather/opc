@@ -87,8 +87,11 @@ _RE_FILE_PATH = re.compile(
     r'|'
     # or file.ext — prefix excludes '.' so the splitter dot is unambiguous
     # (removes O(n^2) backtracking on dot-heavy inputs without a valid ext;
-    # see thoughts/shared/agents/aegis/kg_extractor_redos_audit.md, issue #120)
-    r'[\w-]+(?:\.[\w-]+)*\.(?:' + "|".join(_FILE_EXTENSIONS) + r')'
+    # see thoughts/shared/agents/aegis/kg_extractor_redos_audit.md, issue #120).
+    # The optional leading '\.?' restores dotfile-with-extension support
+    # (e.g. .bashrc.log, .envrc.json — see PR #127 review feedback). The 0-1
+    # quantifier is bounded and does not reintroduce backtracking.
+    r'\.?[\w-]+(?:\.[\w-]+)*\.(?:' + "|".join(_FILE_EXTENSIONS) + r')'
     r')(?=[\s`"\',;()\[\]{}]|$)',
     re.MULTILINE,
 )

@@ -6,10 +6,16 @@ B (``[\\w.-]+\\.(ext|...)``). After tightening branch B to remove ``.`` from the
 prefix character class the backtracking is reduced to linear, but we keep these
 tests as a permanent budget check to catch any future regressions.
 
-The 13 parametrized payloads come directly from the audit's "Test inputs to add"
-section. Each one exercises an adversarial dotty/slashy/underscore pattern at or
-near the ``_KG_QUERY_EXTRACTION_MAX_CHARS = 4096`` cap and must complete inside
-the per-call wall-clock budget.
+The 16 parametrized payloads come directly from the audit's "Test inputs to add"
+section (audit groups 1, 7, and 10 each contribute two payloads, so the visible
+count is 16). Each one exercises an adversarial dotty/slashy/underscore pattern
+at or near the ``_KG_QUERY_EXTRACTION_MAX_CHARS = 4096`` cap and must complete
+inside the per-call wall-clock budget.
+
+The module also includes a focused dotfile-with-known-extension regression test
+to guard against the issue caught by AI review on PR #127: an earlier hardening
+of branch B accidentally rejected inputs like ``.bashrc.log`` because the prefix
+character class no longer permitted a leading dot.
 """
 
 from __future__ import annotations
@@ -51,7 +57,7 @@ REDOS_BUDGET_SECONDS = 0.5
         "(" * 1000 + "a.b" + ")" * 1000,
         # 10. Whitespace-only and zero-width-space inputs.
         " " * 4000,
-        "​" * 4000,
+        "\u200B" * 4000,  # U+200B ZERO WIDTH SPACE — explicit escape, not a literal
         # 11. Long line with no whitespace (stress MULTILINE alternation).
         "x" * 4000,
         # 12. Many short would-be sentences (stress _RE_SENTENCE).
@@ -82,4 +88,34 @@ def test_query_extraction_cap_constant() -> None:
 
     assert _KG_QUERY_EXTRACTION_MAX_CHARS == 4096, (
         "kg query extraction cap must stay at 4096 chars (see audit)."
+    )
+
+
+@pytest.mark.parametrize(
+    "dotfile",
+    [
+        ".bashrc.log",   # leading-dot config + known extension
+        ".envrc.json",
+        ".npmrc.yaml",
+        ".config.toml",
+    ],
+)
+def test_dotfile_with_known_extension_matches(dotfile: str) -> None:
+    """Regression for PR #127: dotfiles with a known extension must still match.
+
+    The previous tightening of ``_RE_FILE_PATH`` branch B replaced the prefix
+    class ``[\\w.-]+`` with ``[\\w-]+``, which rejected inputs starting with
+    ``.`` (e.g. ``.bashrc.log``). The fix restores leading-dot support via an
+    optional ``\\.?`` anchor while preserving the deterministic-splitter
+    property the audit depends on.
+    """
+    payload = f"see {dotfile} for details"
+    entities = extract_entities(payload)
+    # ``display_name`` preserves the original surface form (including the
+    # leading dot). ``name`` is canonicalized via ``lstrip("./")`` for file
+    # entities, so it intentionally drops the leading dot.
+    display_names = {e.display_name for e in entities if e.entity_type == "file"}
+    assert dotfile in display_names, (
+        f"expected dotfile {dotfile!r} to be extracted as a file entity; "
+        f"got file display_names={sorted(display_names)!r}"
     )

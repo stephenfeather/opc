@@ -18,10 +18,12 @@ from __future__ import annotations
 
 import asyncio
 import io
+import sys
 import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -626,6 +628,58 @@ def test_fallback_prompt_matches_daemon_invariant() -> None:
     )
 
     assert CLI_FB is DAEMON_FB
+
+
+# ---------------------------------------------------------------------------
+# Path-mode invocation (task 12 regression)
+# ---------------------------------------------------------------------------
+
+
+def test_path_mode_invocation_does_not_modulenotfounderror(tmp_path) -> None:
+    """`python scripts/core/extract_session.py --help` must succeed.
+
+    The original CLI used absolute ``from scripts.core...`` imports without a
+    sys.path bootstrap, so path-mode invocation (no -m) crashed before
+    reaching argparse with ``ModuleNotFoundError: No module named 'scripts'``.
+    Regression for the bug surfaced in task 12 / PR #129 review.
+    """
+    import subprocess as real_subprocess
+
+    project_root = Path(extract_session.__file__).resolve().parent.parent.parent
+    script_path = project_root / "scripts" / "core" / "extract_session.py"
+    proc = real_subprocess.run(
+        [sys.executable, str(script_path), "--help"],
+        cwd=str(project_root),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, (
+        f"path-mode invocation failed: rc={proc.returncode}\n"
+        f"stdout={proc.stdout!r}\n"
+        f"stderr={proc.stderr!r}"
+    )
+    # argparse --help printed; sanity-check a known token.
+    assert "session-id" in proc.stdout
+
+
+def test_module_mode_invocation_succeeds() -> None:
+    """`python -m scripts.core.extract_session --help` must continue to work."""
+    import subprocess as real_subprocess
+
+    project_root = Path(extract_session.__file__).resolve().parent.parent.parent
+    proc = real_subprocess.run(
+        [sys.executable, "-m", "scripts.core.extract_session", "--help"],
+        cwd=str(project_root),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, (
+        f"module-mode invocation failed: rc={proc.returncode}\n"
+        f"stderr={proc.stderr!r}"
+    )
+    assert "session-id" in proc.stdout
 
 
 # ---------------------------------------------------------------------------

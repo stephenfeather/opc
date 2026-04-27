@@ -34,16 +34,36 @@ import threading
 import uuid
 from pathlib import Path
 
-from scripts.core.config.handlers import get_config
-from scripts.core.db.postgres_pool import get_pool
-from scripts.core.memory_daemon_core import (
+from dotenv import load_dotenv
+
+# Path-mode bootstrap: when invoked as `python scripts/core/extract_session.py`,
+# the project root is not on sys.path, so absolute `from scripts.core...`
+# imports below would fail with ModuleNotFoundError. Mirror the pattern used
+# by scripts/core/recall_learnings.py: load .env files, then prepend the
+# project root (CLAUDE_PROJECT_DIR or the script's grandparent) to sys.path.
+# Module-mode (`python -m scripts.core.extract_session`) already has the
+# project root on sys.path, so this bootstrap is idempotent in that case.
+_global_env = Path.home() / ".claude" / ".env"
+if _global_env.exists():
+    load_dotenv(_global_env)
+load_dotenv()
+
+_project_dir = os.environ.get(
+    "CLAUDE_PROJECT_DIR", str(Path(__file__).parent.parent.parent)
+)
+if _project_dir not in sys.path:
+    sys.path.insert(0, _project_dir)
+
+from scripts.core.config.handlers import get_config  # noqa: E402
+from scripts.core.db.postgres_pool import get_pool  # noqa: E402
+from scripts.core.memory_daemon_core import (  # noqa: E402
     _ALLOWED_EXTRACTION_MODELS,
     build_extraction_command,
     build_extraction_env,
     strip_yaml_frontmatter,
     validate_extraction_model,
 )
-from scripts.core.memory_daemon_extractors import (
+from scripts.core.memory_daemon_extractors import (  # noqa: E402
     _FALLBACK_AGENT_PROMPT,
 )
 

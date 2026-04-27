@@ -29,6 +29,18 @@ from scripts.core.memory_daemon_core import (
 logger = logging.getLogger("memory-daemon")
 
 
+# Fallback prompt used when CLAUDE_CONFIG_DIR/agents/memory-extractor.md is
+# absent. Hoisted to a module-level constant so a single source of truth is
+# importable by adjacent CLIs (e.g. scripts.core.extract_session) and a
+# drift assertion can detect divergence at test time. Keep this byte-stable
+# unless updating both production paths in lock-step.
+_FALLBACK_AGENT_PROMPT = (
+    "Extract learnings from this Claude Code session.\n"
+    "Look for decisions, what worked, what failed, and patterns discovered.\n"
+    "Store each learning using store_learning.py with appropriate type and tags."
+)
+
+
 # ---------------------------------------------------------------------------
 # Step 4.1 — _is_extraction_blocked + extract_memories_impl
 # ---------------------------------------------------------------------------
@@ -103,11 +115,7 @@ def extract_memories_impl(
             content = agent_file.read_text()
             agent_prompt = strip_frontmatter_fn(content)
         else:
-            agent_prompt = (
-                "Extract learnings from this Claude Code session.\n"
-                "Look for decisions, what worked, what failed, and patterns discovered.\n"
-                "Store each learning using store_learning.py with appropriate type and tags."
-            )
+            agent_prompt = _FALLBACK_AGENT_PROMPT
 
         if daemon_cfg.extraction_model not in allowed_models:
             log_fn(

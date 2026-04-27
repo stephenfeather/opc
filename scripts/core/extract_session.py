@@ -43,6 +43,9 @@ from scripts.core.memory_daemon_core import (
     strip_yaml_frontmatter,
     validate_extraction_model,
 )
+from scripts.core.memory_daemon_extractors import (
+    _FALLBACK_AGENT_PROMPT,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -82,16 +85,9 @@ _VERBOSE_ENV_PREFIX_ALLOWLIST: tuple[str, ...] = (
 # without a cap. See PR #129 cycle-1 review (DESIGN 2).
 _DRY_RUN_MAX_TOKEN_CHARS = 256
 
-# Fallback prompt used when CLAUDE_CONFIG_DIR/agents/memory-extractor.md is
-# absent. INVARIANT: this string must remain byte-identical to the daemon's
-# fallback in ``memory_daemon_extractors.extract_memories_impl`` so dev/test
-# behavior matches production. If the daemon's fallback changes, update this
-# constant in lock-step. See PR #129 cycle-1 review (CodeRabbit drift note).
-_FALLBACK_AGENT_PROMPT = (
-    "Extract learnings from this Claude Code session.\n"
-    "Look for decisions, what worked, what failed, and patterns discovered.\n"
-    "Store each learning using store_learning.py with appropriate type and tags."
-)
+# _FALLBACK_AGENT_PROMPT is imported from memory_daemon_extractors above so
+# the daemon owns the canonical string. The CLI re-exports it via the import
+# alias; tests assert identity with the daemon constant to catch any drift.
 
 
 # ---------------------------------------------------------------------------

@@ -611,18 +611,21 @@ def test_load_agent_prompt_fallback_when_missing(monkeypatch, tmp_path) -> None:
 
 
 def test_fallback_prompt_matches_daemon_invariant() -> None:
-    """_FALLBACK_AGENT_PROMPT must stay byte-identical to the daemon fallback.
+    """The CLI fallback must BE the daemon fallback (same import).
 
-    The CodeRabbit drift concern (PR #129 cycle 1): if the daemon's fallback
-    is ever updated, this assertion fails — forcing a paired update here.
+    Tightened per qa CHANGES_REQUESTED on review-10: the previous version
+    compared ``extract_session._FALLBACK_AGENT_PROMPT`` to a hand-typed
+    duplicate inside the test body, which was a tautology. Now we import
+    the constant from both modules and assert object identity — the CLI
+    re-exports the daemon's constant via ``from ... import``, so they must
+    refer to the same string.
     """
-    daemon_fallback = (
-        "Extract learnings from this Claude Code session.\n"
-        "Look for decisions, what worked, what failed, and patterns discovered.\n"
-        "Store each learning using store_learning.py with appropriate "
-        "type and tags."
+    from scripts.core.extract_session import _FALLBACK_AGENT_PROMPT as CLI_FB
+    from scripts.core.memory_daemon_extractors import (
+        _FALLBACK_AGENT_PROMPT as DAEMON_FB,
     )
-    assert extract_session._FALLBACK_AGENT_PROMPT == daemon_fallback
+
+    assert CLI_FB is DAEMON_FB
 
 
 # ---------------------------------------------------------------------------

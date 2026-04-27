@@ -49,6 +49,10 @@ _SECRET_KEY_TOKENS: tuple[str, ...] = (
     "PASSWD",
     "DATABASE_URL",
     "DSN",
+    "AUTH",
+    "CREDENTIAL",
+    "PRIVATE",
+    "CERT",
 )
 
 _REDACTED = "***REDACTED***"
@@ -63,6 +67,41 @@ _FALLBACK_AGENT_PROMPT = (
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
+
+
+def _strict_positive_int(value: str) -> int:
+    """argparse type: require an integer >= 1.
+
+    Used for ``--max-turns`` so the daemon does not spawn an extraction with
+    zero turns budgeted.
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError) as e:
+        raise argparse.ArgumentTypeError(f"expected integer, got {value!r}") from e
+    if n < 1:
+        raise argparse.ArgumentTypeError(
+            f"value must be >= 1, got {n}"
+        )
+    return n
+
+
+def _nonneg_int(value: str) -> int:
+    """argparse type: require an integer >= 0.
+
+    Used for ``--timeout`` where 0 is reserved as "no timeout" — see
+    ``parse_args`` for the policy. Negative values are rejected because
+    they would crash ``proc.wait`` with a confusing low-level ValueError.
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError) as e:
+        raise argparse.ArgumentTypeError(f"expected integer, got {value!r}") from e
+    if n < 0:
+        raise argparse.ArgumentTypeError(
+            f"value must be >= 0, got {n}"
+        )
+    return n
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -105,15 +144,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--max-turns",
-        type=int,
+        type=_strict_positive_int,
         default=None,
-        help="Override extraction_max_turns",
+        help="Override extraction_max_turns (must be >= 1)",
     )
     parser.add_argument(
         "--timeout",
-        type=int,
+        type=_nonneg_int,
         default=None,
-        help="Subprocess timeout in seconds (default: no timeout)",
+        help=(
+            "Subprocess timeout in seconds (must be >= 0; 0 is treated as "
+            "no timeout, same as omitting the flag). Negative values are "
+            "rejected at parse time."
+        ),
     )
     parser.add_argument(
         "--verbose",
@@ -337,32 +380,41 @@ def _spawn_and_collect(
     session_id: str,
     pre_count: int,
 ) -> int:
-    """Spawn the subprocess, stream stderr, then report exit + delta count."""
-    proc = subprocess.Popen(
+    """Spawn the subprocess, stream stderr, then report exit + delta count.
+
+    The Popen handle is held inside a ``with`` block so its PIPEs and the
+    process itself are released deterministically on every exit path, even
+    when the kill-on-timeout branch fires. The inner ``wait(timeout=5)``
+    after kill is retained — the ``with`` is belt-and-suspenders cleanup
+    on top, not a replacement.
+    """
+    # Treat timeout == 0 as "no timeout", consistent with --help wording.
+    effective_timeout: int | None = timeout if timeout else None
+
+    with subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         env=env,
-    )
+    ) as proc:
+        # Drain stderr in the foreground. For an interactive single-session
+        # tool a serial drain is sufficient — we are not multiplexing
+        # multiple extractions like the daemon does.
+        _stream_stderr(proc)
 
-    # Drain stderr in the foreground. For an interactive single-session
-    # tool a serial drain is sufficient — we are not multiplexing multiple
-    # extractions like the daemon does.
-    _stream_stderr(proc)
-
-    try:
-        exit_code = proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
         try:
-            proc.wait(timeout=5)
+            exit_code = proc.wait(timeout=effective_timeout)
         except subprocess.TimeoutExpired:
-            pass
-        print(
-            f"error: subprocess timed out after {timeout}s; killed",
-            file=sys.stderr,
-        )
-        return 124
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            print(
+                f"error: subprocess timed out after {effective_timeout}s; killed",
+                file=sys.stderr,
+            )
+            return 124
 
     post_count = asyncio.run(count_session_memories(session_id))
     delta = max(0, post_count - pre_count)

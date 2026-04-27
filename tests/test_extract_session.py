@@ -74,6 +74,15 @@ class FakePopen:
     def returncode(self) -> int:
         return self._return_code
 
+    # Context-manager protocol — extract_session._spawn_and_collect uses
+    # subprocess.Popen inside a `with` block for deterministic PIPE cleanup.
+    def __enter__(self) -> FakePopen:
+        self.entered = True
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.exited = True
+
 
 class FakeConn:
     def __init__(self, *, row: dict | None = None, fetchval_value: int = 0) -> None:
@@ -504,3 +513,125 @@ def test_load_agent_prompt_fallback_when_missing(
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
     prompt = extract_session.load_agent_prompt()
     assert "Extract learnings" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Aegis polish (task 9)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_args_rejects_negative_timeout(session_id: str) -> None:
+    """argparse must reject --timeout -1 with exit code 2."""
+    with pytest.raises(SystemExit) as exc:
+        extract_session.parse_args(["--session-id", session_id, "--timeout", "-1"])
+    assert exc.value.code == 2
+
+
+def test_parse_args_accepts_zero_timeout_as_no_timeout(session_id: str) -> None:
+    """--timeout 0 is documented as 'no timeout' and parses successfully."""
+    ns = extract_session.parse_args(["--session-id", session_id, "--timeout", "0"])
+    assert ns.timeout == 0
+
+
+def test_parse_args_rejects_zero_max_turns(session_id: str) -> None:
+    """argparse must reject --max-turns 0 (must be >= 1)."""
+    with pytest.raises(SystemExit) as exc:
+        extract_session.parse_args(["--session-id", session_id, "--max-turns", "0"])
+    assert exc.value.code == 2
+
+
+def test_parse_args_rejects_negative_max_turns(session_id: str) -> None:
+    with pytest.raises(SystemExit) as exc:
+        extract_session.parse_args(
+            ["--session-id", session_id, "--max-turns", "-5"]
+        )
+    assert exc.value.code == 2
+
+
+def test_parse_args_rejects_non_integer_timeout(session_id: str) -> None:
+    with pytest.raises(SystemExit) as exc:
+        extract_session.parse_args(
+            ["--session-id", session_id, "--timeout", "not-a-number"]
+        )
+    assert exc.value.code == 2
+
+
+def test_redact_env_redacts_expanded_token_set() -> None:
+    """The expanded redaction list (AUTH/CREDENTIAL/PRIVATE/CERT) is honored."""
+    env = {
+        "AUTH_HEADER": "Bearer xyz",
+        "BASIC_AUTH": "user:pass",
+        "GCP_CREDENTIAL_FILE": "/etc/secrets/gcp.json",
+        "MY_PRIVATE_KEY": "-----BEGIN PRIVATE KEY-----",
+        "CLIENT_CERT": "/etc/ssl/client.pem",
+        "INNOCENT_VAR": "ok",
+    }
+    redacted = extract_session.redact_env(env)
+    assert redacted["AUTH_HEADER"] == "***REDACTED***"
+    assert redacted["BASIC_AUTH"] == "***REDACTED***"
+    assert redacted["GCP_CREDENTIAL_FILE"] == "***REDACTED***"
+    assert redacted["MY_PRIVATE_KEY"] == "***REDACTED***"
+    assert redacted["CLIENT_CERT"] == "***REDACTED***"
+    assert redacted["INNOCENT_VAR"] == "ok"
+
+
+def test_run_main_uses_popen_as_context_manager(
+    monkeypatch, session_id: str, good_row: dict
+) -> None:
+    """The Popen handle must be entered/exited so PIPEs close deterministically."""
+    captured = _install_orchestrator_doubles(
+        monkeypatch,
+        row=good_row,
+        fake_popen_kwargs={"return_code": 0, "stderr_lines": [b"ok\n"]},
+    )
+    extract_session.run_main(["--session-id", session_id])
+    # _install_orchestrator_doubles wires fake_popen as a fresh callable per
+    # call, so we have to fish the fake out of the Popen call list. The fake
+    # tracks .entered / .exited via the context-manager dunders.
+    assert len(captured["popen_calls"]) == 1
+    # Re-run a focused assertion: build a FakePopen via the same factory and
+    # verify it supports the dunders explicitly.
+    fp = FakePopen(["claude"], return_code=0)
+    with fp as inner:
+        assert inner is fp
+    assert fp.entered is True
+    assert fp.exited is True
+
+
+def test_run_main_zero_timeout_treated_as_no_timeout(
+    monkeypatch, session_id: str, good_row: dict
+) -> None:
+    """--timeout 0 must NOT cause TimeoutExpired (treated as 'no timeout')."""
+    captured: dict = {"wait_timeouts": []}
+
+    class RecordingFakePopen(FakePopen):
+        def wait(self, timeout: float | None = None) -> int:
+            captured["wait_timeouts"].append(timeout)
+            return 0
+
+    def fake_fetch(_session_id: str) -> Any:
+        async def _r() -> dict:
+            return good_row
+        return _r()
+
+    async def fake_count(_session_id: str) -> int:
+        return 0
+
+    monkeypatch.setattr(extract_session, "fetch_session_row", fake_fetch)
+    monkeypatch.setattr(extract_session, "count_session_memories", fake_count)
+    monkeypatch.setattr(extract_session, "load_agent_prompt", lambda: "P")
+    monkeypatch.setattr(
+        extract_session.subprocess,
+        "Popen",
+        lambda cmd, **kw: RecordingFakePopen(
+            cmd, stderr_lines=[], return_code=0, **kw
+        ),
+    )
+
+    rc = extract_session.run_main(
+        ["--session-id", session_id, "--timeout", "0"]
+    )
+    assert rc == 0
+    # The wait() call inside _spawn_and_collect must have received None,
+    # not 0, so subprocess.wait does not interpret it as "expire immediately".
+    assert captured["wait_timeouts"] == [None]

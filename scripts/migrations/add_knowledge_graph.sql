@@ -1,3 +1,6 @@
+-- Required extension: pgcrypto provides gen_random_uuid() used by kg_entities/kg_edges
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 -- Knowledge Graph: Entities (nodes)
 CREATE TABLE IF NOT EXISTS kg_entities (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

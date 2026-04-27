@@ -16,7 +16,10 @@ Coverage target on ``scripts/core/extract_session`` is >= 80%.
 
 from __future__ import annotations
 
+import asyncio
 import io
+import threading
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any
@@ -58,6 +61,8 @@ class FakePopen:
         self.stderr = io.BytesIO(b"".join(stderr_lines or []))
         self.terminated = False
         self.killed = False
+        self.entered = False
+        self.exited = False
 
     def wait(self, timeout: float | None = None) -> int:
         if self._raises_on_wait is not None:
@@ -74,8 +79,8 @@ class FakePopen:
     def returncode(self) -> int:
         return self._return_code
 
-    # Context-manager protocol — extract_session._spawn_and_collect uses
-    # subprocess.Popen inside a `with` block for deterministic PIPE cleanup.
+    # subprocess.Popen is a context manager; the production code now relies on
+    # __enter__/__exit__ for deterministic PIPE cleanup.
     def __enter__(self) -> FakePopen:
         self.entered = True
         return self
@@ -143,6 +148,11 @@ def patch_pool(monkeypatch):
     return install
 
 
+def _run_main_sync(argv: list[str]) -> int:
+    """Invoke the async run_main inside a fresh event loop for tests."""
+    return asyncio.run(extract_session.run_main(argv))
+
+
 # ---------------------------------------------------------------------------
 # parse_args
 # ---------------------------------------------------------------------------
@@ -157,11 +167,13 @@ def test_parse_args_defaults(session_id: str) -> None:
     ns = extract_session.parse_args(["--session-id", session_id])
     assert ns.session_id == session_id
     assert ns.dry_run is False
-    assert ns.no_mark_extracted is True  # task spec: default behavior
     assert ns.model is None
     assert ns.max_turns is None
     assert ns.timeout is None
     assert ns.verbose is False
+    # The --no-mark-extracted flag was removed (was a no-op); the CLI never
+    # marks sessions extracted by design.
+    assert not hasattr(ns, "no_mark_extracted")
 
 
 def test_parse_args_overrides(session_id: str) -> None:
@@ -180,6 +192,14 @@ def test_parse_args_overrides(session_id: str) -> None:
     assert ns.max_turns == 5
     assert ns.timeout == 120
     assert ns.verbose is True
+
+
+def test_parse_args_no_longer_accepts_no_mark_extracted(session_id: str) -> None:
+    """The no-op --no-mark-extracted flag was removed; argparse must reject."""
+    with pytest.raises(SystemExit):
+        extract_session.parse_args(
+            ["--session-id", session_id, "--no-mark-extracted"]
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -217,8 +237,7 @@ def test_redact_env_redacts_secret_keys() -> None:
         "INNOCENT_VAR": "ok",
     }
     redacted = extract_session.redact_env(env)
-    # Original is untouched.
-    assert env["OPENAI_API_KEY"] == "sk-secret"
+    assert env["OPENAI_API_KEY"] == "sk-secret"  # original untouched
     assert redacted["OPENAI_API_KEY"] == "***REDACTED***"
     assert redacted["VOYAGE_API_KEY"] == "***REDACTED***"
     assert redacted["DATABASE_URL"] == "***REDACTED***"
@@ -228,8 +247,83 @@ def test_redact_env_redacts_secret_keys() -> None:
     assert redacted["INNOCENT_VAR"] == "ok"
 
 
+def test_redact_env_redacts_expanded_token_set() -> None:
+    """The expanded redaction list (AUTH/CREDENTIAL/PRIVATE/CERT) is honored."""
+    env = {
+        "AUTH_HEADER": "Bearer xyz",
+        "BASIC_AUTH": "user:pass",
+        "GCP_CREDENTIAL_FILE": "/etc/secrets/gcp.json",
+        "MY_PRIVATE_KEY": "-----BEGIN PRIVATE KEY-----",
+        "CLIENT_CERT": "/etc/ssl/client.pem",
+        "INNOCENT_VAR": "ok",
+    }
+    redacted = extract_session.redact_env(env)
+    assert redacted["AUTH_HEADER"] == "***REDACTED***"
+    assert redacted["BASIC_AUTH"] == "***REDACTED***"
+    assert redacted["GCP_CREDENTIAL_FILE"] == "***REDACTED***"
+    assert redacted["MY_PRIVATE_KEY"] == "***REDACTED***"
+    assert redacted["CLIENT_CERT"] == "***REDACTED***"
+    assert redacted["INNOCENT_VAR"] == "ok"
+
+
 # ---------------------------------------------------------------------------
-# fetch_session_row
+# summarize_env_for_verbose (pure)
+# ---------------------------------------------------------------------------
+
+
+def test_summarize_env_only_emits_allowlisted_keys() -> None:
+    env = {
+        "CLAUDE_PROJECT_DIR": "/proj",
+        "CLAUDE_MEMORY_EXTRACTION": "1",
+        "OPC_DEBUG": "1",
+        "PYTHONPATH": "/x",
+        "HOME": "/Users/foo",
+        "PATH": "/usr/bin",
+        "GITHUB_TOKEN": "ghp_xxx",
+    }
+    visible, hidden = extract_session.summarize_env_for_verbose(env)
+    assert set(visible) == {
+        "CLAUDE_PROJECT_DIR",
+        "CLAUDE_MEMORY_EXTRACTION",
+        "OPC_DEBUG",
+        "PYTHONPATH",
+    }
+    # Visible values still subject to redaction (no secret tokens here).
+    assert visible["CLAUDE_MEMORY_EXTRACTION"] == "1"
+    assert hidden == 3  # HOME, PATH, GITHUB_TOKEN
+
+
+def test_summarize_env_redacts_secrets_in_visible_keys() -> None:
+    env = {
+        "CLAUDE_API_KEY": "sk-xxx",  # allowlisted prefix BUT secret-bearing key
+        "OPC_DEBUG": "1",
+    }
+    visible, _ = extract_session.summarize_env_for_verbose(env)
+    assert visible["CLAUDE_API_KEY"] == "***REDACTED***"
+    assert visible["OPC_DEBUG"] == "1"
+
+
+# ---------------------------------------------------------------------------
+# redact_long_tokens_for_dry_run (pure)
+# ---------------------------------------------------------------------------
+
+
+def test_redact_long_tokens_replaces_oversized_argv_tokens() -> None:
+    big = "X" * 500
+    cmd = ["claude", "-p", "--append-system-prompt", big, "trailer"]
+    out = extract_session.redact_long_tokens_for_dry_run(cmd)
+    assert out[0] == "claude"
+    assert out[3] == "<token: 500 chars>"
+    assert out[4] == "trailer"
+
+
+def test_redact_long_tokens_leaves_short_tokens_intact() -> None:
+    cmd = ["claude", "-p", "short", "another"]
+    assert extract_session.redact_long_tokens_for_dry_run(cmd) == cmd
+
+
+# ---------------------------------------------------------------------------
+# fetch_session_row / count_session_memories (async DB helpers)
 # ---------------------------------------------------------------------------
 
 
@@ -253,11 +347,6 @@ async def test_fetch_session_row_returns_none_when_missing(
     assert await extract_session.fetch_session_row(session_id) is None
 
 
-# ---------------------------------------------------------------------------
-# count_session_memories
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_count_session_memories_returns_int(
     patch_pool, session_id: str
@@ -271,7 +360,6 @@ async def test_count_session_memories_returns_int(
 async def test_count_session_memories_returns_zero_when_null(
     patch_pool, session_id: str
 ) -> None:
-    # asyncpg returns None when COUNT(*) is unset (shouldn't happen, but guard).
     conn = FakeConn(fetchval_value=None)  # type: ignore[arg-type]
     patch_pool(conn)
     assert await extract_session.count_session_memories(session_id) == 0
@@ -291,9 +379,17 @@ def _install_orchestrator_doubles(
 ) -> dict:
     """Install fakes on extract_session for run_main tests.
 
-    Returns a dict capturing call data the test can assert on.
+    Returns a dict capturing call data. Note that ``run_main`` is async so
+    callers must invoke ``_run_main_sync`` (which spins ``asyncio.run`` per
+    test) — the fixture stubs the async DB helpers directly to avoid the
+    asyncpg / cached-pool path entirely.
     """
-    captured: dict = {"popen_calls": [], "fetchrow_calls": 0, "fetchval_calls": 0}
+    captured: dict = {
+        "popen_calls": [],
+        "fetchrow_calls": 0,
+        "fetchval_calls": 0,
+        "popens": [],
+    }
 
     async def fake_fetch(session_id: str) -> dict | None:
         captured["fetchrow_calls"] += 1
@@ -309,7 +405,9 @@ def _install_orchestrator_doubles(
 
     def fake_popen(cmd, **kwargs):
         captured["popen_calls"].append({"cmd": cmd, **kwargs})
-        return FakePopen(cmd, **(fake_popen_kwargs or {}), **kwargs)
+        proc = FakePopen(cmd, **(fake_popen_kwargs or {}), **kwargs)
+        captured["popens"].append(proc)
+        return proc
 
     monkeypatch.setattr(extract_session.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(
@@ -322,23 +420,36 @@ def test_run_main_dry_run_does_not_spawn(
     monkeypatch, capsys, session_id: str, good_row: dict
 ) -> None:
     captured = _install_orchestrator_doubles(monkeypatch, row=good_row)
-    rc = extract_session.run_main(
-        ["--session-id", session_id, "--dry-run", "--verbose"]
-    )
+    rc = _run_main_sync(["--session-id", session_id, "--dry-run", "--verbose"])
     assert rc == 0
     assert captured["popen_calls"] == []
     out = capsys.readouterr().out
     assert "DRY RUN" in out
-    assert "claude" in out  # cmd printed
-    # Verbose mode lists env vars (with secrets redacted).
+    assert "claude" in out
+    # --verbose summary names the CLAUDE_ allowlist prefix entries.
     assert "CLAUDE_MEMORY_EXTRACTION" in out
+
+
+def test_run_main_dry_run_redacts_long_argv_tokens(
+    monkeypatch, capsys, session_id: str, good_row: dict
+) -> None:
+    """The agent prompt argv token must be redacted in dry-run output."""
+    _install_orchestrator_doubles(monkeypatch, row=good_row)
+    monkeypatch.setattr(
+        extract_session, "load_agent_prompt", lambda: "P" * 5000
+    )
+    _run_main_sync(["--session-id", session_id, "--dry-run"])
+    out = capsys.readouterr().out
+    assert "<token: 5000 chars>" in out
+    # The raw prompt body must NOT appear.
+    assert "P" * 1000 not in out
 
 
 def test_run_main_missing_session_returns_1(
     monkeypatch, capsys, session_id: str
 ) -> None:
     _install_orchestrator_doubles(monkeypatch, row=None)
-    rc = extract_session.run_main(["--session-id", session_id])
+    rc = _run_main_sync(["--session-id", session_id])
     assert rc == 1
     err = capsys.readouterr().err
     assert "no session" in err.lower() or "not found" in err.lower()
@@ -353,7 +464,7 @@ def test_run_main_missing_transcript_path(
         "transcript_path": None,
     }
     _install_orchestrator_doubles(monkeypatch, row=row)
-    rc = extract_session.run_main(["--session-id", session_id])
+    rc = _run_main_sync(["--session-id", session_id])
     assert rc == 1
     err = capsys.readouterr().err
     assert "transcript_path" in err.lower()
@@ -368,7 +479,7 @@ def test_run_main_transcript_file_missing_on_disk(
         "transcript_path": str(tmp_path / "does-not-exist.jsonl"),
     }
     _install_orchestrator_doubles(monkeypatch, row=row)
-    rc = extract_session.run_main(["--session-id", session_id])
+    rc = _run_main_sync(["--session-id", session_id])
     assert rc == 1
     err = capsys.readouterr().err
     assert "transcript" in err.lower()
@@ -379,9 +490,7 @@ def test_run_main_invalid_model_returns_1(
     monkeypatch, capsys, session_id: str, good_row: dict
 ) -> None:
     _install_orchestrator_doubles(monkeypatch, row=good_row)
-    rc = extract_session.run_main(
-        ["--session-id", session_id, "--model", "gpt4"]
-    )
+    rc = _run_main_sync(["--session-id", session_id, "--model", "gpt4"])
     assert rc == 1
     err = capsys.readouterr().err
     assert "model" in err.lower()
@@ -389,7 +498,7 @@ def test_run_main_invalid_model_returns_1(
 
 def test_run_main_invalid_uuid_returns_1(monkeypatch, capsys) -> None:
     _install_orchestrator_doubles(monkeypatch, row=None)
-    rc = extract_session.run_main(["--session-id", "not-a-uuid"])
+    rc = _run_main_sync(["--session-id", "not-a-uuid"])
     assert rc == 1
     err = capsys.readouterr().err
     assert "uuid" in err.lower() or "invalid" in err.lower()
@@ -405,19 +514,16 @@ def test_run_main_happy_path_returns_subprocess_exit_code(
             "return_code": 0,
             "stderr_lines": [b"extracting...\n", b"done.\n"],
         },
-        counts=(3, 5),  # 3 before, 5 after → delta = 2
+        counts=(3, 5),
     )
-    rc = extract_session.run_main(["--session-id", session_id])
+    rc = _run_main_sync(["--session-id", session_id])
     assert rc == 0
     assert len(captured["popen_calls"]) == 1
     call = captured["popen_calls"][0]
-    # Command is a list (no shell=True path).
     assert isinstance(call["cmd"], list)
     assert call["cmd"][0] == "claude"
-    # Env was passed via env= (not via os.environ mutation).
     assert call["env"] is not None
     assert call["env"]["CLAUDE_MEMORY_EXTRACTION"] == "1"
-    # Stderr stream relayed; delta count printed.
     out = capsys.readouterr().out
     assert "delta" in out.lower() or "+2" in out or "new_memories=2" in out
 
@@ -430,7 +536,7 @@ def test_run_main_subprocess_nonzero_propagates(
         row=good_row,
         fake_popen_kwargs={"return_code": 7},
     )
-    rc = extract_session.run_main(["--session-id", session_id])
+    rc = _run_main_sync(["--session-id", session_id])
     assert rc == 7
 
 
@@ -447,13 +553,10 @@ def test_run_main_timeout_kills_process(
             "raises_on_wait": real_subprocess.TimeoutExpired(cmd="claude", timeout=1),
         },
     )
-    rc = extract_session.run_main(
-        ["--session-id", session_id, "--timeout", "1"]
-    )
-    assert rc != 0
+    rc = _run_main_sync(["--session-id", session_id, "--timeout", "1"])
+    assert rc == 124
     err = capsys.readouterr().err
     assert "timeout" in err.lower() or "timed out" in err.lower()
-    # Verify timeout was wired into wait() (the FakePopen raised TimeoutExpired).
     assert captured["popen_calls"][0]["env"] is not None
 
 
@@ -465,9 +568,8 @@ def test_run_main_model_override_propagates(
         row=good_row,
         fake_popen_kwargs={"return_code": 0, "stderr_lines": []},
     )
-    extract_session.run_main(["--session-id", session_id, "--model", "haiku"])
+    _run_main_sync(["--session-id", session_id, "--model", "haiku"])
     cmd = captured["popen_calls"][0]["cmd"]
-    # build_extraction_command places "--model" then the model name.
     idx = cmd.index("--model")
     assert cmd[idx + 1] == "haiku"
 
@@ -480,9 +582,7 @@ def test_run_main_max_turns_override_propagates(
         row=good_row,
         fake_popen_kwargs={"return_code": 0, "stderr_lines": []},
     )
-    extract_session.run_main(
-        ["--session-id", session_id, "--max-turns", "3"]
-    )
+    _run_main_sync(["--session-id", session_id, "--max-turns", "3"])
     cmd = captured["popen_calls"][0]["cmd"]
     idx = cmd.index("--max-turns")
     assert cmd[idx + 1] == "3"
@@ -493,9 +593,7 @@ def test_run_main_max_turns_override_propagates(
 # ---------------------------------------------------------------------------
 
 
-def test_load_agent_prompt_uses_file_when_present(
-    monkeypatch, tmp_path
-) -> None:
+def test_load_agent_prompt_uses_file_when_present(monkeypatch, tmp_path) -> None:
     config_dir = tmp_path / ".claude"
     (config_dir / "agents").mkdir(parents=True)
     agent_file = config_dir / "agents" / "memory-extractor.md"
@@ -503,16 +601,28 @@ def test_load_agent_prompt_uses_file_when_present(
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
     prompt = extract_session.load_agent_prompt()
     assert "actual prompt body" in prompt
-    # Frontmatter stripped.
     assert "meta: x" not in prompt
 
 
-def test_load_agent_prompt_fallback_when_missing(
-    monkeypatch, tmp_path
-) -> None:
+def test_load_agent_prompt_fallback_when_missing(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
     prompt = extract_session.load_agent_prompt()
     assert "Extract learnings" in prompt
+
+
+def test_fallback_prompt_matches_daemon_invariant() -> None:
+    """_FALLBACK_AGENT_PROMPT must stay byte-identical to the daemon fallback.
+
+    The CodeRabbit drift concern (PR #129 cycle 1): if the daemon's fallback
+    is ever updated, this assertion fails — forcing a paired update here.
+    """
+    daemon_fallback = (
+        "Extract learnings from this Claude Code session.\n"
+        "Look for decisions, what worked, what failed, and patterns discovered.\n"
+        "Store each learning using store_learning.py with appropriate "
+        "type and tags."
+    )
+    assert extract_session._FALLBACK_AGENT_PROMPT == daemon_fallback
 
 
 # ---------------------------------------------------------------------------
@@ -556,46 +666,179 @@ def test_parse_args_rejects_non_integer_timeout(session_id: str) -> None:
     assert exc.value.code == 2
 
 
-def test_redact_env_redacts_expanded_token_set() -> None:
-    """The expanded redaction list (AUTH/CREDENTIAL/PRIVATE/CERT) is honored."""
-    env = {
-        "AUTH_HEADER": "Bearer xyz",
-        "BASIC_AUTH": "user:pass",
-        "GCP_CREDENTIAL_FILE": "/etc/secrets/gcp.json",
-        "MY_PRIVATE_KEY": "-----BEGIN PRIVATE KEY-----",
-        "CLIENT_CERT": "/etc/ssl/client.pem",
-        "INNOCENT_VAR": "ok",
-    }
-    redacted = extract_session.redact_env(env)
-    assert redacted["AUTH_HEADER"] == "***REDACTED***"
-    assert redacted["BASIC_AUTH"] == "***REDACTED***"
-    assert redacted["GCP_CREDENTIAL_FILE"] == "***REDACTED***"
-    assert redacted["MY_PRIVATE_KEY"] == "***REDACTED***"
-    assert redacted["CLIENT_CERT"] == "***REDACTED***"
-    assert redacted["INNOCENT_VAR"] == "ok"
+# ---------------------------------------------------------------------------
+# Cycle-1 regressions (PR #129)
+# ---------------------------------------------------------------------------
 
 
 def test_run_main_uses_popen_as_context_manager(
     monkeypatch, session_id: str, good_row: dict
 ) -> None:
-    """The Popen handle must be entered/exited so PIPEs close deterministically."""
+    """The actual production Popen instance must enter and exit the with-block.
+
+    Tightened per the MINOR finding on PR #129 cycle 1: the previous version
+    of this test built a fresh FakePopen and walked the dunders manually,
+    which did not prove ``run_main`` triggered the context manager on the
+    instance returned by the factory.
+    """
     captured = _install_orchestrator_doubles(
         monkeypatch,
         row=good_row,
         fake_popen_kwargs={"return_code": 0, "stderr_lines": [b"ok\n"]},
     )
-    extract_session.run_main(["--session-id", session_id])
-    # _install_orchestrator_doubles wires fake_popen as a fresh callable per
-    # call, so we have to fish the fake out of the Popen call list. The fake
-    # tracks .entered / .exited via the context-manager dunders.
-    assert len(captured["popen_calls"]) == 1
-    # Re-run a focused assertion: build a FakePopen via the same factory and
-    # verify it supports the dunders explicitly.
-    fp = FakePopen(["claude"], return_code=0)
-    with fp as inner:
-        assert inner is fp
-    assert fp.entered is True
-    assert fp.exited is True
+    _run_main_sync(["--session-id", session_id])
+    assert len(captured["popens"]) == 1
+    proc = captured["popens"][0]
+    assert proc.entered is True
+    assert proc.exited is True
+
+
+def test_run_main_back_to_back_calls_share_no_loop_state(
+    monkeypatch, session_id: str, good_row: dict
+) -> None:
+    """BUG 1 regression: two calls in succession must not raise loop errors.
+
+    The previous implementation called ``asyncio.run`` three times per
+    invocation, which left the cached asyncpg pool bound to a closed loop
+    on the second call. ``run_main`` is async now and the entry point uses
+    a single ``asyncio.run``; in tests we use ``_run_main_sync`` which mimics
+    that contract. Calling it twice in a row exercises the regression.
+    """
+    second_session = str(uuid.uuid4())
+    rows = {good_row["id"]: good_row, second_session: {**good_row, "id": second_session}}
+
+    async def fake_fetch(sid: str) -> dict | None:
+        return rows.get(sid)
+
+    async def fake_count(_sid: str) -> int:
+        return 0
+
+    monkeypatch.setattr(extract_session, "fetch_session_row", fake_fetch)
+    monkeypatch.setattr(extract_session, "count_session_memories", fake_count)
+    monkeypatch.setattr(extract_session, "load_agent_prompt", lambda: "P")
+    monkeypatch.setattr(
+        extract_session.subprocess,
+        "Popen",
+        lambda cmd, **kw: FakePopen(
+            cmd, return_code=0, stderr_lines=[], **kw
+        ),
+    )
+
+    rc1 = _run_main_sync(["--session-id", session_id])
+    rc2 = _run_main_sync(["--session-id", second_session])
+    assert rc1 == 0
+    assert rc2 == 0
+    # And confirm the file uses asyncio.run only ONCE (in main()).
+    src = (
+        __import__("inspect").getsource(extract_session)
+    )
+    assert src.count("asyncio.run(") == 1
+
+
+def test_run_main_timeout_fires_even_when_stderr_blocks(
+    monkeypatch, session_id: str, good_row: dict
+) -> None:
+    """BUG 2 regression: a child holding stderr open must still hit --timeout.
+
+    Models a subprocess that emits some stderr, then blocks on stderr (the
+    iterator never returns). The timeout must fire in roughly the configured
+    window — a serial drain in the main thread would block proc.wait and
+    miss the deadline entirely.
+    """
+    import subprocess as real_subprocess
+
+    class HangingStderr:
+        """Iterator that yields some lines, then blocks on the next __next__.
+
+        Released by the parent test when the production code calls .close()
+        (which subprocess.Popen.__exit__ does on the PIPE).
+        """
+
+        def __init__(self, lines: list[bytes]) -> None:
+            self._lines = list(lines)
+            self._released = threading.Event()
+            self.closed = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self._lines:
+                return self._lines.pop(0)
+            # Block until released; mirror the real "child has stderr open".
+            self._released.wait(timeout=10)
+            raise StopIteration
+
+        def close(self):
+            self.closed = True
+            self._released.set()
+
+    class HangingFakePopen:
+        """Like FakePopen but with a stderr that blocks the streaming thread."""
+
+        def __init__(self, cmd, **kwargs):
+            self.cmd = cmd
+            self.env = kwargs.get("env")
+            self.stderr = HangingStderr([b"line one\n", b"line two\n"])
+            self._wait_calls = 0
+            self.killed = False
+            self.entered = False
+            self.exited = False
+
+        def wait(self, timeout=None):
+            self._wait_calls += 1
+            if timeout is None:
+                # Block forever (test would never call this without a timeout).
+                time.sleep(60)
+                return 0
+            # Sleep up to the timeout to mirror real behavior, then raise.
+            time.sleep(min(timeout, 5))
+            raise real_subprocess.TimeoutExpired(cmd=self.cmd, timeout=timeout)
+
+        def kill(self):
+            self.killed = True
+            self.stderr.close()
+
+        def __enter__(self):
+            self.entered = True
+            return self
+
+        def __exit__(self, *exc):
+            self.exited = True
+            self.stderr.close()
+
+        @property
+        def returncode(self):
+            return 124
+
+    captured: dict = {"popens": []}
+
+    async def fake_fetch(_sid: str) -> dict:
+        return good_row
+
+    async def fake_count(_sid: str) -> int:
+        return 0
+
+    def fake_popen(cmd, **kw):
+        proc = HangingFakePopen(cmd, **kw)
+        captured["popens"].append(proc)
+        return proc
+
+    monkeypatch.setattr(extract_session, "fetch_session_row", fake_fetch)
+    monkeypatch.setattr(extract_session, "count_session_memories", fake_count)
+    monkeypatch.setattr(extract_session, "load_agent_prompt", lambda: "P")
+    monkeypatch.setattr(extract_session.subprocess, "Popen", fake_popen)
+
+    start = time.perf_counter()
+    rc = _run_main_sync(["--session-id", session_id, "--timeout", "1"])
+    elapsed = time.perf_counter() - start
+    assert rc == 124
+    # Comfortable upper bound: even with the in-test sleep up to min(timeout, 5)
+    # the call should return inside a few seconds, not hang on stderr.
+    assert elapsed < 8, f"timeout did not fire promptly (took {elapsed:.2f}s)"
+    proc = captured["popens"][0]
+    assert proc.killed is True
+    assert proc.exited is True
 
 
 def test_run_main_zero_timeout_treated_as_no_timeout(
@@ -609,12 +852,10 @@ def test_run_main_zero_timeout_treated_as_no_timeout(
             captured["wait_timeouts"].append(timeout)
             return 0
 
-    def fake_fetch(_session_id: str) -> Any:
-        async def _r() -> dict:
-            return good_row
-        return _r()
+    async def fake_fetch(_sid: str) -> dict:
+        return good_row
 
-    async def fake_count(_session_id: str) -> int:
+    async def fake_count(_sid: str) -> int:
         return 0
 
     monkeypatch.setattr(extract_session, "fetch_session_row", fake_fetch)
@@ -628,10 +869,6 @@ def test_run_main_zero_timeout_treated_as_no_timeout(
         ),
     )
 
-    rc = extract_session.run_main(
-        ["--session-id", session_id, "--timeout", "0"]
-    )
+    rc = _run_main_sync(["--session-id", session_id, "--timeout", "0"])
     assert rc == 0
-    # The wait() call inside _spawn_and_collect must have received None,
-    # not 0, so subprocess.wait does not interpret it as "expire immediately".
     assert captured["wait_timeouts"] == [None]

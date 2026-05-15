@@ -69,6 +69,59 @@ def test_build_kg_lookup_caps_edges_at_max_per_memory():
     assert capped[-1]["weight"] >= 10.0  # 60 - 50 discarded = min kept weight 10
 
 
+def test_build_kg_lookup_decodes_json_string_elements():
+    """asyncpg returns elements of jsonb[] as JSON-encoded strings, not dicts.
+
+    build_kg_lookup must decode them so downstream code (sorting by weight,
+    apply_kg_enrichment, formatters) gets dicts.
+    """
+    import json
+
+    from scripts.core.recall_learnings import build_kg_lookup
+
+    mid = uuid.uuid4()
+    rows = [
+        {
+            "id": mid,
+            "kg_entities": [
+                json.dumps({"id": "e1", "name": "pytest", "type": "tool"}),
+            ],
+            "kg_edges": [
+                json.dumps(
+                    {"source": "pytest", "target": "asyncpg",
+                     "relation": "used_with", "weight": 2.0}
+                ),
+            ],
+        }
+    ]
+
+    lookup = build_kg_lookup(rows)
+    entry = lookup[str(mid)]
+    assert entry["entities"][0]["name"] == "pytest"
+    assert entry["edges"][0]["weight"] == 2.0
+
+
+def test_build_kg_lookup_caps_edges_with_json_string_elements():
+    """Edge cap path must also handle JSON-string elements without crashing."""
+    import json
+
+    from scripts.core.recall_learnings import KG_MAX_EDGES_PER_MEMORY, build_kg_lookup
+
+    mid = uuid.uuid4()
+    edges = [
+        json.dumps(
+            {"source": f"s{i}", "target": f"t{i}", "relation": "uses", "weight": float(i)}
+        )
+        for i in range(KG_MAX_EDGES_PER_MEMORY + 10)
+    ]
+    rows = [{"id": mid, "kg_entities": [], "kg_edges": edges}]
+
+    lookup = build_kg_lookup(rows)
+    capped = lookup[str(mid)]["edges"]
+    assert len(capped) == KG_MAX_EDGES_PER_MEMORY
+    assert capped[0]["weight"] == float(KG_MAX_EDGES_PER_MEMORY + 10 - 1)
+
+
 # ---------------------------------------------------------------------------
 # apply_kg_enrichment -- pure
 # ---------------------------------------------------------------------------
@@ -200,6 +253,7 @@ def test_fetch_kg_rows_query_shape_exposes_canonical_field():
     """SQL query must return both display 'name' and canonical 'canonical'
     so kg_overlap can match case- and path-canonicalized entity names."""
     import inspect
+
     from scripts.core import recall_learnings
 
     src = inspect.getsource(recall_learnings._fetch_kg_rows)

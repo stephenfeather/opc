@@ -459,8 +459,17 @@ def build_kg_lookup(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     lookup: dict[str, dict[str, Any]] = {}
     for row in rows:
         mid = str(row["id"])
-        entities = list(row.get("kg_entities") or [])
-        edges = list(row.get("kg_edges") or [])
+        # asyncpg auto-decodes top-level jsonb columns to dicts, but elements
+        # inside a jsonb[] array come back as JSON-encoded strings. Decode
+        # defensively so we accept both shapes.
+        entities = [
+            json.loads(e) if isinstance(e, str) else e
+            for e in (row.get("kg_entities") or [])
+        ]
+        edges = [
+            json.loads(e) if isinstance(e, str) else e
+            for e in (row.get("kg_edges") or [])
+        ]
         if len(edges) > KG_MAX_EDGES_PER_MEMORY:
             total = len(edges)
             edges = sorted(edges, key=lambda e: e.get("weight", 0.0), reverse=True)

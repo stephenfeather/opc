@@ -50,6 +50,7 @@ import faulthandler
 import json
 import os
 import re
+import signal
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -60,6 +61,15 @@ faulthandler.enable(
     file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"),
     all_threads=True,
 )
+
+
+def _graceful_exit(signum, _frame):
+    """Exit cleanly on SIGTERM/SIGINT instead of dumping a crash trace."""
+    sys.exit(128 + signum)
+
+
+signal.signal(signal.SIGTERM, _graceful_exit)
+signal.signal(signal.SIGINT, _graceful_exit)
 
 # Note: We use direct LLM-as-judge API calls via Braintrust proxy
 # instead of autoevals library for more control over prompts

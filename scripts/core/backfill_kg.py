@@ -30,7 +30,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
-from scripts.core.db.postgres_pool import get_pool
+from scripts.core.db.postgres_pool import close_pool, get_pool
 from scripts.core.kg_extractor import (
     extract_entities,
     extract_relations,
@@ -353,11 +353,19 @@ def _bootstrap() -> None:
         load_dotenv(opc_env, override=True)
 
 
+async def _main_async(argv: Sequence[str]) -> int:
+    """Run the CLI and always close the connection pool on the way out."""
+    _bootstrap()
+    args = parse_args(argv)
+    try:
+        return await run_backfill(args)
+    finally:
+        await close_pool()
+
+
 def main() -> None:
     """CLI entry point."""
-    _bootstrap()
-    args = parse_args(sys.argv[1:])
-    sys.exit(asyncio.run(run_backfill(args)))
+    sys.exit(asyncio.run(_main_async(sys.argv[1:])))
 
 
 if __name__ == "__main__":

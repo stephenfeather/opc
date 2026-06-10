@@ -144,6 +144,12 @@ class TestParseArgs:
         args = parse_args(["--since", "2026-01-01T00:00:00+05:00"])
         assert args.since.utcoffset().total_seconds() == 5 * 3600
 
+    def test_z_suffix_since_accepted_as_utc(self):
+        # Python >= 3.11 fromisoformat accepts the Z suffix natively
+        # (repo floor is 3.13); regression-documented for PR #132 review
+        args = parse_args(["--since", "2026-01-01T00:00:00Z"])
+        assert args.since.utcoffset().total_seconds() == 0
+
     def test_project_flag(self):
         assert parse_args([]).project is None
         assert parse_args(["--project", "opc"]).project == "opc"
@@ -528,6 +534,51 @@ class TestRunBackfill:
 
         assert rc == 0
         assert mock_one.await_count == 3
+
+
+# ---------------------------------------------------------------------------
+# Async: _main_async pool cleanup
+# ---------------------------------------------------------------------------
+
+
+class TestMainAsync:
+    async def test_returns_run_backfill_code_and_closes_pool(self):
+        from scripts.core.backfill_kg import _main_async
+
+        with (
+            patch("scripts.core.backfill_kg._bootstrap"),
+            patch(
+                "scripts.core.backfill_kg.run_backfill",
+                new_callable=AsyncMock,
+                return_value=0,
+            ),
+            patch(
+                "scripts.core.backfill_kg.close_pool", new_callable=AsyncMock
+            ) as mock_close,
+        ):
+            rc = await _main_async(["--dry-run"])
+
+        assert rc == 0
+        mock_close.assert_awaited_once()
+
+    async def test_closes_pool_even_when_run_raises(self):
+        from scripts.core.backfill_kg import _main_async
+
+        with (
+            patch("scripts.core.backfill_kg._bootstrap"),
+            patch(
+                "scripts.core.backfill_kg.run_backfill",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("boom"),
+            ),
+            patch(
+                "scripts.core.backfill_kg.close_pool", new_callable=AsyncMock
+            ) as mock_close,
+        ):
+            with pytest.raises(RuntimeError):
+                await _main_async([])
+
+        mock_close.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

@@ -494,3 +494,137 @@ class TestBuildRrfCte:
         result = build_rrf_cte(chain_filter=False, use_tsquery=False)
         assert isinstance(result, str)
         assert "WITH fts_ranked AS" in result
+
+
+# ==================== project column merge (issue #130) ====================
+
+
+class TestMergeProjectIntoMetadata:
+    """Pure function: overlay archival_memory.project column onto metadata."""
+
+    def test_column_set_and_metadata_missing(self):
+        from scripts.core.recall_backends import merge_project_into_metadata
+
+        merged = merge_project_into_metadata({"type": "x"}, {"project": "binbrain"})
+        assert merged["project"] == "binbrain"
+
+    def test_column_overrides_stale_metadata(self):
+        from scripts.core.recall_backends import merge_project_into_metadata
+
+        merged = merge_project_into_metadata(
+            {"project": "stale-value"}, {"project": "opc"}
+        )
+        assert merged["project"] == "opc"
+
+    def test_null_column_preserves_existing_metadata(self):
+        from scripts.core.recall_backends import merge_project_into_metadata
+
+        merged = merge_project_into_metadata({"project": "kept"}, {"project": None})
+        assert merged["project"] == "kept"
+
+    def test_missing_column_passes_through(self):
+        from scripts.core.recall_backends import merge_project_into_metadata
+
+        metadata = {"type": "session_learning"}
+        merged = merge_project_into_metadata(metadata, {"id": "abc"})
+        assert merged == {"type": "session_learning"}
+
+    def test_does_not_mutate_input_metadata(self):
+        from scripts.core.recall_backends import merge_project_into_metadata
+
+        metadata: dict[str, Any] = {"type": "x"}
+        merge_project_into_metadata(metadata, {"project": "opc"})
+        assert "project" not in metadata
+
+
+class TestFormattersCarryProject:
+    """Each row formatter must surface the project column for the reranker."""
+
+    def test_format_text_result_merges_project(self):
+        from scripts.core.recall_backends import format_text_result
+
+        row: dict[str, Any] = {
+            "id": UUID("12345678-1234-1234-1234-123456789abc"),
+            "session_id": "s-abc123",
+            "content": "test content",
+            "metadata": {"type": "session_learning"},
+            "created_at": datetime(2026, 1, 1),
+            "similarity": 0.85,
+            "project": "binbrain",
+        }
+        result = format_text_result(row)
+        assert result["metadata"]["project"] == "binbrain"
+
+    def test_format_rrf_result_merges_project(self):
+        from scripts.core.recall_backends import format_rrf_result
+
+        row: dict[str, Any] = {
+            "id": UUID("12345678-1234-1234-1234-123456789abc"),
+            "session_id": "s-abc",
+            "content": "x",
+            "metadata": {"project": "stale"},
+            "created_at": datetime(2026, 1, 1),
+            "rrf_score": 0.03,
+            "fts_rank": 1,
+            "vec_rank": 2,
+            "project": "opc",
+        }
+        result = format_rrf_result(row, has_decay=False)
+        assert result["metadata"]["project"] == "opc"
+
+    def test_format_vector_result_merges_project(self):
+        from scripts.core.recall_backends import format_vector_result
+
+        row: dict[str, Any] = {
+            "id": UUID("12345678-1234-1234-1234-123456789abc"),
+            "session_id": "s-abc",
+            "content": "x",
+            "metadata": {},
+            "created_at": datetime(2026, 1, 1),
+            "similarity": 0.9,
+            "project": "agentic-work",
+        }
+        result = format_vector_result(row)
+        assert result is not None
+        assert result["metadata"]["project"] == "agentic-work"
+
+    def test_format_sqlite_result_without_project_column(self):
+        from scripts.core.recall_backends import format_sqlite_result
+
+        row: dict[str, Any] = {
+            "id": "abc",
+            "session_id": "s-1",
+            "content": "x",
+            "metadata_json": '{"type": "session_learning"}',
+            "created_at": 1700000000,
+            "rank": -1.0,
+        }
+        result = format_sqlite_result(row, divisor=10.0)
+        assert "project" not in result["metadata"]
+
+
+class TestRecallSqlSelectsProject:
+    """Every postgres recall SQL must SELECT the project column (issue #130)."""
+
+    def test_all_postgres_recall_sql_selects_project(self):
+        from scripts.core import recall_backends as rb
+
+        sql_constants = [
+            rb._TEXT_ONLY_FTS_SQL,
+            rb._TEXT_ONLY_FTS_NO_CHAIN_SQL,
+            rb._TEXT_ONLY_ILIKE_SQL,
+            rb._TEXT_ONLY_ILIKE_NO_CHAIN_SQL,
+            rb._PG_RECENCY_SQL,
+            rb._PG_VECTOR_SQL,
+            rb._PG_TEXT_FALLBACK_SQL,
+        ]
+        for sql in sql_constants:
+            select_clause = sql.split("FROM")[0]
+            assert "project" in select_clause, f"project missing from: {sql[:120]}"
+
+    def test_rrf_tails_select_project(self):
+        from scripts.core import recall_backends as rb
+
+        for sql in (rb._RRF_BOOSTED_TAIL_SQL, rb._RRF_PLAIN_TAIL_SQL):
+            select_clause = sql.split("FROM")[0]
+            assert "a.project" in select_clause, f"project missing from: {sql[:120]}"

@@ -99,13 +99,35 @@ def format_row_metadata(metadata: Any) -> dict[str, Any]:
     return {}
 
 
+def merge_project_into_metadata(
+    metadata: dict[str, Any], row: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Overlay the archival_memory.project column onto result metadata.
+
+    The reranker's project_match signal reads metadata["project"], but the
+    canonical project attribution lives in the project column — 37% of rows
+    have the column set with no metadata key (issue #130). The column wins
+    when present and non-null. Rows from backends without the column
+    (SQLite) pass through unchanged.
+    """
+    try:
+        project = row["project"]
+    except (KeyError, IndexError):
+        return metadata
+    if project:
+        return {**metadata, "project": project}
+    return metadata
+
+
 def format_text_result(row: Mapping[str, Any]) -> dict[str, Any]:
     """Convert a text/vector search DB row to a result dict."""
     return {
         "id": str(row["id"]),
         "session_id": row["session_id"],
         "content": row["content"],
-        "metadata": format_row_metadata(row["metadata"]),
+        "metadata": merge_project_into_metadata(
+            format_row_metadata(row["metadata"]), row,
+        ),
         "created_at": row["created_at"],
         "similarity": float(row["similarity"]),
     }
@@ -115,7 +137,9 @@ def format_sqlite_result(
     row: Mapping[str, Any], *, divisor: float,
 ) -> dict[str, Any]:
     """Convert a SQLite FTS5 row to a result dict with normalized BM25 score."""
-    metadata = format_row_metadata(row["metadata_json"])
+    metadata = merge_project_into_metadata(
+        format_row_metadata(row["metadata_json"]), row,
+    )
 
     return {
         "id": row["id"] or "",
@@ -139,7 +163,9 @@ def format_rrf_result(
         "id": str(row["id"]),
         "session_id": row["session_id"],
         "content": row["content"],
-        "metadata": format_row_metadata(row["metadata"]),
+        "metadata": merge_project_into_metadata(
+            format_row_metadata(row["metadata"]), row,
+        ),
         "created_at": row["created_at"],
         "similarity": score,
         "fts_rank": row["fts_rank"],
@@ -174,7 +200,9 @@ def format_vector_result(
         "id": str(row_dict["id"]),
         "session_id": row_dict["session_id"],
         "content": row_dict["content"],
-        "metadata": format_row_metadata(row_dict["metadata"]),
+        "metadata": merge_project_into_metadata(
+            format_row_metadata(row_dict["metadata"]), row_dict,
+        ),
         "created_at": row_dict["created_at"],
         "similarity": score,
     }
@@ -229,6 +257,131 @@ def build_rrf_cte(*, chain_filter: bool, use_tsquery: bool = False) -> str:
 
 
 # ---------------------------------------------------------------------------
+# SQL constants — module-level so wiring (e.g. the project column required by
+# the reranker, issue #130) is testable without a database connection.
+# ---------------------------------------------------------------------------
+
+_TEXT_ONLY_FTS_SQL = """
+    SELECT
+        id, session_id, content, metadata, created_at, project,
+        ts_rank(to_tsvector('english', content),
+                to_tsquery('english', $1)) as similarity
+    FROM archival_memory
+    WHERE metadata->>'type' = 'session_learning'
+        AND superseded_by IS NULL
+        AND to_tsvector('english', content) @@ to_tsquery('english', $1)
+    ORDER BY similarity DESC, created_at DESC
+    LIMIT $2
+    """
+
+_TEXT_ONLY_FTS_NO_CHAIN_SQL = """
+    SELECT
+        id, session_id, content, metadata, created_at, project,
+        ts_rank(to_tsvector('english', content),
+                to_tsquery('english', $1)) as similarity
+    FROM archival_memory
+    WHERE metadata->>'type' = 'session_learning'
+        AND to_tsvector('english', content) @@ to_tsquery('english', $1)
+    ORDER BY similarity DESC, created_at DESC
+    LIMIT $2
+    """
+
+_TEXT_ONLY_ILIKE_SQL = """
+    SELECT
+        id, session_id, content, metadata, created_at, project,
+        0.1 as similarity
+    FROM archival_memory
+    WHERE metadata->>'type' = 'session_learning'
+        AND superseded_by IS NULL
+        AND content ILIKE '%' || $1 || '%'
+    ORDER BY created_at DESC
+    LIMIT $2
+    """
+
+_TEXT_ONLY_ILIKE_NO_CHAIN_SQL = """
+    SELECT
+        id, session_id, content, metadata, created_at, project,
+        0.1 as similarity
+    FROM archival_memory
+    WHERE metadata->>'type' = 'session_learning'
+        AND content ILIKE '%' || $1 || '%'
+    ORDER BY created_at DESC
+    LIMIT $2
+    """
+
+_RRF_BOOSTED_TAIL_SQL = """
+    SELECT
+        a.id, a.session_id, a.content, a.metadata, a.created_at, a.project,
+        a.recall_count, a.last_recalled,
+        c.rrf_score +
+            CASE WHEN COALESCE(a.recall_count, 0) = 0 THEN 0
+            ELSE log(2.0, 1 + COALESCE(a.recall_count, 0)) * $5
+            END as boosted_score,
+        c.rrf_score as raw_rrf_score, c.fts_rank, c.vec_rank
+    FROM combined c
+    JOIN archival_memory a ON a.id = c.id
+    ORDER BY boosted_score DESC
+    LIMIT $4
+    """
+
+_RRF_PLAIN_TAIL_SQL = """
+    SELECT
+        a.id, a.session_id, a.content, a.metadata, a.created_at, a.project,
+        c.rrf_score, c.fts_rank, c.vec_rank
+    FROM combined c
+    JOIN archival_memory a ON a.id = c.id
+    ORDER BY c.rrf_score DESC
+    LIMIT $4
+    """
+
+_PG_RECENCY_SQL = """
+    WITH scored AS (
+        SELECT
+            id, session_id, content, metadata, created_at, project,
+            1 - (embedding <=> $1::vector) as similarity,
+            GREATEST(0, 1.0 - EXTRACT(EPOCH FROM NOW() - created_at)
+                     / (30 * 86400)) as recency
+        FROM archival_memory
+        WHERE metadata->>'type' = 'session_learning'
+            AND embedding IS NOT NULL
+            {chain_filter}
+    )
+    SELECT
+        id, session_id, content, metadata, created_at, project,
+        similarity, recency,
+        (1.0 - $3::float) * similarity + $3::float * recency
+            as combined_score
+    FROM scored
+    ORDER BY combined_score DESC
+    LIMIT $2
+    """
+
+_PG_VECTOR_SQL = """
+    SELECT
+        id, session_id, content, metadata, created_at, project,
+        1 - (embedding <=> $1::vector) as similarity
+    FROM archival_memory
+    WHERE metadata->>'type' = 'session_learning'
+        AND embedding IS NOT NULL
+        {chain_filter}
+    ORDER BY embedding <=> $1::vector
+    LIMIT $2
+    """
+
+_PG_TEXT_FALLBACK_SQL = """
+    SELECT
+        id, session_id, content, metadata, created_at, project,
+        0.5 as similarity
+    FROM archival_memory
+    WHERE metadata->>'type' = 'session_learning'
+        AND content ILIKE '%' || $1 || '%'
+        {chain_filter}
+    ORDER BY created_at DESC
+    LIMIT $2
+    """
+
+
+# ---------------------------------------------------------------------------
 # I/O handlers — async functions that interact with databases
 # ---------------------------------------------------------------------------
 
@@ -251,69 +404,19 @@ async def search_learnings_text_only_postgres(
     pool = await get_pool()
     async with pool.acquire() as conn:
         try:
-            rows = await conn.fetch(
-                """
-                SELECT
-                    id, session_id, content, metadata, created_at,
-                    ts_rank(to_tsvector('english', content),
-                            to_tsquery('english', $1)) as similarity
-                FROM archival_memory
-                WHERE metadata->>'type' = 'session_learning'
-                    AND superseded_by IS NULL
-                    AND to_tsvector('english', content) @@ to_tsquery('english', $1)
-                ORDER BY similarity DESC, created_at DESC
-                LIMIT $2
-                """,
-                or_query, k,
-            )
+            rows = await conn.fetch(_TEXT_ONLY_FTS_SQL, or_query, k)
         except Exception:
             logger.debug("Chain filter fallback in text_only_postgres FTS", exc_info=True)
-            rows = await conn.fetch(
-                """
-                SELECT
-                    id, session_id, content, metadata, created_at,
-                    ts_rank(to_tsvector('english', content),
-                            to_tsquery('english', $1)) as similarity
-                FROM archival_memory
-                WHERE metadata->>'type' = 'session_learning'
-                    AND to_tsvector('english', content) @@ to_tsquery('english', $1)
-                ORDER BY similarity DESC, created_at DESC
-                LIMIT $2
-                """,
-                or_query, k,
-            )
+            rows = await conn.fetch(_TEXT_ONLY_FTS_NO_CHAIN_SQL, or_query, k)
 
         if not rows:
             first_word = query.split()[0] if query.split() else query
             try:
-                rows = await conn.fetch(
-                    """
-                    SELECT
-                        id, session_id, content, metadata, created_at,
-                        0.1 as similarity
-                    FROM archival_memory
-                    WHERE metadata->>'type' = 'session_learning'
-                        AND superseded_by IS NULL
-                        AND content ILIKE '%' || $1 || '%'
-                    ORDER BY created_at DESC
-                    LIMIT $2
-                    """,
-                    first_word, k,
-                )
+                rows = await conn.fetch(_TEXT_ONLY_ILIKE_SQL, first_word, k)
             except Exception:
                 logger.debug("Chain filter fallback in text_only_postgres ILIKE", exc_info=True)
                 rows = await conn.fetch(
-                    """
-                    SELECT
-                        id, session_id, content, metadata, created_at,
-                        0.1 as similarity
-                    FROM archival_memory
-                    WHERE metadata->>'type' = 'session_learning'
-                        AND content ILIKE '%' || $1 || '%'
-                    ORDER BY created_at DESC
-                    LIMIT $2
-                    """,
-                    first_word, k,
+                    _TEXT_ONLY_ILIKE_NO_CHAIN_SQL, first_word, k,
                 )
 
     return [format_text_result(row) for row in rows]
@@ -430,30 +533,8 @@ async def search_learnings_hybrid_rrf(
     rrf_cte = build_rrf_cte(chain_filter=True, use_tsquery=use_tsquery)
     rrf_cte_plain = build_rrf_cte(chain_filter=False, use_tsquery=use_tsquery)
 
-    boosted_tail = """
-            SELECT
-                a.id, a.session_id, a.content, a.metadata, a.created_at,
-                a.recall_count, a.last_recalled,
-                c.rrf_score +
-                    CASE WHEN COALESCE(a.recall_count, 0) = 0 THEN 0
-                    ELSE log(2.0, 1 + COALESCE(a.recall_count, 0)) * $5
-                    END as boosted_score,
-                c.rrf_score as raw_rrf_score, c.fts_rank, c.vec_rank
-            FROM combined c
-            JOIN archival_memory a ON a.id = c.id
-            ORDER BY boosted_score DESC
-            LIMIT $4
-            """
-
-    plain_tail = """
-            SELECT
-                a.id, a.session_id, a.content, a.metadata, a.created_at,
-                c.rrf_score, c.fts_rank, c.vec_rank
-            FROM combined c
-            JOIN archival_memory a ON a.id = c.id
-            ORDER BY c.rrf_score DESC
-            LIMIT $4
-            """
+    boosted_tail = _RRF_BOOSTED_TAIL_SQL
+    plain_tail = _RRF_PLAIN_TAIL_SQL
 
     has_decay_columns = True
     async with pool.acquire() as conn:
@@ -567,27 +648,7 @@ async def search_learnings_postgres(
             await init_pgvector(conn)
 
             if recency_weight > 0:
-                _recency_sql = """
-                    WITH scored AS (
-                        SELECT
-                            id, session_id, content, metadata, created_at,
-                            1 - (embedding <=> $1::vector) as similarity,
-                            GREATEST(0, 1.0 - EXTRACT(EPOCH FROM NOW() - created_at)
-                                     / (30 * 86400)) as recency
-                        FROM archival_memory
-                        WHERE metadata->>'type' = 'session_learning'
-                            AND embedding IS NOT NULL
-                            {chain_filter}
-                    )
-                    SELECT
-                        id, session_id, content, metadata, created_at,
-                        similarity, recency,
-                        (1.0 - $3::float) * similarity + $3::float * recency
-                            as combined_score
-                    FROM scored
-                    ORDER BY combined_score DESC
-                    LIMIT $2
-                    """
+                _recency_sql = _PG_RECENCY_SQL
                 try:
                     rows = await conn.fetch(
                         _recency_sql.format(chain_filter="AND superseded_by IS NULL"),
@@ -600,17 +661,7 @@ async def search_learnings_postgres(
                         str(query_embedding), k, recency_weight,
                     )
             else:
-                _vector_sql = """
-                    SELECT
-                        id, session_id, content, metadata, created_at,
-                        1 - (embedding <=> $1::vector) as similarity
-                    FROM archival_memory
-                    WHERE metadata->>'type' = 'session_learning'
-                        AND embedding IS NOT NULL
-                        {chain_filter}
-                    ORDER BY embedding <=> $1::vector
-                    LIMIT $2
-                    """
+                _vector_sql = _PG_VECTOR_SQL
                 try:
                     rows = await conn.fetch(
                         _vector_sql.format(chain_filter="AND superseded_by IS NULL"),
@@ -623,17 +674,7 @@ async def search_learnings_postgres(
                         str(query_embedding), k,
                     )
     elif text_fallback:
-        _text_sql = """
-                SELECT
-                    id, session_id, content, metadata, created_at,
-                    0.5 as similarity
-                FROM archival_memory
-                WHERE metadata->>'type' = 'session_learning'
-                    AND content ILIKE '%' || $1 || '%'
-                    {chain_filter}
-                ORDER BY created_at DESC
-                LIMIT $2
-                """
+        _text_sql = _PG_TEXT_FALLBACK_SQL
         async with pool.acquire() as conn:
             try:
                 rows = await conn.fetch(

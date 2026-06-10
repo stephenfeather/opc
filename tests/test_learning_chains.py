@@ -61,13 +61,14 @@ class TestRecallChainFilter:
     """Tests that recall queries include superseded_by IS NULL."""
 
     async def test_text_only_query_includes_chain_filter(self):
-        """search_learnings_text_only_postgres SQL should reference superseded_by."""
-        import inspect
+        """The primary text-only SQL constants should reference superseded_by."""
+        from scripts.core.recall_backends import (
+            _TEXT_ONLY_FTS_SQL,
+            _TEXT_ONLY_ILIKE_SQL,
+        )
 
-        from scripts.core.recall_learnings import search_learnings_text_only_postgres
-
-        source = inspect.getsource(search_learnings_text_only_postgres)
-        assert "superseded_by IS NULL" in source
+        assert "superseded_by IS NULL" in _TEXT_ONLY_FTS_SQL
+        assert "superseded_by IS NULL" in _TEXT_ONLY_ILIKE_SQL
 
     async def test_hybrid_rrf_query_includes_chain_filter(self):
         """build_rrf_cte (used by search_learnings_hybrid_rrf) should include superseded_by."""

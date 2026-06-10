@@ -590,14 +590,19 @@ class TestDirectInvocation:
     def test_script_runs_directly_without_module_flag(self):
         """Issue #124 acceptance uses `python scripts/core/backfill_kg.py`;
         the script needs the project root on sys.path (memory_daemon pattern)."""
+        import os
         import subprocess
         import sys
         from pathlib import Path
 
-        project_root = Path(__file__).parent.parent
+        project_root = Path(__file__).resolve().parent.parent
+        # Sanitized env: an inherited PYTHONPATH containing the project root
+        # would make scripts.* importable and false-green this test
+        child_env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
         proc = subprocess.run(
             [sys.executable, "scripts/core/backfill_kg.py", "--help"],
             cwd=project_root,
+            env=child_env,
             capture_output=True,
             text=True,
             timeout=30,

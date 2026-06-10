@@ -344,7 +344,7 @@ async def run_backfill(args: argparse.Namespace) -> int:
     remaining = args.limit
     consecutive_errors = 0
     no_entity_ids: list[str] = []
-    pool = None
+    pool: Any | None = None
     try:
         pool = await get_pool()
 

@@ -4,9 +4,11 @@ Walks archival_memory rows that have no kg_entity_mentions yet and runs the
 same extraction + storage path used by store_learning._try_index_kg.
 
 Idempotent and resumable: store_entities_and_edges dedupes on
-(memory_id, entity_id) and (source_id, target_id, relation, memory_id), and
-the fetch query excludes memories that already have a mention row, so partial
-runs resume cleanly and re-running is a no-op.
+(memory_id, entity_id) and (source_id, target_id, relation, memory_id); the
+fetch query excludes memories that already have a mention row and memories
+durably marked kg_backfill=no_entities in metadata, so partial runs resume
+cleanly and re-running converges to a no-op. Rows that error stay eligible
+and are retried on the next run (exit code 2 signals partial failure).
 
 Usage:
     uv run python scripts/core/backfill_kg.py --dry-run         # counts only
@@ -24,7 +26,7 @@ import os
 import sys
 import time
 import uuid
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 
@@ -46,17 +48,25 @@ def build_fetch_query(
     since: datetime | None = None,
     memory_id: str | None = None,
     count_only: bool = False,
+    after: tuple[datetime, str] | None = None,
 ) -> tuple[str, list[Any]]:
-    """Build the SQL to select memories with no KG mentions yet.
+    """Build the SQL to select memories that still need KG indexing.
 
     Returns (sql, params) with consecutively numbered placeholders.
-    The NOT EXISTS filter makes partial runs resumable.
+    Eligibility excludes memories that already have a kg_entity_mentions row
+    and memories durably marked kg_backfill in metadata (zero-entity rows),
+    so partial runs resume cleanly and reruns converge to a no-op.
+
+    ``after`` is a (created_at, id) keyset cursor: combined with the
+    deterministic ORDER BY it pages through the backlog without loading it
+    all at once, and advances past rows that errored mid-run.
     """
-    select = "SELECT count(*)" if count_only else "SELECT id, content"
+    select = "SELECT count(*)" if count_only else "SELECT id, content, created_at"
     sql = (
         f"{select} FROM archival_memory m "
         "WHERE NOT EXISTS ("
         "SELECT 1 FROM kg_entity_mentions km WHERE km.memory_id = m.id)"
+        " AND (m.metadata->>'kg_backfill') IS NULL"
     )
     params: list[Any] = []
     if since is not None:
@@ -65,18 +75,17 @@ def build_fetch_query(
     if memory_id is not None:
         params.append(memory_id)
         sql += f" AND m.id = ${len(params)}::uuid"
+    if after is not None:
+        params.extend([after[0], after[1]])
+        sql += (
+            f" AND (m.created_at, m.id) > (${len(params) - 1}, ${len(params)}::uuid)"
+        )
     if not count_only:
-        sql += " ORDER BY m.created_at"
+        sql += " ORDER BY m.created_at, m.id"
     if limit is not None:
         params.append(limit)
         sql += f" LIMIT ${len(params)}"
     return sql, params
-
-
-def chunked(items: Sequence[Any], size: int) -> Iterator[list[Any]]:
-    """Yield successive lists of at most ``size`` items."""
-    for i in range(0, len(items), size):
-        yield list(items[i : i + size])
 
 
 def format_summary(stats: dict[str, int]) -> str:
@@ -168,8 +177,43 @@ async def backfill_one(memory_id: str, content: str) -> dict[str, Any]:
         return {"status": "error", "error": str(e)[:200]}
 
 
+async def mark_no_entities(pool: Any, memory_ids: list[str]) -> None:
+    """Durably mark zero-entity memories so reruns skip them."""
+    if not memory_ids:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE archival_memory "
+            "SET metadata = COALESCE(metadata, '{}'::jsonb) "
+            "|| '{\"kg_backfill\": \"no_entities\"}'::jsonb "
+            "WHERE id = ANY($1::uuid[])",
+            memory_ids,
+        )
+
+
+async def _fetch_page(
+    pool: Any,
+    args: argparse.Namespace,
+    after: tuple[datetime, str] | None,
+    page_size: int,
+) -> list[Any]:
+    """Fetch one keyset page of eligible memories."""
+    sql, params = build_fetch_query(
+        limit=page_size,
+        since=args.since,
+        memory_id=args.memory_id,
+        after=after,
+    )
+    async with pool.acquire() as conn:
+        return await conn.fetch(sql, *params)
+
+
 async def run_backfill(args: argparse.Namespace) -> int:
-    """Run the backfill per parsed CLI args. Returns a process exit code."""
+    """Run the backfill per parsed CLI args.
+
+    Exit codes: 0 = success, 1 = unusable backend, 2 = some rows failed
+    (failed rows stay eligible and are retried on the next run).
+    """
     backend = detect_backend(dict(os.environ), fallback="sqlite")
     if backend != "postgres":
         _log(
@@ -191,26 +235,41 @@ async def run_backfill(args: argparse.Namespace) -> int:
             _log(f"--limit {args.limit} would cap this run at {min(eligible, args.limit)}")
         return 0
 
-    sql, params = build_fetch_query(
-        limit=args.limit, since=args.since, memory_id=args.memory_id
-    )
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(sql, *params)
-
-    total = len(rows)
-    _log(f"{total} memories to index")
     stats = {"processed": 0, "indexed": 0, "no_entities": 0, "errors": 0}
-    for batch in chunked(rows, args.batch_size):
-        for row in batch:
+    after: tuple[datetime, str] | None = None
+    remaining = args.limit
+    while True:
+        page_size = (
+            args.batch_size if remaining is None else min(args.batch_size, remaining)
+        )
+        if page_size <= 0:
+            break
+        rows = await _fetch_page(pool, args, after, page_size)
+        if not rows:
+            break
+
+        no_entity_ids: list[str] = []
+        for row in rows:
             result = await backfill_one(str(row["id"]), row["content"])
             stats["processed"] += 1
             status = result["status"]
             stats["errors" if status == "error" else status] += 1
             if status == "error":
                 _log(f"error indexing {row['id']}: {result['error']}")
-        _log(f"progress: {stats['processed']}/{total}")
+            elif status == "no_entities":
+                no_entity_ids.append(str(row["id"]))
+        await mark_no_entities(pool, no_entity_ids)
+
+        last = rows[-1]
+        after = (last["created_at"], str(last["id"]))
+        if remaining is not None:
+            remaining -= len(rows)
+        _log(f"progress: {stats['processed']} processed")
+        if len(rows) < page_size:
+            break
+
     print(format_summary(stats), flush=True)
-    return 0
+    return 2 if stats["errors"] else 0
 
 
 # ---------------------------------------------------------------------------

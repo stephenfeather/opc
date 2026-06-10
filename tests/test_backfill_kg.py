@@ -11,8 +11,8 @@ import pytest
 from scripts.core.backfill_kg import (
     backfill_one,
     build_fetch_query,
-    chunked,
     format_summary,
+    mark_no_entities,
     parse_args,
     run_backfill,
 )
@@ -32,25 +32,38 @@ def _mock_pool(conn: AsyncMock) -> MagicMock:
     return pool
 
 
+def _row(content: str = "content") -> dict:
+    """Build a fake archival_memory row."""
+    return {
+        "id": uuid.uuid4(),
+        "content": content,
+        "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Pure: build_fetch_query
 # ---------------------------------------------------------------------------
 
 
 class TestBuildFetchQuery:
-    def test_default_selects_unindexed_memories(self):
+    def test_default_selects_unindexed_unmarked_memories(self):
         sql, params = build_fetch_query()
         assert "SELECT id, content" in sql
         assert "archival_memory" in sql
         assert "NOT EXISTS" in sql
         assert "kg_entity_mentions" in sql
-        assert "ORDER BY" in sql
+        # Zero-entity memories are durably marked and excluded on reruns
+        assert "kg_backfill" in sql
+        # Keyset pagination requires a deterministic order with id tiebreak
+        assert "ORDER BY m.created_at, m.id" in sql
         assert params == []
 
     def test_count_only_uses_count_star(self):
         sql, params = build_fetch_query(count_only=True)
         assert "count(*)" in sql.lower()
         assert "NOT EXISTS" in sql
+        assert "kg_backfill" in sql
         assert "ORDER BY" not in sql
         assert params == []
 
@@ -71,28 +84,20 @@ class TestBuildFetchQuery:
         assert "id = $1" in sql
         assert params == [mid]
 
+    def test_after_adds_keyset_predicate(self):
+        after = (datetime(2026, 1, 1, tzinfo=UTC), str(uuid.uuid4()))
+        sql, params = build_fetch_query(after=after)
+        assert "(m.created_at, m.id) > ($1, $2::uuid)" in sql
+        assert params == [after[0], after[1]]
+
     def test_combined_filters_number_params_consecutively(self):
         since = datetime(2026, 1, 1, tzinfo=UTC)
-        sql, params = build_fetch_query(limit=10, since=since)
+        after = (datetime(2026, 2, 1, tzinfo=UTC), str(uuid.uuid4()))
+        sql, params = build_fetch_query(limit=10, since=since, after=after)
         assert "created_at >= $1" in sql
-        assert "LIMIT $2" in sql
-        assert params == [since, 10]
-
-
-# ---------------------------------------------------------------------------
-# Pure: chunked
-# ---------------------------------------------------------------------------
-
-
-class TestChunked:
-    def test_even_split(self):
-        assert list(chunked([1, 2, 3, 4], 2)) == [[1, 2], [3, 4]]
-
-    def test_remainder_in_last_chunk(self):
-        assert list(chunked([1, 2, 3, 4, 5], 2)) == [[1, 2], [3, 4], [5]]
-
-    def test_empty_input(self):
-        assert list(chunked([], 3)) == []
+        assert "(m.created_at, m.id) > ($2, $3::uuid)" in sql
+        assert "LIMIT $4" in sql
+        assert params == [since, after[0], after[1], 10]
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +211,34 @@ class TestBackfillOne:
 
 
 # ---------------------------------------------------------------------------
+# Async: mark_no_entities
+# ---------------------------------------------------------------------------
+
+
+class TestMarkNoEntities:
+    async def test_marks_ids_in_metadata(self):
+        conn = AsyncMock()
+        pool = _mock_pool(conn)
+        ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+
+        await mark_no_entities(pool, ids)
+
+        conn.execute.assert_awaited_once()
+        sql_arg = conn.execute.await_args[0][0]
+        assert "kg_backfill" in sql_arg
+        assert "UPDATE archival_memory" in sql_arg
+        assert conn.execute.await_args[0][1] == ids
+
+    async def test_empty_ids_is_noop(self):
+        conn = AsyncMock()
+        pool = _mock_pool(conn)
+
+        await mark_no_entities(pool, [])
+
+        conn.execute.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # Async: run_backfill orchestration
 # ---------------------------------------------------------------------------
 
@@ -250,12 +283,10 @@ class TestRunBackfill:
         assert "42" in capsys.readouterr().out
         mock_store.assert_not_called()
 
-    async def test_processes_rows_and_continues_on_error(self, capsys):
-        rows = [
-            {"id": uuid.uuid4(), "content": f"content {i}"} for i in range(3)
-        ]
+    async def test_partial_errors_exit_nonzero(self, capsys):
+        rows = [_row(f"content {i}") for i in range(3)]
         conn = AsyncMock()
-        conn.fetch.return_value = rows
+        conn.fetch.side_effect = [rows, []]
         pool = _mock_pool(conn)
 
         outcomes = [
@@ -281,19 +312,45 @@ class TestRunBackfill:
         ):
             rc = await run_backfill(parse_args([]))
 
-        assert rc == 0
+        # Partial failure must be visible to automation
+        assert rc == 2
         assert mock_one.await_count == 3
         out = capsys.readouterr().out
-        # Summary reflects one of each outcome
         assert "indexed" in out
         assert "errors" in out
 
-    async def test_batching_respects_batch_size(self):
-        rows = [
-            {"id": uuid.uuid4(), "content": f"content {i}"} for i in range(5)
-        ]
+    async def test_all_success_exits_zero(self):
+        rows = [_row()]
         conn = AsyncMock()
-        conn.fetch.return_value = rows
+        conn.fetch.side_effect = [rows, []]
+        pool = _mock_pool(conn)
+
+        with (
+            patch(
+                "scripts.core.backfill_kg.detect_backend", return_value="postgres"
+            ),
+            patch(
+                "scripts.core.backfill_kg.get_pool",
+                new_callable=AsyncMock,
+                return_value=pool,
+            ),
+            patch(
+                "scripts.core.backfill_kg.backfill_one",
+                new_callable=AsyncMock,
+                return_value={
+                    "status": "indexed",
+                    "stats": {"entities": 1, "edges": 0, "mentions": 1},
+                },
+            ),
+        ):
+            rc = await run_backfill(parse_args([]))
+
+        assert rc == 0
+
+    async def test_no_entity_rows_are_marked(self):
+        rows = [_row("plain text")]
+        conn = AsyncMock()
+        conn.fetch.side_effect = [rows, []]
         pool = _mock_pool(conn)
 
         with (
@@ -309,12 +366,84 @@ class TestRunBackfill:
                 "scripts.core.backfill_kg.backfill_one",
                 new_callable=AsyncMock,
                 return_value={"status": "no_entities"},
+            ),
+            patch(
+                "scripts.core.backfill_kg.mark_no_entities",
+                new_callable=AsyncMock,
+            ) as mock_mark,
+        ):
+            rc = await run_backfill(parse_args([]))
+
+        assert rc == 0
+        mock_mark.assert_awaited_once()
+        marked_ids = mock_mark.await_args[0][1]
+        assert marked_ids == [str(rows[0]["id"])]
+
+    async def test_pagination_fetches_in_batch_sized_pages(self):
+        pages = [
+            [_row("a"), _row("b")],
+            [_row("c"), _row("d")],
+            [_row("e")],
+        ]
+        conn = AsyncMock()
+        conn.fetch.side_effect = pages
+        pool = _mock_pool(conn)
+
+        with (
+            patch(
+                "scripts.core.backfill_kg.detect_backend", return_value="postgres"
+            ),
+            patch(
+                "scripts.core.backfill_kg.get_pool",
+                new_callable=AsyncMock,
+                return_value=pool,
+            ),
+            patch(
+                "scripts.core.backfill_kg.backfill_one",
+                new_callable=AsyncMock,
+                return_value={
+                    "status": "indexed",
+                    "stats": {"entities": 1, "edges": 0, "mentions": 1},
+                },
             ) as mock_one,
         ):
             rc = await run_backfill(parse_args(["--batch-size", "2"]))
 
         assert rc == 0
         assert mock_one.await_count == 5
+        # Short final page (1 < 2) terminates the loop without a 4th fetch
+        assert conn.fetch.await_count == 3
+
+    async def test_limit_caps_total_processed(self):
+        pages = [[_row("a"), _row("b")], [_row("c")]]
+        conn = AsyncMock()
+        conn.fetch.side_effect = pages
+        pool = _mock_pool(conn)
+
+        with (
+            patch(
+                "scripts.core.backfill_kg.detect_backend", return_value="postgres"
+            ),
+            patch(
+                "scripts.core.backfill_kg.get_pool",
+                new_callable=AsyncMock,
+                return_value=pool,
+            ),
+            patch(
+                "scripts.core.backfill_kg.backfill_one",
+                new_callable=AsyncMock,
+                return_value={
+                    "status": "indexed",
+                    "stats": {"entities": 1, "edges": 0, "mentions": 1},
+                },
+            ) as mock_one,
+        ):
+            rc = await run_backfill(
+                parse_args(["--batch-size", "2", "--limit", "3"])
+            )
+
+        assert rc == 0
+        assert mock_one.await_count == 3
 
 
 # ---------------------------------------------------------------------------
@@ -350,9 +479,10 @@ class TestBackfillIntegration:
         yield
         reset_pool()
 
-    async def _seed(self, conn, marker: str, n: int = 3) -> list[str]:
+    async def _seed(self, conn, marker: str) -> tuple[list[str], str]:
+        """Insert 3 entity-bearing memories plus 1 zero-entity memory."""
         ids = []
-        for i in range(n):
+        for i in range(3):
             row = await conn.fetchrow(
                 """
                 INSERT INTO archival_memory (session_id, content, content_hash)
@@ -364,7 +494,18 @@ class TestBackfillIntegration:
                 f"bf124-{marker}-{i}",
             )
             ids.append(str(row["id"]))
-        return ids
+        row = await conn.fetchrow(
+            """
+            INSERT INTO archival_memory (session_id, content, content_hash)
+            VALUES ($1, $2, $3)
+            RETURNING id
+            """,
+            f"test-backfill-kg-{marker}",
+            "the meeting went well and everyone agreed on the plan",
+            f"bf124-{marker}-noent",
+        )
+        no_entity_id = str(row["id"])
+        return ids + [no_entity_id], no_entity_id
 
     async def _cleanup(self, conn, marker: str, ids: list[str]):
         await conn.execute(
@@ -397,9 +538,8 @@ class TestBackfillIntegration:
         marker = uuid.uuid4().hex[:8]
         pool = await get_pool()
         async with pool.acquire() as conn:
-            ids = await self._seed(conn, marker)
+            ids, no_entity_id = await self._seed(conn, marker)
         try:
-            seeded_at = None
             async with pool.acquire() as conn:
                 seeded_at = await conn.fetchval(
                     "SELECT min(created_at) FROM archival_memory "
@@ -418,7 +558,13 @@ class TestBackfillIntegration:
                     "WHERE memory_id = ANY($1::uuid[])",
                     ids,
                 )
+                no_entity_flag = await conn.fetchval(
+                    "SELECT metadata->>'kg_backfill' FROM archival_memory "
+                    "WHERE id = $1::uuid",
+                    no_entity_id,
+                )
             assert mentions_after_first > 0
+            assert no_entity_flag == "no_entities"
 
             rc2 = await run_backfill(parse_args(["--since", since_arg]))
             assert rc2 == 0
@@ -429,7 +575,13 @@ class TestBackfillIntegration:
                     "WHERE memory_id = ANY($1::uuid[])",
                     ids,
                 )
+                sql, params = build_fetch_query(
+                    since=seeded_at, count_only=True
+                )
+                eligible_after_second = await conn.fetchval(sql, *params)
             assert mentions_after_second == mentions_after_first
+            # Zero-entity row is durably marked: nothing left to retry
+            assert eligible_after_second == 0
         finally:
             async with pool.acquire() as conn:
                 await self._cleanup(conn, marker, ids)

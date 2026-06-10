@@ -63,12 +63,12 @@ MAX_CONTENT_CHARS = 100_000
 
 # Issue #131: systemic failures must abort the run promptly instead of being
 # logged once per row across the whole backlog. Explicit allowlist of
-# connectivity/availability failures — deliberately NOT the generic
-# asyncpg.InterfaceError, whose subtree includes deterministic client API
-# misuse (e.g. ClientConfigurationError) that must stay on the per-row error
-# path (review round 2):
+# connectivity/availability failures:
 # - PostgresConnectionError: server-side connection loss
 #   (ConnectionDoesNotExistError, ConnectionFailureError, ...)
+# - InterfaceError: client-side connection/pool state — asyncpg raises the
+#   bare class for "pool is closing", "connection is closed", etc. Its
+#   deterministic client-misuse subclass is carved out below.
 # - InvalidAuthorizationSpecificationError: bad/revoked credentials at
 #   connect time (covers InvalidPasswordError)
 # - CannotConnectNowError: server starting up / not accepting connections
@@ -78,12 +78,19 @@ MAX_CONTENT_CHARS = 100_000
 # - TimeoutError: pool-acquire timeouts (asyncio.TimeoutError alias)
 INFRA_ERRORS: tuple[type[BaseException], ...] = (
     asyncpg.PostgresConnectionError,
+    asyncpg.InterfaceError,
     asyncpg.InvalidAuthorizationSpecificationError,
     asyncpg.CannotConnectNowError,
     asyncpg.InsufficientResourcesError,
     OSError,
     TimeoutError,
 )
+
+# Deterministic client API misuse under InterfaceError (review rounds 2-3):
+# a config/code bug fails identically for every row, so it stays on the
+# per-row error path and trips the circuit breaker rather than masquerading
+# as retryable infrastructure. Checked BEFORE INFRA_ERRORS in backfill_one.
+CLIENT_MISUSE_ERRORS: tuple[type[BaseException], ...] = (asyncpg.ClientConfigurationError,)
 
 # ---------------------------------------------------------------------------
 # Pure functions
@@ -273,6 +280,10 @@ async def backfill_one(memory_id: str, content: str) -> dict[str, Any]:
         relations = extract_relations(content, entities)
         stats = await store_entities_and_edges(memory_id, entities, relations)
         return {"status": "indexed", "stats": stats}
+    except CLIENT_MISUSE_ERRORS as e:
+        # Deterministic client misuse is a per-row error, not infra — must
+        # precede INFRA_ERRORS (its parent InterfaceError is in that tuple)
+        return {"status": "error", "error": str(e)[:200]}
     except INFRA_ERRORS:
         # Systemic failure (DB down, pool closing): abort, don't retry rows
         raise

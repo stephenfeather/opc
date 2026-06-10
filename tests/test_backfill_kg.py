@@ -266,6 +266,7 @@ class TestBackfillOne:
 
         infra_errors = [
             asyncpg.PostgresConnectionError("db down"),
+            asyncpg.InterfaceError("pool is closing"),
             asyncpg.InvalidAuthorizationSpecificationError("bad credentials"),
             asyncpg.CannotConnectNowError("the database system is starting up"),
             asyncpg.TooManyConnectionsError("too many clients"),
@@ -472,6 +473,29 @@ class TestRunBackfill:
                 "scripts.core.backfill_kg.get_pool",
                 new_callable=AsyncMock,
                 side_effect=ConnectionRefusedError("connect refused"),
+            ),
+        ):
+            rc = await run_backfill(parse_args([]))
+
+        assert rc == 3
+        assert "infrastructure error" in capsys.readouterr().out
+
+    async def test_fetch_page_interface_error_exits_3(self, capsys):
+        # Adversarial review round 3: a closed/exhausted pool surfaces as
+        # bare InterfaceError from acquire/fetch — that is connection-state,
+        # not client misuse, and must take the exit-3 path
+        import asyncpg
+
+        conn = AsyncMock()
+        conn.fetch.side_effect = asyncpg.InterfaceError("pool is closing")
+        pool = _mock_pool(conn)
+
+        with (
+            patch("scripts.core.backfill_kg.detect_backend", return_value="postgres"),
+            patch(
+                "scripts.core.backfill_kg.get_pool",
+                new_callable=AsyncMock,
+                return_value=pool,
             ),
         ):
             rc = await run_backfill(parse_args([]))

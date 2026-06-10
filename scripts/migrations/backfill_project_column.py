@@ -131,11 +131,8 @@ def normalize_session_path(path: str) -> str | None:
     if not path:
         return None
 
-    p = Path(path)
-    parts = p.parts
-
     # Try matching known suffixes (most specific first)
-    path_str = str(p)
+    path_str = str(Path(path))
     for suffix, project in sorted(PATH_TO_PROJECT.items(), key=lambda x: -len(x[0])):
         if path_str.endswith(suffix):
             return project
@@ -144,8 +141,12 @@ def normalize_session_path(path: str) -> str | None:
     if path_str in ("/Users/stephenfeather", "/Users/stephenfeather/Development"):
         return "_ambiguous"
 
-    # Default: lowercase basename
-    return parts[-1].lower() if parts else None
+    # Default: shared worktree-aware resolver (canonicalizes; issue #130
+    # review r3 — sessions.project can hold raw worktree paths, and a bare
+    # basename would store the branch name as the project)
+    from scripts.core.project_naming import project_from_path
+
+    return project_from_path(path_str)
 
 
 def infer_from_session_id(session_id: str) -> str | None:

@@ -305,3 +305,26 @@ class TestBackfillProducesCanonicalNames:
             assert inferred == canonicalize_project(inferred), (
                 f"tags {required_tags!r} infer non-canonical {inferred!r}"
             )
+
+    def test_tier1_session_path_is_worktree_aware(self):
+        """Review round 3: sessions.project can hold raw worktree paths;
+        tier-1 must resolve them to the parent repo, not the branch name."""
+        from scripts.migrations.backfill_project_column import (
+            normalize_session_path,
+        )
+
+        assert normalize_session_path(
+            "/Users/x/opc/.worktrees/issue-130-normalize"
+        ) == "opc"
+        assert normalize_session_path(
+            "/Users/x/opc/.claude/worktrees/issue-131-circuit-breaker"
+        ) == "opc"
+
+    def test_tier1_plain_path_canonicalizes(self):
+        from scripts.migrations.backfill_project_column import (
+            normalize_session_path,
+        )
+
+        assert normalize_session_path(
+            "/Users/x/Operations/DigitalOcean"
+        ) == "digitalocean"

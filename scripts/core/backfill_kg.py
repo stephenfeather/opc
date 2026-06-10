@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import os
 import sys
 import time
@@ -228,7 +229,9 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         type=_positive_int,
         default=10,
         help="Abort the run (exit 3) after this many consecutive per-row "
-        "errors — a systemic-failure circuit breaker (default 10)",
+        "errors — a systemic-failure circuit breaker (default 10). Raise it "
+        "to push past a contiguous block of poison rows; error rows stay "
+        "eligible and are never marked",
     )
     args = parser.parse_args(argv)
     if args.memory_id is not None and (
@@ -315,28 +318,30 @@ async def run_backfill(args: argparse.Namespace) -> int:
         )
         return 1
 
-    pool = await get_pool()
-
-    if args.dry_run:
-        sql, params = build_fetch_query(
-            since=args.since,
-            memory_id=args.memory_id,
-            count_only=True,
-            project=args.project,
-            recheck_no_entities=args.recheck_no_entities,
-        )
-        async with pool.acquire() as conn:
-            eligible = await conn.fetchval(sql, *params)
-        _log(f"Dry run: {eligible} memories eligible for KG backfill")
-        if args.limit is not None:
-            _log(f"--limit {args.limit} would cap this run at {min(eligible, args.limit)}")
-        return 0
-
     stats = {"processed": 0, "indexed": 0, "no_entities": 0, "errors": 0}
     after: tuple[datetime, str] | None = None
     remaining = args.limit
     consecutive_errors = 0
+    no_entity_ids: list[str] = []
+    pool = None
     try:
+        pool = await get_pool()
+
+        if args.dry_run:
+            sql, params = build_fetch_query(
+                since=args.since,
+                memory_id=args.memory_id,
+                count_only=True,
+                project=args.project,
+                recheck_no_entities=args.recheck_no_entities,
+            )
+            async with pool.acquire() as conn:
+                eligible = await conn.fetchval(sql, *params)
+            _log(f"Dry run: {eligible} memories eligible for KG backfill")
+            if args.limit is not None:
+                _log(f"--limit {args.limit} would cap this run at " f"{min(eligible, args.limit)}")
+            return 0
+
         while True:
             page_size = args.batch_size if remaining is None else min(args.batch_size, remaining)
             if page_size <= 0:
@@ -364,7 +369,9 @@ async def run_backfill(args: argparse.Namespace) -> int:
                         await mark_no_entities(pool, no_entity_ids)
                         _log(
                             f"aborting: {consecutive_errors} consecutive "
-                            "errors (circuit breaker)"
+                            "errors (circuit breaker); if these are isolated "
+                            "poison rows rerun with a higher "
+                            "--max-consecutive-errors to push past them"
                         )
                         print(format_summary(stats), flush=True)
                         return 3
@@ -384,6 +391,13 @@ async def run_backfill(args: argparse.Namespace) -> int:
     except INFRA_ERRORS as e:
         # Issue #131: systemic failure — abort promptly instead of logging
         # once per remaining row. Errored/unprocessed rows stay eligible.
+        if pool is not None and no_entity_ids:
+            # Best-effort: keep durable markers for rows already classified
+            # this page when the pool still answers (e.g. the abort came
+            # from a transient acquire timeout). Re-marking a previous
+            # page's ids is an idempotent UPDATE.
+            with contextlib.suppress(*INFRA_ERRORS):
+                await mark_no_entities(pool, no_entity_ids)
         _log(f"aborting: infrastructure error: {safe(str(e)[:200])}")
         print(format_summary(stats), flush=True)
         return 3

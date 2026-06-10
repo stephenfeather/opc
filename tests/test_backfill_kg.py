@@ -434,6 +434,119 @@ class TestRunBackfill:
         assert "infrastructure error" in out
         assert "db down" in out
 
+    async def test_pool_creation_infra_error_exits_3(self, capsys):
+        # DB down before row processing even begins must still exit 3,
+        # not escape with a traceback (adversarial review round 1)
+        with (
+            patch("scripts.core.backfill_kg.detect_backend", return_value="postgres"),
+            patch(
+                "scripts.core.backfill_kg.get_pool",
+                new_callable=AsyncMock,
+                side_effect=ConnectionRefusedError("connect refused"),
+            ),
+        ):
+            rc = await run_backfill(parse_args([]))
+
+        assert rc == 3
+        assert "infrastructure error" in capsys.readouterr().out
+
+    async def test_dry_run_infra_error_exits_3(self, capsys):
+        # --dry-run hits the DB too; an acquire timeout is a systemic
+        # failure, not a crash
+        conn = AsyncMock()
+        conn.fetchval.side_effect = TimeoutError("pool acquire timed out")
+        pool = _mock_pool(conn)
+
+        with (
+            patch("scripts.core.backfill_kg.detect_backend", return_value="postgres"),
+            patch(
+                "scripts.core.backfill_kg.get_pool",
+                new_callable=AsyncMock,
+                return_value=pool,
+            ),
+        ):
+            rc = await run_backfill(parse_args(["--dry-run"]))
+
+        assert rc == 3
+        assert "infrastructure error" in capsys.readouterr().out
+
+    async def test_infra_abort_flushes_no_entities_best_effort(self):
+        # Rows already classified no_entities in the aborted page keep their
+        # durable marker when the pool still answers (e.g. transient acquire
+        # timeout raised by a later row)
+        import asyncpg
+
+        rows = [_row("plain"), _row("entity-bearing")]
+        conn = AsyncMock()
+        conn.fetch.side_effect = [rows, []]
+        pool = _mock_pool(conn)
+
+        outcomes = [
+            {"status": "no_entities"},
+            asyncpg.PostgresConnectionError("db down"),
+        ]
+
+        with (
+            patch("scripts.core.backfill_kg.detect_backend", return_value="postgres"),
+            patch(
+                "scripts.core.backfill_kg.get_pool",
+                new_callable=AsyncMock,
+                return_value=pool,
+            ),
+            patch(
+                "scripts.core.backfill_kg.backfill_one",
+                new_callable=AsyncMock,
+                side_effect=outcomes,
+            ),
+            patch(
+                "scripts.core.backfill_kg.mark_no_entities",
+                new_callable=AsyncMock,
+            ) as mock_mark,
+        ):
+            rc = await run_backfill(parse_args([]))
+
+        assert rc == 3
+        mock_mark.assert_awaited_once()
+        assert mock_mark.await_args[0][1] == [str(rows[0]["id"])]
+
+    async def test_infra_abort_survives_failed_flush(self, capsys):
+        # The best-effort flush itself hits the dead DB: still exit 3, no
+        # secondary traceback
+        import asyncpg
+
+        rows = [_row("plain"), _row("entity-bearing")]
+        conn = AsyncMock()
+        conn.fetch.side_effect = [rows, []]
+        pool = _mock_pool(conn)
+
+        outcomes = [
+            {"status": "no_entities"},
+            asyncpg.PostgresConnectionError("db down"),
+        ]
+
+        with (
+            patch("scripts.core.backfill_kg.detect_backend", return_value="postgres"),
+            patch(
+                "scripts.core.backfill_kg.get_pool",
+                new_callable=AsyncMock,
+                return_value=pool,
+            ),
+            patch(
+                "scripts.core.backfill_kg.backfill_one",
+                new_callable=AsyncMock,
+                side_effect=outcomes,
+            ),
+            patch(
+                "scripts.core.backfill_kg.mark_no_entities",
+                new_callable=AsyncMock,
+                side_effect=asyncpg.PostgresConnectionError("still down"),
+            ),
+        ):
+            rc = await run_backfill(parse_args([]))
+
+        assert rc == 3
+        assert "infrastructure error" in capsys.readouterr().out
+
     async def test_consecutive_errors_trip_circuit_breaker(self, capsys):
         # Issue #131: schema mismatch etc. errors every row without raising
         # an INFRA_ERRORS type; the breaker stops the run at the threshold

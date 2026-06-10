@@ -50,6 +50,7 @@ def build_fetch_query(
     count_only: bool = False,
     after: tuple[datetime, str] | None = None,
     project: str | None = None,
+    recheck_no_entities: bool = False,
 ) -> tuple[str, list[Any]]:
     """Build the SQL to select memories that still need KG indexing.
 
@@ -60,6 +61,8 @@ def build_fetch_query(
 
     A targeted ``memory_id`` run bypasses the kg_backfill marker so a row
     previously marked no_entities can be reprocessed (repair path).
+    ``recheck_no_entities`` does the same for bulk runs, letting an
+    extractor upgrade revisit previously marked rows.
 
     ``after`` is a (created_at, id) keyset cursor: combined with the
     deterministic ORDER BY it pages through the backlog without loading it
@@ -71,7 +74,7 @@ def build_fetch_query(
         "WHERE NOT EXISTS ("
         "SELECT 1 FROM kg_entity_mentions km WHERE km.memory_id = m.id)"
     )
-    if memory_id is None:
+    if memory_id is None and not recheck_no_entities:
         sql += " AND (m.metadata->>'kg_backfill') IS NULL"
     params: list[Any] = []
     if since is not None:
@@ -163,7 +166,9 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "--memory-id",
         type=_uuid_str,
         default=None,
-        help="Backfill a single memory by UUID (bypasses the no_entities marker)",
+        help="Backfill a single still-unindexed memory by UUID. Bypasses the "
+        "no_entities marker; rows that already have kg_entity_mentions are "
+        "skipped. Mutually exclusive with --since/--project/--limit.",
     )
     parser.add_argument(
         "--project",
@@ -172,12 +177,23 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "the KG is a global graph by design)",
     )
     parser.add_argument(
+        "--recheck-no-entities",
+        action="store_true",
+        help="Re-include rows previously marked kg_backfill=no_entities "
+        "(use after extractor upgrades)",
+    )
+    parser.add_argument(
         "--batch-size",
         type=_positive_int,
         default=500,
-        help="Progress-logging batch size (default 500)",
+        help="DB page size and progress-logging batch (default 500)",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.memory_id is not None and (
+        args.since is not None or args.project is not None or args.limit is not None
+    ):
+        parser.error("--memory-id cannot be combined with --since/--project/--limit")
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +241,7 @@ async def _fetch_page(
         memory_id=args.memory_id,
         after=after,
         project=args.project,
+        recheck_no_entities=args.recheck_no_entities,
     )
     async with pool.acquire() as conn:
         return await conn.fetch(sql, *params)
@@ -252,6 +269,7 @@ async def run_backfill(args: argparse.Namespace) -> int:
             memory_id=args.memory_id,
             count_only=True,
             project=args.project,
+            recheck_no_entities=args.recheck_no_entities,
         )
         async with pool.acquire() as conn:
             eligible = await conn.fetchval(sql, *params)

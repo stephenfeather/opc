@@ -92,6 +92,13 @@ class TestBuildFetchQuery:
         assert "project = $1" in sql
         assert params == ["opc"]
 
+    def test_recheck_no_entities_includes_marked_rows(self):
+        # After an extractor upgrade, bulk runs can revisit rows previously
+        # marked no_entities
+        sql, params = build_fetch_query(recheck_no_entities=True)
+        assert "kg_backfill" not in sql
+        assert params == []
+
     def test_after_adds_keyset_predicate(self):
         after = (datetime(2026, 1, 1, tzinfo=UTC), str(uuid.uuid4()))
         sql, params = build_fetch_query(after=after)
@@ -156,6 +163,20 @@ class TestParseArgs:
     def test_zero_limit_rejected(self):
         with pytest.raises(SystemExit):
             parse_args(["--limit", "0"])
+
+    def test_recheck_no_entities_flag(self):
+        assert parse_args([]).recheck_no_entities is False
+        assert parse_args(["--recheck-no-entities"]).recheck_no_entities is True
+
+    def test_memory_id_exclusive_with_other_scoping_flags(self):
+        mid = str(uuid.uuid4())
+        for extra in (
+            ["--since", "2026-01-01"],
+            ["--project", "opc"],
+            ["--limit", "5"],
+        ):
+            with pytest.raises(SystemExit):
+                parse_args(["--memory-id", mid, *extra])
 
 
 # ---------------------------------------------------------------------------

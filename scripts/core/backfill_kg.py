@@ -10,6 +10,12 @@ durably marked kg_backfill=no_entities in metadata, so partial runs resume
 cleanly and re-running converges to a no-op. Rows that error stay eligible
 and are retried on the next run (exit code 2 signals partial failure).
 
+Systemic failures abort promptly instead of erroring once per row (#131):
+infrastructure errors (connection loss, pool timeouts) propagate out of the
+per-row handler, and a circuit breaker trips after --max-consecutive-errors
+consecutive per-row errors. Both abort paths exit 3; unprocessed rows stay
+eligible for the next run.
+
 Usage:
     uv run python scripts/core/backfill_kg.py --dry-run         # counts only
     uv run python scripts/core/backfill_kg.py                   # full backfill
@@ -38,6 +44,8 @@ _project_root = str(Path(__file__).resolve().parent.parent.parent)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+import asyncpg
+
 from scripts.core.db.postgres_pool import close_pool, get_pool
 from scripts.core.kg_extractor import (
     extract_entities,
@@ -51,6 +59,19 @@ from scripts.core.store_learning import detect_backend
 # transcript row must not stall the whole backfill. Extraction is heuristic;
 # the leading portion of a learning carries the salient entities.
 MAX_CONTENT_CHARS = 100_000
+
+# Issue #131: systemic failures must abort the run promptly instead of being
+# logged once per row across the whole backlog. asyncpg.PostgresConnectionError
+# covers server-side connection loss (ConnectionDoesNotExistError, ...),
+# InterfaceError covers client-side pool/connection misuse (e.g. pool is
+# closing), OSError covers socket-level failures (ConnectionError subclasses),
+# and TimeoutError covers pool-acquire timeouts (asyncio.TimeoutError alias).
+INFRA_ERRORS: tuple[type[BaseException], ...] = (
+    asyncpg.PostgresConnectionError,
+    asyncpg.InterfaceError,
+    OSError,
+    TimeoutError,
+)
 
 # ---------------------------------------------------------------------------
 # Pure functions
@@ -202,6 +223,13 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         default=500,
         help="DB page size and progress-logging batch (default 500)",
     )
+    parser.add_argument(
+        "--max-consecutive-errors",
+        type=_positive_int,
+        default=10,
+        help="Abort the run (exit 3) after this many consecutive per-row "
+        "errors — a systemic-failure circuit breaker (default 10)",
+    )
     args = parser.parse_args(argv)
     if args.memory_id is not None and (
         args.since is not None or args.project is not None or args.limit is not None
@@ -231,6 +259,9 @@ async def backfill_one(memory_id: str, content: str) -> dict[str, Any]:
         relations = extract_relations(content, entities)
         stats = await store_entities_and_edges(memory_id, entities, relations)
         return {"status": "indexed", "stats": stats}
+    except INFRA_ERRORS:
+        # Systemic failure (DB down, pool closing): abort, don't retry rows
+        raise
     except Exception as e:
         return {"status": "error", "error": str(e)[:200]}
 
@@ -272,7 +303,9 @@ async def run_backfill(args: argparse.Namespace) -> int:
     """Run the backfill per parsed CLI args.
 
     Exit codes: 0 = success, 1 = unusable backend, 2 = some rows failed
-    (failed rows stay eligible and are retried on the next run).
+    (failed rows stay eligible and are retried on the next run), 3 = aborted
+    on a systemic failure — an infrastructure error or the consecutive-error
+    circuit breaker (#131).
     """
     backend = detect_backend(dict(os.environ), fallback="sqlite")
     if backend != "postgres":
@@ -302,36 +335,58 @@ async def run_backfill(args: argparse.Namespace) -> int:
     stats = {"processed": 0, "indexed": 0, "no_entities": 0, "errors": 0}
     after: tuple[datetime, str] | None = None
     remaining = args.limit
-    while True:
-        page_size = args.batch_size if remaining is None else min(args.batch_size, remaining)
-        if page_size <= 0:
-            break
-        rows = await _fetch_page(pool, args, after, page_size)
-        if not rows:
-            break
+    consecutive_errors = 0
+    try:
+        while True:
+            page_size = args.batch_size if remaining is None else min(args.batch_size, remaining)
+            if page_size <= 0:
+                break
+            rows = await _fetch_page(pool, args, after, page_size)
+            if not rows:
+                break
 
-        no_entity_ids: list[str] = []
-        for row in rows:
-            result = await backfill_one(str(row["id"]), row["content"])
-            stats["processed"] += 1
-            status = result["status"]
-            stats["errors" if status == "error" else status] += 1
-            if status == "error":
-                # safe() at the log site, after the raw [:200] slice in
-                # backfill_one: exception text can embed semi-trusted memory
-                # content (issue #104 log-injection class)
-                _log(f"error indexing {row['id']}: {safe(result['error'])}")
-            elif status == "no_entities":
-                no_entity_ids.append(str(row["id"]))
-        await mark_no_entities(pool, no_entity_ids)
+            no_entity_ids: list[str] = []
+            for row in rows:
+                result = await backfill_one(str(row["id"]), row["content"])
+                stats["processed"] += 1
+                status = result["status"]
+                stats["errors" if status == "error" else status] += 1
+                if status == "error":
+                    # safe() at the log site, after the raw [:200] slice in
+                    # backfill_one: exception text can embed semi-trusted
+                    # memory content (issue #104 log-injection class)
+                    _log(f"error indexing {row['id']}: {safe(result['error'])}")
+                    consecutive_errors += 1
+                    if consecutive_errors >= args.max_consecutive_errors:
+                        # Issue #131: every row failing in a row is a
+                        # systemic failure even when no INFRA_ERRORS type
+                        # surfaced (e.g. schema mismatch) — stop the run
+                        await mark_no_entities(pool, no_entity_ids)
+                        _log(
+                            f"aborting: {consecutive_errors} consecutive "
+                            "errors (circuit breaker)"
+                        )
+                        print(format_summary(stats), flush=True)
+                        return 3
+                else:
+                    consecutive_errors = 0
+                    if status == "no_entities":
+                        no_entity_ids.append(str(row["id"]))
+            await mark_no_entities(pool, no_entity_ids)
 
-        last = rows[-1]
-        after = (last["created_at"], str(last["id"]))
-        if remaining is not None:
-            remaining -= len(rows)
-        _log(f"progress: {stats['processed']} processed")
-        if len(rows) < page_size:
-            break
+            last = rows[-1]
+            after = (last["created_at"], str(last["id"]))
+            if remaining is not None:
+                remaining -= len(rows)
+            _log(f"progress: {stats['processed']} processed")
+            if len(rows) < page_size:
+                break
+    except INFRA_ERRORS as e:
+        # Issue #131: systemic failure — abort promptly instead of logging
+        # once per remaining row. Errored/unprocessed rows stay eligible.
+        _log(f"aborting: infrastructure error: {safe(str(e)[:200])}")
+        print(format_summary(stats), flush=True)
+        return 3
 
     print(format_summary(stats), flush=True)
     return 2 if stats["errors"] else 0

@@ -174,6 +174,15 @@ class TestParseArgs:
         assert parse_args([]).recheck_no_entities is False
         assert parse_args(["--recheck-no-entities"]).recheck_no_entities is True
 
+    def test_max_consecutive_errors_default_and_override(self):
+        # Issue #131 circuit breaker threshold
+        assert parse_args([]).max_consecutive_errors == 10
+        assert parse_args(["--max-consecutive-errors", "3"]).max_consecutive_errors == 3
+
+    def test_zero_max_consecutive_errors_rejected(self):
+        with pytest.raises(SystemExit):
+            parse_args(["--max-consecutive-errors", "0"])
+
     def test_memory_id_exclusive_with_other_scoping_flags(self):
         mid = str(uuid.uuid4())
         for extra in (
@@ -249,6 +258,33 @@ class TestBackfillOne:
 
         assert result["status"] == "error"
         assert "boom" in result["error"]
+
+    async def test_infrastructure_errors_propagate(self):
+        # Issue #131: a dead DB mid-run must abort promptly, not get logged
+        # once per row across the whole backlog like a bad-content row
+        import asyncpg
+
+        infra_errors = [
+            asyncpg.PostgresConnectionError("db down"),
+            asyncpg.InterfaceError("pool is closing"),
+            ConnectionResetError("socket reset"),
+            TimeoutError("pool acquire timed out"),
+        ]
+        for exc in infra_errors:
+            with (
+                patch(
+                    "scripts.core.backfill_kg.extract_entities",
+                    return_value=[MagicMock()],
+                ),
+                patch("scripts.core.backfill_kg.extract_relations", return_value=[]),
+                patch(
+                    "scripts.core.backfill_kg.store_entities_and_edges",
+                    new_callable=AsyncMock,
+                    side_effect=exc,
+                ),
+            ):
+                with pytest.raises(type(exc)):
+                    await backfill_one(str(uuid.uuid4()), "uses pytest")
 
     async def test_oversized_content_truncated_before_extraction(self):
         from scripts.core.backfill_kg import MAX_CONTENT_CHARS
@@ -360,6 +396,106 @@ class TestRunBackfill:
         out = capsys.readouterr().out
         assert "indexed" in out
         assert "errors" in out
+
+    async def test_infra_error_aborts_run_with_exit_code_3(self, capsys):
+        # Issue #131: DB down mid-run → prompt abort with a distinct exit
+        # code, remaining rows never attempted
+        import asyncpg
+
+        rows = [_row(f"content {i}") for i in range(3)]
+        conn = AsyncMock()
+        conn.fetch.side_effect = [rows, []]
+        pool = _mock_pool(conn)
+
+        outcomes = [
+            {"status": "indexed", "stats": {"entities": 1, "edges": 0, "mentions": 1}},
+            asyncpg.PostgresConnectionError("db down"),
+        ]
+
+        with (
+            patch("scripts.core.backfill_kg.detect_backend", return_value="postgres"),
+            patch(
+                "scripts.core.backfill_kg.get_pool",
+                new_callable=AsyncMock,
+                return_value=pool,
+            ),
+            patch(
+                "scripts.core.backfill_kg.backfill_one",
+                new_callable=AsyncMock,
+                side_effect=outcomes,
+            ) as mock_one,
+        ):
+            rc = await run_backfill(parse_args([]))
+
+        assert rc == 3
+        # Third row never attempted: the run aborted promptly
+        assert mock_one.await_count == 2
+        out = capsys.readouterr().out
+        assert "infrastructure error" in out
+        assert "db down" in out
+
+    async def test_consecutive_errors_trip_circuit_breaker(self, capsys):
+        # Issue #131: schema mismatch etc. errors every row without raising
+        # an INFRA_ERRORS type; the breaker stops the run at the threshold
+        rows = [_row(f"content {i}") for i in range(4)]
+        conn = AsyncMock()
+        conn.fetch.side_effect = [rows, []]
+        pool = _mock_pool(conn)
+
+        with (
+            patch("scripts.core.backfill_kg.detect_backend", return_value="postgres"),
+            patch(
+                "scripts.core.backfill_kg.get_pool",
+                new_callable=AsyncMock,
+                return_value=pool,
+            ),
+            patch(
+                "scripts.core.backfill_kg.backfill_one",
+                new_callable=AsyncMock,
+                return_value={"status": "error", "error": "schema mismatch"},
+            ) as mock_one,
+        ):
+            rc = await run_backfill(parse_args(["--max-consecutive-errors", "2"]))
+
+        assert rc == 3
+        # Breaker trips at the threshold: rows 3 and 4 never attempted
+        assert mock_one.await_count == 2
+        out = capsys.readouterr().out
+        assert "consecutive errors" in out
+
+    async def test_success_resets_consecutive_error_count(self):
+        # Interleaved successes prove the errors are per-row, not systemic:
+        # the breaker must not trip and the run finishes with exit 2
+        rows = [_row(f"content {i}") for i in range(5)]
+        conn = AsyncMock()
+        conn.fetch.side_effect = [rows, []]
+        pool = _mock_pool(conn)
+
+        outcomes = [
+            {"status": "error", "error": "bad row"},
+            {"status": "indexed", "stats": {"entities": 1, "edges": 0, "mentions": 1}},
+            {"status": "error", "error": "bad row"},
+            {"status": "no_entities"},
+            {"status": "error", "error": "bad row"},
+        ]
+
+        with (
+            patch("scripts.core.backfill_kg.detect_backend", return_value="postgres"),
+            patch(
+                "scripts.core.backfill_kg.get_pool",
+                new_callable=AsyncMock,
+                return_value=pool,
+            ),
+            patch(
+                "scripts.core.backfill_kg.backfill_one",
+                new_callable=AsyncMock,
+                side_effect=outcomes,
+            ) as mock_one,
+        ):
+            rc = await run_backfill(parse_args(["--max-consecutive-errors", "2"]))
+
+        assert rc == 2
+        assert mock_one.await_count == 5
 
     async def test_error_log_sanitizes_control_characters(self, capsys):
         rows = [_row("adversarial")]

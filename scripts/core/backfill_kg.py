@@ -28,7 +28,15 @@ import time
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
+
+# Ensure project root is on sys.path so `scripts.*` imports work
+# when launched via `uv run python scripts/core/backfill_kg.py`
+# (which doesn't add cwd to sys.path) — memory_daemon.py pattern
+_project_root = str(Path(__file__).parent.parent.parent)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
 from scripts.core.db.postgres_pool import close_pool, get_pool
 from scripts.core.kg_extractor import (

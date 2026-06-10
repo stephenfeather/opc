@@ -582,6 +582,31 @@ class TestMainAsync:
 
 
 # ---------------------------------------------------------------------------
+# CLI: direct file invocation
+# ---------------------------------------------------------------------------
+
+
+class TestDirectInvocation:
+    def test_script_runs_directly_without_module_flag(self):
+        """Issue #124 acceptance uses `python scripts/core/backfill_kg.py`;
+        the script needs the project root on sys.path (memory_daemon pattern)."""
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        project_root = Path(__file__).parent.parent
+        proc = subprocess.run(
+            [sys.executable, "scripts/core/backfill_kg.py", "--help"],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert "--dry-run" in proc.stdout
+
+
+# ---------------------------------------------------------------------------
 # Integration: real PostgreSQL (skipped when unavailable)
 # ---------------------------------------------------------------------------
 

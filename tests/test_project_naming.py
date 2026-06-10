@@ -180,18 +180,18 @@ class TestBuildNormalizationPlan:
         assert build_normalization_plan([]) == []
 
     def test_metadata_sync_phase_is_guarded_and_idempotent(self):
-        """Review round 1: the migration must also align metadata.project
-        (the field the reranker historically reads) with the column."""
+        """Review rounds 1-2: the migration must align metadata.project
+        (the field the reranker historically reads) with the column —
+        rewriting stale keys AND creating missing ones (backfilled rows)."""
         from scripts.migrations.normalize_project_values import (
             METADATA_SYNC_COUNT_SQL,
             METADATA_SYNC_SQL,
         )
 
         assert "jsonb_set" in METADATA_SYNC_SQL
+        assert "COALESCE(metadata, '{}'::jsonb)" in METADATA_SYNC_SQL
         for sql in (METADATA_SYNC_SQL, METADATA_SYNC_COUNT_SQL):
-            # Only rewrite rows where the key exists and disagrees —
-            # makes re-runs match zero rows (idempotent).
-            assert "metadata ? 'project'" in sql
+            # Only touch rows that disagree — re-runs match zero rows.
             assert "IS DISTINCT FROM" in sql
 
 
@@ -218,3 +218,90 @@ class TestWritePathsCanonicalize:
 
         parsed = parse_args(["--project", "Operations-DigitalOcean"])
         assert parsed["project"] == "digitalocean"
+
+
+class TestProjectFromPath:
+    """Review round 2: store-time path resolution must be worktree-aware,
+    or worktree sessions re-fragment project values immediately."""
+
+    def test_plain_repo_path(self):
+        from scripts.core.project_naming import project_from_path
+
+        assert project_from_path("/Users/x/opc") == "opc"
+
+    def test_dot_worktrees_resolves_to_parent_repo(self):
+        from scripts.core.project_naming import project_from_path
+
+        assert project_from_path(
+            "/Users/x/opc/.worktrees/issue-130-normalize"
+        ) == "opc"
+
+    def test_claude_worktrees_resolves_to_parent_repo(self):
+        from scripts.core.project_naming import project_from_path
+
+        assert project_from_path(
+            "/Users/x/opc/.claude/worktrees/issue-131-circuit-breaker"
+        ) == "opc"
+
+    def test_worktree_of_aliased_project_canonicalizes(self):
+        from scripts.core.project_naming import project_from_path
+
+        assert project_from_path(
+            "/Users/x/Operations/DigitalOcean/.worktrees/fix-1"
+        ) == "digitalocean"
+
+    def test_none_and_empty(self):
+        from scripts.core.project_naming import project_from_path
+
+        assert project_from_path(None) is None
+        assert project_from_path("") is None
+
+    def test_resolve_for_store_is_worktree_aware(self):
+        from scripts.core.project_naming import resolve_project_for_store
+
+        assert resolve_project_for_store(
+            None, env_project_dir="/Users/x/opc/.worktrees/agent-130-normalize",
+        ) == "opc"
+
+
+class TestBackfillProducesCanonicalNames:
+    """Review round 2: backfill_project_column reruns (e.g. on remaining
+    NULL rows) must not reintroduce deprecated aliases."""
+
+    def test_session_prefix_inference_is_canonical(self):
+        from scripts.core.project_naming import canonicalize_project
+        from scripts.migrations.backfill_project_column import (
+            SESSION_PREFIX_TO_PROJECT,
+            infer_from_session_id,
+        )
+
+        for prefix in SESSION_PREFIX_TO_PROJECT:
+            inferred = infer_from_session_id(f"{prefix}-some-session")
+            assert inferred == canonicalize_project(inferred), (
+                f"prefix {prefix!r} infers non-canonical {inferred!r}"
+            )
+
+    def test_deprecated_alias_prefix_maps_to_canonical(self):
+        from scripts.migrations.backfill_project_column import (
+            infer_from_session_id,
+        )
+
+        assert infer_from_session_id("calebs-hospital-abc") == (
+            "2026-calebs-hospital"
+        )
+        assert infer_from_session_id("2026-calebs-hospital-abc") == (
+            "2026-calebs-hospital"
+        )
+
+    def test_tag_inference_is_canonical(self):
+        from scripts.core.project_naming import canonicalize_project
+        from scripts.migrations.backfill_project_column import (
+            TAG_TO_PROJECT,
+            infer_from_tags,
+        )
+
+        for required_tags, _project in TAG_TO_PROJECT:
+            inferred = infer_from_tags(sorted(required_tags))
+            assert inferred == canonicalize_project(inferred), (
+                f"tags {required_tags!r} infer non-canonical {inferred!r}"
+            )

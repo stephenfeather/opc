@@ -45,24 +45,22 @@ def build_normalization_plan(
     return sorted(plan)
 
 
-# Phase 2: align metadata->'project' with the (now canonical) column for
-# rows where the key exists and disagrees. The reranker historically reads
-# metadata['project'], so the column rewrite alone would leave ranking on
-# stale values. Only existing keys are rewritten — recall injects the
-# column into metadata at result-shaping time for the rest (PR #138).
-# Idempotent: re-running matches zero rows.
+# Phase 2: align metadata->'project' with the (now canonical) column —
+# rewriting stale keys AND creating missing ones (backfilled rows have a
+# column value but no metadata key, and the reranker historically reads
+# metadata['project']). Idempotent: re-running matches zero rows.
 METADATA_SYNC_SQL = """
     UPDATE archival_memory
-    SET metadata = jsonb_set(metadata, '{project}', to_jsonb(project))
+    SET metadata = jsonb_set(
+        COALESCE(metadata, '{}'::jsonb), '{project}', to_jsonb(project)
+    )
     WHERE project IS NOT NULL
-      AND metadata ? 'project'
       AND metadata->>'project' IS DISTINCT FROM project
 """
 
 METADATA_SYNC_COUNT_SQL = """
     SELECT count(*) FROM archival_memory
     WHERE project IS NOT NULL
-      AND metadata ? 'project'
       AND metadata->>'project' IS DISTINCT FROM project
 """
 

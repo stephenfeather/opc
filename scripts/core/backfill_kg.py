@@ -210,7 +210,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 
 async def backfill_one(memory_id: str, content: str) -> dict[str, Any]:
-    """Extract and store KG rows for one memory. Never raises."""
+    """Extract and store KG rows for one memory.
+
+    Returns a status dict; regular exceptions are converted into
+    ``{"status": "error", "error": ...}``.
+    """
     try:
         # Truncate once so entity spans and relation extraction index into
         # the same string

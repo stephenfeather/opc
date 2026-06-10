@@ -152,7 +152,11 @@ def _normalize_project(path_str: str | None) -> str | None:
 
     Returns the leaf directory name, or for worktree paths
     (containing .worktrees), returns the parent project name.
+    The result is canonicalized (lowercase, aliases collapsed) so every
+    write path produces the same project values (issue #130).
     """
+    from scripts.core.project_naming import canonicalize_project
+
     if not path_str:
         return None
     p = Path(path_str)
@@ -160,8 +164,8 @@ def _normalize_project(path_str: str | None) -> str | None:
     if ".worktrees" in parts:
         idx = parts.index(".worktrees")
         name = parts[idx - 1] if idx > 0 else p.name
-        return name or None
-    return p.name or None
+        return canonicalize_project(name)
+    return canonicalize_project(p.name)
 
 
 def validate_extraction_model(model: str, allowed: frozenset[str]) -> bool:

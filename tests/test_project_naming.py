@@ -178,3 +178,43 @@ class TestBuildNormalizationPlan:
         )
 
         assert build_normalization_plan([]) == []
+
+    def test_metadata_sync_phase_is_guarded_and_idempotent(self):
+        """Review round 1: the migration must also align metadata.project
+        (the field the reranker historically reads) with the column."""
+        from scripts.migrations.normalize_project_values import (
+            METADATA_SYNC_COUNT_SQL,
+            METADATA_SYNC_SQL,
+        )
+
+        assert "jsonb_set" in METADATA_SYNC_SQL
+        for sql in (METADATA_SYNC_SQL, METADATA_SYNC_COUNT_SQL):
+            # Only rewrite rows where the key exists and disagrees —
+            # makes re-runs match zero rows (idempotent).
+            assert "metadata ? 'project'" in sql
+            assert "IS DISTINCT FROM" in sql
+
+
+class TestWritePathsCanonicalize:
+    """Review round 1: every writer and exact-match reader must share the
+    canonical form, or the migration re-fragments immediately."""
+
+    def test_daemon_normalize_project_canonicalizes(self):
+        from scripts.core.memory_daemon_core import _normalize_project
+
+        assert _normalize_project(
+            "/Users/x/Operations/DigitalOcean"
+        ) == "digitalocean"
+
+    def test_daemon_normalize_project_worktree_canonicalizes(self):
+        from scripts.core.memory_daemon_core import _normalize_project
+
+        assert _normalize_project(
+            "/Users/x/Operations/DigitalOcean/.worktrees/fix-123"
+        ) == "digitalocean"
+
+    def test_push_learnings_args_canonicalized(self):
+        from scripts.core.push_learnings import parse_args
+
+        parsed = parse_args(["--project", "Operations-DigitalOcean"])
+        assert parsed["project"] == "digitalocean"

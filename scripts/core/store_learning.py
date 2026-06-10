@@ -586,6 +586,12 @@ async def store_learning_v2(
     if not content or not content.strip():
         return {"success": False, "error": "No content provided"}
 
+    # Canonicalize at the write boundary so non-CLI callers cannot
+    # re-fragment project values after the one-time migration (issue #130).
+    from scripts.core.project_naming import canonicalize_project
+
+    project = canonicalize_project(project)
+
     backend = detect_backend(dict(os.environ))
     memory = None
 

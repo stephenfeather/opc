@@ -250,6 +250,17 @@ class TestBackfillOne:
         assert result["status"] == "error"
         assert "boom" in result["error"]
 
+    async def test_oversized_content_truncated_before_extraction(self):
+        from scripts.core.backfill_kg import MAX_CONTENT_CHARS
+
+        with patch(
+            "scripts.core.backfill_kg.extract_entities", return_value=[]
+        ) as mock_ents:
+            await backfill_one(str(uuid.uuid4()), "x" * (MAX_CONTENT_CHARS + 5000))
+
+        passed = mock_ents.call_args[0][0]
+        assert len(passed) == MAX_CONTENT_CHARS
+
 
 # ---------------------------------------------------------------------------
 # Async: mark_no_entities
@@ -359,6 +370,38 @@ class TestRunBackfill:
         out = capsys.readouterr().out
         assert "indexed" in out
         assert "errors" in out
+
+    async def test_error_log_sanitizes_control_characters(self, capsys):
+        rows = [_row("adversarial")]
+        conn = AsyncMock()
+        conn.fetch.side_effect = [rows, []]
+        pool = _mock_pool(conn)
+
+        with (
+            patch(
+                "scripts.core.backfill_kg.detect_backend", return_value="postgres"
+            ),
+            patch(
+                "scripts.core.backfill_kg.get_pool",
+                new_callable=AsyncMock,
+                return_value=pool,
+            ),
+            patch(
+                "scripts.core.backfill_kg.backfill_one",
+                new_callable=AsyncMock,
+                return_value={
+                    "status": "error",
+                    "error": "boom\x1b[2J\nFORGED LOG LINE",
+                },
+            ),
+        ):
+            rc = await run_backfill(parse_args([]))
+
+        assert rc == 2
+        out = capsys.readouterr().out
+        # Issue #104 class: no raw escapes or newline-forged lines on the TTY
+        assert "\x1b" not in out
+        assert "\nFORGED LOG LINE" not in out
 
     async def test_all_success_exits_zero(self):
         rows = [_row()]
@@ -521,29 +564,37 @@ class TestBackfillIntegration:
         reset_pool()
 
     async def _seed(self, conn, marker: str) -> tuple[list[str], str]:
-        """Insert 3 entity-bearing memories plus 1 zero-entity memory."""
+        """Insert 3 entity-bearing memories plus 1 zero-entity memory.
+
+        Rows carry a sentinel project so the real run_backfill calls below
+        can be scoped with --project and never touch unrelated memories.
+        """
         ids = []
         for i in range(3):
             row = await conn.fetchrow(
                 """
-                INSERT INTO archival_memory (session_id, content, content_hash)
-                VALUES ($1, $2, $3)
+                INSERT INTO archival_memory (session_id, content, content_hash,
+                                             project)
+                VALUES ($1, $2, $3, $4)
                 RETURNING id
                 """,
                 f"test-backfill-kg-{marker}",
                 f"Fixed bug in scripts/bf124_{marker}_{i}.py using pytest",
                 f"bf124-{marker}-{i}",
+                f"test-bf124-{marker}",
             )
             ids.append(str(row["id"]))
         row = await conn.fetchrow(
             """
-            INSERT INTO archival_memory (session_id, content, content_hash)
-            VALUES ($1, $2, $3)
+            INSERT INTO archival_memory (session_id, content, content_hash,
+                                         project)
+            VALUES ($1, $2, $3, $4)
             RETURNING id
             """,
             f"test-backfill-kg-{marker}",
             "the meeting went well and everyone agreed on the plan",
             f"bf124-{marker}-noent",
+            f"test-bf124-{marker}",
         )
         no_entity_id = str(row["id"])
         return ids + [no_entity_id], no_entity_id
@@ -589,8 +640,9 @@ class TestBackfillIntegration:
                 )
 
             since_arg = seeded_at.isoformat()
+            scope = ["--since", since_arg, "--project", f"test-bf124-{marker}"]
 
-            rc1 = await run_backfill(parse_args(["--since", since_arg]))
+            rc1 = await run_backfill(parse_args(scope))
             assert rc1 == 0
 
             async with pool.acquire() as conn:
@@ -607,7 +659,7 @@ class TestBackfillIntegration:
             assert mentions_after_first > 0
             assert no_entity_flag == "no_entities"
 
-            rc2 = await run_backfill(parse_args(["--since", since_arg]))
+            rc2 = await run_backfill(parse_args(scope))
             assert rc2 == 0
 
             async with pool.acquire() as conn:
@@ -617,7 +669,9 @@ class TestBackfillIntegration:
                     ids,
                 )
                 sql, params = build_fetch_query(
-                    since=seeded_at, count_only=True
+                    since=seeded_at,
+                    project=f"test-bf124-{marker}",
+                    count_only=True,
                 )
                 eligible_after_second = await conn.fetchval(sql, *params)
             assert mentions_after_second == mentions_after_first

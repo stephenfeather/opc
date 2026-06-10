@@ -36,7 +36,13 @@ from scripts.core.kg_extractor import (
     extract_relations,
     store_entities_and_edges,
 )
+from scripts.core.log_safety import safe
 from scripts.core.store_learning import detect_backend
+
+# Per-row cap before regex extraction: a single oversized adversarial
+# transcript row must not stall the whole backfill. Extraction is heuristic;
+# the leading portion of a learning carries the salient entities.
+MAX_CONTENT_CHARS = 100_000
 
 # ---------------------------------------------------------------------------
 # Pure functions
@@ -68,6 +74,8 @@ def build_fetch_query(
     deterministic ORDER BY it pages through the backlog without loading it
     all at once, and advances past rows that errored mid-run.
     """
+    # Invariant: f-string parts below are compile-time constants or in-code
+    # integers (placeholder numbers) only; every user/data value binds via $N
     select = "SELECT count(*)" if count_only else "SELECT id, content, created_at"
     sql = (
         f"{select} FROM archival_memory m "
@@ -204,6 +212,9 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 async def backfill_one(memory_id: str, content: str) -> dict[str, Any]:
     """Extract and store KG rows for one memory. Never raises."""
     try:
+        # Truncate once so entity spans and relation extraction index into
+        # the same string
+        content = content[:MAX_CONTENT_CHARS]
         entities = extract_entities(content)
         if not entities:
             return {"status": "no_entities"}
@@ -298,7 +309,10 @@ async def run_backfill(args: argparse.Namespace) -> int:
             status = result["status"]
             stats["errors" if status == "error" else status] += 1
             if status == "error":
-                _log(f"error indexing {row['id']}: {result['error']}")
+                # safe() at the log site, after the raw [:200] slice in
+                # backfill_one: exception text can embed semi-trusted memory
+                # content (issue #104 log-injection class)
+                _log(f"error indexing {row['id']}: {safe(result['error'])}")
             elif status == "no_entities":
                 no_entity_ids.append(str(row["id"]))
         await mark_no_entities(pool, no_entity_ids)

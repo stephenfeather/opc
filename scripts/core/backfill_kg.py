@@ -104,9 +104,7 @@ def build_fetch_query(
         sql += f" AND m.project = ${len(params)}"
     if after is not None:
         params.extend([after[0], after[1]])
-        sql += (
-            f" AND (m.created_at, m.id) > (${len(params) - 1}, ${len(params)}::uuid)"
-        )
+        sql += f" AND (m.created_at, m.id) > (${len(params) - 1}, ${len(params)}::uuid)"
     if not count_only:
         sql += " ORDER BY m.created_at, m.id"
     if limit is not None:
@@ -245,7 +243,7 @@ async def mark_no_entities(pool: Any, memory_ids: list[str]) -> None:
         await conn.execute(
             "UPDATE archival_memory "
             "SET metadata = COALESCE(metadata, '{}'::jsonb) "
-            "|| '{\"kg_backfill\": \"no_entities\"}'::jsonb "
+            '|| \'{"kg_backfill": "no_entities"}\'::jsonb '
             "WHERE id = ANY($1::uuid[])",
             memory_ids,
         )
@@ -305,9 +303,7 @@ async def run_backfill(args: argparse.Namespace) -> int:
     after: tuple[datetime, str] | None = None
     remaining = args.limit
     while True:
-        page_size = (
-            args.batch_size if remaining is None else min(args.batch_size, remaining)
-        )
+        page_size = args.batch_size if remaining is None else min(args.batch_size, remaining)
         if page_size <= 0:
             break
         rows = await _fetch_page(pool, args, after, page_size)

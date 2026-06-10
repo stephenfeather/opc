@@ -202,8 +202,10 @@ def make_recall_context(
         except Exception as e:
             logger.debug("Query-side entity extraction failed: %s", e)
 
+    from scripts.core.project_naming import canonicalize_project
+
     return RecallContext(
-        project=project,
+        project=canonicalize_project(project),
         tags_hint=tags,
         retrieval_mode=retrieval_mode,
         query_entities=query_entities,
@@ -706,10 +708,11 @@ async def main() -> int:
         retrieval_mode = determine_retrieval_mode(
             backend, text_only=args.text_only, vector_only=args.vector_only
         )
+        from scripts.core.project_naming import project_from_path
+
         ctx = make_recall_context(
             project=args.project
-            or os.environ.get("CLAUDE_PROJECT_DIR", "").rsplit("/", 1)[-1]
-            or None,
+            or project_from_path(os.environ.get("CLAUDE_PROJECT_DIR") or None),
             tags=args.tags,
             retrieval_mode=retrieval_mode,
             query=args.query,

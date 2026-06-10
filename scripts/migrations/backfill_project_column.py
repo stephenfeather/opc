@@ -17,9 +17,20 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from pathlib import Path
 
 import psycopg2
+
+# Repo-pattern bootstrap for direct file invocation (memory_daemon.py:43-47)
+sys.path.insert(
+    0,
+    os.environ.get(
+        "CLAUDE_PROJECT_DIR", str(Path(__file__).parent.parent.parent)
+    ),
+)
+
+from scripts.core.project_naming import canonicalize_project  # noqa: E402
 
 # Path normalization: map full session project paths to short names
 PATH_TO_PROJECT: dict[str, str] = {
@@ -120,11 +131,8 @@ def normalize_session_path(path: str) -> str | None:
     if not path:
         return None
 
-    p = Path(path)
-    parts = p.parts
-
     # Try matching known suffixes (most specific first)
-    path_str = str(p)
+    path_str = str(Path(path))
     for suffix, project in sorted(PATH_TO_PROJECT.items(), key=lambda x: -len(x[0])):
         if path_str.endswith(suffix):
             return project
@@ -133,12 +141,20 @@ def normalize_session_path(path: str) -> str | None:
     if path_str in ("/Users/stephenfeather", "/Users/stephenfeather/Development"):
         return "_ambiguous"
 
-    # Default: lowercase basename
-    return parts[-1].lower() if parts else None
+    # Default: shared worktree-aware resolver (canonicalizes; issue #130
+    # review r3 — sessions.project can hold raw worktree paths, and a bare
+    # basename would store the branch name as the project)
+    from scripts.core.project_naming import project_from_path
+
+    return project_from_path(path_str)
 
 
 def infer_from_session_id(session_id: str) -> str | None:
-    """Infer project from session_id naming convention."""
+    """Infer project from session_id naming convention.
+
+    Results are canonicalized so reruns after the issue #130 normalization
+    migration cannot reintroduce deprecated aliases.
+    """
     sid_lower = session_id.lower()
 
     # Check OPC patterns
@@ -151,7 +167,7 @@ def infer_from_session_id(session_id: str) -> str | None:
         SESSION_PREFIX_TO_PROJECT.items(), key=lambda x: -len(x[0])
     ):
         if sid_lower.startswith(prefix):
-            return project
+            return canonicalize_project(project)
 
     # Manual/generic session IDs — can't infer
     if sid_lower.startswith("manual-") or len(session_id) == 8:
@@ -161,11 +177,11 @@ def infer_from_session_id(session_id: str) -> str | None:
 
 
 def infer_from_tags(tags: list[str]) -> str | None:
-    """Infer project from tag combinations."""
+    """Infer project from tag combinations (canonicalized, issue #130)."""
     tag_set = set(t.lower() for t in tags)
     for required_tags, project in TAG_TO_PROJECT:
         if required_tags.issubset(tag_set):
-            return project
+            return canonicalize_project(project)
     return None
 
 
@@ -232,7 +248,11 @@ def run_tier1(
     for am_id, session_id, session_project in rows:
         project = normalize_session_path(session_project)
         if project and project != "_ambiguous":
-            updates.setdefault(project, []).append(am_id)
+            canonical = canonicalize_project(project)
+            if canonical is None:
+                skipped += 1
+                continue
+            updates.setdefault(canonical, []).append(am_id)
         else:
             skipped += 1
             if verbose:

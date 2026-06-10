@@ -220,8 +220,12 @@ def parse_args(argv: list[str] | None = None) -> dict[str, Any]:
         parser.error("--k must be >= 1")
     if args.max_chars < 1:
         parser.error("--max-chars must be >= 1")
+    # Exact-match SQL filters (project = $1) require the same canonical
+    # form the store path writes (issue #130).
+    from scripts.core.project_naming import canonicalize_project
+
     return {
-        "project": args.project,
+        "project": canonicalize_project(args.project),
         "k": args.k,
         "json_output": args.json_output,
         "no_record": args.no_record,

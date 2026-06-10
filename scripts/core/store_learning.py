@@ -586,6 +586,12 @@ async def store_learning_v2(
     if not content or not content.strip():
         return {"success": False, "error": "No content provided"}
 
+    # Canonicalize at the write boundary so non-CLI callers cannot
+    # re-fragment project values after the one-time migration (issue #130).
+    from scripts.core.project_naming import canonicalize_project
+
+    project = canonicalize_project(project)
+
     backend = detect_backend(dict(os.environ))
     memory = None
 
@@ -809,9 +815,11 @@ async def main() -> None:
     """CLI entrypoint -- parses args, routes to v2 or legacy, prints output."""
     args = parse_cli_args()
 
-    # Auto-detect project from environment
-    project = (
-        args.project or os.environ.get("CLAUDE_PROJECT_DIR", "").rsplit("/", 1)[-1] or None
+    # Auto-detect project from environment, canonicalized (issue #130)
+    from scripts.core.project_naming import resolve_project_for_store
+
+    project = resolve_project_for_store(
+        args.project, env_project_dir=os.environ.get("CLAUDE_PROJECT_DIR", ""),
     )
 
     # Determine which mode to use: v2 if --content is provided, else legacy

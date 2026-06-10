@@ -145,6 +145,9 @@ Bypass contextual re-ranking. Returns raw retrieval scores. When set, `score` eq
 ### `--project`
 
 Project context for re-ranking. Default: auto-detected from `CLAUDE_PROJECT_DIR`.
+The value is canonicalized (lowercased, known aliases collapsed — see
+`scripts/core/project_naming.py`) before matching, and the match itself is
+case-insensitive.
 
 ### `--provider` (default: local)
 
@@ -281,6 +284,9 @@ Confidence level. Choices: `high`, `medium`, `low`. When omitted, auto-calibrate
 ### `--project`
 
 Project name for recall relevance. Default: auto-detected from `CLAUDE_PROJECT_DIR`.
+Stored canonicalized (lowercased, known aliases collapsed — see
+`scripts/core/project_naming.py`). Existing rows can be normalized with
+`scripts/migrations/normalize_project_values.py` (dry-run by default).
 
 ### `--supersedes`
 

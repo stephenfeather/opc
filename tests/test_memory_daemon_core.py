@@ -93,12 +93,11 @@ class TestNormalizeProject:
             "/Users/dev/myproject/.worktrees/refactor/feat-x"
         ) == "myproject"
 
-    def test_worktree_at_root_returns_name(self):
-        """Edge case: .worktrees at index 0 in parts."""
-        result = _normalize_project("/.worktrees/something")
-        # idx=1 (.worktrees), idx-1=0 ("/"), parts[0]="/"
-        # p.name would be "something"
-        assert result is not None
+    def test_worktree_at_root_returns_none(self):
+        """Edge case: .worktrees anchored at the filesystem root has no
+        parent repo — labeling the project "/" would mis-scope rows
+        (issue #130 aegis finding), so no project is the correct answer."""
+        assert _normalize_project("/.worktrees/something") is None
 
     def test_single_component_path(self):
         assert _normalize_project("myproject") == "myproject"

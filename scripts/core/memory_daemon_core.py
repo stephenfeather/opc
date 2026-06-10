@@ -148,20 +148,14 @@ def debug(msg_fn: str | Callable[[], str]) -> None:
 
 
 def _normalize_project(path_str: str | None) -> str | None:
-    """Normalize project path to short name, handling worktrees.
+    """Normalize project path to short canonical name, handling worktrees.
 
-    Returns the leaf directory name, or for worktree paths
-    (containing .worktrees), returns the parent project name.
+    Delegates to project_naming.project_from_path — the single source of
+    truth shared with store_learning and push_learnings (issue #130).
     """
-    if not path_str:
-        return None
-    p = Path(path_str)
-    parts = p.parts
-    if ".worktrees" in parts:
-        idx = parts.index(".worktrees")
-        name = parts[idx - 1] if idx > 0 else p.name
-        return name or None
-    return p.name or None
+    from scripts.core.project_naming import project_from_path
+
+    return project_from_path(path_str)
 
 
 def validate_extraction_model(model: str, allowed: frozenset[str]) -> bool:

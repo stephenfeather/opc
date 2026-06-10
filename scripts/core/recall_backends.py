@@ -107,8 +107,11 @@ def merge_project_into_metadata(
     The reranker's project_match signal reads metadata["project"], but the
     canonical project attribution lives in the project column — 37% of rows
     have the column set with no metadata key (issue #130). The column wins
-    when present and non-null. Rows from backends without the column
-    (SQLite) pass through unchanged.
+    when non-empty; NULL and empty-string values are treated as absent
+    (an empty project scores 0 in project_match regardless, and the
+    issue #130 canonicalizer never stores one). When the column
+    contributes, a new dict is returned; otherwise the input metadata is
+    returned as-is (it is already per-row, never shared).
     """
     try:
         project = row["project"]

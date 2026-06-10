@@ -408,16 +408,27 @@ _PG_TEXT_FALLBACK_SQL = """
 _recall_cfg = _get_config().recall
 
 # Cached result of the project-column capability probe. None = not yet
-# probed. Lives for the process lifetime: a migration applied while a
-# daemon is running is picked up on restart.
+# probed (or last probe failed transiently — retry next call). Only
+# definitive answers are cached: True on probe success, False on a
+# concrete missing-column/table error or a mid-query downgrade. Lives for
+# the process lifetime: a migration applied while a daemon is running is
+# picked up on restart.
 _project_column_cache: bool | None = None
 
-_PROJECT_COLUMN_PROBE_SQL = """
-    SELECT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'archival_memory' AND column_name = 'project'
-    )
-    """
+# Probes the exact relation the recall queries hit (same search_path
+# resolution), not information_schema by bare table name — schema drift
+# between the two was a review round-2 finding. LIMIT 0 keeps it free.
+_PROJECT_COLUMN_PROBE_SQL = "SELECT project FROM archival_memory LIMIT 0"
+
+
+def _missing_relation_errors() -> tuple[type[Exception], ...]:
+    """asyncpg error classes meaning the column/table definitively lacks."""
+    try:
+        from asyncpg.exceptions import UndefinedColumnError, UndefinedTableError
+
+        return (UndefinedColumnError, UndefinedTableError)
+    except ImportError:  # pragma: no cover - asyncpg absent (sqlite-only)
+        return ()
 
 
 def reset_project_column_cache() -> None:
@@ -426,22 +437,53 @@ def reset_project_column_cache() -> None:
     _project_column_cache = None
 
 
+def _set_project_column_cache_for_tests(value: bool | None) -> None:
+    """Force the probe cache to a value (test-only stale-cache simulation)."""
+    global _project_column_cache
+    _project_column_cache = value
+
+
+def mark_project_column_missing() -> None:
+    """Downgrade to project-free SQL after a mid-query UndefinedColumnError."""
+    global _project_column_cache
+    if _project_column_cache is not False:
+        logger.warning(
+            "archival_memory.project disappeared mid-process; recall "
+            "downgraded to no-project mode (project_match disabled, issue #130)"
+        )
+    _project_column_cache = False
+
+
 async def project_column_available(conn: Any) -> bool:
     """Check (once per process) whether archival_memory.project exists.
 
-    Degrades to False on probe failure so recall keeps working with
-    project-free SQL rather than erroring out.
+    Only definitive answers are cached. A transient probe failure
+    (timeout, connection reset) degrades THIS call to project-free SQL
+    but leaves the cache unset so the next recall retries — one hiccup
+    must not silently disable project scoping for the process lifetime.
     """
     global _project_column_cache
-    if _project_column_cache is None:
-        try:
-            _project_column_cache = bool(
-                await conn.fetchval(_PROJECT_COLUMN_PROBE_SQL)
-            )
-        except Exception:
-            logger.debug("project column probe failed", exc_info=True)
-            _project_column_cache = False
-    return _project_column_cache
+    if _project_column_cache is not None:
+        return _project_column_cache
+    try:
+        await conn.fetch(_PROJECT_COLUMN_PROBE_SQL)
+    except _missing_relation_errors():
+        logger.warning(
+            "archival_memory.project column missing — recall running in "
+            "degraded no-project mode (project_match disabled, issue #130). "
+            "Apply scripts/migrations/add_project_column.sql to enable."
+        )
+        _project_column_cache = False
+        return False
+    except Exception:
+        logger.warning(
+            "project column probe failed transiently; degrading this recall "
+            "to no-project SQL and retrying the probe on the next call",
+            exc_info=True,
+        )
+        return False
+    _project_column_cache = True
+    return True
 
 
 async def search_learnings_text_only_postgres(
@@ -457,14 +499,14 @@ async def search_learnings_text_only_postgres(
 
     or_query = build_or_query(query, STOPWORDS)
 
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        has_project = await project_column_available(conn)
+    async def _fetch_all(conn: Any, has_project: bool) -> list[Any]:
         try:
             rows = await conn.fetch(
                 render_recall_sql(_TEXT_ONLY_FTS_SQL, include_project=has_project),
                 or_query, k,
             )
+        except _missing_relation_errors():
+            raise
         except Exception:
             logger.debug("Chain filter fallback in text_only_postgres FTS", exc_info=True)
             rows = await conn.fetch(
@@ -483,6 +525,8 @@ async def search_learnings_text_only_postgres(
                     ),
                     first_word, k,
                 )
+            except _missing_relation_errors():
+                raise
             except Exception:
                 logger.debug("Chain filter fallback in text_only_postgres ILIKE", exc_info=True)
                 rows = await conn.fetch(
@@ -491,6 +535,20 @@ async def search_learnings_text_only_postgres(
                     ),
                     first_word, k,
                 )
+        return rows
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        has_project = await project_column_available(conn)
+        try:
+            rows = await _fetch_all(conn, has_project)
+        except _missing_relation_errors():
+            # Stale/wrong capability answer (schema drift after probe):
+            # downgrade and retry once with project-free SQL.
+            if not has_project:
+                raise
+            mark_project_column_missing()
+            rows = await _fetch_all(conn, False)
 
     return [format_text_result(row) for row in rows]
 
@@ -607,9 +665,9 @@ async def search_learnings_hybrid_rrf(
     rrf_cte_plain = build_rrf_cte(chain_filter=False, use_tsquery=use_tsquery)
 
     has_decay_columns = True
-    async with pool.acquire() as conn:
-        await init_pgvector(conn)
-        has_project = await project_column_available(conn)
+
+    async def _fetch_all(conn: Any, has_project: bool) -> list[Any]:
+        nonlocal has_decay_columns
         boosted_tail = render_recall_sql(
             _RRF_BOOSTED_TAIL_SQL,
             include_project=has_project, project_expr=", a.project",
@@ -625,11 +683,15 @@ async def search_learnings_hybrid_rrf(
 
         try:
             rows = await conn.fetch(rrf_cte + boosted_tail, *boosted_args)
+        except _missing_relation_errors():
+            raise
         except Exception:
             logger.debug("RRF boosted+chain fallback", exc_info=True)
             has_decay_columns = False
             try:
                 rows = await conn.fetch(rrf_cte + plain_tail, *plain_args)
+            except _missing_relation_errors():
+                raise
             except Exception:
                 logger.debug("RRF plain+chain fallback", exc_info=True)
                 rows = await conn.fetch(
@@ -646,6 +708,8 @@ async def search_learnings_hybrid_rrf(
                     rows = await conn.fetch(plain_cte + boosted_tail, *fb_boosted)
                 else:
                     rows = await conn.fetch(plain_cte + plain_tail, *fb_plain)
+            except _missing_relation_errors():
+                raise
             except Exception:
                 logger.debug("plainto_tsquery chain fallback", exc_info=True)
                 try:
@@ -655,8 +719,22 @@ async def search_learnings_hybrid_rrf(
                     rows = await conn.fetch(
                         no_chain_cte + plain_tail, *fb_plain,
                     )
+                except _missing_relation_errors():
+                    raise
                 except Exception:
                     logger.debug("plainto_tsquery fallback also failed", exc_info=True)
+        return rows
+
+    async with pool.acquire() as conn:
+        await init_pgvector(conn)
+        has_project = await project_column_available(conn)
+        try:
+            rows = await _fetch_all(conn, has_project)
+        except _missing_relation_errors():
+            if not has_project:
+                raise
+            mark_project_column_missing()
+            rows = await _fetch_all(conn, False)
 
     results = []
     for row in rows:
@@ -721,6 +799,41 @@ async def search_learnings_postgres(
         finally:
             await embedder.aclose()
 
+    async def _fetch_with_chain_fallback(
+        conn: Any,
+        template: str,
+        has_project: bool,
+        args: tuple[Any, ...],
+        label: str,
+    ) -> list[Any]:
+        def _sql(chain_filter: str) -> str:
+            return render_recall_sql(
+                template, include_project=has_project, chain_filter=chain_filter,
+            )
+        try:
+            return await conn.fetch(_sql("AND superseded_by IS NULL"), *args)
+        except _missing_relation_errors():
+            raise
+        except Exception:
+            logger.debug("Chain filter fallback in postgres %s", label, exc_info=True)
+            return await conn.fetch(_sql(""), *args)
+
+    async def _fetch_branch(
+        conn: Any, template: str, has_project: bool,
+        args: tuple[Any, ...], label: str,
+    ) -> list[Any]:
+        try:
+            return await _fetch_with_chain_fallback(
+                conn, template, has_project, args, label,
+            )
+        except _missing_relation_errors():
+            if not has_project:
+                raise
+            mark_project_column_missing()
+            return await _fetch_with_chain_fallback(
+                conn, template, False, args, label,
+            )
+
     if has_embeddings:
         async with pool.acquire() as conn:
             from scripts.core.db.postgres_pool import init_pgvector
@@ -728,59 +841,21 @@ async def search_learnings_postgres(
             has_project = await project_column_available(conn)
 
             if recency_weight > 0:
-                def _recency_sql(chain_filter: str) -> str:
-                    return render_recall_sql(
-                        _PG_RECENCY_SQL,
-                        include_project=has_project, chain_filter=chain_filter,
-                    )
-                try:
-                    rows = await conn.fetch(
-                        _recency_sql("AND superseded_by IS NULL"),
-                        str(query_embedding), k, recency_weight,
-                    )
-                except Exception:
-                    logger.debug("Chain filter fallback in postgres recency", exc_info=True)
-                    rows = await conn.fetch(
-                        _recency_sql(""),
-                        str(query_embedding), k, recency_weight,
-                    )
+                rows = await _fetch_branch(
+                    conn, _PG_RECENCY_SQL, has_project,
+                    (str(query_embedding), k, recency_weight), "recency",
+                )
             else:
-                def _vector_sql(chain_filter: str) -> str:
-                    return render_recall_sql(
-                        _PG_VECTOR_SQL,
-                        include_project=has_project, chain_filter=chain_filter,
-                    )
-                try:
-                    rows = await conn.fetch(
-                        _vector_sql("AND superseded_by IS NULL"),
-                        str(query_embedding), k,
-                    )
-                except Exception:
-                    logger.debug("Chain filter fallback in postgres vector", exc_info=True)
-                    rows = await conn.fetch(
-                        _vector_sql(""),
-                        str(query_embedding), k,
-                    )
+                rows = await _fetch_branch(
+                    conn, _PG_VECTOR_SQL, has_project,
+                    (str(query_embedding), k), "vector",
+                )
     elif text_fallback:
         async with pool.acquire() as conn:
             has_project = await project_column_available(conn)
-
-            def _text_sql(chain_filter: str) -> str:
-                return render_recall_sql(
-                    _PG_TEXT_FALLBACK_SQL,
-                    include_project=has_project, chain_filter=chain_filter,
-                )
-            try:
-                rows = await conn.fetch(
-                    _text_sql("AND superseded_by IS NULL"),
-                    query, k,
-                )
-            except Exception:
-                logger.debug("Chain filter fallback in postgres text", exc_info=True)
-                rows = await conn.fetch(
-                    _text_sql(""),
-                    query, k,
-                )
+            rows = await _fetch_branch(
+                conn, _PG_TEXT_FALLBACK_SQL, has_project, (query, k), "text",
+            )
     else:
         return []
 

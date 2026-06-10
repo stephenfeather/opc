@@ -670,19 +670,30 @@ class TestRecallSqlSelectsProject:
             assert "{" not in sql and "}" not in sql
 
 
-class TestProjectColumnProbe:
-    """Capability probe: recall degrades gracefully on pre-migration DBs."""
+def _undefined_column_error() -> Exception:
+    from asyncpg.exceptions import UndefinedColumnError
 
-    def _make_conn(self, exists: bool | Exception):
+    return UndefinedColumnError("column \"project\" does not exist")
+
+
+class TestProjectColumnProbe:
+    """Capability probe: recall degrades gracefully on pre-migration DBs.
+
+    Cache semantics (review round 2): only definitive answers are cached.
+    Transient probe failures must NOT permanently disable project scoping.
+    """
+
+    def _make_conn(self, outcome: Exception | None):
         class FakeConn:
             def __init__(self) -> None:
                 self.calls = 0
+                self.outcome: Exception | None = outcome
 
-            async def fetchval(self, _sql: str) -> bool:
+            async def fetch(self, _sql: str, *args: Any) -> list[Any]:
                 self.calls += 1
-                if isinstance(exists, Exception):
-                    raise exists
-                return exists
+                if self.outcome is not None:
+                    raise self.outcome
+                return []
 
         return FakeConn()
 
@@ -690,45 +701,84 @@ class TestProjectColumnProbe:
         from scripts.core import recall_backends as rb
 
         rb.reset_project_column_cache()
-        conn = self._make_conn(True)
+        conn = self._make_conn(None)
         assert await rb.project_column_available(conn) is True
 
     async def test_probe_false_when_column_missing(self):
         from scripts.core import recall_backends as rb
 
         rb.reset_project_column_cache()
-        conn = self._make_conn(False)
+        conn = self._make_conn(_undefined_column_error())
         assert await rb.project_column_available(conn) is False
 
-    async def test_probe_result_is_cached(self):
+    async def test_probe_targets_actual_relation(self):
+        """Probe must touch archival_memory.project itself, not
+        information_schema by bare table name (schema/search_path skew)."""
+        from scripts.core import recall_backends as rb
+
+        sql = rb._PROJECT_COLUMN_PROBE_SQL
+        assert "archival_memory" in sql
+        assert "project" in sql
+        assert "information_schema" not in sql
+
+    async def test_definitive_results_are_cached(self):
         from scripts.core import recall_backends as rb
 
         rb.reset_project_column_cache()
-        conn = self._make_conn(True)
+        conn = self._make_conn(None)
         await rb.project_column_available(conn)
         await rb.project_column_available(conn)
         assert conn.calls == 1
 
-    async def test_probe_failure_degrades_to_no_project(self):
+        rb.reset_project_column_cache()
+        conn = self._make_conn(_undefined_column_error())
+        await rb.project_column_available(conn)
+        await rb.project_column_available(conn)
+        assert conn.calls == 1
+
+    async def test_transient_failure_not_cached(self):
+        """A timeout/permission hiccup must not disable scoping for the
+        process lifetime — the next call retries the probe."""
         from scripts.core import recall_backends as rb
 
         rb.reset_project_column_cache()
-        conn = self._make_conn(RuntimeError("information_schema unavailable"))
+        conn = self._make_conn(RuntimeError("connection reset"))
         assert await rb.project_column_available(conn) is False
+        conn.outcome = None  # transient issue clears
+        assert await rb.project_column_available(conn) is True
+        assert conn.calls == 2
 
-    async def test_text_only_runs_without_project_on_old_db(self, monkeypatch):
-        """Regression: pre-migration DBs must get project-free SQL, not errors."""
+    async def test_mark_project_column_missing_downgrades_cache(self):
         from scripts.core import recall_backends as rb
 
         rb.reset_project_column_cache()
-        executed: list[str] = []
+        conn = self._make_conn(None)
+        assert await rb.project_column_available(conn) is True
+        rb.mark_project_column_missing()
+        assert await rb.project_column_available(conn) is False
+        assert conn.calls == 1  # downgrade did not trigger a re-probe
+
+
+class _FakeRecallDb:
+    """Fake pool/conn pair simulating a DB with or without the project column."""
+
+    def __init__(self, has_project_column: bool) -> None:
+        self.has_project_column = has_project_column
+        self.executed: list[str] = []
+
+    def _project_referenced(self, sql: str) -> bool:
+        return "project" in sql.split("FROM")[0]
+
+    def make_pool(self):
+        db = self
 
         class FakeConn:
-            async def fetchval(self, _sql: str) -> bool:
-                return False  # probe: project column absent
-
             async def fetch(self, sql: str, *args: Any) -> list[Any]:
-                executed.append(sql)
+                if not db.has_project_column and db._project_referenced(sql):
+                    from asyncpg.exceptions import UndefinedColumnError
+
+                    raise UndefinedColumnError('column "project" does not exist')
+                db.executed.append(sql)
                 return []
 
         class FakeAcquire:
@@ -742,8 +792,20 @@ class TestProjectColumnProbe:
             def acquire(self) -> FakeAcquire:
                 return FakeAcquire()
 
-        async def fake_get_pool() -> FakePool:
-            return FakePool()
+        return FakePool()
+
+
+class TestOldDatabaseDegradation:
+    """End-to-end: pre-migration DBs get project-free SQL, not errors."""
+
+    async def test_text_only_runs_without_project_on_old_db(self, monkeypatch):
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        db = _FakeRecallDb(has_project_column=False)
+
+        async def fake_get_pool():
+            return db.make_pool()
 
         import scripts.core.db.postgres_pool as pool_mod
 
@@ -751,6 +813,30 @@ class TestProjectColumnProbe:
 
         results = await rb.search_learnings_text_only_postgres("query terms", k=3)
         assert results == []
-        assert executed, "expected SQL to be executed"
-        for sql in executed:
+        assert db.executed, "expected SQL to be executed"
+        for sql in db.executed:
+            assert "project" not in sql.split("FROM")[0], sql[:120]
+
+    async def test_stale_true_cache_recovers_dynamically(self, monkeypatch):
+        """Review round 2: a wrong/stale has_project=True (schema drift after
+        probe) must fall back to project-free SQL, not crash recall."""
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        db = _FakeRecallDb(has_project_column=False)
+
+        async def fake_get_pool():
+            return db.make_pool()
+
+        import scripts.core.db.postgres_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "get_pool", fake_get_pool)
+
+        # Poison the cache as if the column existed at probe time.
+        rb._set_project_column_cache_for_tests(True)
+
+        results = await rb.search_learnings_text_only_postgres("query terms", k=3)
+        assert results == []
+        assert db.executed, "expected fallback SQL to be executed"
+        for sql in db.executed:
             assert "project" not in sql.split("FROM")[0], sql[:120]

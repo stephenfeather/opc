@@ -760,26 +760,31 @@ class TestProjectColumnProbe:
 
 
 class _FakeRecallDb:
-    """Fake pool/conn pair simulating a DB with or without the project column."""
+    """Fake pool/conn pair simulating a DB with missing additive columns."""
 
-    def __init__(self, has_project_column: bool) -> None:
-        self.has_project_column = has_project_column
+    def __init__(self, missing_columns: set[str]) -> None:
+        self.missing_columns = missing_columns
         self.executed: list[str] = []
-
-    def _project_referenced(self, sql: str) -> bool:
-        return "project" in sql.split("FROM")[0]
 
     def make_pool(self):
         db = self
 
         class FakeConn:
             async def fetch(self, sql: str, *args: Any) -> list[Any]:
-                if not db.has_project_column and db._project_referenced(sql):
-                    from asyncpg.exceptions import UndefinedColumnError
+                from asyncpg.exceptions import UndefinedColumnError
 
-                    raise UndefinedColumnError('column "project" does not exist')
+                for col in db.missing_columns:
+                    if col in sql:
+                        raise UndefinedColumnError(
+                            f'column "{col}" does not exist'
+                        )
                 db.executed.append(sql)
                 return []
+
+            async def fetchrow(self, sql: str, *args: Any) -> dict[str, Any]:
+                # Embedding-count probe in search_learnings_postgres:
+                # report no embeddings so the text fallback branch runs.
+                return {"cnt": 0}
 
         class FakeAcquire:
             async def __aenter__(self) -> FakeConn:
@@ -798,18 +803,20 @@ class _FakeRecallDb:
 class TestOldDatabaseDegradation:
     """End-to-end: pre-migration DBs get project-free SQL, not errors."""
 
-    async def test_text_only_runs_without_project_on_old_db(self, monkeypatch):
-        from scripts.core import recall_backends as rb
-
-        rb.reset_project_column_cache()
-        db = _FakeRecallDb(has_project_column=False)
-
+    def _patch_pool(self, monkeypatch, db: _FakeRecallDb) -> None:
         async def fake_get_pool():
             return db.make_pool()
 
         import scripts.core.db.postgres_pool as pool_mod
 
         monkeypatch.setattr(pool_mod, "get_pool", fake_get_pool)
+
+    async def test_text_only_runs_without_project_on_old_db(self, monkeypatch):
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        db = _FakeRecallDb(missing_columns={"project"})
+        self._patch_pool(monkeypatch, db)
 
         results = await rb.search_learnings_text_only_postgres("query terms", k=3)
         assert results == []
@@ -823,14 +830,8 @@ class TestOldDatabaseDegradation:
         from scripts.core import recall_backends as rb
 
         rb.reset_project_column_cache()
-        db = _FakeRecallDb(has_project_column=False)
-
-        async def fake_get_pool():
-            return db.make_pool()
-
-        import scripts.core.db.postgres_pool as pool_mod
-
-        monkeypatch.setattr(pool_mod, "get_pool", fake_get_pool)
+        db = _FakeRecallDb(missing_columns={"project"})
+        self._patch_pool(monkeypatch, db)
 
         # Poison the cache as if the column existed at probe time.
         rb._set_project_column_cache_for_tests(True)
@@ -840,3 +841,95 @@ class TestOldDatabaseDegradation:
         assert db.executed, "expected fallback SQL to be executed"
         for sql in db.executed:
             assert "project" not in sql.split("FROM")[0], sql[:120]
+
+    async def test_missing_superseded_by_keeps_chain_fallback(self, monkeypatch):
+        """Review round 3: a missing superseded_by column must flow into the
+        existing no-chain fallback — NOT be misread as a missing project
+        column. Project stays selected and the capability cache stays True."""
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        db = _FakeRecallDb(missing_columns={"superseded_by"})
+        self._patch_pool(monkeypatch, db)
+
+        results = await rb.search_learnings_text_only_postgres("query terms", k=3)
+        assert results == []
+        assert db.executed, "expected no-chain fallback SQL to be executed"
+        for sql in db.executed:
+            assert "superseded_by" not in sql, sql[:120]
+            assert "project" in sql.split("FROM")[0], sql[:120]
+        # Cache must NOT have been poisoned by the unrelated column error:
+        # the cached True is returned without touching the connection.
+        assert await rb.project_column_available(_ProbeFailConn()) is True
+
+    async def test_text_fallback_missing_superseded_by_keeps_chain_fallback(
+        self, monkeypatch,
+    ):
+        """Same round-3 regression for the postgres text-fallback path."""
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        db = _FakeRecallDb(missing_columns={"superseded_by"})
+        self._patch_pool(monkeypatch, db)
+
+        results = await rb.search_learnings_postgres(
+            "query terms", k=3, text_fallback=True,
+        )
+        assert results == []
+        assert db.executed, "expected no-chain fallback SQL to be executed"
+        for sql in db.executed:
+            assert "superseded_by" not in sql, sql[:120]
+            assert "project" in sql.split("FROM")[0], sql[:120]
+        assert await rb.project_column_available(_ProbeFailConn()) is True
+
+
+class _ProbeFailConn:
+    """Conn that fails on any query — proves cached answers skip the probe."""
+
+    async def fetch(self, _sql: str, *args: Any) -> list[Any]:
+        raise AssertionError("probe should have been served from cache")
+
+
+class TestRrfDecayColumnFallback:
+    """Review round 3: missing recall_count/last_recalled must degrade to the
+    plain RRF tail — not be misread as a missing project column."""
+
+    async def test_missing_decay_columns_fall_back_to_plain_tail(
+        self, monkeypatch,
+    ):
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        db = _FakeRecallDb(missing_columns={"recall_count"})
+
+        async def fake_get_pool():
+            return db.make_pool()
+
+        async def fake_init_pgvector(_conn: Any) -> None:
+            return None
+
+        import scripts.core.db.embedding_service as emb_mod
+        import scripts.core.db.postgres_pool as pool_mod
+
+        class FakeEmbedder:
+            def __init__(self, *a: Any, **kw: Any) -> None: ...
+
+            async def embed(self, *_a: Any, **_kw: Any) -> list[float]:
+                return [0.1] * 8
+
+            async def aclose(self) -> None: ...
+
+        monkeypatch.setattr(pool_mod, "get_pool", fake_get_pool)
+        monkeypatch.setattr(pool_mod, "init_pgvector", fake_init_pgvector)
+        monkeypatch.setattr(emb_mod, "EmbeddingService", FakeEmbedder)
+
+        results = await rb.search_learnings_hybrid_rrf(
+            "query terms", k=3, expand=False,
+        )
+        assert results == []
+        assert db.executed, "expected plain-tail SQL to be executed"
+        for sql in db.executed:
+            assert "recall_count" not in sql, sql[:120]
+        # Plain tail still selects project; capability cache not poisoned.
+        assert any("a.project" in sql for sql in db.executed)
+        assert await rb.project_column_available(_ProbeFailConn()) is True

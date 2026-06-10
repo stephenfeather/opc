@@ -431,6 +431,34 @@ def _missing_relation_errors() -> tuple[type[Exception], ...]:
         return ()
 
 
+# Matches Postgres undefined_column messages about the project column in any
+# qualification: 'column "project"', 'column a.project',
+# 'column archival_memory.project'.
+_PROJECT_COLUMN_ERROR_RE = re.compile(
+    r'column\s+"?(?:[\w]+\.)?"?project"?\s+does not exist', re.IGNORECASE,
+)
+
+
+def _is_project_capability_error(exc: BaseException) -> bool:
+    """True only when exc says the project column (or the table) is missing.
+
+    Other additive columns (superseded_by, recall_count, last_recalled)
+    raise the same UndefinedColumnError class on mixed-schema installs and
+    must keep flowing into their own chain/decay fallbacks instead of
+    being misread as a project-capability miss (review round 3).
+    """
+    errors = _missing_relation_errors()
+    if not errors or not isinstance(exc, errors):
+        return False
+    try:
+        from asyncpg.exceptions import UndefinedTableError
+    except ImportError:  # pragma: no cover - asyncpg absent
+        return False
+    if isinstance(exc, UndefinedTableError):
+        return True
+    return bool(_PROJECT_COLUMN_ERROR_RE.search(str(exc)))
+
+
 def reset_project_column_cache() -> None:
     """Clear the cached capability probe (test isolation)."""
     global _project_column_cache
@@ -505,9 +533,9 @@ async def search_learnings_text_only_postgres(
                 render_recall_sql(_TEXT_ONLY_FTS_SQL, include_project=has_project),
                 or_query, k,
             )
-        except _missing_relation_errors():
-            raise
-        except Exception:
+        except Exception as exc:
+            if _is_project_capability_error(exc):
+                raise
             logger.debug("Chain filter fallback in text_only_postgres FTS", exc_info=True)
             rows = await conn.fetch(
                 render_recall_sql(
@@ -525,9 +553,9 @@ async def search_learnings_text_only_postgres(
                     ),
                     first_word, k,
                 )
-            except _missing_relation_errors():
-                raise
-            except Exception:
+            except Exception as exc:
+                if _is_project_capability_error(exc):
+                    raise
                 logger.debug("Chain filter fallback in text_only_postgres ILIKE", exc_info=True)
                 rows = await conn.fetch(
                     render_recall_sql(
@@ -542,10 +570,11 @@ async def search_learnings_text_only_postgres(
         has_project = await project_column_available(conn)
         try:
             rows = await _fetch_all(conn, has_project)
-        except _missing_relation_errors():
+        except _missing_relation_errors() as exc:
             # Stale/wrong capability answer (schema drift after probe):
-            # downgrade and retry once with project-free SQL.
-            if not has_project:
+            # downgrade and retry once with project-free SQL. Errors about
+            # other columns are not a project-capability signal.
+            if not has_project or not _is_project_capability_error(exc):
                 raise
             mark_project_column_missing()
             rows = await _fetch_all(conn, False)
@@ -683,16 +712,16 @@ async def search_learnings_hybrid_rrf(
 
         try:
             rows = await conn.fetch(rrf_cte + boosted_tail, *boosted_args)
-        except _missing_relation_errors():
-            raise
-        except Exception:
+        except Exception as exc:
+            if _is_project_capability_error(exc):
+                raise
             logger.debug("RRF boosted+chain fallback", exc_info=True)
             has_decay_columns = False
             try:
                 rows = await conn.fetch(rrf_cte + plain_tail, *plain_args)
-            except _missing_relation_errors():
-                raise
-            except Exception:
+            except Exception as exc:
+                if _is_project_capability_error(exc):
+                    raise
                 logger.debug("RRF plain+chain fallback", exc_info=True)
                 rows = await conn.fetch(
                     rrf_cte_plain + plain_tail, *plain_args,
@@ -708,9 +737,9 @@ async def search_learnings_hybrid_rrf(
                     rows = await conn.fetch(plain_cte + boosted_tail, *fb_boosted)
                 else:
                     rows = await conn.fetch(plain_cte + plain_tail, *fb_plain)
-            except _missing_relation_errors():
-                raise
-            except Exception:
+            except Exception as exc:
+                if _is_project_capability_error(exc):
+                    raise
                 logger.debug("plainto_tsquery chain fallback", exc_info=True)
                 try:
                     no_chain_cte = build_rrf_cte(
@@ -719,9 +748,9 @@ async def search_learnings_hybrid_rrf(
                     rows = await conn.fetch(
                         no_chain_cte + plain_tail, *fb_plain,
                     )
-                except _missing_relation_errors():
-                    raise
-                except Exception:
+                except Exception as exc:
+                    if _is_project_capability_error(exc):
+                        raise
                     logger.debug("plainto_tsquery fallback also failed", exc_info=True)
         return rows
 
@@ -730,8 +759,8 @@ async def search_learnings_hybrid_rrf(
         has_project = await project_column_available(conn)
         try:
             rows = await _fetch_all(conn, has_project)
-        except _missing_relation_errors():
-            if not has_project:
+        except _missing_relation_errors() as exc:
+            if not has_project or not _is_project_capability_error(exc):
                 raise
             mark_project_column_missing()
             rows = await _fetch_all(conn, False)
@@ -812,9 +841,9 @@ async def search_learnings_postgres(
             )
         try:
             return await conn.fetch(_sql("AND superseded_by IS NULL"), *args)
-        except _missing_relation_errors():
-            raise
-        except Exception:
+        except Exception as exc:
+            if _is_project_capability_error(exc):
+                raise
             logger.debug("Chain filter fallback in postgres %s", label, exc_info=True)
             return await conn.fetch(_sql(""), *args)
 
@@ -826,8 +855,8 @@ async def search_learnings_postgres(
             return await _fetch_with_chain_fallback(
                 conn, template, has_project, args, label,
             )
-        except _missing_relation_errors():
-            if not has_project:
+        except _missing_relation_errors() as exc:
+            if not has_project or not _is_project_capability_error(exc):
                 raise
             mark_project_column_missing()
             return await _fetch_with_chain_fallback(

@@ -202,8 +202,10 @@ def make_recall_context(
         except Exception as e:
             logger.debug("Query-side entity extraction failed: %s", e)
 
+    from scripts.core.project_naming import canonicalize_project
+
     return RecallContext(
-        project=project,
+        project=canonicalize_project(project),
         tags_hint=tags,
         retrieval_mode=retrieval_mode,
         query_entities=query_entities,

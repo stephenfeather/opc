@@ -127,7 +127,11 @@ def calibrate_score(
 # ---------------------------------------------------------------------------
 
 def project_match(result: dict, ctx: RecallContext) -> float:
-    """Score based on project match: 1.0 exact, 0.5 substring, 0.0 none."""
+    """Score based on project match: 1.0 exact, 0.5 substring, 0.0 none.
+
+    Comparison is case-insensitive: stored values predate canonicalization
+    (issue #130) and contain case variants of the same project.
+    """
     if not ctx.project:
         return 0.0
 
@@ -135,9 +139,11 @@ def project_match(result: dict, ctx: RecallContext) -> float:
     if not result_project:
         return 0.0
 
-    if result_project == ctx.project:
+    ctx_project = ctx.project.lower()
+    result_project = result_project.lower()
+    if result_project == ctx_project:
         return 1.0
-    if ctx.project in result_project or result_project in ctx.project:
+    if ctx_project in result_project or result_project in ctx_project:
         return 0.5
     return 0.0
 

@@ -116,14 +116,11 @@ class TestRRFRecallBoost:
     """Tests for recall_count boost in hybrid RRF scoring."""
 
     async def test_rrf_query_includes_recall_count(self):
-        """The hybrid RRF SQL should reference recall_count for boosting."""
-        import inspect
+        """The boosted RRF tail SQL should reference recall_count for boosting."""
+        from scripts.core.recall_backends import _RRF_BOOSTED_TAIL_SQL
 
-        from scripts.core.recall_learnings import search_learnings_hybrid_rrf
-
-        source = inspect.getsource(search_learnings_hybrid_rrf)
-        assert "recall_count" in source
-        assert "boosted_score" in source
+        assert "recall_count" in _RRF_BOOSTED_TAIL_SQL
+        assert "boosted_score" in _RRF_BOOSTED_TAIL_SQL
 
     async def test_rrf_results_include_recall_fields(self):
         """Hybrid RRF results should include recall_count and last_recalled."""

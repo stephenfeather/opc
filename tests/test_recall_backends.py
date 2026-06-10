@@ -494,3 +494,442 @@ class TestBuildRrfCte:
         result = build_rrf_cte(chain_filter=False, use_tsquery=False)
         assert isinstance(result, str)
         assert "WITH fts_ranked AS" in result
+
+
+# ==================== project column merge (issue #130) ====================
+
+
+class TestMergeProjectIntoMetadata:
+    """Pure function: overlay archival_memory.project column onto metadata."""
+
+    def test_column_set_and_metadata_missing(self):
+        from scripts.core.recall_backends import merge_project_into_metadata
+
+        merged = merge_project_into_metadata({"type": "x"}, {"project": "binbrain"})
+        assert merged["project"] == "binbrain"
+
+    def test_column_overrides_stale_metadata(self):
+        from scripts.core.recall_backends import merge_project_into_metadata
+
+        merged = merge_project_into_metadata(
+            {"project": "stale-value"}, {"project": "opc"}
+        )
+        assert merged["project"] == "opc"
+
+    def test_null_column_preserves_existing_metadata(self):
+        from scripts.core.recall_backends import merge_project_into_metadata
+
+        merged = merge_project_into_metadata({"project": "kept"}, {"project": None})
+        assert merged["project"] == "kept"
+
+    def test_missing_column_passes_through(self):
+        from scripts.core.recall_backends import merge_project_into_metadata
+
+        metadata = {"type": "session_learning"}
+        merged = merge_project_into_metadata(metadata, {"id": "abc"})
+        assert merged == {"type": "session_learning"}
+
+    def test_does_not_mutate_input_metadata(self):
+        from scripts.core.recall_backends import merge_project_into_metadata
+
+        metadata: dict[str, Any] = {"type": "x"}
+        merge_project_into_metadata(metadata, {"project": "opc"})
+        assert "project" not in metadata
+
+
+class TestFormattersCarryProject:
+    """Each row formatter must surface the project column for the reranker."""
+
+    def test_format_text_result_merges_project(self):
+        from scripts.core.recall_backends import format_text_result
+
+        row: dict[str, Any] = {
+            "id": UUID("12345678-1234-1234-1234-123456789abc"),
+            "session_id": "s-abc123",
+            "content": "test content",
+            "metadata": {"type": "session_learning"},
+            "created_at": datetime(2026, 1, 1),
+            "similarity": 0.85,
+            "project": "binbrain",
+        }
+        result = format_text_result(row)
+        assert result["metadata"]["project"] == "binbrain"
+
+    def test_format_rrf_result_merges_project(self):
+        from scripts.core.recall_backends import format_rrf_result
+
+        row: dict[str, Any] = {
+            "id": UUID("12345678-1234-1234-1234-123456789abc"),
+            "session_id": "s-abc",
+            "content": "x",
+            "metadata": {"project": "stale"},
+            "created_at": datetime(2026, 1, 1),
+            "rrf_score": 0.03,
+            "fts_rank": 1,
+            "vec_rank": 2,
+            "project": "opc",
+        }
+        result = format_rrf_result(row, has_decay=False)
+        assert result["metadata"]["project"] == "opc"
+
+    def test_format_vector_result_merges_project(self):
+        from scripts.core.recall_backends import format_vector_result
+
+        row: dict[str, Any] = {
+            "id": UUID("12345678-1234-1234-1234-123456789abc"),
+            "session_id": "s-abc",
+            "content": "x",
+            "metadata": {},
+            "created_at": datetime(2026, 1, 1),
+            "similarity": 0.9,
+            "project": "agentic-work",
+        }
+        result = format_vector_result(row)
+        assert result is not None
+        assert result["metadata"]["project"] == "agentic-work"
+
+    def test_format_sqlite_result_without_project_column(self):
+        from scripts.core.recall_backends import format_sqlite_result
+
+        row: dict[str, Any] = {
+            "id": "abc",
+            "session_id": "s-1",
+            "content": "x",
+            "metadata_json": '{"type": "session_learning"}',
+            "created_at": 1700000000,
+            "rank": -1.0,
+        }
+        result = format_sqlite_result(row, divisor=10.0)
+        assert "project" not in result["metadata"]
+
+
+class TestRecallSqlSelectsProject:
+    """Every postgres recall SQL must SELECT the project column when the
+    database has it, and omit it on pre-migration databases (issue #130)."""
+
+    def _simple_templates(self):
+        from scripts.core import recall_backends as rb
+
+        return [
+            rb._TEXT_ONLY_FTS_SQL,
+            rb._TEXT_ONLY_FTS_NO_CHAIN_SQL,
+            rb._TEXT_ONLY_ILIKE_SQL,
+            rb._TEXT_ONLY_ILIKE_NO_CHAIN_SQL,
+        ]
+
+    def _chain_templates(self):
+        from scripts.core import recall_backends as rb
+
+        return [rb._PG_RECENCY_SQL, rb._PG_VECTOR_SQL, rb._PG_TEXT_FALLBACK_SQL]
+
+    def test_postgres_recall_sql_selects_project_when_available(self):
+        from scripts.core.recall_backends import render_recall_sql
+
+        for tmpl in self._simple_templates():
+            sql = render_recall_sql(tmpl, include_project=True)
+            assert "project" in sql.split("FROM")[0], f"missing: {sql[:120]}"
+        for tmpl in self._chain_templates():
+            sql = render_recall_sql(tmpl, include_project=True, chain_filter="")
+            assert "project" in sql.split("FROM")[0], f"missing: {sql[:120]}"
+
+    def test_postgres_recall_sql_omits_project_when_unavailable(self):
+        from scripts.core.recall_backends import render_recall_sql
+
+        for tmpl in self._simple_templates():
+            sql = render_recall_sql(tmpl, include_project=False)
+            assert "project" not in sql.split("FROM")[0], f"present: {sql[:120]}"
+        for tmpl in self._chain_templates():
+            sql = render_recall_sql(tmpl, include_project=False, chain_filter="")
+            assert "project" not in sql.split("FROM")[0], f"present: {sql[:120]}"
+
+    def test_rrf_tails_select_project_when_available(self):
+        from scripts.core import recall_backends as rb
+
+        for tmpl in (rb._RRF_BOOSTED_TAIL_SQL, rb._RRF_PLAIN_TAIL_SQL):
+            sql = rb.render_recall_sql(
+                tmpl, include_project=True, project_expr=", a.project",
+            )
+            assert "a.project" in sql.split("FROM")[0]
+            sql_without = rb.render_recall_sql(
+                tmpl, include_project=False, project_expr=", a.project",
+            )
+            assert "a.project" not in sql_without.split("FROM")[0]
+
+    def test_rendered_sql_has_no_unfilled_placeholders(self):
+        from scripts.core import recall_backends as rb
+
+        for tmpl in self._simple_templates():
+            for include in (True, False):
+                sql = rb.render_recall_sql(tmpl, include_project=include)
+                assert "{" not in sql and "}" not in sql
+        for tmpl in self._chain_templates():
+            sql = rb.render_recall_sql(
+                tmpl, include_project=True,
+                chain_filter="AND superseded_by IS NULL",
+            )
+            assert "{" not in sql and "}" not in sql
+
+
+def _undefined_column_error() -> Exception:
+    from asyncpg.exceptions import UndefinedColumnError
+
+    return UndefinedColumnError("column \"project\" does not exist")
+
+
+class TestProjectColumnProbe:
+    """Capability probe: recall degrades gracefully on pre-migration DBs.
+
+    Cache semantics (review round 2): only definitive answers are cached.
+    Transient probe failures must NOT permanently disable project scoping.
+    """
+
+    def _make_conn(self, outcome: Exception | None):
+        class FakeConn:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.outcome: Exception | None = outcome
+
+            async def fetch(self, _sql: str, *args: Any) -> list[Any]:
+                self.calls += 1
+                if self.outcome is not None:
+                    raise self.outcome
+                return []
+
+        return FakeConn()
+
+    async def test_probe_true_when_column_exists(self):
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        conn = self._make_conn(None)
+        assert await rb.project_column_available(conn) is True
+
+    async def test_probe_false_when_column_missing(self):
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        conn = self._make_conn(_undefined_column_error())
+        assert await rb.project_column_available(conn) is False
+
+    async def test_probe_targets_actual_relation(self):
+        """Probe must touch archival_memory.project itself, not
+        information_schema by bare table name (schema/search_path skew)."""
+        from scripts.core import recall_backends as rb
+
+        sql = rb._PROJECT_COLUMN_PROBE_SQL
+        assert "archival_memory" in sql
+        assert "project" in sql
+        assert "information_schema" not in sql
+
+    async def test_definitive_results_are_cached(self):
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        conn = self._make_conn(None)
+        await rb.project_column_available(conn)
+        await rb.project_column_available(conn)
+        assert conn.calls == 1
+
+        rb.reset_project_column_cache()
+        conn = self._make_conn(_undefined_column_error())
+        await rb.project_column_available(conn)
+        await rb.project_column_available(conn)
+        assert conn.calls == 1
+
+    async def test_transient_failure_not_cached(self):
+        """A timeout/permission hiccup must not disable scoping for the
+        process lifetime — the next call retries the probe."""
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        conn = self._make_conn(RuntimeError("connection reset"))
+        assert await rb.project_column_available(conn) is False
+        conn.outcome = None  # transient issue clears
+        assert await rb.project_column_available(conn) is True
+        assert conn.calls == 2
+
+    async def test_mark_project_column_missing_downgrades_cache(self):
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        conn = self._make_conn(None)
+        assert await rb.project_column_available(conn) is True
+        rb.mark_project_column_missing()
+        assert await rb.project_column_available(conn) is False
+        assert conn.calls == 1  # downgrade did not trigger a re-probe
+
+
+class _FakeRecallDb:
+    """Fake pool/conn pair simulating a DB with missing additive columns."""
+
+    def __init__(self, missing_columns: set[str]) -> None:
+        self.missing_columns = missing_columns
+        self.executed: list[str] = []
+
+    def make_pool(self):
+        db = self
+
+        class FakeConn:
+            async def fetch(self, sql: str, *args: Any) -> list[Any]:
+                from asyncpg.exceptions import UndefinedColumnError
+
+                for col in db.missing_columns:
+                    if col in sql:
+                        raise UndefinedColumnError(
+                            f'column "{col}" does not exist'
+                        )
+                db.executed.append(sql)
+                return []
+
+            async def fetchrow(self, sql: str, *args: Any) -> dict[str, Any]:
+                # Embedding-count probe in search_learnings_postgres:
+                # report no embeddings so the text fallback branch runs.
+                return {"cnt": 0}
+
+        class FakeAcquire:
+            async def __aenter__(self) -> FakeConn:
+                return FakeConn()
+
+            async def __aexit__(self, *exc: Any) -> bool:
+                return False
+
+        class FakePool:
+            def acquire(self) -> FakeAcquire:
+                return FakeAcquire()
+
+        return FakePool()
+
+
+class TestOldDatabaseDegradation:
+    """End-to-end: pre-migration DBs get project-free SQL, not errors."""
+
+    def _patch_pool(self, monkeypatch, db: _FakeRecallDb) -> None:
+        async def fake_get_pool():
+            return db.make_pool()
+
+        import scripts.core.db.postgres_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "get_pool", fake_get_pool)
+
+    async def test_text_only_runs_without_project_on_old_db(self, monkeypatch):
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        db = _FakeRecallDb(missing_columns={"project"})
+        self._patch_pool(monkeypatch, db)
+
+        results = await rb.search_learnings_text_only_postgres("query terms", k=3)
+        assert results == []
+        assert db.executed, "expected SQL to be executed"
+        for sql in db.executed:
+            assert "project" not in sql.split("FROM")[0], sql[:120]
+
+    async def test_stale_true_cache_recovers_dynamically(self, monkeypatch):
+        """Review round 2: a wrong/stale has_project=True (schema drift after
+        probe) must fall back to project-free SQL, not crash recall."""
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        db = _FakeRecallDb(missing_columns={"project"})
+        self._patch_pool(monkeypatch, db)
+
+        # Poison the cache as if the column existed at probe time.
+        rb._set_project_column_cache_for_tests(True)
+
+        results = await rb.search_learnings_text_only_postgres("query terms", k=3)
+        assert results == []
+        assert db.executed, "expected fallback SQL to be executed"
+        for sql in db.executed:
+            assert "project" not in sql.split("FROM")[0], sql[:120]
+
+    async def test_missing_superseded_by_keeps_chain_fallback(self, monkeypatch):
+        """Review round 3: a missing superseded_by column must flow into the
+        existing no-chain fallback — NOT be misread as a missing project
+        column. Project stays selected and the capability cache stays True."""
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        db = _FakeRecallDb(missing_columns={"superseded_by"})
+        self._patch_pool(monkeypatch, db)
+
+        results = await rb.search_learnings_text_only_postgres("query terms", k=3)
+        assert results == []
+        assert db.executed, "expected no-chain fallback SQL to be executed"
+        for sql in db.executed:
+            assert "superseded_by" not in sql, sql[:120]
+            assert "project" in sql.split("FROM")[0], sql[:120]
+        # Cache must NOT have been poisoned by the unrelated column error:
+        # the cached True is returned without touching the connection.
+        assert await rb.project_column_available(_ProbeFailConn()) is True
+
+    async def test_text_fallback_missing_superseded_by_keeps_chain_fallback(
+        self, monkeypatch,
+    ):
+        """Same round-3 regression for the postgres text-fallback path."""
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        db = _FakeRecallDb(missing_columns={"superseded_by"})
+        self._patch_pool(monkeypatch, db)
+
+        results = await rb.search_learnings_postgres(
+            "query terms", k=3, text_fallback=True,
+        )
+        assert results == []
+        assert db.executed, "expected no-chain fallback SQL to be executed"
+        for sql in db.executed:
+            assert "superseded_by" not in sql, sql[:120]
+            assert "project" in sql.split("FROM")[0], sql[:120]
+        assert await rb.project_column_available(_ProbeFailConn()) is True
+
+
+class _ProbeFailConn:
+    """Conn that fails on any query — proves cached answers skip the probe."""
+
+    async def fetch(self, _sql: str, *args: Any) -> list[Any]:
+        raise AssertionError("probe should have been served from cache")
+
+
+class TestRrfDecayColumnFallback:
+    """Review round 3: missing recall_count/last_recalled must degrade to the
+    plain RRF tail — not be misread as a missing project column."""
+
+    async def test_missing_decay_columns_fall_back_to_plain_tail(
+        self, monkeypatch,
+    ):
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        db = _FakeRecallDb(missing_columns={"recall_count"})
+
+        async def fake_get_pool():
+            return db.make_pool()
+
+        async def fake_init_pgvector(_conn: Any) -> None:
+            return None
+
+        import scripts.core.db.embedding_service as emb_mod
+        import scripts.core.db.postgres_pool as pool_mod
+
+        class FakeEmbedder:
+            def __init__(self, *a: Any, **kw: Any) -> None: ...
+
+            async def embed(self, *_a: Any, **_kw: Any) -> list[float]:
+                return [0.1] * 8
+
+            async def aclose(self) -> None: ...
+
+        monkeypatch.setattr(pool_mod, "get_pool", fake_get_pool)
+        monkeypatch.setattr(pool_mod, "init_pgvector", fake_init_pgvector)
+        monkeypatch.setattr(emb_mod, "EmbeddingService", FakeEmbedder)
+
+        results = await rb.search_learnings_hybrid_rrf(
+            "query terms", k=3, expand=False,
+        )
+        assert results == []
+        assert db.executed, "expected plain-tail SQL to be executed"
+        for sql in db.executed:
+            assert "recall_count" not in sql, sql[:120]
+        # Plain tail still selects project; capability cache not poisoned.
+        assert any("a.project" in sql for sql in db.executed)
+        assert await rb.project_column_available(_ProbeFailConn()) is True

@@ -78,11 +78,19 @@ class TestBuildFetchQuery:
         assert "created_at >= $1" in sql
         assert params == [since]
 
-    def test_memory_id_filters_id(self):
+    def test_memory_id_filters_id_and_bypasses_marker(self):
         mid = str(uuid.uuid4())
         sql, params = build_fetch_query(memory_id=mid)
         assert "id = $1" in sql
         assert params == [mid]
+        # Targeted repair: --memory-id must reprocess rows previously
+        # marked kg_backfill=no_entities
+        assert "kg_backfill" not in sql
+
+    def test_project_filters_project(self):
+        sql, params = build_fetch_query(project="opc")
+        assert "project = $1" in sql
+        assert params == ["opc"]
 
     def test_after_adds_keyset_predicate(self):
         after = (datetime(2026, 1, 1, tzinfo=UTC), str(uuid.uuid4()))
@@ -120,6 +128,18 @@ class TestParseArgs:
     def test_since_parsed_as_datetime(self):
         args = parse_args(["--since", "2026-01-01"])
         assert isinstance(args.since, datetime)
+
+    def test_naive_since_normalized_to_utc(self):
+        args = parse_args(["--since", "2026-01-01"])
+        assert args.since.tzinfo is UTC
+
+    def test_aware_since_preserves_offset(self):
+        args = parse_args(["--since", "2026-01-01T00:00:00+05:00"])
+        assert args.since.utcoffset().total_seconds() == 5 * 3600
+
+    def test_project_flag(self):
+        assert parse_args([]).project is None
+        assert parse_args(["--project", "opc"]).project == "opc"
 
     def test_invalid_since_rejected(self):
         with pytest.raises(SystemExit):
@@ -582,6 +602,16 @@ class TestBackfillIntegration:
             assert mentions_after_second == mentions_after_first
             # Zero-entity row is durably marked: nothing left to retry
             assert eligible_after_second == 0
+
+            # Targeted repair: --memory-id bypasses the no_entities marker
+            async with pool.acquire() as conn:
+                sql, params = build_fetch_query(
+                    memory_id=no_entity_id, count_only=True
+                )
+                repair_eligible = await conn.fetchval(sql, *params)
+            assert repair_eligible == 1
+            rc3 = await run_backfill(parse_args(["--memory-id", no_entity_id]))
+            assert rc3 == 0
         finally:
             async with pool.acquire() as conn:
                 await self._cleanup(conn, marker, ids)

@@ -27,7 +27,7 @@ import sys
 import time
 import uuid
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from scripts.core.db.postgres_pool import get_pool
@@ -49,6 +49,7 @@ def build_fetch_query(
     memory_id: str | None = None,
     count_only: bool = False,
     after: tuple[datetime, str] | None = None,
+    project: str | None = None,
 ) -> tuple[str, list[Any]]:
     """Build the SQL to select memories that still need KG indexing.
 
@@ -56,6 +57,9 @@ def build_fetch_query(
     Eligibility excludes memories that already have a kg_entity_mentions row
     and memories durably marked kg_backfill in metadata (zero-entity rows),
     so partial runs resume cleanly and reruns converge to a no-op.
+
+    A targeted ``memory_id`` run bypasses the kg_backfill marker so a row
+    previously marked no_entities can be reprocessed (repair path).
 
     ``after`` is a (created_at, id) keyset cursor: combined with the
     deterministic ORDER BY it pages through the backlog without loading it
@@ -66,8 +70,9 @@ def build_fetch_query(
         f"{select} FROM archival_memory m "
         "WHERE NOT EXISTS ("
         "SELECT 1 FROM kg_entity_mentions km WHERE km.memory_id = m.id)"
-        " AND (m.metadata->>'kg_backfill') IS NULL"
     )
+    if memory_id is None:
+        sql += " AND (m.metadata->>'kg_backfill') IS NULL"
     params: list[Any] = []
     if since is not None:
         params.append(since)
@@ -75,6 +80,9 @@ def build_fetch_query(
     if memory_id is not None:
         params.append(memory_id)
         sql += f" AND m.id = ${len(params)}::uuid"
+    if project is not None:
+        params.append(project)
+        sql += f" AND m.project = ${len(params)}"
     if after is not None:
         params.extend([after[0], after[1]])
         sql += (
@@ -106,11 +114,18 @@ def _positive_int(value: str) -> int:
 
 
 def _iso_datetime(value: str) -> datetime:
-    """Argparse type for ISO-8601 dates/datetimes."""
+    """Argparse type for ISO-8601 dates/datetimes.
+
+    Naive inputs are normalized to UTC so the cutoff against the
+    TIMESTAMPTZ created_at column does not depend on runtime timezone.
+    """
     try:
-        return datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value)
     except ValueError as e:
         raise argparse.ArgumentTypeError(f"invalid ISO date: {value!r}") from e
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
 
 
 def _uuid_str(value: str) -> str:
@@ -148,7 +163,13 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "--memory-id",
         type=_uuid_str,
         default=None,
-        help="Backfill a single memory by UUID",
+        help="Backfill a single memory by UUID (bypasses the no_entities marker)",
+    )
+    parser.add_argument(
+        "--project",
+        default=None,
+        help="Only memories tagged with this project (default: all projects; "
+        "the KG is a global graph by design)",
     )
     parser.add_argument(
         "--batch-size",
@@ -203,6 +224,7 @@ async def _fetch_page(
         since=args.since,
         memory_id=args.memory_id,
         after=after,
+        project=args.project,
     )
     async with pool.acquire() as conn:
         return await conn.fetch(sql, *params)
@@ -226,7 +248,10 @@ async def run_backfill(args: argparse.Namespace) -> int:
 
     if args.dry_run:
         sql, params = build_fetch_query(
-            since=args.since, memory_id=args.memory_id, count_only=True
+            since=args.since,
+            memory_id=args.memory_id,
+            count_only=True,
+            project=args.project,
         )
         async with pool.acquire() as conn:
             eligible = await conn.fetchval(sql, *params)

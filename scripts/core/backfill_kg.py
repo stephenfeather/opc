@@ -344,7 +344,7 @@ async def run_backfill(args: argparse.Namespace) -> int:
     remaining = args.limit
     consecutive_errors = 0
     no_entity_ids: list[str] = []
-    pool: Any | None = None
+    pool: Any = None
     try:
         pool = await get_pool()
 
@@ -371,7 +371,7 @@ async def run_backfill(args: argparse.Namespace) -> int:
             if not rows:
                 break
 
-            no_entity_ids: list[str] = []
+            no_entity_ids = []
             for row in rows:
                 result = await backfill_one(str(row["id"]), row["content"])
                 stats["processed"] += 1

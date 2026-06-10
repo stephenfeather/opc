@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
 import os
 import sys
 import time
@@ -381,8 +380,10 @@ async def run_backfill(args: argparse.Namespace) -> int:
                 if status == "error":
                     # safe() at the log site, after the raw [:200] slice in
                     # backfill_one: exception text can embed semi-trusted
-                    # memory content (issue #104 log-injection class)
-                    _log(f"error indexing {row['id']}: {safe(result['error'])}")
+                    # memory content (issue #104 log-injection class). The id
+                    # is uuid-typed today but safe() keeps the log line
+                    # independent of the column type staying that way.
+                    _log(f"error indexing {safe(str(row['id']))}: " f"{safe(result['error'])}")
                     consecutive_errors += 1
                     if consecutive_errors >= args.max_consecutive_errors:
                         # Issue #131: every row failing in a row is a
@@ -418,8 +419,11 @@ async def run_backfill(args: argparse.Namespace) -> int:
             # this page when the pool still answers (e.g. the abort came
             # from a transient acquire timeout). Re-marking a previous
             # page's ids is an idempotent UPDATE.
-            with contextlib.suppress(*INFRA_ERRORS):
+            try:
                 await mark_no_entities(pool, no_entity_ids)
+            except INFRA_ERRORS as flush_exc:
+                # Aegis #131: leave a trace instead of swallowing silently
+                _log("no_entities flush failed during abort: " f"{safe(str(flush_exc)[:200])}")
         _log(f"aborting: infrastructure error: {safe(str(e)[:200])}")
         print(format_summary(stats), flush=True)
         return 3

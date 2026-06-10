@@ -580,9 +580,43 @@ class TestRunBackfill:
         mock_mark.assert_awaited_once()
         assert mock_mark.await_args[0][1] == [str(rows[0]["id"])]
 
+    async def test_error_log_sanitizes_row_id(self, capsys):
+        # Aegis #131: the id column is uuid-typed today, but the log line
+        # must not depend on that staying true — safe() the id too
+        rows = [
+            {
+                "id": "forged\x1b[2J\nFAKE LINE",
+                "content": "x",
+                "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+            }
+        ]
+        conn = AsyncMock()
+        conn.fetch.side_effect = [rows, []]
+        pool = _mock_pool(conn)
+
+        with (
+            patch("scripts.core.backfill_kg.detect_backend", return_value="postgres"),
+            patch(
+                "scripts.core.backfill_kg.get_pool",
+                new_callable=AsyncMock,
+                return_value=pool,
+            ),
+            patch(
+                "scripts.core.backfill_kg.backfill_one",
+                new_callable=AsyncMock,
+                return_value={"status": "error", "error": "boom"},
+            ),
+        ):
+            rc = await run_backfill(parse_args([]))
+
+        assert rc == 2
+        out = capsys.readouterr().out
+        assert "\x1b" not in out
+        assert "\nFAKE LINE" not in out
+
     async def test_infra_abort_survives_failed_flush(self, capsys):
-        # The best-effort flush itself hits the dead DB: still exit 3, no
-        # secondary traceback
+        # The best-effort flush itself hits the dead DB: still exit 3 with a
+        # log line about the failed flush, no secondary traceback
         import asyncpg
 
         rows = [_row("plain"), _row("entity-bearing")]
@@ -616,7 +650,10 @@ class TestRunBackfill:
             rc = await run_backfill(parse_args([]))
 
         assert rc == 3
-        assert "infrastructure error" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "infrastructure error" in out
+        # The swallowed flush failure must leave a trace for operators
+        assert "no_entities flush failed" in out
 
     async def test_consecutive_errors_trip_circuit_breaker(self, capsys):
         # Issue #131: schema mismatch etc. errors every row without raising

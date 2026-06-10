@@ -50,7 +50,11 @@ def canonicalize_project(raw: str | None) -> str | None:
     if value == UNRESOLVED_SENTINEL:
         return value
     value = value.lower()
-    value = _FLATTENED_HOME_RE.sub("", value)
+    value = _FLATTENED_HOME_RE.sub("", value).strip("/").strip()
+    if not value:
+        # e.g. '-users-bob-' strips to nothing, or a bare '/' — an empty
+        # string would violate the fixed-point contract (aegis MEDIUM-1).
+        return None
     return PROJECT_ALIASES.get(value, value)
 
 

@@ -56,6 +56,17 @@ class TestCanonicalizeProject:
     def test_alias_lookup_happens_after_lowercasing(self):
         assert canonicalize_project("Operations-DigitalOcean") == "digitalocean"
 
+    def test_strip_residue_becomes_none_not_empty(self):
+        # aegis MEDIUM-1: '-users-bob-' strips to nothing; an empty string
+        # would break the fixed-point/idempotency contract.
+        assert canonicalize_project("-Users-bob-") is None
+        assert canonicalize_project("/") is None
+
+    def test_root_anchored_worktree_path_rejected(self):
+        from scripts.core.project_naming import project_from_path
+
+        assert project_from_path("/.worktrees/branch") is None
+
     def test_unresolved_sentinel_preserved(self):
         # '_unresolved' is the daemon's explicit unknown marker, not a name.
         assert canonicalize_project("_unresolved") == "_unresolved"

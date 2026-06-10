@@ -70,7 +70,9 @@ async def run(apply: bool) -> int:
     from scripts.core.db.postgres_pool import get_pool
 
     pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire() as conn, conn.transaction():
+        # Single transaction: a failure mid-rewrite rolls back atomically
+        # instead of leaving values half-normalized (aegis recommendation).
         rows = await conn.fetch(
             "SELECT DISTINCT project FROM archival_memory WHERE project IS NOT NULL"
         )

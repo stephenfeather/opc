@@ -174,6 +174,15 @@ class TestParseArgs:
         assert parse_args([]).recheck_no_entities is False
         assert parse_args(["--recheck-no-entities"]).recheck_no_entities is True
 
+    def test_max_consecutive_errors_default_and_override(self):
+        # Issue #131 circuit breaker threshold
+        assert parse_args([]).max_consecutive_errors == 10
+        assert parse_args(["--max-consecutive-errors", "3"]).max_consecutive_errors == 3
+
+    def test_zero_max_consecutive_errors_rejected(self):
+        with pytest.raises(SystemExit):
+            parse_args(["--max-consecutive-errors", "0"])
+
     def test_memory_id_exclusive_with_other_scoping_flags(self):
         mid = str(uuid.uuid4())
         for extra in (
@@ -192,9 +201,7 @@ class TestParseArgs:
 
 class TestFormatSummary:
     def test_includes_all_counts(self):
-        text = format_summary(
-            {"processed": 7, "indexed": 4, "no_entities": 2, "errors": 1}
-        )
+        text = format_summary({"processed": 7, "indexed": 4, "no_entities": 2, "errors": 1})
         assert "7" in text
         assert "4" in text
         assert "2" in text
@@ -213,12 +220,8 @@ class TestBackfillOne:
         kg_stats = {"entities": 1, "edges": 0, "mentions": 1}
 
         with (
-            patch(
-                "scripts.core.backfill_kg.extract_entities", return_value=entities
-            ) as mock_ents,
-            patch(
-                "scripts.core.backfill_kg.extract_relations", return_value=[]
-            ) as mock_rels,
+            patch("scripts.core.backfill_kg.extract_entities", return_value=entities) as mock_ents,
+            patch("scripts.core.backfill_kg.extract_relations", return_value=[]) as mock_rels,
             patch(
                 "scripts.core.backfill_kg.store_entities_and_edges",
                 new_callable=AsyncMock,
@@ -256,12 +259,67 @@ class TestBackfillOne:
         assert result["status"] == "error"
         assert "boom" in result["error"]
 
+    async def test_infrastructure_errors_propagate(self):
+        # Issue #131: a dead DB mid-run must abort promptly, not get logged
+        # once per row across the whole backlog like a bad-content row
+        import asyncpg
+
+        infra_errors = [
+            asyncpg.PostgresConnectionError("db down"),
+            asyncpg.InterfaceError("pool is closing"),
+            asyncpg.InvalidAuthorizationSpecificationError("bad credentials"),
+            asyncpg.CannotConnectNowError("the database system is starting up"),
+            asyncpg.TooManyConnectionsError("too many clients"),
+            ConnectionResetError("socket reset"),
+            TimeoutError("pool acquire timed out"),
+        ]
+        for exc in infra_errors:
+            with (
+                patch(
+                    "scripts.core.backfill_kg.extract_entities",
+                    return_value=[MagicMock()],
+                ),
+                patch("scripts.core.backfill_kg.extract_relations", return_value=[]),
+                patch(
+                    "scripts.core.backfill_kg.store_entities_and_edges",
+                    new_callable=AsyncMock,
+                    side_effect=exc,
+                ),
+            ):
+                with pytest.raises(type(exc)):
+                    await backfill_one(str(uuid.uuid4()), "uses pytest")
+
+    async def test_per_row_postgres_data_errors_stay_nonfatal(self):
+        # Adversarial review round 2: server-side data errors and client
+        # API misuse are per-row/deterministic, NOT retryable infra — they
+        # must keep the error-dict path (and trip the breaker if repeated)
+        import asyncpg
+
+        per_row_errors = [
+            asyncpg.DataError("value out of range"),
+            asyncpg.ClientConfigurationError("bad client config"),
+        ]
+        for exc in per_row_errors:
+            with (
+                patch(
+                    "scripts.core.backfill_kg.extract_entities",
+                    return_value=[MagicMock()],
+                ),
+                patch("scripts.core.backfill_kg.extract_relations", return_value=[]),
+                patch(
+                    "scripts.core.backfill_kg.store_entities_and_edges",
+                    new_callable=AsyncMock,
+                    side_effect=exc,
+                ),
+            ):
+                result = await backfill_one(str(uuid.uuid4()), "uses pytest")
+
+            assert result["status"] == "error"
+
     async def test_oversized_content_truncated_before_extraction(self):
         from scripts.core.backfill_kg import MAX_CONTENT_CHARS
 
-        with patch(
-            "scripts.core.backfill_kg.extract_entities", return_value=[]
-        ) as mock_ents:
+        with patch("scripts.core.backfill_kg.extract_entities", return_value=[]) as mock_ents:
             await backfill_one(str(uuid.uuid4()), "x" * (MAX_CONTENT_CHARS + 5000))
 
         passed = mock_ents.call_args[0][0]
@@ -304,12 +362,8 @@ class TestMarkNoEntities:
 class TestRunBackfill:
     async def test_non_postgres_backend_exits_without_db(self):
         with (
-            patch(
-                "scripts.core.backfill_kg.detect_backend", return_value="sqlite"
-            ),
-            patch(
-                "scripts.core.backfill_kg.get_pool", new_callable=AsyncMock
-            ) as mock_pool,
+            patch("scripts.core.backfill_kg.detect_backend", return_value="sqlite"),
+            patch("scripts.core.backfill_kg.get_pool", new_callable=AsyncMock) as mock_pool,
         ):
             rc = await run_backfill(parse_args([]))
 
@@ -322,9 +376,7 @@ class TestRunBackfill:
         pool = _mock_pool(conn)
 
         with (
-            patch(
-                "scripts.core.backfill_kg.detect_backend", return_value="postgres"
-            ),
+            patch("scripts.core.backfill_kg.detect_backend", return_value="postgres"),
             patch(
                 "scripts.core.backfill_kg.get_pool",
                 new_callable=AsyncMock,
@@ -354,9 +406,7 @@ class TestRunBackfill:
         ]
 
         with (
-            patch(
-                "scripts.core.backfill_kg.detect_backend", return_value="postgres"
-            ),
+            patch("scripts.core.backfill_kg.detect_backend", return_value="postgres"),
             patch(
                 "scripts.core.backfill_kg.get_pool",
                 new_callable=AsyncMock,
@@ -377,6 +427,297 @@ class TestRunBackfill:
         assert "indexed" in out
         assert "errors" in out
 
+    async def test_infra_error_aborts_run_with_exit_code_3(self, capsys):
+        # Issue #131: DB down mid-run → prompt abort with a distinct exit
+        # code, remaining rows never attempted
+        import asyncpg
+
+        rows = [_row(f"content {i}") for i in range(3)]
+        conn = AsyncMock()
+        conn.fetch.side_effect = [rows, []]
+        pool = _mock_pool(conn)
+
+        outcomes = [
+            {"status": "indexed", "stats": {"entities": 1, "edges": 0, "mentions": 1}},
+            asyncpg.PostgresConnectionError("db down"),
+        ]
+
+        with (
+            patch("scripts.core.backfill_kg.detect_backend", return_value="postgres"),
+            patch(
+                "scripts.core.backfill_kg.get_pool",
+                new_callable=AsyncMock,
+                return_value=pool,
+            ),
+            patch(
+                "scripts.core.backfill_kg.backfill_one",
+                new_callable=AsyncMock,
+                side_effect=outcomes,
+            ) as mock_one,
+        ):
+            rc = await run_backfill(parse_args([]))
+
+        assert rc == 3
+        # Third row never attempted: the run aborted promptly
+        assert mock_one.await_count == 2
+        out = capsys.readouterr().out
+        assert "infrastructure error" in out
+        assert "db down" in out
+
+    async def test_pool_creation_infra_error_exits_3(self, capsys):
+        # DB down before row processing even begins must still exit 3,
+        # not escape with a traceback (adversarial review round 1)
+        with (
+            patch("scripts.core.backfill_kg.detect_backend", return_value="postgres"),
+            patch(
+                "scripts.core.backfill_kg.get_pool",
+                new_callable=AsyncMock,
+                side_effect=ConnectionRefusedError("connect refused"),
+            ),
+        ):
+            rc = await run_backfill(parse_args([]))
+
+        assert rc == 3
+        assert "infrastructure error" in capsys.readouterr().out
+
+    async def test_fetch_page_interface_error_exits_3(self, capsys):
+        # Adversarial review round 3: a closed/exhausted pool surfaces as
+        # bare InterfaceError from acquire/fetch — that is connection-state,
+        # not client misuse, and must take the exit-3 path
+        import asyncpg
+
+        conn = AsyncMock()
+        conn.fetch.side_effect = asyncpg.InterfaceError("pool is closing")
+        pool = _mock_pool(conn)
+
+        with (
+            patch("scripts.core.backfill_kg.detect_backend", return_value="postgres"),
+            patch(
+                "scripts.core.backfill_kg.get_pool",
+                new_callable=AsyncMock,
+                return_value=pool,
+            ),
+        ):
+            rc = await run_backfill(parse_args([]))
+
+        assert rc == 3
+        assert "infrastructure error" in capsys.readouterr().out
+
+    async def test_startup_auth_failure_exits_3(self, capsys):
+        # Bad credentials / revoked access at startup are PostgresError, not
+        # PostgresConnectionError — they must still exit 3, not traceback
+        import asyncpg
+
+        with (
+            patch("scripts.core.backfill_kg.detect_backend", return_value="postgres"),
+            patch(
+                "scripts.core.backfill_kg.get_pool",
+                new_callable=AsyncMock,
+                side_effect=asyncpg.InvalidPasswordError("password authentication failed"),
+            ),
+        ):
+            rc = await run_backfill(parse_args([]))
+
+        assert rc == 3
+        assert "infrastructure error" in capsys.readouterr().out
+
+    async def test_dry_run_infra_error_exits_3(self, capsys):
+        # --dry-run hits the DB too; an acquire timeout is a systemic
+        # failure, not a crash
+        conn = AsyncMock()
+        conn.fetchval.side_effect = TimeoutError("pool acquire timed out")
+        pool = _mock_pool(conn)
+
+        with (
+            patch("scripts.core.backfill_kg.detect_backend", return_value="postgres"),
+            patch(
+                "scripts.core.backfill_kg.get_pool",
+                new_callable=AsyncMock,
+                return_value=pool,
+            ),
+        ):
+            rc = await run_backfill(parse_args(["--dry-run"]))
+
+        assert rc == 3
+        assert "infrastructure error" in capsys.readouterr().out
+
+    async def test_infra_abort_flushes_no_entities_best_effort(self):
+        # Rows already classified no_entities in the aborted page keep their
+        # durable marker when the pool still answers (e.g. transient acquire
+        # timeout raised by a later row)
+        import asyncpg
+
+        rows = [_row("plain"), _row("entity-bearing")]
+        conn = AsyncMock()
+        conn.fetch.side_effect = [rows, []]
+        pool = _mock_pool(conn)
+
+        outcomes = [
+            {"status": "no_entities"},
+            asyncpg.PostgresConnectionError("db down"),
+        ]
+
+        with (
+            patch("scripts.core.backfill_kg.detect_backend", return_value="postgres"),
+            patch(
+                "scripts.core.backfill_kg.get_pool",
+                new_callable=AsyncMock,
+                return_value=pool,
+            ),
+            patch(
+                "scripts.core.backfill_kg.backfill_one",
+                new_callable=AsyncMock,
+                side_effect=outcomes,
+            ),
+            patch(
+                "scripts.core.backfill_kg.mark_no_entities",
+                new_callable=AsyncMock,
+            ) as mock_mark,
+        ):
+            rc = await run_backfill(parse_args([]))
+
+        assert rc == 3
+        mock_mark.assert_awaited_once()
+        assert mock_mark.await_args[0][1] == [str(rows[0]["id"])]
+
+    async def test_error_log_sanitizes_row_id(self, capsys):
+        # Aegis #131: the id column is uuid-typed today, but the log line
+        # must not depend on that staying true — safe() the id too
+        rows = [
+            {
+                "id": "forged\x1b[2J\nFAKE LINE",
+                "content": "x",
+                "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+            }
+        ]
+        conn = AsyncMock()
+        conn.fetch.side_effect = [rows, []]
+        pool = _mock_pool(conn)
+
+        with (
+            patch("scripts.core.backfill_kg.detect_backend", return_value="postgres"),
+            patch(
+                "scripts.core.backfill_kg.get_pool",
+                new_callable=AsyncMock,
+                return_value=pool,
+            ),
+            patch(
+                "scripts.core.backfill_kg.backfill_one",
+                new_callable=AsyncMock,
+                return_value={"status": "error", "error": "boom"},
+            ),
+        ):
+            rc = await run_backfill(parse_args([]))
+
+        assert rc == 2
+        out = capsys.readouterr().out
+        assert "\x1b" not in out
+        assert "\nFAKE LINE" not in out
+
+    async def test_infra_abort_survives_failed_flush(self, capsys):
+        # The best-effort flush itself hits the dead DB: still exit 3 with a
+        # log line about the failed flush, no secondary traceback
+        import asyncpg
+
+        rows = [_row("plain"), _row("entity-bearing")]
+        conn = AsyncMock()
+        conn.fetch.side_effect = [rows, []]
+        pool = _mock_pool(conn)
+
+        outcomes = [
+            {"status": "no_entities"},
+            asyncpg.PostgresConnectionError("db down"),
+        ]
+
+        with (
+            patch("scripts.core.backfill_kg.detect_backend", return_value="postgres"),
+            patch(
+                "scripts.core.backfill_kg.get_pool",
+                new_callable=AsyncMock,
+                return_value=pool,
+            ),
+            patch(
+                "scripts.core.backfill_kg.backfill_one",
+                new_callable=AsyncMock,
+                side_effect=outcomes,
+            ),
+            patch(
+                "scripts.core.backfill_kg.mark_no_entities",
+                new_callable=AsyncMock,
+                side_effect=asyncpg.PostgresConnectionError("still down"),
+            ),
+        ):
+            rc = await run_backfill(parse_args([]))
+
+        assert rc == 3
+        out = capsys.readouterr().out
+        assert "infrastructure error" in out
+        # The swallowed flush failure must leave a trace for operators
+        assert "no_entities flush failed" in out
+
+    async def test_consecutive_errors_trip_circuit_breaker(self, capsys):
+        # Issue #131: schema mismatch etc. errors every row without raising
+        # an INFRA_ERRORS type; the breaker stops the run at the threshold
+        rows = [_row(f"content {i}") for i in range(4)]
+        conn = AsyncMock()
+        conn.fetch.side_effect = [rows, []]
+        pool = _mock_pool(conn)
+
+        with (
+            patch("scripts.core.backfill_kg.detect_backend", return_value="postgres"),
+            patch(
+                "scripts.core.backfill_kg.get_pool",
+                new_callable=AsyncMock,
+                return_value=pool,
+            ),
+            patch(
+                "scripts.core.backfill_kg.backfill_one",
+                new_callable=AsyncMock,
+                return_value={"status": "error", "error": "schema mismatch"},
+            ) as mock_one,
+        ):
+            rc = await run_backfill(parse_args(["--max-consecutive-errors", "2"]))
+
+        assert rc == 3
+        # Breaker trips at the threshold: rows 3 and 4 never attempted
+        assert mock_one.await_count == 2
+        out = capsys.readouterr().out
+        assert "consecutive errors" in out
+
+    async def test_success_resets_consecutive_error_count(self):
+        # Interleaved successes prove the errors are per-row, not systemic:
+        # the breaker must not trip and the run finishes with exit 2
+        rows = [_row(f"content {i}") for i in range(5)]
+        conn = AsyncMock()
+        conn.fetch.side_effect = [rows, []]
+        pool = _mock_pool(conn)
+
+        outcomes = [
+            {"status": "error", "error": "bad row"},
+            {"status": "indexed", "stats": {"entities": 1, "edges": 0, "mentions": 1}},
+            {"status": "error", "error": "bad row"},
+            {"status": "no_entities"},
+            {"status": "error", "error": "bad row"},
+        ]
+
+        with (
+            patch("scripts.core.backfill_kg.detect_backend", return_value="postgres"),
+            patch(
+                "scripts.core.backfill_kg.get_pool",
+                new_callable=AsyncMock,
+                return_value=pool,
+            ),
+            patch(
+                "scripts.core.backfill_kg.backfill_one",
+                new_callable=AsyncMock,
+                side_effect=outcomes,
+            ) as mock_one,
+        ):
+            rc = await run_backfill(parse_args(["--max-consecutive-errors", "2"]))
+
+        assert rc == 2
+        assert mock_one.await_count == 5
+
     async def test_error_log_sanitizes_control_characters(self, capsys):
         rows = [_row("adversarial")]
         conn = AsyncMock()
@@ -384,9 +725,7 @@ class TestRunBackfill:
         pool = _mock_pool(conn)
 
         with (
-            patch(
-                "scripts.core.backfill_kg.detect_backend", return_value="postgres"
-            ),
+            patch("scripts.core.backfill_kg.detect_backend", return_value="postgres"),
             patch(
                 "scripts.core.backfill_kg.get_pool",
                 new_callable=AsyncMock,
@@ -416,9 +755,7 @@ class TestRunBackfill:
         pool = _mock_pool(conn)
 
         with (
-            patch(
-                "scripts.core.backfill_kg.detect_backend", return_value="postgres"
-            ),
+            patch("scripts.core.backfill_kg.detect_backend", return_value="postgres"),
             patch(
                 "scripts.core.backfill_kg.get_pool",
                 new_callable=AsyncMock,
@@ -444,9 +781,7 @@ class TestRunBackfill:
         pool = _mock_pool(conn)
 
         with (
-            patch(
-                "scripts.core.backfill_kg.detect_backend", return_value="postgres"
-            ),
+            patch("scripts.core.backfill_kg.detect_backend", return_value="postgres"),
             patch(
                 "scripts.core.backfill_kg.get_pool",
                 new_callable=AsyncMock,
@@ -480,9 +815,7 @@ class TestRunBackfill:
         pool = _mock_pool(conn)
 
         with (
-            patch(
-                "scripts.core.backfill_kg.detect_backend", return_value="postgres"
-            ),
+            patch("scripts.core.backfill_kg.detect_backend", return_value="postgres"),
             patch(
                 "scripts.core.backfill_kg.get_pool",
                 new_callable=AsyncMock,
@@ -511,9 +844,7 @@ class TestRunBackfill:
         pool = _mock_pool(conn)
 
         with (
-            patch(
-                "scripts.core.backfill_kg.detect_backend", return_value="postgres"
-            ),
+            patch("scripts.core.backfill_kg.detect_backend", return_value="postgres"),
             patch(
                 "scripts.core.backfill_kg.get_pool",
                 new_callable=AsyncMock,
@@ -528,9 +859,7 @@ class TestRunBackfill:
                 },
             ) as mock_one,
         ):
-            rc = await run_backfill(
-                parse_args(["--batch-size", "2", "--limit", "3"])
-            )
+            rc = await run_backfill(parse_args(["--batch-size", "2", "--limit", "3"]))
 
         assert rc == 0
         assert mock_one.await_count == 3
@@ -552,9 +881,7 @@ class TestMainAsync:
                 new_callable=AsyncMock,
                 return_value=0,
             ),
-            patch(
-                "scripts.core.backfill_kg.close_pool", new_callable=AsyncMock
-            ) as mock_close,
+            patch("scripts.core.backfill_kg.close_pool", new_callable=AsyncMock) as mock_close,
         ):
             rc = await _main_async(["--dry-run"])
 
@@ -571,9 +898,7 @@ class TestMainAsync:
                 new_callable=AsyncMock,
                 side_effect=RuntimeError("boom"),
             ),
-            patch(
-                "scripts.core.backfill_kg.close_pool", new_callable=AsyncMock
-            ) as mock_close,
+            patch("scripts.core.backfill_kg.close_pool", new_callable=AsyncMock) as mock_close,
         ):
             with pytest.raises(RuntimeError):
                 await _main_async([])
@@ -681,28 +1006,17 @@ class TestBackfillIntegration:
         return ids + [no_entity_id], no_entity_id
 
     async def _cleanup(self, conn, marker: str, ids: list[str]):
-        await conn.execute(
-            "DELETE FROM kg_edges WHERE memory_id = ANY($1::uuid[])", ids
-        )
-        await conn.execute(
-            "DELETE FROM kg_entity_mentions WHERE memory_id = ANY($1::uuid[])", ids
-        )
-        await conn.execute(
-            "DELETE FROM kg_entities WHERE name LIKE $1", f"%bf124_{marker}%"
-        )
-        await conn.execute(
-            "DELETE FROM archival_memory WHERE id = ANY($1::uuid[])", ids
-        )
+        await conn.execute("DELETE FROM kg_edges WHERE memory_id = ANY($1::uuid[])", ids)
+        await conn.execute("DELETE FROM kg_entity_mentions WHERE memory_id = ANY($1::uuid[])", ids)
+        await conn.execute("DELETE FROM kg_entities WHERE name LIKE $1", f"%bf124_{marker}%")
+        await conn.execute("DELETE FROM archival_memory WHERE id = ANY($1::uuid[])", ids)
 
     async def test_backfill_twice_second_run_is_noop(self):
         import os
 
         from scripts.core.db.postgres_pool import get_pool
 
-        if not (
-            os.environ.get("CONTINUOUS_CLAUDE_DB_URL")
-            or os.environ.get("DATABASE_URL")
-        ):
+        if not (os.environ.get("CONTINUOUS_CLAUDE_DB_URL") or os.environ.get("DATABASE_URL")):
             pytest.skip(
                 "No DB URL in env (CONTINUOUS_CLAUDE_DB_URL / DATABASE_URL); "
                 "issue #62 forbids hardcoded fallbacks"
@@ -715,8 +1029,7 @@ class TestBackfillIntegration:
         try:
             async with pool.acquire() as conn:
                 seeded_at = await conn.fetchval(
-                    "SELECT min(created_at) FROM archival_memory "
-                    "WHERE id = ANY($1::uuid[])",
+                    "SELECT min(created_at) FROM archival_memory " "WHERE id = ANY($1::uuid[])",
                     ids,
                 )
 
@@ -728,13 +1041,11 @@ class TestBackfillIntegration:
 
             async with pool.acquire() as conn:
                 mentions_after_first = await conn.fetchval(
-                    "SELECT count(*) FROM kg_entity_mentions "
-                    "WHERE memory_id = ANY($1::uuid[])",
+                    "SELECT count(*) FROM kg_entity_mentions " "WHERE memory_id = ANY($1::uuid[])",
                     ids,
                 )
                 no_entity_flag = await conn.fetchval(
-                    "SELECT metadata->>'kg_backfill' FROM archival_memory "
-                    "WHERE id = $1::uuid",
+                    "SELECT metadata->>'kg_backfill' FROM archival_memory " "WHERE id = $1::uuid",
                     no_entity_id,
                 )
             assert mentions_after_first > 0
@@ -745,8 +1056,7 @@ class TestBackfillIntegration:
 
             async with pool.acquire() as conn:
                 mentions_after_second = await conn.fetchval(
-                    "SELECT count(*) FROM kg_entity_mentions "
-                    "WHERE memory_id = ANY($1::uuid[])",
+                    "SELECT count(*) FROM kg_entity_mentions " "WHERE memory_id = ANY($1::uuid[])",
                     ids,
                 )
                 sql, params = build_fetch_query(
@@ -761,9 +1071,7 @@ class TestBackfillIntegration:
 
             # Targeted repair: --memory-id bypasses the no_entities marker
             async with pool.acquire() as conn:
-                sql, params = build_fetch_query(
-                    memory_id=no_entity_id, count_only=True
-                )
+                sql, params = build_fetch_query(memory_id=no_entity_id, count_only=True)
                 repair_eligible = await conn.fetchval(sql, *params)
             assert repair_eligible == 1
             rc3 = await run_backfill(parse_args(["--memory-id", no_entity_id]))

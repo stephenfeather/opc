@@ -266,7 +266,9 @@ class TestBackfillOne:
 
         infra_errors = [
             asyncpg.PostgresConnectionError("db down"),
-            asyncpg.InterfaceError("pool is closing"),
+            asyncpg.InvalidAuthorizationSpecificationError("bad credentials"),
+            asyncpg.CannotConnectNowError("the database system is starting up"),
+            asyncpg.TooManyConnectionsError("too many clients"),
             ConnectionResetError("socket reset"),
             TimeoutError("pool acquire timed out"),
         ]
@@ -285,6 +287,33 @@ class TestBackfillOne:
             ):
                 with pytest.raises(type(exc)):
                     await backfill_one(str(uuid.uuid4()), "uses pytest")
+
+    async def test_per_row_postgres_data_errors_stay_nonfatal(self):
+        # Adversarial review round 2: server-side data errors and client
+        # API misuse are per-row/deterministic, NOT retryable infra — they
+        # must keep the error-dict path (and trip the breaker if repeated)
+        import asyncpg
+
+        per_row_errors = [
+            asyncpg.DataError("value out of range"),
+            asyncpg.ClientConfigurationError("bad client config"),
+        ]
+        for exc in per_row_errors:
+            with (
+                patch(
+                    "scripts.core.backfill_kg.extract_entities",
+                    return_value=[MagicMock()],
+                ),
+                patch("scripts.core.backfill_kg.extract_relations", return_value=[]),
+                patch(
+                    "scripts.core.backfill_kg.store_entities_and_edges",
+                    new_callable=AsyncMock,
+                    side_effect=exc,
+                ),
+            ):
+                result = await backfill_one(str(uuid.uuid4()), "uses pytest")
+
+            assert result["status"] == "error"
 
     async def test_oversized_content_truncated_before_extraction(self):
         from scripts.core.backfill_kg import MAX_CONTENT_CHARS
@@ -443,6 +472,24 @@ class TestRunBackfill:
                 "scripts.core.backfill_kg.get_pool",
                 new_callable=AsyncMock,
                 side_effect=ConnectionRefusedError("connect refused"),
+            ),
+        ):
+            rc = await run_backfill(parse_args([]))
+
+        assert rc == 3
+        assert "infrastructure error" in capsys.readouterr().out
+
+    async def test_startup_auth_failure_exits_3(self, capsys):
+        # Bad credentials / revoked access at startup are PostgresError, not
+        # PostgresConnectionError — they must still exit 3, not traceback
+        import asyncpg
+
+        with (
+            patch("scripts.core.backfill_kg.detect_backend", return_value="postgres"),
+            patch(
+                "scripts.core.backfill_kg.get_pool",
+                new_callable=AsyncMock,
+                side_effect=asyncpg.InvalidPasswordError("password authentication failed"),
             ),
         ):
             rc = await run_backfill(parse_args([]))

@@ -62,14 +62,25 @@ from scripts.core.store_learning import detect_backend
 MAX_CONTENT_CHARS = 100_000
 
 # Issue #131: systemic failures must abort the run promptly instead of being
-# logged once per row across the whole backlog. asyncpg.PostgresConnectionError
-# covers server-side connection loss (ConnectionDoesNotExistError, ...),
-# InterfaceError covers client-side pool/connection misuse (e.g. pool is
-# closing), OSError covers socket-level failures (ConnectionError subclasses),
-# and TimeoutError covers pool-acquire timeouts (asyncio.TimeoutError alias).
+# logged once per row across the whole backlog. Explicit allowlist of
+# connectivity/availability failures — deliberately NOT the generic
+# asyncpg.InterfaceError, whose subtree includes deterministic client API
+# misuse (e.g. ClientConfigurationError) that must stay on the per-row error
+# path (review round 2):
+# - PostgresConnectionError: server-side connection loss
+#   (ConnectionDoesNotExistError, ConnectionFailureError, ...)
+# - InvalidAuthorizationSpecificationError: bad/revoked credentials at
+#   connect time (covers InvalidPasswordError)
+# - CannotConnectNowError: server starting up / not accepting connections
+# - InsufficientResourcesError: server out of capacity
+#   (covers TooManyConnectionsError)
+# - OSError: socket-level failures (ConnectionError subclasses)
+# - TimeoutError: pool-acquire timeouts (asyncio.TimeoutError alias)
 INFRA_ERRORS: tuple[type[BaseException], ...] = (
     asyncpg.PostgresConnectionError,
-    asyncpg.InterfaceError,
+    asyncpg.InvalidAuthorizationSpecificationError,
+    asyncpg.CannotConnectNowError,
+    asyncpg.InsufficientResourcesError,
     OSError,
     TimeoutError,
 )

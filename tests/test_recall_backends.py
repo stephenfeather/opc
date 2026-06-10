@@ -604,27 +604,153 @@ class TestFormattersCarryProject:
 
 
 class TestRecallSqlSelectsProject:
-    """Every postgres recall SQL must SELECT the project column (issue #130)."""
+    """Every postgres recall SQL must SELECT the project column when the
+    database has it, and omit it on pre-migration databases (issue #130)."""
 
-    def test_all_postgres_recall_sql_selects_project(self):
+    def _simple_templates(self):
         from scripts.core import recall_backends as rb
 
-        sql_constants = [
+        return [
             rb._TEXT_ONLY_FTS_SQL,
             rb._TEXT_ONLY_FTS_NO_CHAIN_SQL,
             rb._TEXT_ONLY_ILIKE_SQL,
             rb._TEXT_ONLY_ILIKE_NO_CHAIN_SQL,
-            rb._PG_RECENCY_SQL,
-            rb._PG_VECTOR_SQL,
-            rb._PG_TEXT_FALLBACK_SQL,
         ]
-        for sql in sql_constants:
-            select_clause = sql.split("FROM")[0]
-            assert "project" in select_clause, f"project missing from: {sql[:120]}"
 
-    def test_rrf_tails_select_project(self):
+    def _chain_templates(self):
         from scripts.core import recall_backends as rb
 
-        for sql in (rb._RRF_BOOSTED_TAIL_SQL, rb._RRF_PLAIN_TAIL_SQL):
-            select_clause = sql.split("FROM")[0]
-            assert "a.project" in select_clause, f"project missing from: {sql[:120]}"
+        return [rb._PG_RECENCY_SQL, rb._PG_VECTOR_SQL, rb._PG_TEXT_FALLBACK_SQL]
+
+    def test_postgres_recall_sql_selects_project_when_available(self):
+        from scripts.core.recall_backends import render_recall_sql
+
+        for tmpl in self._simple_templates():
+            sql = render_recall_sql(tmpl, include_project=True)
+            assert "project" in sql.split("FROM")[0], f"missing: {sql[:120]}"
+        for tmpl in self._chain_templates():
+            sql = render_recall_sql(tmpl, include_project=True, chain_filter="")
+            assert "project" in sql.split("FROM")[0], f"missing: {sql[:120]}"
+
+    def test_postgres_recall_sql_omits_project_when_unavailable(self):
+        from scripts.core.recall_backends import render_recall_sql
+
+        for tmpl in self._simple_templates():
+            sql = render_recall_sql(tmpl, include_project=False)
+            assert "project" not in sql.split("FROM")[0], f"present: {sql[:120]}"
+        for tmpl in self._chain_templates():
+            sql = render_recall_sql(tmpl, include_project=False, chain_filter="")
+            assert "project" not in sql.split("FROM")[0], f"present: {sql[:120]}"
+
+    def test_rrf_tails_select_project_when_available(self):
+        from scripts.core import recall_backends as rb
+
+        for tmpl in (rb._RRF_BOOSTED_TAIL_SQL, rb._RRF_PLAIN_TAIL_SQL):
+            sql = rb.render_recall_sql(
+                tmpl, include_project=True, project_expr=", a.project",
+            )
+            assert "a.project" in sql.split("FROM")[0]
+            sql_without = rb.render_recall_sql(
+                tmpl, include_project=False, project_expr=", a.project",
+            )
+            assert "a.project" not in sql_without.split("FROM")[0]
+
+    def test_rendered_sql_has_no_unfilled_placeholders(self):
+        from scripts.core import recall_backends as rb
+
+        for tmpl in self._simple_templates():
+            for include in (True, False):
+                sql = rb.render_recall_sql(tmpl, include_project=include)
+                assert "{" not in sql and "}" not in sql
+        for tmpl in self._chain_templates():
+            sql = rb.render_recall_sql(
+                tmpl, include_project=True,
+                chain_filter="AND superseded_by IS NULL",
+            )
+            assert "{" not in sql and "}" not in sql
+
+
+class TestProjectColumnProbe:
+    """Capability probe: recall degrades gracefully on pre-migration DBs."""
+
+    def _make_conn(self, exists: bool | Exception):
+        class FakeConn:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def fetchval(self, _sql: str) -> bool:
+                self.calls += 1
+                if isinstance(exists, Exception):
+                    raise exists
+                return exists
+
+        return FakeConn()
+
+    async def test_probe_true_when_column_exists(self):
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        conn = self._make_conn(True)
+        assert await rb.project_column_available(conn) is True
+
+    async def test_probe_false_when_column_missing(self):
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        conn = self._make_conn(False)
+        assert await rb.project_column_available(conn) is False
+
+    async def test_probe_result_is_cached(self):
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        conn = self._make_conn(True)
+        await rb.project_column_available(conn)
+        await rb.project_column_available(conn)
+        assert conn.calls == 1
+
+    async def test_probe_failure_degrades_to_no_project(self):
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        conn = self._make_conn(RuntimeError("information_schema unavailable"))
+        assert await rb.project_column_available(conn) is False
+
+    async def test_text_only_runs_without_project_on_old_db(self, monkeypatch):
+        """Regression: pre-migration DBs must get project-free SQL, not errors."""
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        executed: list[str] = []
+
+        class FakeConn:
+            async def fetchval(self, _sql: str) -> bool:
+                return False  # probe: project column absent
+
+            async def fetch(self, sql: str, *args: Any) -> list[Any]:
+                executed.append(sql)
+                return []
+
+        class FakeAcquire:
+            async def __aenter__(self) -> FakeConn:
+                return FakeConn()
+
+            async def __aexit__(self, *exc: Any) -> bool:
+                return False
+
+        class FakePool:
+            def acquire(self) -> FakeAcquire:
+                return FakeAcquire()
+
+        async def fake_get_pool() -> FakePool:
+            return FakePool()
+
+        import scripts.core.db.postgres_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "get_pool", fake_get_pool)
+
+        results = await rb.search_learnings_text_only_postgres("query terms", k=3)
+        assert results == []
+        assert executed, "expected SQL to be executed"
+        for sql in executed:
+            assert "project" not in sql.split("FROM")[0], sql[:120]

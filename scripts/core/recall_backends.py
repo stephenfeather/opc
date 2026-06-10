@@ -256,14 +256,34 @@ def build_rrf_cte(*, chain_filter: bool, use_tsquery: bool = False) -> str:
             )"""
 
 
+def render_recall_sql(
+    template: str,
+    *,
+    include_project: bool,
+    project_expr: str = ", project",
+    **fmt: str,
+) -> str:
+    """Render a recall SQL template, optionally selecting the project column.
+
+    The project column comes from an additive migration
+    (scripts/migrations/add_project_column.sql); pre-migration databases
+    must receive project-free SQL instead of UndefinedColumnError
+    (issue #130 review finding).
+    """
+    return template.format(
+        project_col=project_expr if include_project else "", **fmt,
+    )
+
+
 # ---------------------------------------------------------------------------
-# SQL constants — module-level so wiring (e.g. the project column required by
-# the reranker, issue #130) is testable without a database connection.
+# SQL constants — module-level templates so wiring (e.g. the project column
+# required by the reranker, issue #130) is testable without a database
+# connection. Render with render_recall_sql().
 # ---------------------------------------------------------------------------
 
 _TEXT_ONLY_FTS_SQL = """
     SELECT
-        id, session_id, content, metadata, created_at, project,
+        id, session_id, content, metadata, created_at{project_col},
         ts_rank(to_tsvector('english', content),
                 to_tsquery('english', $1)) as similarity
     FROM archival_memory
@@ -276,7 +296,7 @@ _TEXT_ONLY_FTS_SQL = """
 
 _TEXT_ONLY_FTS_NO_CHAIN_SQL = """
     SELECT
-        id, session_id, content, metadata, created_at, project,
+        id, session_id, content, metadata, created_at{project_col},
         ts_rank(to_tsvector('english', content),
                 to_tsquery('english', $1)) as similarity
     FROM archival_memory
@@ -288,7 +308,7 @@ _TEXT_ONLY_FTS_NO_CHAIN_SQL = """
 
 _TEXT_ONLY_ILIKE_SQL = """
     SELECT
-        id, session_id, content, metadata, created_at, project,
+        id, session_id, content, metadata, created_at{project_col},
         0.1 as similarity
     FROM archival_memory
     WHERE metadata->>'type' = 'session_learning'
@@ -300,7 +320,7 @@ _TEXT_ONLY_ILIKE_SQL = """
 
 _TEXT_ONLY_ILIKE_NO_CHAIN_SQL = """
     SELECT
-        id, session_id, content, metadata, created_at, project,
+        id, session_id, content, metadata, created_at{project_col},
         0.1 as similarity
     FROM archival_memory
     WHERE metadata->>'type' = 'session_learning'
@@ -311,7 +331,7 @@ _TEXT_ONLY_ILIKE_NO_CHAIN_SQL = """
 
 _RRF_BOOSTED_TAIL_SQL = """
     SELECT
-        a.id, a.session_id, a.content, a.metadata, a.created_at, a.project,
+        a.id, a.session_id, a.content, a.metadata, a.created_at{project_col},
         a.recall_count, a.last_recalled,
         c.rrf_score +
             CASE WHEN COALESCE(a.recall_count, 0) = 0 THEN 0
@@ -326,7 +346,7 @@ _RRF_BOOSTED_TAIL_SQL = """
 
 _RRF_PLAIN_TAIL_SQL = """
     SELECT
-        a.id, a.session_id, a.content, a.metadata, a.created_at, a.project,
+        a.id, a.session_id, a.content, a.metadata, a.created_at{project_col},
         c.rrf_score, c.fts_rank, c.vec_rank
     FROM combined c
     JOIN archival_memory a ON a.id = c.id
@@ -337,7 +357,7 @@ _RRF_PLAIN_TAIL_SQL = """
 _PG_RECENCY_SQL = """
     WITH scored AS (
         SELECT
-            id, session_id, content, metadata, created_at, project,
+            id, session_id, content, metadata, created_at{project_col},
             1 - (embedding <=> $1::vector) as similarity,
             GREATEST(0, 1.0 - EXTRACT(EPOCH FROM NOW() - created_at)
                      / (30 * 86400)) as recency
@@ -347,7 +367,7 @@ _PG_RECENCY_SQL = """
             {chain_filter}
     )
     SELECT
-        id, session_id, content, metadata, created_at, project,
+        id, session_id, content, metadata, created_at{project_col},
         similarity, recency,
         (1.0 - $3::float) * similarity + $3::float * recency
             as combined_score
@@ -358,7 +378,7 @@ _PG_RECENCY_SQL = """
 
 _PG_VECTOR_SQL = """
     SELECT
-        id, session_id, content, metadata, created_at, project,
+        id, session_id, content, metadata, created_at{project_col},
         1 - (embedding <=> $1::vector) as similarity
     FROM archival_memory
     WHERE metadata->>'type' = 'session_learning'
@@ -370,7 +390,7 @@ _PG_VECTOR_SQL = """
 
 _PG_TEXT_FALLBACK_SQL = """
     SELECT
-        id, session_id, content, metadata, created_at, project,
+        id, session_id, content, metadata, created_at{project_col},
         0.5 as similarity
     FROM archival_memory
     WHERE metadata->>'type' = 'session_learning'
@@ -386,6 +406,42 @@ _PG_TEXT_FALLBACK_SQL = """
 # ---------------------------------------------------------------------------
 
 _recall_cfg = _get_config().recall
+
+# Cached result of the project-column capability probe. None = not yet
+# probed. Lives for the process lifetime: a migration applied while a
+# daemon is running is picked up on restart.
+_project_column_cache: bool | None = None
+
+_PROJECT_COLUMN_PROBE_SQL = """
+    SELECT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'archival_memory' AND column_name = 'project'
+    )
+    """
+
+
+def reset_project_column_cache() -> None:
+    """Clear the cached capability probe (test isolation)."""
+    global _project_column_cache
+    _project_column_cache = None
+
+
+async def project_column_available(conn: Any) -> bool:
+    """Check (once per process) whether archival_memory.project exists.
+
+    Degrades to False on probe failure so recall keeps working with
+    project-free SQL rather than erroring out.
+    """
+    global _project_column_cache
+    if _project_column_cache is None:
+        try:
+            _project_column_cache = bool(
+                await conn.fetchval(_PROJECT_COLUMN_PROBE_SQL)
+            )
+        except Exception:
+            logger.debug("project column probe failed", exc_info=True)
+            _project_column_cache = False
+    return _project_column_cache
 
 
 async def search_learnings_text_only_postgres(
@@ -403,20 +459,37 @@ async def search_learnings_text_only_postgres(
 
     pool = await get_pool()
     async with pool.acquire() as conn:
+        has_project = await project_column_available(conn)
         try:
-            rows = await conn.fetch(_TEXT_ONLY_FTS_SQL, or_query, k)
+            rows = await conn.fetch(
+                render_recall_sql(_TEXT_ONLY_FTS_SQL, include_project=has_project),
+                or_query, k,
+            )
         except Exception:
             logger.debug("Chain filter fallback in text_only_postgres FTS", exc_info=True)
-            rows = await conn.fetch(_TEXT_ONLY_FTS_NO_CHAIN_SQL, or_query, k)
+            rows = await conn.fetch(
+                render_recall_sql(
+                    _TEXT_ONLY_FTS_NO_CHAIN_SQL, include_project=has_project,
+                ),
+                or_query, k,
+            )
 
         if not rows:
             first_word = query.split()[0] if query.split() else query
             try:
-                rows = await conn.fetch(_TEXT_ONLY_ILIKE_SQL, first_word, k)
+                rows = await conn.fetch(
+                    render_recall_sql(
+                        _TEXT_ONLY_ILIKE_SQL, include_project=has_project,
+                    ),
+                    first_word, k,
+                )
             except Exception:
                 logger.debug("Chain filter fallback in text_only_postgres ILIKE", exc_info=True)
                 rows = await conn.fetch(
-                    _TEXT_ONLY_ILIKE_NO_CHAIN_SQL, first_word, k,
+                    render_recall_sql(
+                        _TEXT_ONLY_ILIKE_NO_CHAIN_SQL, include_project=has_project,
+                    ),
+                    first_word, k,
                 )
 
     return [format_text_result(row) for row in rows]
@@ -533,12 +606,18 @@ async def search_learnings_hybrid_rrf(
     rrf_cte = build_rrf_cte(chain_filter=True, use_tsquery=use_tsquery)
     rrf_cte_plain = build_rrf_cte(chain_filter=False, use_tsquery=use_tsquery)
 
-    boosted_tail = _RRF_BOOSTED_TAIL_SQL
-    plain_tail = _RRF_PLAIN_TAIL_SQL
-
     has_decay_columns = True
     async with pool.acquire() as conn:
         await init_pgvector(conn)
+        has_project = await project_column_available(conn)
+        boosted_tail = render_recall_sql(
+            _RRF_BOOSTED_TAIL_SQL,
+            include_project=has_project, project_expr=", a.project",
+        )
+        plain_tail = render_recall_sql(
+            _RRF_PLAIN_TAIL_SQL,
+            include_project=has_project, project_expr=", a.project",
+        )
         boost = _recall_cfg.recall_boost_multiplier
         embedding_str = str(query_embedding)
         boosted_args = (text_query, embedding_str, rrf_k, k * 2, boost)
@@ -646,45 +725,60 @@ async def search_learnings_postgres(
         async with pool.acquire() as conn:
             from scripts.core.db.postgres_pool import init_pgvector
             await init_pgvector(conn)
+            has_project = await project_column_available(conn)
 
             if recency_weight > 0:
-                _recency_sql = _PG_RECENCY_SQL
+                def _recency_sql(chain_filter: str) -> str:
+                    return render_recall_sql(
+                        _PG_RECENCY_SQL,
+                        include_project=has_project, chain_filter=chain_filter,
+                    )
                 try:
                     rows = await conn.fetch(
-                        _recency_sql.format(chain_filter="AND superseded_by IS NULL"),
+                        _recency_sql("AND superseded_by IS NULL"),
                         str(query_embedding), k, recency_weight,
                     )
                 except Exception:
                     logger.debug("Chain filter fallback in postgres recency", exc_info=True)
                     rows = await conn.fetch(
-                        _recency_sql.format(chain_filter=""),
+                        _recency_sql(""),
                         str(query_embedding), k, recency_weight,
                     )
             else:
-                _vector_sql = _PG_VECTOR_SQL
+                def _vector_sql(chain_filter: str) -> str:
+                    return render_recall_sql(
+                        _PG_VECTOR_SQL,
+                        include_project=has_project, chain_filter=chain_filter,
+                    )
                 try:
                     rows = await conn.fetch(
-                        _vector_sql.format(chain_filter="AND superseded_by IS NULL"),
+                        _vector_sql("AND superseded_by IS NULL"),
                         str(query_embedding), k,
                     )
                 except Exception:
                     logger.debug("Chain filter fallback in postgres vector", exc_info=True)
                     rows = await conn.fetch(
-                        _vector_sql.format(chain_filter=""),
+                        _vector_sql(""),
                         str(query_embedding), k,
                     )
     elif text_fallback:
-        _text_sql = _PG_TEXT_FALLBACK_SQL
         async with pool.acquire() as conn:
+            has_project = await project_column_available(conn)
+
+            def _text_sql(chain_filter: str) -> str:
+                return render_recall_sql(
+                    _PG_TEXT_FALLBACK_SQL,
+                    include_project=has_project, chain_filter=chain_filter,
+                )
             try:
                 rows = await conn.fetch(
-                    _text_sql.format(chain_filter="AND superseded_by IS NULL"),
+                    _text_sql("AND superseded_by IS NULL"),
                     query, k,
                 )
             except Exception:
                 logger.debug("Chain filter fallback in postgres text", exc_info=True)
                 rows = await conn.fetch(
-                    _text_sql.format(chain_filter=""),
+                    _text_sql(""),
                     query, k,
                 )
     else:

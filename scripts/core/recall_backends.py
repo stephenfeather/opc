@@ -116,10 +116,10 @@ def merge_project_into_metadata(
     try:
         project = row["project"]
     except (KeyError, IndexError):
-        return metadata
-    if project:
+        return dict(metadata)
+    if project is not None:
         return {**metadata, "project": project}
-    return metadata
+    return dict(metadata)
 
 
 def format_text_result(row: Mapping[str, Any]) -> dict[str, Any]:

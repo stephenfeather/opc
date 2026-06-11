@@ -211,6 +211,56 @@ logged (privacy). See the [Recall Event Log](#recall-event-log) section.
 
 Embedding provider. Choices: `local` (BGE), `voyage` (Voyage AI).
 
+## Embedding-space contract (issue #151)
+
+Vector similarity is only meaningful **within a single embedding space**.
+Different providers (and different models within a provider) produce vectors
+that are not comparable even when they share a dimension — a `local`/BGE
+vector and a `voyage-code-3` vector are both 1024-dim, so PostgreSQL will
+happily cosine-compare them, but the result is semantic noise. Mixing spaces
+in one corpus ("split-brain") silently degrades recall, dedup, and query
+expansion.
+
+**Canonical space: `voyage-code-3`.** This matches the global
+`EMBEDDING_PROVIDER=voyage` default and is the space the corpus is being
+migrated to (`scripts/core/re_embed_voyage.py`, bge → voyage-code-3).
+
+**How the contract is enforced**
+
+- Each provider exposes a stable `model_label` (the value written to the
+  `archival_memory.embedding_model` column):
+
+  | Provider | `model_label` |
+  |----------|---------------|
+  | `local` (any BGE variant) | `bge` |
+  | `local` (non-BGE model) | the model name |
+  | `voyage` | the model name (e.g. `voyage-code-3`, honoring `--model`) |
+  | `openai` | `text-embedding-3-small` |
+  | `ollama` | the model name |
+  | `mock` | `mock` |
+
+- Store paths write `embedding_model` explicitly from `model_label`, so new
+  rows are labeled by their real space (previously the column silently fell
+  back to its `'bge'` default, mislabeling voyage rows).
+
+- Every vector-distance query path filters to the query provider's space via
+  `AND embedding_model = $N` (hybrid RRF vector leg, `--vector-only`,
+  recency-weighted vector, and query-expansion neighbors). The filter lives on
+  the **vector leg only** — never the FTS leg.
+
+**Post-canonicalization behavior of `--provider local`**
+
+After the corpus is canonicalized to `voyage-code-3`, a `--provider local`
+(BGE) query embeds in `bge` space and its `AND embedding_model = 'bge'`
+vector filter matches **zero rows** until/unless the corpus is re-embedded
+back to BGE. This is deliberate, not a bug: the empty vector leg makes hybrid
+RRF degrade to the text (BM25) leg (see
+[Hybrid → text-only degradation](#hybrid--text-only-degradation-issue-53)),
+so `--provider local` becomes **text-degraded** rather than returning
+cross-space noise. Use `--provider voyage` (or rely on the
+`EMBEDDING_PROVIDER=voyage` default) for full vector recall. To make `local`
+fully vector-capable again, re-embed the corpus to BGE.
+
 ## Search Modes
 
 | Flags | Search Method | Score Range |

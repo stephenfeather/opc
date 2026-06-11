@@ -124,6 +124,17 @@ class EmbeddingProvider(ABC):
         """Embedding dimension."""
         ...
 
+    @property
+    def model_label(self) -> str:
+        """Stable DB label for this provider's embedding space (issue #151).
+
+        This is the value written to ``archival_memory.embedding_model`` and
+        bound into the recall-time ``AND embedding_model = $N`` filter so
+        queries never cross-compare cosine distances between distinct spaces.
+        Defaults to the class name lowercased; concrete providers override.
+        """
+        return type(self).__name__.lower()
+
 
 # ---------------------------------------------------------------------------
 # Mock provider (kept here — no external dependencies, useful for testing)
@@ -151,6 +162,10 @@ class MockEmbeddingProvider(EmbeddingProvider):
     @property
     def dimension(self) -> int:
         return self._dimension
+
+    @property
+    def model_label(self) -> str:
+        return "mock"
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +367,11 @@ class EmbeddingService:
     @property
     def dimension(self) -> int:
         return self._provider.dimension
+
+    @property
+    def model_label(self) -> str:
+        """DB embedding-space label of the underlying provider (issue #151)."""
+        return self._provider.model_label
 
     def clear_cache(self) -> None:
         self._cache.clear()

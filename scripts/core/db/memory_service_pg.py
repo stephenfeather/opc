@@ -266,8 +266,14 @@ class MemoryServicePG:
         supersedes: str | None = None,
         project: str | None = None,
         source_time: datetime | None = None,
+        embedding_model: str | None = None,
     ) -> str:
         """Store a fact in archival memory.
+
+        ``embedding_model`` (issue #151) is the embedding-space label written
+        to the ``embedding_model`` column so recall can pin a single space.
+        When ``None`` the column is omitted and the DB default ('bge')
+        applies, keeping legacy callers byte-identical.
 
         Returns memory ID (or empty string if deduplicated).
         """
@@ -280,50 +286,44 @@ class MemoryServicePG:
         async with get_transaction() as conn:
             if padded_embedding is not None:
                 await init_pgvector(conn)
+                # Issue #151: bind embedding_model explicitly so the recall
+                # filter keys on the real space. Omit the column when no label
+                # is provided so the DB default ('bge') still applies.
+                base_cols = (
+                    "id, session_id, agent_id, content, "
+                    "metadata, embedding, content_hash, host_id, project"
+                )
+                base_vals = [
+                    memory_id,
+                    self.session_id,
+                    self.agent_id,
+                    content,
+                    json.dumps(metadata or {}),
+                    padded_embedding,
+                    content_hash,
+                    host_id,
+                    project,
+                ]
+                model_col = ", embedding_model" if embedding_model else ""
+                model_val = [embedding_model] if embedding_model else []
                 if source_time is not None:
-                    result = await conn.execute(
-                        """
-                        INSERT INTO archival_memory
-                            (id, session_id, agent_id, content,
-                             metadata, embedding, content_hash, host_id,
-                             project, created_at)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                        ON CONFLICT (content_hash)
-                            WHERE content_hash IS NOT NULL
-                            DO NOTHING
-                        """,
-                        memory_id,
-                        self.session_id,
-                        self.agent_id,
-                        content,
-                        json.dumps(metadata or {}),
-                        padded_embedding,
-                        content_hash,
-                        host_id,
-                        project,
-                        source_time,
-                    )
+                    cols = f"{base_cols}{model_col}, created_at"
+                    vals = [*base_vals, *model_val, source_time]
                 else:
-                    result = await conn.execute(
-                        """
-                        INSERT INTO archival_memory
-                            (id, session_id, agent_id, content,
-                             metadata, embedding, content_hash, host_id, project)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                        ON CONFLICT (content_hash)
-                            WHERE content_hash IS NOT NULL
-                            DO NOTHING
-                        """,
-                        memory_id,
-                        self.session_id,
-                        self.agent_id,
-                        content,
-                        json.dumps(metadata or {}),
-                        padded_embedding,
-                        content_hash,
-                        host_id,
-                        project,
-                    )
+                    cols = f"{base_cols}{model_col}"
+                    vals = [*base_vals, *model_val]
+                placeholders = ", ".join(f"${i + 1}" for i in range(len(vals)))
+                result = await conn.execute(
+                    f"""
+                    INSERT INTO archival_memory
+                        ({cols})
+                    VALUES ({placeholders})
+                    ON CONFLICT (content_hash)
+                        WHERE content_hash IS NOT NULL
+                        DO NOTHING
+                    """,
+                    *vals,
+                )
             else:
                 if source_time is not None:
                     result = await conn.execute(

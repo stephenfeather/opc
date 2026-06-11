@@ -676,10 +676,12 @@ async def store_learning_v2(
         embedder = EmbeddingService(provider=embed_provider)
         embedding = await embedder.embed(content)
 
-        # Determine embedding model name for metadata
-        embedding_model = None
-        if hasattr(embedder, "_provider") and hasattr(embedder._provider, "model"):
-            embedding_model = embedder._provider.model
+        # Determine embedding-space label for metadata and the
+        # embedding_model column (issue #151). Use the provider's
+        # model_label property — the old .model probe missed
+        # LocalEmbeddingProvider (.model_name), silently falling back to the
+        # 'bge' column default and mislabeling rows.
+        embedding_model = getattr(embedder, "model_label", None)
 
         # Semantic dedup check
         threshold = _dedup_threshold()
@@ -772,6 +774,7 @@ async def store_learning_v2(
             tags=tags if backend == "postgres" else None,
             project=project if backend == "postgres" else None,
             source_time=source_time if backend == "postgres" else None,
+            embedding_model=embedding_model if backend == "postgres" else None,
         )
 
         # content_hash dedup returns empty string

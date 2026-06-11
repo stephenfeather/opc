@@ -347,6 +347,7 @@ async def expand_query(
     max_neighbors: int = 20,
     max_expansion_terms: int = 5,
     min_idf: float = 1.0,
+    model_label: str | None = None,
 ) -> str:
     """Expand a query with related terms from vector neighbors.
 
@@ -359,6 +360,10 @@ async def expand_query(
         max_neighbors: Number of vector neighbors to examine
         max_expansion_terms: Max terms to add
         min_idf: Minimum corpus IDF to include a term
+        model_label: Optional embedding-space label (issue #151). When set,
+            neighbors are restricted to the same space via
+            ``AND embedding_model = $N`` so expansion never pulls cross-space
+            neighbors. ``None`` leaves the query byte-identical to today.
 
     Returns:
         OR-joined tsquery string: "original | term1 | term2 | ..."
@@ -375,20 +380,26 @@ async def expand_query(
     if not original_words:
         return query
 
-    # Fetch vector neighbors (I/O boundary)
+    # Fetch vector neighbors (I/O boundary). The model filter (issue #151)
+    # is bound at $3 only when a label is supplied; otherwise the SQL and
+    # params stay byte-identical to the pre-#151 path.
+    model_clause = "AND embedding_model = $3" if model_label else ""
+    params: list[object] = [str(query_embedding), max_neighbors]
+    if model_label:
+        params.append(model_label)
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            """
+            f"""
             SELECT content FROM archival_memory
             WHERE metadata->>'type' = 'session_learning'
             AND superseded_by IS NULL
             AND embedding IS NOT NULL
+            {model_clause}
             ORDER BY embedding <=> $1::vector
             LIMIT $2
             """,
-            str(query_embedding),
-            max_neighbors,
+            *params,
         )
 
     if not rows:

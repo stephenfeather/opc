@@ -471,14 +471,19 @@ instead of the database `NOW()` default. This exists so backfilled learnings
 inflate the reranker's recency score.
 
 - Naive timestamps (no offset) are interpreted as **UTC**.
-- Garbage or more-than-5-minutes-in-the-future values are **ignored with a
-  warning** — the store still succeeds with the default `created_at`.
+- Garbage, more-than-5-minutes-in-the-future, or **pre-2024-01-01** values
+  (implausibility floor matching `fix_backfill_created_at.sql`) are **ignored
+  with a warning** — the store still succeeds with the default `created_at`.
 - When omitted, behavior is unchanged (the DB default applies).
 - Falls back to the `CLAUDE_SOURCE_TIME` environment variable when the flag is
-  absent. The backfill pipeline (`backfill_learnings.py`) injects the source
-  session's JSONL mtime via this env var so the memory-extractor agent's
-  `store_learning.py` calls stamp the correct time without needing to pass the
-  flag itself.
+  absent — but only inside the extraction subprocess: the env value is honored
+  **only when `CLAUDE_MEMORY_EXTRACTION=1`** is also set (trust boundary), so
+  an ambient or user-set value cannot silently backdate live stores. The
+  backfill pipeline (`backfill_learnings.py`) injects a trusted source time
+  via this env var, preferring `sessions.exited_at`, then the S3 listing
+  LastModified, then the local JSONL mtime, so the memory-extractor agent's
+  `store_learning.py` calls stamp the correct time without needing to pass
+  the flag itself.
 
 ```bash
 uv run python scripts/core/store_learning.py \

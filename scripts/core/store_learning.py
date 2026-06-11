@@ -375,8 +375,10 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--source-time",
         help=(
             "ISO8601 timestamp for created_at (backfill/source session time). "
-            "Naive values are treated as UTC; garbage or >5min-future values "
-            "are ignored with a warning. Falls back to CLAUDE_SOURCE_TIME env."
+            "Naive values are treated as UTC; garbage, >5min-future, or "
+            "pre-2024-01-01 values are ignored with a warning. Falls back to "
+            "CLAUDE_SOURCE_TIME env (honored only inside the extraction "
+            "subprocess, i.e. with CLAUDE_MEMORY_EXTRACTION=1)."
         ),
     )
 

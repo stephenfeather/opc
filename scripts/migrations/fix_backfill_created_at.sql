@@ -16,51 +16,121 @@
 -- working_on = 'backfill' and exited_at = JSONL mtime (the session end time).
 -- archival_memory.session_id -> sessions.id recovers that time via JOIN.
 --
--- VERIFIED PREDICATE (dev DB, 2026-06-11):
+-- ---------------------------------------------------------------------------
+-- TIMEZONE CONVENTION (Round 2, FIX 4 -- VERIFIED)
+-- ---------------------------------------------------------------------------
+-- sessions.exited_at is `timestamp WITHOUT time zone` (naive); created_at is
+-- `timestamptz`. backfill_sessions.py populates exited_at via
+--   _build_session_info():  "mtime": datetime.fromtimestamp(st.st_mtime)
+--   build_session_record(): "exited_at": session["mtime"]
+-- `datetime.fromtimestamp()` (no tz arg) yields the backfill HOST's LOCAL wall
+-- clock, stored verbatim into the naive column (psycopg2 does no conversion).
+--
+-- We interpret that naive value as UTC -- `s.exited_at AT TIME ZONE 'UTC'` --
+-- for two reasons:
+--   1. The DB session TimeZone is 'Etc/UTC' (verified: SHOW timezone), so the
+--      Round 1 implicit naive->timestamptz cast ALREADY resolved exited_at as
+--      UTC. Making it explicit here changes NO existing semantics (the matched
+--      row set stays 90; verified below) -- it just removes the silent cast.
+--   2. No host-timezone provenance is recorded anywhere in the DB, so UTC is
+--      the only defensible, non-invented convention. If a future backfill is
+--      known to run in a non-UTC tz, change the zone literal accordingly.
+--
+-- `AT TIME ZONE 'UTC'` applied to a naive timestamp PRODUCES a timestamptz at
+-- that instant in UTC, which is exactly what created_at needs.
+--
+-- ---------------------------------------------------------------------------
+-- VERIFIED PREDICATE (dev DB, 2026-06-11)
+-- ---------------------------------------------------------------------------
 --   sessions.working_on = 'backfill'  distinguishes 152 backfilled sessions
---   (the live/non-backfill rows have working_on = '' or NULL). The JOIN +
---   only-move-earlier guard matched 90 archival_memory rows whose created_at
---   was 2-3 days later than the true session time.
+--   (live/non-backfill rows have working_on = '' or NULL). Of those, 55 have
+--   exited_at IS NULL (excluded), 0 are pre-2024, 0 are in the future. The
+--   JOIN + only-move-earlier + sanity guards matched 90 archival_memory rows
+--   whose created_at was 2-3 days later than the true session time.
 --
 -- SAFETY:
---   * Scoped to working_on = 'backfill' ONLY -- live-session rows are untouched.
---   * Only-move-EARLIER guard (s.exited_at < a.created_at) -- created_at is
---     never moved forward, so re-running cannot inflate recency.
---   * exited_at IS NOT NULL guard -- skips sessions with no recorded end time.
---   * Idempotent -- after the first run the guard makes the row set empty.
+--   * Scoped to working_on = 'backfill' ONLY -- live-session rows untouched.
+--   * Only-move-EARLIER guard ((exited_at AT TIME ZONE 'UTC') < a.created_at)
+--     -- created_at is never moved forward, so re-running cannot inflate
+--     recency.
+--   * Plausibility guard -- exited_at IS NOT NULL, exited_at >= 2024-01-01,
+--     and (exited_at AT TIME ZONE 'UTC') <= NOW() -- excludes NULL/garbage/
+--     future source times from BOTH the dry run and the UPDATE.
+--   * Idempotent -- after the first run the guards make the row set empty.
 --
 -- Apply with `psql -f` (autocommit). This is a bounded single-statement UPDATE
 -- over ~90 rows; no locking concerns.
 --
--- ---------------------------------------------------------------------------
--- DRY RUN (run this SELECT first; it mutates nothing). It reports the row
--- count and the created_at shift window so the operator can sanity-check the
--- blast radius before running the UPDATE below.
--- ---------------------------------------------------------------------------
+-- ===========================================================================
+-- STEP 1 -- DRY RUN (run first; mutates nothing). Reports the row count, the
+-- exact target timestamptz window, and the backward shift so the operator can
+-- sanity-check the blast radius before the UPDATE.
+-- ===========================================================================
 --
 --   SELECT
---       COUNT(*)                              AS rows_to_fix,
---       MIN(s.exited_at)                      AS min_session_time,
---       MAX(s.exited_at)                      AS max_session_time,
---       MIN(a.created_at - s.exited_at)       AS min_backward_shift,
---       MAX(a.created_at - s.exited_at)       AS max_backward_shift
+--       COUNT(*)                                               AS rows_to_fix,
+--       MIN(s.exited_at AT TIME ZONE 'UTC')                    AS min_target_tstz,
+--       MAX(s.exited_at AT TIME ZONE 'UTC')                    AS max_target_tstz,
+--       MIN(a.created_at - (s.exited_at AT TIME ZONE 'UTC'))   AS min_backward_shift,
+--       MAX(a.created_at - (s.exited_at AT TIME ZONE 'UTC'))   AS max_backward_shift
 --   FROM archival_memory a
 --   JOIN sessions s ON a.session_id = s.id
 --   WHERE s.working_on = 'backfill'
 --     AND s.exited_at IS NOT NULL
---     AND s.exited_at < a.created_at;
+--     AND s.exited_at >= TIMESTAMP '2024-01-01'
+--     AND (s.exited_at AT TIME ZONE 'UTC') <= NOW()
+--     AND (s.exited_at AT TIME ZONE 'UTC') < a.created_at;
 --
--- ---------------------------------------------------------------------------
--- UPDATE
--- ---------------------------------------------------------------------------
+-- ===========================================================================
+-- STEP 2 -- ORPHAN AUDIT (Round 2, FIX 3 -- run first; mutates nothing).
+-- ===========================================================================
+-- The S3 backfill path (backfill_learnings.py) can store learnings under a
+-- bare JSONL-UUID session_id when no sessions row exists and --skip-no-db is
+-- unset (classify_session() returns the uuid as the effective session_id).
+-- Those archival_memory rows have NO matching sessions row, so the INNER JOIN
+-- repair above CANNOT see them and they retain the created_at = NOW() bias.
+--
+-- backfill_log carries only processed_at (EXTRACTION time, NOT the session
+-- time) and no original-session timestamp, so these orphans are UNREPAIRABLE
+-- from DB data alone. The only trustworthy source time for them is the S3
+-- object LastModified, which is not persisted anywhere in the database;
+-- repairing them would require re-listing S3. We DO NOT invent timestamps.
+--
+-- This audit reports the residual so the operator knows what remains biased.
+-- On the dev DB (2026-06-11): 4 orphan rows recorded in backfill_log
+-- (created_at 2026-04-01 23:35..23:53). (A broader LEFT JOIN with no
+-- backfill_log filter shows 510 session-less rows, but those are dominated by
+-- live sessions whose sessions row was pruned -- NOT backfill orphans -- so
+-- the backfill_log-scoped count below is the accurate residual.)
+--
+--   SELECT
+--       COUNT(*)              AS orphan_backfill_rows,
+--       MIN(a.created_at)     AS min_created_at,
+--       MAX(a.created_at)     AS max_created_at
+--   FROM archival_memory a
+--   LEFT JOIN sessions s ON a.session_id = s.id
+--   JOIN backfill_log bl  ON a.session_id = bl.session_id
+--   WHERE s.id IS NULL;
+--
+-- NOTE: no UPDATE is emitted for orphans -- there is no trustworthy DB-derived
+-- source time. They remain on created_at = extraction time until/unless an
+-- S3-re-listing repair is run. Going forward, the store-time fix
+-- (CLAUDE_SOURCE_TIME from S3 LastModified -- issue #52 Round 1) prevents new
+-- orphans from being mis-stamped.
+--
+-- ===========================================================================
+-- STEP 3 -- UPDATE (joinable backfill rows only)
+-- ===========================================================================
 
 UPDATE archival_memory AS a
-SET created_at = s.exited_at
+SET created_at = (s.exited_at AT TIME ZONE 'UTC')
 FROM sessions AS s
 WHERE a.session_id = s.id
   AND s.working_on = 'backfill'
   AND s.exited_at IS NOT NULL
-  AND s.exited_at < a.created_at;  -- only move EARLIER; never forward
+  AND s.exited_at >= TIMESTAMP '2024-01-01'            -- plausibility: not garbage
+  AND (s.exited_at AT TIME ZONE 'UTC') <= NOW()        -- plausibility: not future
+  AND (s.exited_at AT TIME ZONE 'UTC') < a.created_at;  -- only move EARLIER
 
--- Echo the number of rows repaired (0 on a re-run thanks to the guard above).
+-- Echo the number of rows repaired (0 on a re-run thanks to the guards above).
 -- The number is reported by psql as "UPDATE <n>".

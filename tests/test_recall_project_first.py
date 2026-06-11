@@ -549,7 +549,7 @@ class TestMainDegradesWithWarning:
         monkeypatch.setattr(rl, "_dispatch_search_project_first", fake_first)
         monkeypatch.setattr(rl, "get_backend", lambda: "postgres")
 
-        async def noop_record(_ids):
+        async def noop_record(_ids, *, caller_project=None, source=None):
             return None
 
         monkeypatch.setattr(rl, "record_recall", noop_record)

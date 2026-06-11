@@ -190,6 +190,31 @@ CREATE INDEX IF NOT EXISTS idx_feedback_created ON memory_feedback(created_at DE
 CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_unique_per_session
     ON memory_feedback(learning_id, session_id);
 
+-- Recall Log: Append-only per-recall-event log (issue #140). One row per
+-- recall event with parallel arrays of the recalled rows' ids and projects,
+-- so cross-project mis-scope frequency (issue #130) is measurable. Zero-result
+-- recalls are logged too (empty arrays, result_count = 0) -- finding nothing
+-- signals over-restrictive scoping. Never stores raw query text (privacy).
+-- Retention: manual until automated pruning lands (follow-up issue) -- prune
+-- with `DELETE FROM recall_log WHERE created_at < NOW() - INTERVAL '90 days'`.
+-- Analysis queries (time-scoped, e.g. INTERVAL '30 days', using the
+-- created_at DESC index) live in scripts/migrations/add_recall_log.sql.
+CREATE TABLE IF NOT EXISTS recall_log (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    caller_project TEXT,                 -- canonicalized; NULL = no project context
+    recalled_ids UUID[] NOT NULL,
+    recalled_projects TEXT[] NOT NULL,   -- NULL elements = unattributed memories
+    result_count INTEGER NOT NULL,
+    -- source is validated at the writer (record_recall) against the regex
+    -- ^[a-z][a-z0-9_-]{0,31}$, NOT with a DB CHECK constraint: a CHECK
+    -- violation would abort the whole INSERT and silently drop the entire
+    -- append-only log row (losing the recall event). Invalid labels are
+    -- dropped to NULL in Python instead, so the event is still recorded.
+    source TEXT,                         -- short caller label (hook|mcp|cli); NULL = unknown
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_recall_log_created ON recall_log(created_at DESC);
+
 -- Backfill Log: Track extraction attempts by S3 UUID so sessions without
 -- a DB row in `sessions` still get marked and aren't re-processed.
 CREATE TABLE IF NOT EXISTS backfill_log (

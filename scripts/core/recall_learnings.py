@@ -33,6 +33,7 @@ import faulthandler
 import json
 import logging
 import os
+import re
 import sys
 import uuid
 from pathlib import Path
@@ -43,6 +44,13 @@ logger = logging.getLogger(__name__)
 from dotenv import load_dotenv
 
 _FAULT_LOG_FILE = None
+
+# Hard upper bound on best-effort recall-event logging (issue #140). Well under
+# the memory-awareness hook's 5s spawnSync budget (spawnSync waits for process
+# EXIT, so a slow DB write would otherwise burn the whole budget). Telemetry is
+# best-effort and cancellation-safe: on timeout the asyncio.wait_for cancels
+# record_recall and the pool.acquire() context manager releases the connection.
+RECORD_RECALL_TIMEOUT = 2.0
 
 
 def _enable_faulthandler() -> None:
@@ -295,6 +303,20 @@ def resolve_project_scope(
     return project_from_path(project_dir or None)
 
 
+def resolve_caller_project(project: str | None, project_dir: str | None) -> str | None:
+    """Resolve the caller's canonical project for recall-event logging (#140).
+
+    Explicit ``--project`` wins (canonicalized); otherwise the project is
+    derived from ``project_dir`` (worktree-aware ``project_from_path``).
+    Returns ``None`` when neither yields a project. Unlike
+    ``resolve_project_scope``, this resolves unconditionally (no opt-in flag)
+    so every recall event can record who called it.
+    """
+    from scripts.core.project_naming import canonicalize_project, project_from_path
+
+    return canonicalize_project(project) or project_from_path(project_dir or None)
+
+
 def resolve_search_params(
     *,
     backend: str,
@@ -403,34 +425,154 @@ def get_backend() -> str:
 # ---------------------------------------------------------------------------
 
 
-async def record_recall(result_ids: list[str]) -> None:
-    """Update last_recalled and recall_count for recalled learnings.
+# Source labels are validated here (writer-side) instead of with a DB CHECK
+# constraint: recall_log is append-only and a CHECK violation would abort the
+# whole INSERT, silently dropping the entire log row (losing the recall event).
+# Validating in Python lets us drop just the bad label to NULL and still log.
+_SOURCE_LABEL_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
-    Batch-updates all returned results in a single query.
-    Fails silently to avoid breaking recall if columns don't exist yet.
+
+def _sanitize_source(source: str | None) -> str | None:
+    """Validate a recall ``source`` label (issue #140).
+
+    Labels are documented as fixed call-site identifiers (``hook``/``mcp``/
+    ``cli``), never prompt-derived text. A value that does not match
+    ``^[a-z][a-z0-9_-]{0,31}$`` is dropped to ``None`` so arbitrary text can't
+    leak into the append-only log. Pure function.
     """
-    if not result_ids:
+    if source is None:
+        return None
+    if _SOURCE_LABEL_RE.fullmatch(source):
+        return source
+    logger.debug("invalid recall source label dropped")
+    return None
+
+
+async def record_recall(
+    result_ids: list[str],
+    caller_project: str | None = None,
+    source: str | None = None,
+) -> None:
+    """Update last_recalled/recall_count and log the recall event (issue #140).
+
+    Batch-updates the recalled rows in a single ``UPDATE ... RETURNING id,
+    project`` (point-in-time truth, zero extra round trips), then best-effort
+    appends one ``recall_log`` row with parallel ``recalled_ids`` /
+    ``recalled_projects`` arrays plus the caller's project and source label.
+
+    A **zero-result** recall (empty ``result_ids``) skips the counter UPDATE
+    (nothing to update) but STILL logs a recall_log row with empty arrays and
+    ``result_count = 0`` — empty results are the signature of over-restrictive
+    project scoping (#130), so they must be observable.
+
+    The INSERT is wrapped in its own try/except so a pre-migration DB (no
+    ``recall_log`` table) still gets the counter UPDATE committed — both run
+    as separate autocommitted statements in the same acquire, NOT a CTE or
+    transaction. If ``archival_memory.project`` itself is missing (temporal-
+    decay columns applied but not add_project_column.sql), the RETURNING fetch
+    raises ``UndefinedColumnError``; we fall back to the original counter-only
+    UPDATE so counters never silently stop, and skip the recall_log INSERT.
+    The whole body never raises (recall must not break).
+
+    ``caller_project`` and ``source`` are accepted for SQLite parity but
+    unused there: SQLite has no project/log columns, so it skips entirely.
+    """
+    if get_backend() != "postgres":
+        logger.debug(
+            "record_recall: sqlite backend, skipping recall-event logging"
+        )
         return
 
-    if get_backend() != "postgres":
-        return
+    source = _sanitize_source(source)
 
     try:
+        from asyncpg.exceptions import UndefinedColumnError
+
         from scripts.core.db.postgres_pool import get_pool
 
         pool = await get_pool()
         async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE archival_memory
-                SET last_recalled = NOW(),
-                    recall_count = recall_count + 1
-                WHERE id = ANY($1::uuid[])
-                """,
-                result_ids,
+            # Zero-result recall: no rows to bump, but log the event so
+            # over-restrictive scoping (#130) is visible.
+            if not result_ids:
+                await _insert_recall_log(conn, caller_project, [], [], source)
+                return
+
+            try:
+                rows = await conn.fetch(
+                    """
+                    UPDATE archival_memory
+                    SET last_recalled = NOW(),
+                        recall_count = recall_count + 1
+                    WHERE id = ANY($1::uuid[])
+                    RETURNING id, project
+                    """,
+                    result_ids,
+                )
+            except UndefinedColumnError:
+                # archival_memory.project absent: keep counters working and
+                # skip recall_log entirely (point-in-time projects unknown).
+                logger.debug(
+                    "archival_memory.project missing; "
+                    "counters updated, recall_log skipped"
+                )
+                await conn.execute(
+                    """
+                    UPDATE archival_memory
+                    SET last_recalled = NOW(),
+                        recall_count = recall_count + 1
+                    WHERE id = ANY($1::uuid[])
+                    """,
+                    result_ids,
+                )
+                return
+
+            # ids were supplied but matched nothing (e.g. concurrent deletion):
+            # skip the INSERT — this is a stale-id event, not a zero-result one.
+            if not rows:
+                return
+
+            recalled_ids = [str(r["id"]) for r in rows]
+            recalled_projects = [r["project"] for r in rows]
+            await _insert_recall_log(
+                conn, caller_project, recalled_ids, recalled_projects, source
             )
     except Exception:
-        pass
+        # Best-effort telemetry must never break recall, but failures (e.g.
+        # pool acquisition) should still be observable at debug level.
+        logger.debug("record_recall failed", exc_info=True)
+
+
+async def _insert_recall_log(
+    conn: Any,
+    caller_project: str | None,
+    recalled_ids: list[str],
+    recalled_projects: list[str | None],
+    source: str | None,
+) -> None:
+    """Best-effort append one recall_log row (issue #140).
+
+    Runs as a separate autocommitted statement after the counter UPDATE (NOT a
+    CTE or transaction) so a pre-migration DB lacking ``recall_log`` fails here
+    alone — the failure is swallowed (debug log) and the counter UPDATE stands.
+    """
+    try:
+        await conn.execute(
+            """
+            INSERT INTO recall_log (
+                caller_project, recalled_ids, recalled_projects,
+                result_count, source
+            )
+            VALUES ($1, $2, $3, $4, $5)
+            """,
+            caller_project,
+            recalled_ids,
+            recalled_projects,
+            len(recalled_ids),
+            source,
+        )
+    except Exception:
+        logger.debug("recall_log insert failed", exc_info=True)
 
 
 async def _fetch_pattern_rows(result_ids: list[str]) -> list[dict[str, Any]]:
@@ -829,6 +971,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--structured", action="store_true", help="Group results by type")
+    parser.add_argument(
+        "--source",
+        help=(
+            "Short caller label for recall-event logging (e.g. hook|mcp|cli). "
+            "Label-only -- never prompt-derived text. Must match "
+            "^[a-z][a-z0-9_-]{0,31}$; invalid labels are dropped to NULL "
+            "(issue #140)."
+        ),
+    )
     return parser
 
 
@@ -921,12 +1072,29 @@ async def main() -> int:
 
         results = rerank(results, ctx, k=args.k)
 
-    # Record recall (skip benchmarking mode)
-    if not args.json_full:
-        await record_recall([r["id"] for r in results])
-
-    # Output
+    # Output FIRST: best-effort recall logging must never delay user-visible
+    # output under the memory-awareness hook's 5s spawn timeout (issue #140).
     print(_format_output(results, output_mode=output_mode, structured=args.structured))
+
+    # Record recall (skip benchmarking mode). Bounded by RECORD_RECALL_TIMEOUT
+    # so a slow DB write can't burn the hook's spawn budget; telemetry is
+    # best-effort and cancellation-safe (issue #140).
+    if not args.json_full:
+        caller_project = resolve_caller_project(
+            args.project, os.environ.get("CLAUDE_PROJECT_DIR")
+        )
+        try:
+            await asyncio.wait_for(
+                record_recall(
+                    [r["id"] for r in results],
+                    caller_project=caller_project,
+                    source=args.source,
+                ),
+                timeout=RECORD_RECALL_TIMEOUT,
+            )
+        except TimeoutError:
+            logger.debug("record_recall timed out; recall event dropped")
+
     return 0
 
 

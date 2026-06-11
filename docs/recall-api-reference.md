@@ -196,6 +196,17 @@ database that lacks the `project` column, the scoped pass is skipped and a
 single global fetch runs — no error. The SQLite cache backend has no project
 column and always degrades to a global fetch.
 
+### `--source`
+
+Short caller label recorded with each recall event in the `recall_log` table
+(issue #140), e.g. `hook`, `mcp`, or `cli`. Optional; defaults to `NULL`
+(unknown). **Label-only** — pass a fixed identifier for the call site, never
+prompt-derived or user text. The label is validated at the writer against
+`^[a-z][a-z0-9_-]{0,31}$`; any value that does not match (uppercase, spaces,
+over 32 chars, prompt-like text) is **dropped to `NULL`** rather than stored,
+so arbitrary text cannot leak into the append-only log. No query text is ever
+logged (privacy). See the [Recall Event Log](#recall-event-log) section.
+
 ### `--provider` (default: local)
 
 Embedding provider. Choices: `local` (BGE), `voyage` (Voyage AI).
@@ -211,6 +222,107 @@ Embedding provider. Choices: `local` (BGE), `voyage` (Voyage AI).
 `--project-first` is orthogonal to the search mode: it changes the fetch-pool
 composition (own-project rows first, then a global fill) and applies to every
 PostgreSQL mode above. The SQLite backend ignores it and fetches globally.
+
+## Recall Event Log
+
+Every recall (except `--json-full` benchmarking) appends one row to the
+`recall_log` table (issue #140) so cross-project recall mis-scope frequency
+(issue #130) is measurable. The recalled rows' projects are captured
+point-in-time via `UPDATE archival_memory ... RETURNING id, project`, so no
+extra round trip is added. **Zero-result recalls are logged too** — with empty
+`recalled_ids`/`recalled_projects` arrays and `result_count = 0` — because
+finding nothing is the signature of over-restrictive project scoping (#130).
+
+**Counters and the log are decoupled by design.** The counter columns
+(`recall_count` / `last_recalled` on `archival_memory`) and `recall_log` are
+written as **two separate autocommitted statements**, not a transaction or CTE,
+so a pre-migration DB keeps working counters even when the log INSERT fails. A
+consequence: a transient INSERT failure can bump counters without writing a log
+row. Treat counters as a coarse popularity signal and `recall_log` as the
+analysis source of truth.
+
+### Schema
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | `BIGINT` identity | Primary key |
+| `caller_project` | `TEXT` | Canonicalized caller project; `NULL` = no project context |
+| `recalled_ids` | `UUID[]` | Ids of the rows whose counters were bumped |
+| `recalled_projects` | `TEXT[]` | Parallel to `recalled_ids`; `NULL` elements = unattributed memories |
+| `result_count` | `INTEGER` | Number of recalled rows (length of the arrays) |
+| `source` | `TEXT` | Short caller label from `--source` (`hook`/`mcp`/`cli`); validated `^[a-z][a-z0-9_-]{0,31}$` at the writer, invalid → `NULL`; `NULL` = unknown |
+| `created_at` | `TIMESTAMPTZ` | Event time, defaults to `NOW()` |
+
+### Write semantics
+
+- **Skipped entirely** for `--json-full` (benchmark mode) and the SQLite
+  backend (no project/log columns — logs a debug line and returns).
+- **Zero-result vs. stale-id:** an empty `result_ids` (the recall found
+  nothing) skips the counter UPDATE but still logs a `result_count = 0` row.
+  This is distinct from supplying ids that match no rows (e.g. concurrently
+  deleted ids) — that is a stale-id event and the INSERT is skipped, since the
+  recall did surface candidates.
+- **Best-effort:** the INSERT runs as a separate autocommitted statement after
+  the counter UPDATE (not a CTE or transaction). On a pre-migration DB that
+  lacks `recall_log`, the INSERT fails alone, is swallowed (debug log), and the
+  counter UPDATE still persists.
+- **Version-skew safe:** if `archival_memory.project` itself is missing
+  (temporal-decay columns applied but `add_project_column.sql` not), the
+  `RETURNING project` fetch raises `UndefinedColumnError`; recall falls back to
+  the original counter-only `UPDATE` (no `RETURNING`) so counters never
+  silently stop, and skips the `recall_log` INSERT for that event.
+- **Source validated at the writer:** `source` is checked against
+  `^[a-z][a-z0-9_-]{0,31}$` in Python before the INSERT; an invalid label is
+  dropped to `NULL`. This is deliberately *not* a DB `CHECK` constraint — a
+  CHECK violation would abort the whole INSERT and silently drop the entire log
+  row, losing the recall event.
+- **Latency-bounded:** the call is wrapped in `asyncio.wait_for(...,
+  timeout=RECORD_RECALL_TIMEOUT)` (2.0s, well under the memory-awareness hook's
+  5s `spawnSync` budget, which waits for process exit). On timeout the write is
+  cancelled (cancellation-safe — the `pool.acquire()` context manager releases
+  the connection) and the event is dropped with a debug log; output is already
+  printed by then.
+- **Never raises:** the whole path is wrapped so recall can never break.
+- **No query text, ever:** only project labels, ids, a count, and a source
+  label are stored (privacy — see issue #139).
+
+### Mis-scope analysis (answers issue #130)
+
+```sql
+SELECT caller_project,
+       COUNT(*) AS recalled_rows,
+       COUNT(*) FILTER (WHERE rp IS NULL) AS unattributed_rows,
+       COUNT(*) FILTER (WHERE rp IS NOT NULL AND rp <> caller_project) AS mis_scoped_rows,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE rp IS NOT NULL AND rp <> caller_project) / COUNT(*), 1) AS mis_scope_pct
+FROM recall_log
+CROSS JOIN LATERAL unnest(recalled_projects) AS rp
+WHERE caller_project IS NOT NULL
+  -- time-scope to a recent window; the created_at DESC index
+  -- (idx_recall_log_created) supports this range scan
+  AND created_at > NOW() - INTERVAL '30 days'
+GROUP BY caller_project ORDER BY mis_scope_pct DESC;
+```
+
+The `LATERAL unnest` drops zero-result rows automatically (an empty
+`recalled_projects` array yields no rows), which is correct for per-row
+mis-scope analysis. Count those events separately as a scoping-pressure signal
+(same recent window, same index):
+
+```sql
+SELECT caller_project,
+       COUNT(*) FILTER (WHERE result_count = 0) AS empty_recalls,
+       COUNT(*) AS total_recalls
+FROM recall_log
+WHERE created_at > NOW() - INTERVAL '30 days'
+GROUP BY caller_project ORDER BY empty_recalls DESC;
+```
+
+**Retention:** manual until automated pruning lands (follow-up issue). Pruning
+is operator-owned for now — run the documented `DELETE` periodically, e.g.:
+
+```sql
+DELETE FROM recall_log WHERE created_at < NOW() - INTERVAL '90 days';
+```
 
 ## Error Response
 

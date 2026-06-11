@@ -15,6 +15,8 @@ the query text is never included in any warning.
 
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import Any
 
 import pytest
@@ -77,6 +79,23 @@ class _RaiseEmbedAndCloseEmbedder:
 
     async def aclose(self) -> None:
         raise RuntimeError("aclose blew up")
+
+
+class _SlowEmbedder:
+    """embed() stalls (simulating a network hang past the recall deadline);
+    aclose records that cleanup ran so we can assert cancellation safety."""
+
+    SLEEP = 5.0
+
+    def __init__(self, *a: Any, **kw: Any) -> None:
+        self.closed = False
+
+    async def embed(self, *_a: Any, **_kw: Any) -> list[float]:
+        await asyncio.sleep(self.SLEEP)
+        return [0.1] * 8
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 @pytest.fixture(autouse=True)
@@ -385,3 +404,56 @@ class TestHybridEmbedFallback:
         assert "secret" not in err
         assert "user:secret@" not in err
         assert "secret query phrase" not in err
+
+    async def test_embed_timeout_degrades_to_text_only_fast(self, monkeypatch):
+        """FIX (round 3): a stalled embed must hit the recall-specific deadline
+        and degrade to text-only well before the hook's 5s budget — not block on
+        the provider's own 30s+retry timeout."""
+        from scripts.core import recall_backends as rb
+
+        # Tiny deadline so the test is fast; the embed sleeps far longer.
+        monkeypatch.setattr(rb, "QUERY_EMBED_TIMEOUT", 0.05)
+        _patch_embedder(monkeypatch, _SlowEmbedder)
+        _patch_pool(monkeypatch)
+
+        async def fake_text_only(query, k=10, *, project=None):
+            return [dict(_TEXT_RESULT)]
+
+        monkeypatch.setattr(rb, "search_learnings_text_only_postgres", fake_text_only)
+
+        start = time.monotonic()
+        results = await rb.search_learnings_hybrid_rrf("query terms", k=3)
+        elapsed = time.monotonic() - start
+
+        assert results == [dict(_TEXT_RESULT)]
+        # Generous, loaded-machine-tolerant bound: well under the 5s embed sleep
+        # (and under the hook's 5s budget). See the #140 timing-flake lesson.
+        assert elapsed < 3.0, f"degrade took {elapsed:.2f}s; deadline not enforced"
+
+    async def test_embed_timeout_emits_latched_provider_warning(
+        self, monkeypatch, capsys,
+    ):
+        """Timeout flows into the same latched, redacted, provider-named warning,
+        and the message signals a timeout."""
+        from scripts.core import recall_backends as rb
+
+        monkeypatch.setattr(rb, "QUERY_EMBED_TIMEOUT", 0.05)
+        _patch_embedder(monkeypatch, _SlowEmbedder)
+        _patch_pool(monkeypatch)
+
+        async def fake_text_only(query, k=10, *, project=None):
+            return [dict(_TEXT_RESULT)]
+
+        monkeypatch.setattr(rb, "search_learnings_text_only_postgres", fake_text_only)
+
+        # Two stalled searches → exactly one warning (latch still applies).
+        await rb.search_learnings_hybrid_rrf("first query", k=3, provider="voyage")
+        await rb.search_learnings_hybrid_rrf("second query", k=3, provider="voyage")
+
+        err = capsys.readouterr().err
+        assert err.lower().count("warning") == 1, err
+        assert "voyage" in err.lower()
+        assert "timed out" in err.lower()
+        # Redaction + no query text still hold.
+        assert "first query" not in err
+        assert "second query" not in err

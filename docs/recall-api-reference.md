@@ -236,13 +236,18 @@ provider is reachable: in that case behavior is identical to today's
 `--text-only`.
 
 **Trigger:** any exception from the query-embed call inside
-`search_learnings_hybrid_rrf`.
+`search_learnings_hybrid_rrf`, including a `QUERY_EMBED_TIMEOUT` (2.0s)
+deadline. The deadline exists because providers carry their own long
+timeouts (e.g. Voyage: httpx 30s + retries ≈ 90s+); without it a network
+stall would blow the hook's 5s budget and the fallback would never run.
+2.0s leaves ~3s for the text-only query, reranking, and output. The warning
+says "unavailable or timed out" since both land in this path.
 
 **Warning:** a single redacted line is printed to stderr (where the
 memory-awareness hook captures it into model context):
 
 ```
-warning: hybrid recall degraded to text-only (provider 'voyage' unavailable: <redacted reason>); set the provider API key or pass --text-only to silence.
+warning: hybrid recall degraded to text-only (provider 'voyage' unavailable or timed out: <redacted reason>); set the provider API key or pass --text-only to silence.
 ```
 
 The reason text is passed through the `#139` credential redactor

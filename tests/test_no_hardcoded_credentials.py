@@ -280,3 +280,9 @@ def test_scan_excludes_gitignored_paths():
         )
     finally:
         sentinel.unlink(missing_ok=True)
+        # Best-effort cleanup of created directories (ignore if non-empty).
+        for parent in (sentinel.parent, sentinel.parent.parent):
+            try:
+                parent.rmdir()
+            except OSError:
+                pass

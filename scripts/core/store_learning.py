@@ -264,6 +264,7 @@ def parse_tags(tags_str: str | None) -> list[str] | None:
 # stamped slightly ahead of wall-clock (NTP jitter, fast backfill host) is
 # accepted; anything further in the future is treated as garbage and ignored.
 _SOURCE_TIME_MAX_FUTURE_SKEW = timedelta(minutes=5)
+_SOURCE_TIME_MIN = datetime(2024, 1, 1, tzinfo=UTC)
 
 
 def resolve_source_time(arg: str | None, env: dict[str, str]) -> str | None:
@@ -293,9 +294,11 @@ def validate_source_time(raw: str | None, *, now: datetime | None = None) -> dat
     """Parse and validate a source-time string into an aware datetime.
 
     Pure function. Returns a timezone-aware ``datetime`` on success, or None
-    when ``raw`` is empty, unparseable, or more than five minutes in the
-    future (clock-skew guard). Naive ISO8601 timestamps are interpreted as
-    UTC. Callers treat None as "no override" and warn on rejected input.
+    when ``raw`` is empty, unparseable, more than five minutes in the future
+    (clock-skew guard), or before 2024-01-01 (implausibility floor matching
+    fix_backfill_created_at.sql -- no real session predates the system).
+    Naive ISO8601 timestamps are interpreted as UTC. Callers treat None as
+    "no override" and warn on rejected input.
     """
     if not raw:
         return None
@@ -307,6 +310,8 @@ def validate_source_time(raw: str | None, *, now: datetime | None = None) -> dat
         parsed = parsed.replace(tzinfo=UTC)
     reference = now or datetime.now(UTC)
     if parsed > reference + _SOURCE_TIME_MAX_FUTURE_SKEW:
+        return None
+    if parsed < _SOURCE_TIME_MIN:
         return None
     return parsed
 

@@ -84,6 +84,16 @@ class TestValidateSourceTime:
         past = (self.NOW - timedelta(days=90)).isoformat()
         assert validate_source_time(past, now=self.NOW) is not None
 
+    def test_pre_2024_timestamp_rejected(self) -> None:
+        # Implausibility floor mirrors fix_backfill_created_at.sql (aegis
+        # MEDIUM: no real session predates the system; a 1970 value must not
+        # silently bury a learning in recency ranking).
+        assert validate_source_time("1970-01-01T00:00:00+00:00", now=self.NOW) is None
+        assert validate_source_time("2023-12-31T23:59:59+00:00", now=self.NOW) is None
+
+    def test_floor_boundary_accepted(self) -> None:
+        assert validate_source_time("2024-01-01T00:00:00+00:00", now=self.NOW) is not None
+
 
 # ---------------------------------------------------------------------------
 # Pure: resolve_source_time (CLI arg vs env fallback)

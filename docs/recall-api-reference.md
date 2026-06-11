@@ -253,8 +253,9 @@ warning: hybrid recall degraded to text-only (provider 'voyage' unavailable or t
 The reason text is passed through the `#139` credential redactor
 (`sanitize_log_message`), so DSN passwords never leak, and the **query text is
 never included** in the warning. The full traceback is kept in the debug log
-only. If the text-only fallback itself also fails, the original error
-propagates, exactly like the non-degraded (default) path.
+only. If the text-only fallback itself also fails, that fallback's
+exception propagates (the embedding failure stays attached as the chained
+`__context__`), so recall still fails loudly when neither path works.
 
 **This degrade is deliberate, not an error.** The contract is to fall back
 quietly so the hook keeps working in the exact missing-key case the feature

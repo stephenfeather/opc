@@ -350,6 +350,20 @@ class TestRecordRecallLogging:
         insert_args = conn.execute_calls[0][1]
         assert insert_args[4] is None  # invalid source dropped to NULL
 
+    async def test_trailing_newline_source_label_bound_as_null(self, monkeypatch):
+        # re.match with `$` matches before a trailing newline; fullmatch must
+        # reject "hook\n" so the stray byte never persists (aegis LOW-1).
+        rid = str(uuid.uuid4())
+        conn = _CapturingConn(fetch_rows=[_row(rid, "opc")])
+        _patch_postgres(monkeypatch)
+        _patch_pool(monkeypatch, conn)
+
+        await record_recall([rid], caller_project="opc", source="hook\n")
+
+        assert len(conn.execute_calls) == 1
+        insert_args = conn.execute_calls[0][1]
+        assert insert_args[4] is None
+
     async def test_valid_source_label_preserved(self, monkeypatch):
         rid = str(uuid.uuid4())
         conn = _CapturingConn(fetch_rows=[_row(rid, "opc")])

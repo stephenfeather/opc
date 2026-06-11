@@ -442,7 +442,7 @@ def _sanitize_source(source: str | None) -> str | None:
     """
     if source is None:
         return None
-    if _SOURCE_LABEL_RE.match(source):
+    if _SOURCE_LABEL_RE.fullmatch(source):
         return source
     logger.debug("invalid recall source label dropped")
     return None

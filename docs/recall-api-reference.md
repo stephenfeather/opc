@@ -223,6 +223,34 @@ Embedding provider. Choices: `local` (BGE), `voyage` (Voyage AI).
 composition (own-project rows first, then a global fill) and applies to every
 PostgreSQL mode above. The SQLite backend ignores it and fetches globally.
 
+### Hybrid → text-only degradation (issue #53)
+
+Hybrid RRF needs a query embedding. When that embedding cannot be produced —
+a missing API key, a model load error, or a network/provider timeout — the
+hybrid path does **not** error out. It degrades to the text-only backend for
+that one query, with the same `k` and `--project` semantics, and returns
+results whose shape is identical to `--text-only` (no `fts_rank` / `vec_rank`
+/ decay keys). This lets the memory-awareness hook call hybrid (instead of
+hardcoding `--text-only`) without risking a hard failure when no embedding
+provider is reachable: in that case behavior is identical to today's
+`--text-only`.
+
+**Trigger:** any exception from the query-embed call inside
+`search_learnings_hybrid_rrf`.
+
+**Warning:** a single redacted line is printed to stderr (where the
+memory-awareness hook captures it into model context):
+
+```
+warning: hybrid recall query-embed failed (<redacted reason>); degrading to text-only search for this query.
+```
+
+The reason text is passed through the `#139` credential redactor
+(`sanitize_log_message`), so DSN passwords never leak, and the **query text is
+never included** in the warning. The full traceback is kept in the debug log
+only. If the text-only fallback itself also fails, the original error
+propagates, exactly like the non-degraded (default) path.
+
 ## Recall Event Log
 
 Every recall (except `--json-full` benchmarking) appends one row to the

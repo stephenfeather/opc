@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sys
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
@@ -752,6 +753,29 @@ async def search_learnings_hybrid_rrf(
     embedder = EmbeddingService(provider=provider)
     try:
         query_embedding = await embedder.embed(query, input_type="query")
+    except Exception as exc:  # noqa: BLE001 - degrade, do not crash recall
+        # Issue #53: the memory-awareness hook now calls hybrid (no
+        # --text-only). If the query-embed is unavailable (missing API key,
+        # model load error, network timeout), degrade to the text-only
+        # backend instead of aborting — same pool/k/project semantics and
+        # an identical result shape to --text-only. exc text can embed a
+        # DSN/host; recall stderr is injected into the model context by
+        # hooks, so redact and never echo the query (#139 redactor; aegis).
+        from scripts.core.db.postgres_pool import sanitize_log_message
+
+        logger.debug(
+            "hybrid query-embed failed; degrading to text-only", exc_info=True,
+        )
+        print(
+            "warning: hybrid recall query-embed failed "
+            f"({sanitize_log_message(str(exc))}); "
+            "degrading to text-only search for this query.",
+            file=sys.stderr,
+        )
+        # finally below runs on return and closes the embedder.
+        return await search_learnings_text_only_postgres(
+            query, k, project=project,
+        )
     finally:
         await embedder.aclose()
 

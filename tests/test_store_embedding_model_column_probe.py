@@ -16,70 +16,10 @@ import pytest
 
 from tests.test_memory_service_pg import FakeTransaction  # type: ignore
 
-
-class TestStoreColumnProbe:
-    async def test_legacy_insert_shape_when_column_absent(self):
-        from scripts.core.db.memory_service_pg import MemoryServicePG
-
-        conn = AsyncMock()
-        conn.execute = AsyncMock(return_value="INSERT 0 1")
-        svc = MemoryServicePG(session_id="s1")
-
-        with patch(
-            "scripts.core.db.memory_service_pg.get_transaction",
-            return_value=FakeTransaction(conn),
-        ), patch(
-            "scripts.core.db.memory_service_pg.init_pgvector",
-            AsyncMock(),
-        ), patch(
-            "scripts.core.db.memory_service_pg."
-            "embedding_model_column_available",
-            AsyncMock(return_value=False),
-        ):
-            await svc.store(
-                "fact",
-                embedding=[0.1] * 1024,
-                embedding_model="voyage-code-3",
-            )
-
-        insert_call = next(
-            c for c in conn.execute.call_args_list
-            if "INSERT INTO archival_memory" in str(c)
-        )
-        # Column absent -> must NOT name embedding_model in the INSERT.
-        assert "embedding_model" not in str(insert_call)
-        assert "voyage-code-3" not in [str(a) for a in insert_call.args]
-
-    async def test_column_bound_when_present(self):
-        from scripts.core.db.memory_service_pg import MemoryServicePG
-
-        conn = AsyncMock()
-        conn.execute = AsyncMock(return_value="INSERT 0 1")
-        svc = MemoryServicePG(session_id="s1")
-
-        with patch(
-            "scripts.core.db.memory_service_pg.get_transaction",
-            return_value=FakeTransaction(conn),
-        ), patch(
-            "scripts.core.db.memory_service_pg.init_pgvector",
-            AsyncMock(),
-        ), patch(
-            "scripts.core.db.memory_service_pg."
-            "embedding_model_column_available",
-            AsyncMock(return_value=True),
-        ):
-            await svc.store(
-                "fact",
-                embedding=[0.1] * 1024,
-                embedding_model="voyage-code-3",
-            )
-
-        insert_call = next(
-            c for c in conn.execute.call_args_list
-            if "INSERT INTO archival_memory" in str(c)
-        )
-        assert "embedding_model" in str(insert_call)
-        assert "voyage-code-3" in [str(a) for a in insert_call.args]
+# NOTE: the round-1 probe-based store-column tests were superseded by round 2
+# FIX 3 — the WRITE path is now evidence-based (attempt labeled INSERT, retry
+# legacy on UndefinedColumnError) and never consults the read probe. Those
+# scenarios now live in tests/test_store_label_evidence_based.py.
 
 
 class TestSearchVectorGlobalModelFilter:

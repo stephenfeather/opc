@@ -260,6 +260,128 @@ class MemoryServicePG:
 
     # ==================== Archival Memory ====================
 
+    @staticmethod
+    def _build_embedding_insert(
+        *,
+        memory_id: str,
+        session_id: str,
+        agent_id: str | None,
+        content: str,
+        metadata: dict[str, Any] | None,
+        padded_embedding: Any,
+        content_hash: str | None,
+        host_id: str | None,
+        project: str | None,
+        source_time: datetime | None,
+        embedding_model: str | None,
+    ) -> tuple[str, list[Any]]:
+        """Build the (sql, vals) for an embedding INSERT.
+
+        When ``embedding_model`` is set the labeled column is included;
+        otherwise the legacy (pre-#151) shape is produced. Pure — no I/O.
+        """
+        base_cols = (
+            "id, session_id, agent_id, content, "
+            "metadata, embedding, content_hash, host_id, project"
+        )
+        base_vals: list[Any] = [
+            memory_id,
+            session_id,
+            agent_id,
+            content,
+            json.dumps(metadata or {}),
+            padded_embedding,
+            content_hash,
+            host_id,
+            project,
+        ]
+        model_col = ", embedding_model" if embedding_model else ""
+        model_val = [embedding_model] if embedding_model else []
+        if source_time is not None:
+            cols = f"{base_cols}{model_col}, created_at"
+            vals = [*base_vals, *model_val, source_time]
+        else:
+            cols = f"{base_cols}{model_col}"
+            vals = [*base_vals, *model_val]
+        placeholders = ", ".join(f"${i + 1}" for i in range(len(vals)))
+        sql = f"""
+                    INSERT INTO archival_memory
+                        ({cols})
+                    VALUES ({placeholders})
+                    ON CONFLICT (content_hash)
+                        WHERE content_hash IS NOT NULL
+                        DO NOTHING
+                    """
+        return sql, vals
+
+    async def _insert_with_embedding(
+        self,
+        conn: Any,
+        *,
+        memory_id: str,
+        content: str,
+        metadata: dict[str, Any] | None,
+        padded_embedding: Any,
+        content_hash: str | None,
+        host_id: str | None,
+        project: str | None,
+        source_time: datetime | None,
+        embedding_model: str | None,
+    ) -> str:
+        """Run the embedding INSERT, labeling the row evidence-based.
+
+        FIX 3 (round 2, issue #151): the WRITE path must NOT be governed by
+        the read-degradation capability probe — a probe cached False (process
+        lifetime) or a transient probe error would make stores fall back to
+        the unlabeled INSERT and let the 'bge' column default permanently
+        mislabel voyage/openai rows. Instead, when a label is present we ALWAYS
+        attempt the labeled INSERT first (inside a savepoint so the outer
+        transaction survives) and retry the legacy INSERT exactly once on a
+        real UndefinedColumnError. This self-heals after a mid-process
+        migration with no cache to invalidate.
+        """
+        labeled_sql, labeled_vals = self._build_embedding_insert(
+            memory_id=memory_id,
+            session_id=self.session_id,
+            agent_id=self.agent_id,
+            content=content,
+            metadata=metadata,
+            padded_embedding=padded_embedding,
+            content_hash=content_hash,
+            host_id=host_id,
+            project=project,
+            source_time=source_time,
+            embedding_model=embedding_model,
+        )
+        if not embedding_model:
+            # No label -> nothing to degrade; one plain INSERT.
+            return await conn.execute(labeled_sql, *labeled_vals)
+        try:
+            # Savepoint: a labeled-INSERT failure rolls back to here, leaving
+            # the outer transaction usable for the legacy retry.
+            async with conn.transaction():
+                return await conn.execute(labeled_sql, *labeled_vals)
+        except asyncpg.exceptions.UndefinedColumnError:
+            logger.debug(
+                "embedding_model column absent; retrying legacy INSERT "
+                "(row written with the 'bge' column default until migrated)",
+                exc_info=True,
+            )
+            legacy_sql, legacy_vals = self._build_embedding_insert(
+                memory_id=memory_id,
+                session_id=self.session_id,
+                agent_id=self.agent_id,
+                content=content,
+                metadata=metadata,
+                padded_embedding=padded_embedding,
+                content_hash=content_hash,
+                host_id=host_id,
+                project=project,
+                source_time=source_time,
+                embedding_model=None,
+            )
+            return await conn.execute(legacy_sql, *legacy_vals)
+
     async def store(
         self,
         content: str,
@@ -291,49 +413,17 @@ class MemoryServicePG:
         async with get_transaction() as conn:
             if padded_embedding is not None:
                 await init_pgvector(conn)
-                # Issue #151: bind embedding_model explicitly so the recall
-                # filter keys on the real space. Omit the column when no label
-                # is provided so the DB default ('bge') still applies. FIX 1
-                # (round 1): on a pre-migration DB the column may not exist —
-                # probe and skip the explicit bind so the legacy INSERT shape
-                # still works instead of raising UndefinedColumnError.
-                write_model = bool(embedding_model)
-                if write_model and not await embedding_model_column_available(conn):
-                    write_model = False
-                base_cols = (
-                    "id, session_id, agent_id, content, "
-                    "metadata, embedding, content_hash, host_id, project"
-                )
-                base_vals = [
-                    memory_id,
-                    self.session_id,
-                    self.agent_id,
-                    content,
-                    json.dumps(metadata or {}),
-                    padded_embedding,
-                    content_hash,
-                    host_id,
-                    project,
-                ]
-                model_col = ", embedding_model" if write_model else ""
-                model_val = [embedding_model] if write_model else []
-                if source_time is not None:
-                    cols = f"{base_cols}{model_col}, created_at"
-                    vals = [*base_vals, *model_val, source_time]
-                else:
-                    cols = f"{base_cols}{model_col}"
-                    vals = [*base_vals, *model_val]
-                placeholders = ", ".join(f"${i + 1}" for i in range(len(vals)))
-                result = await conn.execute(
-                    f"""
-                    INSERT INTO archival_memory
-                        ({cols})
-                    VALUES ({placeholders})
-                    ON CONFLICT (content_hash)
-                        WHERE content_hash IS NOT NULL
-                        DO NOTHING
-                    """,
-                    *vals,
+                result = await self._insert_with_embedding(
+                    conn,
+                    memory_id=memory_id,
+                    content=content,
+                    metadata=metadata,
+                    padded_embedding=padded_embedding,
+                    content_hash=content_hash,
+                    host_id=host_id,
+                    project=project,
+                    source_time=source_time,
+                    embedding_model=embedding_model,
                 )
             else:
                 if source_time is not None:

@@ -1243,6 +1243,20 @@ async def search_learnings_postgres(
                     (str(query_embedding), k), "vector",
                     model_label,
                 )
+
+            # FIX 4 (round 2, issue #151): a model-filtered vector query can
+            # match zero rows during a split corpus (the query's space has no
+            # rows yet). resolve_search_params() sets text_fallback=True even
+            # for --vector-only, so honor it: when the vector/recency fetch is
+            # empty AND text_fallback is on, run the ILIKE text fallback rather
+            # than returning nothing. The text fallback never touches
+            # embedding_model, so it is safe across spaces.
+            if not rows and text_fallback:
+                has_project = await project_column_available(conn)
+                rows = await _fetch_branch(
+                    conn, _PG_TEXT_FALLBACK_SQL, has_project,
+                    (query, k), "text",
+                )
     elif text_fallback:
         async with pool.acquire() as conn:
             has_project = await project_column_available(conn)

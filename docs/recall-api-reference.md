@@ -619,6 +619,23 @@ Two layers, checked in order:
 1. **Semantic dedup** — Cosine similarity >= 0.92 against all existing learnings (cross-session). Returns `skipped` with `existing_id`.
 2. **Content hash dedup** — SHA-256 of exact content. Returns `skipped` without `existing_id`.
 
+### Same-space-only semantic dedup during a split corpus (issue #151)
+
+Semantic dedup is **same-embedding-space-only by design**. The probe is pinned
+to the same `embedding_model` label that will be written with the new row
+(see the [Embedding-space contract](#embedding-space-contract-issue-151)),
+because cosine similarity across different embedding spaces is meaningless — a
+voyage vector compared against bge rows produces noise, and a spurious
+cross-space "match" would silently skip a legitimate write (data loss). The
+consequence during the split-corpus window is that a cross-space **paraphrase**
+duplicate (same idea, different space) is temporarily **not** caught by
+semantic dedup. **Exact** duplicates are still caught across spaces by the
+content-hash layer (it is space-independent). This window closes once
+`scripts/core/re_embed_voyage.py` canonicalizes the corpus to a single space,
+after which every row shares one label and semantic dedup spans the whole
+corpus again. Corpus-wide retroactive duplicate cleanup is tracked separately
+in issue #58.
+
 ---
 
 # Memory Feedback API Reference

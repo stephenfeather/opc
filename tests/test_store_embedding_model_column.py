@@ -15,12 +15,29 @@ import pytest
 from tests.test_memory_service_pg import FakeTransaction  # type: ignore
 
 
+class _Savepoint:
+    """Async CM standing in for conn.transaction() (asyncpg savepoint)."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def _txn_conn() -> AsyncMock:
+    """AsyncMock conn whose .transaction() is a real async CM (savepoint)."""
+    conn = AsyncMock()
+    conn.execute = AsyncMock(return_value="INSERT 0 1")
+    conn.transaction = lambda: _Savepoint()
+    return conn
+
+
 class TestStoreWritesEmbeddingModelColumn:
     async def test_embedding_model_bound_on_embedding_insert(self):
         from scripts.core.db.memory_service_pg import MemoryServicePG
 
-        conn = AsyncMock()
-        conn.execute = AsyncMock(return_value="INSERT 0 1")
+        conn = _txn_conn()
         svc = MemoryServicePG(session_id="s1")
 
         with patch(
@@ -29,10 +46,6 @@ class TestStoreWritesEmbeddingModelColumn:
         ), patch(
             "scripts.core.db.memory_service_pg.init_pgvector",
             AsyncMock(),
-        ), patch(
-            "scripts.core.db.memory_service_pg."
-            "embedding_model_column_available",
-            AsyncMock(return_value=True),
         ):
             await svc.store(
                 "fact",

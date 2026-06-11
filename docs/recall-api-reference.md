@@ -32,7 +32,18 @@ When reranking is active (default), results may also include:
   "results": [
     {
       ...
-      "rerank_details": { "recency_boost": 0.1, "tag_boost": 0.05, ... }
+      "rerank_details": {
+        "calibrated_score": 0.72,
+        "project_match": 1.0,
+        "recency": 0.85,
+        "confidence": 0.5,
+        "recall": 0.0,
+        "type_match": 0.5,
+        "tag_overlap": 0.0,
+        "pattern": 0.0,
+        "kg_overlap": 0.0,
+        "kg_active": false
+      }
     }
   ],
   "total": 1
@@ -149,6 +160,28 @@ The value is canonicalized (lowercased, known aliases collapsed — see
 `scripts/core/project_naming.py`) before matching, and the match itself is
 case-insensitive.
 
+`--project` alone only affects **re-ranking** (the `project_match` signal),
+not the fetch pool. On a large project, the global fetch can fill its entire
+candidate pool with foreign rows before the reranker runs, so own-project
+rows are never surfaced. Use `--project-first` to change the fetch composition.
+
+### `--project-first`
+
+Opt-in fetch-time project scoping (issue #139). Runs a **two-pass fetch**:
+pass 1 is scoped to the resolved project via a SQL `AND project = $N` clause,
+pass 2 fetches globally; the two are merged own-project-first, deduped by id,
+and truncated to the rerank pool size. This guarantees own-project rows are in
+the pool when they exist — complementary to `--project`'s rerank signal, not a
+replacement.
+
+The project is resolved from `--project` if given, otherwise auto-detected
+from `CLAUDE_PROJECT_DIR` (worktree-aware), then canonicalized before the SQL
+bind. If no project resolves, a warning is printed to stderr and recall
+degrades to the normal global fetch (exit code unchanged). On a pre-migration
+database that lacks the `project` column, the scoped pass is skipped and a
+single global fetch runs — no error. The SQLite cache backend has no project
+column and always degrades to a global fetch.
+
 ### `--provider` (default: local)
 
 Embedding provider. Choices: `local` (BGE), `voyage` (Voyage AI).
@@ -160,6 +193,10 @@ Embedding provider. Choices: `local` (BGE), `voyage` (Voyage AI).
 | *(default)* | Hybrid RRF (text + vector) | 0.01-0.03 |
 | `--text-only` | BM25 text search | 0.01-0.05 |
 | `--vector-only` | Cosine similarity | 0.4-0.6 |
+
+`--project-first` is orthogonal to the search mode: it changes the fetch-pool
+composition (own-project rows first, then a global fill) and applies to every
+PostgreSQL mode above. The SQLite backend ignores it and fetches globally.
 
 ## Error Response
 

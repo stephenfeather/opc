@@ -102,6 +102,33 @@ def compute_fetch_k(k: int, *, no_rerank: bool) -> int:
     return max(3 * k, 50)
 
 
+def merge_project_first(
+    own: list[dict[str, Any]],
+    global_: list[dict[str, Any]],
+    fetch_k: int,
+) -> list[dict[str, Any]]:
+    """Merge a project-scoped pass with the global pass, own-project first.
+
+    Two-pass fetch for ``--project-first`` (issue #139): own-project rows
+    lead, then global rows backfill, deduped by ``id`` (the own copy wins
+    on collision), and the whole list is truncated to ``fetch_k`` so the
+    rerank pool stays the same size as the single-pass path. Pure: inputs
+    are not mutated.
+    """
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in [*own, *global_]:
+        rid = row.get("id")
+        if rid in seen:
+            continue
+        if rid is not None:
+            seen.add(rid)
+        merged.append(row)
+        if len(merged) >= fetch_k:
+            break
+    return merged
+
+
 def determine_retrieval_mode(
     backend: str, *, text_only: bool, vector_only: bool
 ) -> str:
@@ -212,6 +239,29 @@ def make_recall_context(
     )
 
 
+def resolve_project_scope(
+    *,
+    project_first: bool,
+    project: str | None,
+    project_dir: str | None,
+) -> str | None:
+    """Resolve the project to fetch-scope to for ``--project-first``.
+
+    Returns ``None`` (no scoping, global recall) when the flag is off or no
+    project can be resolved. Explicit ``--project`` wins; otherwise the
+    project is auto-detected from ``CLAUDE_PROJECT_DIR`` (worktree-aware).
+    The value is canonicalized so the SQL bind matches stored project
+    values (issue #139, mirrors make_recall_context's read boundary).
+    """
+    if not project_first:
+        return None
+    from scripts.core.project_naming import canonicalize_project, project_from_path
+
+    if project:
+        return canonicalize_project(project)
+    return project_from_path(project_dir or None)
+
+
 def resolve_search_params(
     *,
     backend: str,
@@ -226,10 +276,14 @@ def resolve_search_params(
     no_expand: bool,
     expand_terms: int,
     rebuild_idf: bool,
+    project_scope: str | None = None,
 ) -> dict[str, Any]:
     """Resolve CLI flags into a search parameter dict.
 
-    All returned dicts include ``mode``, ``query``, and ``k``.
+    All returned dicts include ``mode``, ``query``, ``k``, and
+    ``project_scope`` (the canonical project to fetch-scope to under
+    ``--project-first``, or ``None`` for the default global pass — issue
+    #139).
 
     Additional keys depend on the selected mode:
     - ``sqlite``: no additional keys.
@@ -240,10 +294,20 @@ def resolve_search_params(
       ``max_expansion_terms``, and ``rebuild_idf``.
     """
     if backend == "sqlite":
-        return {"mode": "sqlite", "query": query, "k": fetch_k}
+        return {
+            "mode": "sqlite",
+            "query": query,
+            "k": fetch_k,
+            "project_scope": project_scope,
+        }
 
     if text_only:
-        return {"mode": "text_only", "query": query, "k": fetch_k}
+        return {
+            "mode": "text_only",
+            "query": query,
+            "k": fetch_k,
+            "project_scope": project_scope,
+        }
 
     if vector_only:
         sql_recency = 0.0 if not no_rerank else recency
@@ -255,6 +319,7 @@ def resolve_search_params(
             "similarity_threshold": threshold,
             "recency_weight": sql_recency,
             "text_fallback": True,
+            "project_scope": project_scope,
         }
 
     # Default: hybrid RRF — no recency_weight; temporal relevance is handled
@@ -268,6 +333,7 @@ def resolve_search_params(
         "expand": not no_expand,
         "max_expansion_terms": expand_terms,
         "rebuild_idf": rebuild_idf,
+        "project_scope": project_scope,
     }
 
 
@@ -573,13 +639,27 @@ async def search_learnings(
     )
 
 
-async def _dispatch_search(params: dict[str, Any]) -> list[dict[str, Any]]:
-    """Dispatch a search call based on resolved params dict."""
+async def _dispatch_search(
+    params: dict[str, Any], *, project: str | None = None,
+) -> list[dict[str, Any]]:
+    """Dispatch a search call based on resolved params dict.
+
+    ``project`` (issue #139) optionally fetch-scopes the backend query.
+    ``None`` (the default) leaves every backend call byte-identical to the
+    pre-#139 path.
+    """
     mode = params["mode"]
+    # Only forward project= when scoping is active so the default path stays
+    # byte-identical to the pre-#139 call signatures.
+    project_kw: dict[str, Any] = {"project": project} if project is not None else {}
     if mode == "sqlite":
-        return await search_learnings_sqlite(params["query"], params["k"])
+        return await search_learnings_sqlite(
+            params["query"], params["k"], **project_kw,
+        )
     if mode == "text_only":
-        return await search_learnings_text_only_postgres(params["query"], params["k"])
+        return await search_learnings_text_only_postgres(
+            params["query"], params["k"], **project_kw,
+        )
     if mode == "vector":
         return await search_learnings_postgres(
             params["query"],
@@ -588,6 +668,7 @@ async def _dispatch_search(params: dict[str, Any]) -> list[dict[str, Any]]:
             text_fallback=params.get("text_fallback", True),
             similarity_threshold=params["similarity_threshold"],
             recency_weight=params["recency_weight"],
+            **project_kw,
         )
     # hybrid_rrf
     if params.get("rebuild_idf"):
@@ -601,7 +682,25 @@ async def _dispatch_search(params: dict[str, Any]) -> list[dict[str, Any]]:
         similarity_threshold=params["similarity_threshold"],
         expand=params.get("expand", True),
         max_expansion_terms=params.get("max_expansion_terms", 5),
+        **project_kw,
     )
+
+
+async def _dispatch_search_project_first(
+    params: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Two-pass fetch for ``--project-first`` (issue #139).
+
+    Pass 1 scopes the backend to ``params["project_scope"]``; pass 2 fetches
+    globally. The passes are merged own-project-first, deduped by id and
+    truncated to ``params["k"]`` (the over-fetched rerank pool size) by
+    ``merge_project_first``. The reranker's project_match signal still runs
+    downstream — this only changes the fetch pool composition.
+    """
+    scope = params.get("project_scope")
+    own = await _dispatch_search(params, project=scope)
+    global_ = await _dispatch_search(params, project=None)
+    return merge_project_first(own, global_, params["k"])
 
 
 def _format_output(
@@ -647,6 +746,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expand-terms", type=int, default=5, help="Expansion terms (default: 5)")
     parser.add_argument("--rebuild-idf", action="store_true", help="Force rebuild IDF index")
     parser.add_argument("--project", help="Project context for re-ranking")
+    parser.add_argument(
+        "--project-first",
+        action="store_true",
+        help=(
+            "Fetch own-project rows first, then fill globally (issue #139). "
+            "Opt-in; degrades to global recall if no project resolves."
+        ),
+    )
     parser.add_argument("--structured", action="store_true", help="Group results by type")
     return parser
 
@@ -665,6 +772,21 @@ async def main() -> int:
 
     backend = get_backend()
 
+    # Fetch-time project scoping (issue #139). Opt-in: resolve a project for
+    # --project-first, warn-and-degrade to global recall when none resolves.
+    project_scope = resolve_project_scope(
+        project_first=args.project_first,
+        project=args.project,
+        project_dir=os.environ.get("CLAUDE_PROJECT_DIR") or None,
+    )
+    if args.project_first and project_scope is None:
+        print(
+            "warning: --project-first set but no project could be resolved; "
+            "falling back to global recall (pass --project or set "
+            "CLAUDE_PROJECT_DIR).",
+            file=sys.stderr,
+        )
+
     # Resolve and dispatch search
     try:
         params = resolve_search_params(
@@ -680,12 +802,16 @@ async def main() -> int:
             no_expand=args.no_expand,
             expand_terms=args.expand_terms,
             rebuild_idf=args.rebuild_idf,
+            project_scope=project_scope,
         )
 
         if backend == "sqlite" and output_mode == "human" and not args.text_only:
             print("  (SQLite backend - using text search)")
 
-        results = await _dispatch_search(params)
+        if project_scope is not None:
+            results = await _dispatch_search_project_first(params)
+        else:
+            results = await _dispatch_search(params)
     except Exception as e:
         if output_mode != "human":
             from scripts.core.recall_formatters import get_api_version

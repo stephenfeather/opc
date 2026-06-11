@@ -219,10 +219,26 @@ def format_vector_result(
     return result
 
 
-def build_rrf_cte(*, chain_filter: bool, use_tsquery: bool = False) -> str:
-    """Build the SQL CTE for RRF (Reciprocal Rank Fusion) queries."""
+def build_rrf_cte(
+    *,
+    chain_filter: bool,
+    use_tsquery: bool = False,
+    project_filter: str | None = None,
+) -> str:
+    """Build the SQL CTE for RRF (Reciprocal Rank Fusion) queries.
+
+    ``project_filter`` is the optional fetch-time scoping predicate for
+    ``--project-first`` (issue #139). It must live inside *both* ranking
+    subqueries (fts_ranked and vector_ranked) so the project predicate
+    shrinks the pool *before* ranking — filtering only the tail would rank
+    the global pool and then drop rows, defeating the purpose. ``None``
+    leaves the CTE byte-identical to today.
+    """
     chain_clause = (
         "\n                AND superseded_by IS NULL" if chain_filter else ""
+    )
+    project_clause = (
+        f"\n                {project_filter}" if project_filter else ""
     )
     tsquery_fn = "to_tsquery" if use_tsquery else "plainto_tsquery"
     return f"""
@@ -236,7 +252,7 @@ def build_rrf_cte(*, chain_filter: bool, use_tsquery: bool = False) -> str:
                         ) DESC
                     ) as fts_rank
                 FROM archival_memory
-                WHERE metadata->>'type' = 'session_learning'{chain_clause}
+                WHERE metadata->>'type' = 'session_learning'{chain_clause}{project_clause}
                 AND to_tsvector('english', content) @@ {tsquery_fn}('english', $1)
             ),
             vector_ranked AS (
@@ -244,7 +260,7 @@ def build_rrf_cte(*, chain_filter: bool, use_tsquery: bool = False) -> str:
                     id,
                     ROW_NUMBER() OVER (ORDER BY embedding <=> $2::vector) as vec_rank
                 FROM archival_memory
-                WHERE metadata->>'type' = 'session_learning'{chain_clause}
+                WHERE metadata->>'type' = 'session_learning'{chain_clause}{project_clause}
                 AND embedding IS NOT NULL
             ),
             combined AS (
@@ -264,6 +280,7 @@ def render_recall_sql(
     *,
     include_project: bool,
     project_expr: str = ", project",
+    project_filter: str | None = None,
     **fmt: str,
 ) -> str:
     """Render a recall SQL template, optionally selecting the project column.
@@ -272,10 +289,33 @@ def render_recall_sql(
     (scripts/migrations/add_project_column.sql); pre-migration databases
     must receive project-free SQL instead of UndefinedColumnError
     (issue #130 review finding).
+
+    ``project_filter`` is the optional fetch-time scoping clause for
+    ``--project-first`` (issue #139). It is the fully-formed predicate the
+    backend computed (e.g. ``"AND project = $3"`` — bound last so the
+    existing positional params keep their numbers). ``None`` renders the
+    ``{project_filter}`` placeholder empty, leaving the SQL byte-identical
+    to today.
     """
     return template.format(
-        project_col=project_expr if include_project else "", **fmt,
+        project_col=project_expr if include_project else "",
+        project_filter=project_filter or "",
+        **fmt,
     )
+
+
+def project_filter_clause(
+    project: str | None, *, has_project: bool, param_index: int,
+) -> str:
+    """Build the optional 'AND project = $N' scoping clause (issue #139).
+
+    Returns "" — leaving the SQL byte-identical to the global path — when no
+    project was requested or the column is unavailable (pre-migration DB).
+    The caller binds ``project`` as the ``param_index``-th positional arg.
+    """
+    if not project or not has_project:
+        return ""
+    return f"AND project = ${param_index}"
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +333,7 @@ _TEXT_ONLY_FTS_SQL = """
     WHERE metadata->>'type' = 'session_learning'
         AND superseded_by IS NULL
         AND to_tsvector('english', content) @@ to_tsquery('english', $1)
+        {project_filter}
     ORDER BY similarity DESC, created_at DESC
     LIMIT $2
     """
@@ -305,6 +346,7 @@ _TEXT_ONLY_FTS_NO_CHAIN_SQL = """
     FROM archival_memory
     WHERE metadata->>'type' = 'session_learning'
         AND to_tsvector('english', content) @@ to_tsquery('english', $1)
+        {project_filter}
     ORDER BY similarity DESC, created_at DESC
     LIMIT $2
     """
@@ -317,6 +359,7 @@ _TEXT_ONLY_ILIKE_SQL = """
     WHERE metadata->>'type' = 'session_learning'
         AND superseded_by IS NULL
         AND content ILIKE '%' || $1 || '%'
+        {project_filter}
     ORDER BY created_at DESC
     LIMIT $2
     """
@@ -328,6 +371,7 @@ _TEXT_ONLY_ILIKE_NO_CHAIN_SQL = """
     FROM archival_memory
     WHERE metadata->>'type' = 'session_learning'
         AND content ILIKE '%' || $1 || '%'
+        {project_filter}
     ORDER BY created_at DESC
     LIMIT $2
     """
@@ -368,6 +412,7 @@ _PG_RECENCY_SQL = """
         WHERE metadata->>'type' = 'session_learning'
             AND embedding IS NOT NULL
             {chain_filter}
+            {project_filter}
     )
     SELECT
         id, session_id, content, metadata, created_at{project_col},
@@ -387,6 +432,7 @@ _PG_VECTOR_SQL = """
     WHERE metadata->>'type' = 'session_learning'
         AND embedding IS NOT NULL
         {chain_filter}
+        {project_filter}
     ORDER BY embedding <=> $1::vector
     LIMIT $2
     """
@@ -399,6 +445,7 @@ _PG_TEXT_FALLBACK_SQL = """
     WHERE metadata->>'type' = 'session_learning'
         AND content ILIKE '%' || $1 || '%'
         {chain_filter}
+        {project_filter}
     ORDER BY created_at DESC
     LIMIT $2
     """
@@ -518,12 +565,16 @@ async def project_column_available(conn: Any) -> bool:
 
 
 async def search_learnings_text_only_postgres(
-    query: str, k: int = _recall_cfg.default_k,
+    query: str, k: int = _recall_cfg.default_k, *, project: str | None = None,
 ) -> list[dict[str, Any]]:
     """Fast text-only search for PostgreSQL using full-text search.
 
     Uses tsvector/tsquery with GIN index. Automatic stopword handling.
     Falls back to ILIKE if tsquery fails (e.g., all stopwords).
+
+    ``project`` (issue #139) scopes the fetch to one project via an
+    ``AND project = $3`` clause bound last; ``None`` (or a pre-migration DB
+    lacking the column) leaves the query byte-identical to the global path.
     """
     from scripts.core.db.postgres_pool import get_pool
     from scripts.core.query_expansion import STOPWORDS
@@ -531,40 +582,38 @@ async def search_learnings_text_only_postgres(
     or_query = build_or_query(query, STOPWORDS)
 
     async def _fetch_all(conn: Any, has_project: bool) -> list[Any]:
-        try:
-            rows = await conn.fetch(
-                render_recall_sql(_TEXT_ONLY_FTS_SQL, include_project=has_project),
-                or_query, k,
+        # Project value (when scoping) is bound as $3, after $1 (query) and
+        # $2 (limit) — see project_filter_clause's param_index.
+        pf = project_filter_clause(project, has_project=has_project, param_index=3)
+        extra = (project,) if pf else ()
+
+        def _r(template: str) -> str:
+            return render_recall_sql(
+                template, include_project=has_project, project_filter=pf,
             )
+
+        try:
+            rows = await conn.fetch(_r(_TEXT_ONLY_FTS_SQL), or_query, k, *extra)
         except Exception as exc:
             if _is_project_capability_error(exc):
                 raise
             logger.debug("Chain filter fallback in text_only_postgres FTS", exc_info=True)
             rows = await conn.fetch(
-                render_recall_sql(
-                    _TEXT_ONLY_FTS_NO_CHAIN_SQL, include_project=has_project,
-                ),
-                or_query, k,
+                _r(_TEXT_ONLY_FTS_NO_CHAIN_SQL), or_query, k, *extra,
             )
 
         if not rows:
             first_word = query.split()[0] if query.split() else query
             try:
                 rows = await conn.fetch(
-                    render_recall_sql(
-                        _TEXT_ONLY_ILIKE_SQL, include_project=has_project,
-                    ),
-                    first_word, k,
+                    _r(_TEXT_ONLY_ILIKE_SQL), first_word, k, *extra,
                 )
             except Exception as exc:
                 if _is_project_capability_error(exc):
                     raise
                 logger.debug("Chain filter fallback in text_only_postgres ILIKE", exc_info=True)
                 rows = await conn.fetch(
-                    render_recall_sql(
-                        _TEXT_ONLY_ILIKE_NO_CHAIN_SQL, include_project=has_project,
-                    ),
-                    first_word, k,
+                    _r(_TEXT_ONLY_ILIKE_NO_CHAIN_SQL), first_word, k, *extra,
                 )
         return rows
 
@@ -586,13 +635,24 @@ async def search_learnings_text_only_postgres(
 
 
 async def search_learnings_sqlite(
-    query: str, k: int = _recall_cfg.default_k,
+    query: str, k: int = _recall_cfg.default_k, *, project: str | None = None,
 ) -> list[dict[str, Any]]:
     """Search learnings using SQLite FTS5 (BM25 ranking).
 
     Cross-session search - finds learnings from ALL sessions.
+
+    The SQLite cache has no project column, so ``project`` (issue #139) is
+    accepted for signature parity but ignored — this backend always
+    degrades to a global fetch.
     """
     import sqlite3
+
+    if project:
+        logger.debug(
+            "search_learnings_sqlite ignores project=%r: the SQLite cache "
+            "has no project column; degrading to global fetch (issue #139)",
+            project,
+        )
 
     db_path = Path.home() / ".claude" / "cache" / "memory.db"
     if not db_path.exists():
@@ -659,11 +719,19 @@ async def search_learnings_hybrid_rrf(
     similarity_threshold: float = 0.0,
     expand: bool = True,
     max_expansion_terms: int = _recall_cfg.max_expansion_terms,
+    *,
+    project: str | None = None,
 ) -> list[dict[str, Any]]:
     """Hybrid RRF search combining text and vector rankings.
 
     Uses Reciprocal Rank Fusion:
         score = 1/(k + rank_fts) + 1/(k + rank_vector)
+
+    ``project`` (issue #139) scopes the fetch to one project. The predicate
+    lives inside both CTE ranking subqueries (so it shrinks the pool before
+    ranking) and is bound last; the boosted tail carries 5 base params so
+    project is $6, the plain tail 4 so project is $5. ``None`` or a
+    pre-migration DB leaves the SQL byte-identical to the global path.
     """
     from scripts.core.db.embedding_service import EmbeddingService
     from scripts.core.db.postgres_pool import get_pool, init_pgvector
@@ -693,9 +761,6 @@ async def search_learnings_hybrid_rrf(
         except Exception:
             logger.debug("Query expansion failed, using original", exc_info=True)
 
-    rrf_cte = build_rrf_cte(chain_filter=True, use_tsquery=use_tsquery)
-    rrf_cte_plain = build_rrf_cte(chain_filter=False, use_tsquery=use_tsquery)
-
     has_decay_columns = True
 
     async def _fetch_all(conn: Any, has_project: bool) -> list[Any]:
@@ -710,44 +775,66 @@ async def search_learnings_hybrid_rrf(
         )
         boost = _recall_cfg.recall_boost_multiplier
         embedding_str = str(query_embedding)
-        boosted_args = (text_query, embedding_str, rrf_k, k * 2, boost)
-        plain_args = (text_query, embedding_str, rrf_k, k * 2)
+
+        # Project scoping (issue #139): the predicate lives in the CTE
+        # subqueries, bound after the tail's params. The boosted tail's
+        # last positional is $5 (project -> $6); the plain tail's is $4
+        # (project -> $5). When unscoped, both filters are "" and the
+        # *_scoped CTEs equal the plain CTEs — byte-identical default path.
+        boosted_pf = project_filter_clause(
+            project, has_project=has_project, param_index=6,
+        )
+        plain_pf = project_filter_clause(
+            project, has_project=has_project, param_index=5,
+        )
+
+        def _cte(*, chain: bool, ts: bool, pf: str) -> str:
+            return build_rrf_cte(chain_filter=chain, use_tsquery=ts, project_filter=pf)
+
+        # Append the project value to the args only when a filter is active.
+        boosted_extra = (project,) if boosted_pf else ()
+        plain_extra = (project,) if plain_pf else ()
+        boosted_args = (text_query, embedding_str, rrf_k, k * 2, boost, *boosted_extra)
+        plain_args = (text_query, embedding_str, rrf_k, k * 2, *plain_extra)
+
+        cte_boosted = _cte(chain=True, ts=use_tsquery, pf=boosted_pf)
+        cte_plain_args = _cte(chain=True, ts=use_tsquery, pf=plain_pf)
+        cte_plain_nochain = _cte(chain=False, ts=use_tsquery, pf=plain_pf)
 
         try:
-            rows = await conn.fetch(rrf_cte + boosted_tail, *boosted_args)
+            rows = await conn.fetch(cte_boosted + boosted_tail, *boosted_args)
         except Exception as exc:
             if _is_project_capability_error(exc):
                 raise
             logger.debug("RRF boosted+chain fallback", exc_info=True)
             has_decay_columns = False
             try:
-                rows = await conn.fetch(rrf_cte + plain_tail, *plain_args)
+                rows = await conn.fetch(cte_plain_args + plain_tail, *plain_args)
             except Exception as exc:
                 if _is_project_capability_error(exc):
                     raise
                 logger.debug("RRF plain+chain fallback", exc_info=True)
                 rows = await conn.fetch(
-                    rrf_cte_plain + plain_tail, *plain_args,
+                    cte_plain_nochain + plain_tail, *plain_args,
                 )
 
         if not rows and use_tsquery:
             logger.debug("Expanded tsquery returned no results, falling back to plainto_tsquery")
-            plain_cte = build_rrf_cte(chain_filter=True, use_tsquery=False)
-            fb_boosted = (query, embedding_str, rrf_k, k * 2, boost)
-            fb_plain = (query, embedding_str, rrf_k, k * 2)
+            fb_boosted = (query, embedding_str, rrf_k, k * 2, boost, *boosted_extra)
+            fb_plain = (query, embedding_str, rrf_k, k * 2, *plain_extra)
+            fb_cte_boosted = _cte(chain=True, ts=False, pf=boosted_pf)
+            fb_cte_plain = _cte(chain=True, ts=False, pf=plain_pf)
             try:
                 if has_decay_columns:
-                    rows = await conn.fetch(plain_cte + boosted_tail, *fb_boosted)
+                    rows = await conn.fetch(fb_cte_boosted + boosted_tail, *fb_boosted)
                 else:
-                    rows = await conn.fetch(plain_cte + plain_tail, *fb_plain)
+                    rows = await conn.fetch(fb_cte_plain + plain_tail, *fb_plain)
             except Exception as exc:
                 if _is_project_capability_error(exc):
                     raise
                 logger.debug("plainto_tsquery chain fallback", exc_info=True)
                 try:
-                    no_chain_cte = build_rrf_cte(
-                        chain_filter=False, use_tsquery=False,
-                    )
+                    no_chain_cte = _cte(chain=False, ts=False, pf=plain_pf)
                     rows = await conn.fetch(
                         no_chain_cte + plain_tail, *fb_plain,
                     )
@@ -787,8 +874,16 @@ async def search_learnings_postgres(
     text_fallback: bool = True,
     similarity_threshold: float = 0.0,
     recency_weight: float = 0.0,
+    *,
+    project: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Search learnings using PostgreSQL (vector similarity or text fallback)."""
+    """Search learnings using PostgreSQL (vector similarity or text fallback).
+
+    ``project`` (issue #139) scopes the fetch to one project. The clause is
+    bound as the last positional arg (its index is derived from each
+    branch's base arg count); ``None`` or a pre-migration DB leaves the SQL
+    byte-identical to the global path.
+    """
     from scripts.core.db.embedding_service import EmbeddingService
     from scripts.core.db.postgres_pool import get_pool
 
@@ -838,17 +933,25 @@ async def search_learnings_postgres(
         args: tuple[Any, ...],
         label: str,
     ) -> list[Any]:
+        pf = project_filter_clause(
+            project, has_project=has_project, param_index=len(args) + 1,
+        )
+        scoped_args = (*args, project) if pf else args
+
         def _sql(chain_filter: str) -> str:
             return render_recall_sql(
-                template, include_project=has_project, chain_filter=chain_filter,
+                template,
+                include_project=has_project,
+                chain_filter=chain_filter,
+                project_filter=pf,
             )
         try:
-            return await conn.fetch(_sql("AND superseded_by IS NULL"), *args)
+            return await conn.fetch(_sql("AND superseded_by IS NULL"), *scoped_args)
         except Exception as exc:
             if _is_project_capability_error(exc):
                 raise
             logger.debug("Chain filter fallback in postgres %s", label, exc_info=True)
-            return await conn.fetch(_sql(""), *args)
+            return await conn.fetch(_sql(""), *scoped_args)
 
     async def _fetch_branch(
         conn: Any, template: str, has_project: bool,

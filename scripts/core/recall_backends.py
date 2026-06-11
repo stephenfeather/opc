@@ -650,26 +650,6 @@ _EMBEDDING_MODEL_COLUMN_PROBE_SQL = (
     "SELECT embedding_model FROM archival_memory LIMIT 0"
 )
 
-_EMBEDDING_MODEL_COLUMN_ERROR_RE = re.compile(
-    r'column\s+"?(?:[\w]+\.)?"?embedding_model"?\s+does not exist',
-    re.IGNORECASE,
-)
-
-
-def _is_embedding_model_capability_error(exc: BaseException) -> bool:
-    """True only when exc says the embedding_model column (or table) lacks."""
-    errors = _missing_relation_errors()
-    if not errors or not isinstance(exc, errors):
-        return False
-    try:
-        from asyncpg.exceptions import UndefinedTableError
-    except ImportError:  # pragma: no cover - asyncpg absent
-        return False
-    if isinstance(exc, UndefinedTableError):
-        return True
-    return bool(_EMBEDDING_MODEL_COLUMN_ERROR_RE.search(str(exc)))
-
-
 def reset_embedding_model_column_cache() -> None:
     """Clear the cached embedding_model capability probe (test isolation)."""
     global _embedding_model_column_cache

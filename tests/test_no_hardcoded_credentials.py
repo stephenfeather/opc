@@ -27,6 +27,7 @@ changes cannot silently reintroduce a hardcoded fallback URL.
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -110,10 +111,14 @@ _ALLOWED_MATCHES = frozenset({
 })
 
 
-def _scan_paths() -> list[Path]:
-    """Return files to scan, excluding exempted directories and files."""
-    paths: list[Path] = []
-    for path in _REPO_ROOT.rglob("*"):
+def _apply_filters(paths: list[Path]) -> list[Path]:
+    """Apply exemption filters and extension checks to a list of candidate paths.
+
+    Shared by both the git-backed and the rglob fallback path so filtering
+    logic is defined exactly once.
+    """
+    result: list[Path] = []
+    for path in paths:
         if not path.is_file():
             continue
         if path in _EXEMPT_FILES:
@@ -144,8 +149,48 @@ def _scan_paths() -> list[Path]:
             # unless they match a known filename — none for this project.
             if not path.suffix:
                 continue
-        paths.append(path)
-    return paths
+        result.append(path)
+    return result
+
+
+def _rglob_paths() -> list[Path]:
+    """Fallback: return candidate files via filesystem walk (rglob).
+
+    Used when git is unavailable or the git command fails.
+    """
+    return _apply_filters(list(_REPO_ROOT.rglob("*")))
+
+
+def _scan_paths() -> list[Path]:
+    """Return files to scan, excluding exempted directories and gitignored paths.
+
+    Uses ``git ls-files --cached --others --exclude-standard`` so that gitignored
+    local state (e.g. .claude/cache/ agent output files that may contain a dev DSN)
+    is never included in the scan, making results machine-independent (issue #133).
+
+    Tracked files plus untracked-but-not-gitignored files are both included so
+    a NEW file containing a credential is still caught before it is committed.
+
+    Falls back to an rglob walk if git is unavailable or the command fails, so
+    the guard never silently disappears in unusual environments.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+            cwd=_REPO_ROOT,
+            check=True,
+            capture_output=True,
+        )
+        # -z gives NUL-separated entries; robust to filenames with spaces/newlines.
+        raw_paths = result.stdout.decode("utf-8").split("\0")
+        candidates = [
+            _REPO_ROOT / p for p in raw_paths if p  # filter trailing empty string
+        ]
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        # git unavailable or not a git repo — fall back to filesystem walk.
+        return _rglob_paths()
+
+    return _apply_filters(candidates)
 
 
 def test_no_hardcoded_credential_literal_in_code():
@@ -212,3 +257,32 @@ def test_scan_covers_expected_paths():
     }
     missing = expected - scanned
     assert not missing, f"Walker missed expected files: {missing}"
+
+
+def test_scan_excludes_gitignored_paths():
+    """Gitignored local caches must not appear in the scan (issue #133).
+
+    A stale agent-cache file under .claude/ (which is gitignored) was being
+    picked up by the rglob walker, causing machine-dependent false positives
+    when that file happened to contain a dev DSN.
+    """
+    sentinel = _REPO_ROOT / ".claude" / "cache" / "test_issue133_sentinel.md"
+    sentinel.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        sentinel.write_text(
+            "sentinel for issue #133\npostgresql://fake:fakepw@localhost/db\n",
+            encoding="utf-8",
+        )
+        scanned = {p.relative_to(_REPO_ROOT) for p in _scan_paths()}
+        assert sentinel.relative_to(_REPO_ROOT) not in scanned, (
+            "Gitignored sentinel file was included in scan — "
+            "_scan_paths() must exclude gitignored paths (issue #133)"
+        )
+    finally:
+        sentinel.unlink(missing_ok=True)
+        # Best-effort cleanup of created directories (ignore if non-empty).
+        for parent in (sentinel.parent, sentinel.parent.parent):
+            try:
+                parent.rmdir()
+            except OSError:
+                pass

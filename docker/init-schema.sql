@@ -190,6 +190,21 @@ CREATE INDEX IF NOT EXISTS idx_feedback_created ON memory_feedback(created_at DE
 CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_unique_per_session
     ON memory_feedback(learning_id, session_id);
 
+-- Recall Log: Append-only per-recall-event log (issue #140). One row per
+-- recall event with parallel arrays of the recalled rows' ids and projects,
+-- so cross-project mis-scope frequency (issue #130) is measurable. Never
+-- stores raw query text (privacy). See scripts/migrations/add_recall_log.sql.
+CREATE TABLE IF NOT EXISTS recall_log (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    caller_project TEXT,                 -- canonicalized; NULL = no project context
+    recalled_ids UUID[] NOT NULL,
+    recalled_projects TEXT[] NOT NULL,   -- NULL elements = unattributed memories
+    result_count INTEGER NOT NULL,
+    source TEXT,                         -- short caller label (hook|mcp|cli); NULL = unknown
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_recall_log_created ON recall_log(created_at DESC);
+
 -- Backfill Log: Track extraction attempts by S3 UUID so sessions without
 -- a DB row in `sessions` still get marked and aren't re-processed.
 CREATE TABLE IF NOT EXISTS backfill_log (

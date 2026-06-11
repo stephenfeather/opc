@@ -22,7 +22,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts.core.recall_learnings import record_recall  # noqa: E402
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -61,7 +60,7 @@ class TestRecordRecall:
     """Tests for the record_recall write-back function."""
 
     async def test_updates_recalled_rows(self, mock_pool):
-        """record_recall calls UPDATE with the given IDs."""
+        """record_recall runs the counter UPDATE (RETURNING id, project) with the IDs."""
         pool, conn = mock_pool
         ids = [str(uuid.uuid4()), str(uuid.uuid4())]
 
@@ -69,11 +68,13 @@ class TestRecordRecall:
              patch("scripts.core.db.postgres_pool.get_pool", return_value=pool):
             await record_recall(ids)
 
-        conn.execute.assert_called_once()
-        call_args = conn.execute.call_args
+        # The counter UPDATE now runs via fetch() with RETURNING (issue #140).
+        conn.fetch.assert_called_once()
+        call_args = conn.fetch.call_args
         sql = call_args[0][0]
         assert "recall_count = recall_count + 1" in sql
         assert "last_recalled = NOW()" in sql
+        assert "RETURNING id, project" in sql
         assert call_args[0][1] == ids
 
     async def test_skips_empty_ids(self, mock_pool):
@@ -84,6 +85,7 @@ class TestRecordRecall:
              patch("scripts.core.db.postgres_pool.get_pool", return_value=pool):
             await record_recall([])
 
+        conn.fetch.assert_not_called()
         conn.execute.assert_not_called()
 
     async def test_skips_sqlite_backend(self, mock_pool):
@@ -94,18 +96,20 @@ class TestRecordRecall:
         with patch("scripts.core.recall_learnings.get_backend", return_value="sqlite"):
             await record_recall(ids)
 
+        conn.fetch.assert_not_called()
         conn.execute.assert_not_called()
 
     async def test_graceful_on_db_error(self, mock_pool):
         """record_recall doesn't raise on database errors."""
         pool, conn = mock_pool
-        conn.execute.side_effect = Exception("column does not exist")
+        conn.fetch.side_effect = Exception("column does not exist")
         ids = [str(uuid.uuid4())]
 
         with patch("scripts.core.recall_learnings.get_backend", return_value="postgres"), \
              patch("scripts.core.db.postgres_pool.get_pool", return_value=pool):
             # Should not raise
             await record_recall(ids)
+
 
 
 # ---------------------------------------------------------------------------

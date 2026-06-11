@@ -295,6 +295,20 @@ def resolve_project_scope(
     return project_from_path(project_dir or None)
 
 
+def resolve_caller_project(project: str | None, project_dir: str | None) -> str | None:
+    """Resolve the caller's canonical project for recall-event logging (#140).
+
+    Explicit ``--project`` wins (canonicalized); otherwise the project is
+    derived from ``project_dir`` (worktree-aware ``project_from_path``).
+    Returns ``None`` when neither yields a project. Unlike
+    ``resolve_project_scope``, this resolves unconditionally (no opt-in flag)
+    so every recall event can record who called it.
+    """
+    from scripts.core.project_naming import canonicalize_project, project_from_path
+
+    return canonicalize_project(project) or project_from_path(project_dir or None)
+
+
 def resolve_search_params(
     *,
     backend: str,
@@ -403,16 +417,33 @@ def get_backend() -> str:
 # ---------------------------------------------------------------------------
 
 
-async def record_recall(result_ids: list[str]) -> None:
-    """Update last_recalled and recall_count for recalled learnings.
+async def record_recall(
+    result_ids: list[str],
+    caller_project: str | None = None,
+    source: str | None = None,
+) -> None:
+    """Update last_recalled/recall_count and log the recall event (issue #140).
 
-    Batch-updates all returned results in a single query.
-    Fails silently to avoid breaking recall if columns don't exist yet.
+    Batch-updates all returned results in a single ``UPDATE ... RETURNING id,
+    project`` (point-in-time truth, zero extra round trips), then best-effort
+    appends one ``recall_log`` row with parallel ``recalled_ids`` /
+    ``recalled_projects`` arrays plus the caller's project and source label.
+
+    The INSERT is wrapped in its own try/except so a pre-migration DB (no
+    ``recall_log`` table) still gets the counter UPDATE committed — both run
+    as separate autocommitted statements in the same acquire, NOT a CTE or
+    transaction. The whole body never raises (recall must not break).
+
+    ``caller_project`` and ``source`` are accepted for SQLite parity but
+    unused there: SQLite has no project/log columns, so it skips entirely.
     """
     if not result_ids:
         return
 
     if get_backend() != "postgres":
+        logger.debug(
+            "record_recall: sqlite backend, skipping recall-event logging"
+        )
         return
 
     try:
@@ -420,15 +451,38 @@ async def record_recall(result_ids: list[str]) -> None:
 
         pool = await get_pool()
         async with pool.acquire() as conn:
-            await conn.execute(
+            rows = await conn.fetch(
                 """
                 UPDATE archival_memory
                 SET last_recalled = NOW(),
                     recall_count = recall_count + 1
                 WHERE id = ANY($1::uuid[])
+                RETURNING id, project
                 """,
                 result_ids,
             )
+            if not rows:
+                return
+
+            recalled_ids = [str(r["id"]) for r in rows]
+            recalled_projects = [r["project"] for r in rows]
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO recall_log (
+                        caller_project, recalled_ids, recalled_projects,
+                        result_count, source
+                    )
+                    VALUES ($1, $2, $3, $4, $5)
+                    """,
+                    caller_project,
+                    recalled_ids,
+                    recalled_projects,
+                    len(rows),
+                    source,
+                )
+            except Exception:
+                logger.debug("recall_log insert failed", exc_info=True)
     except Exception:
         pass
 
@@ -829,6 +883,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--structured", action="store_true", help="Group results by type")
+    parser.add_argument(
+        "--source",
+        help=(
+            "Short caller label for recall-event logging (e.g. hook|mcp|cli). "
+            "Label-only -- never prompt-derived text (issue #140)."
+        ),
+    )
     return parser
 
 
@@ -923,7 +984,14 @@ async def main() -> int:
 
     # Record recall (skip benchmarking mode)
     if not args.json_full:
-        await record_recall([r["id"] for r in results])
+        caller_project = resolve_caller_project(
+            args.project, os.environ.get("CLAUDE_PROJECT_DIR")
+        )
+        await record_recall(
+            [r["id"] for r in results],
+            caller_project=caller_project,
+            source=args.source,
+        )
 
     # Output
     print(_format_output(results, output_mode=output_mode, structured=args.structured))

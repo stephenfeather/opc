@@ -196,6 +196,14 @@ database that lacks the `project` column, the scoped pass is skipped and a
 single global fetch runs — no error. The SQLite cache backend has no project
 column and always degrades to a global fetch.
 
+### `--source`
+
+Short caller label recorded with each recall event in the `recall_log` table
+(issue #140), e.g. `hook`, `mcp`, or `cli`. Optional; defaults to `NULL`
+(unknown). **Label-only** — pass a fixed identifier for the call site, never
+prompt-derived or user text. No query text is ever logged (privacy). See the
+[Recall Event Log](#recall-event-log) section.
+
 ### `--provider` (default: local)
 
 Embedding provider. Choices: `local` (BGE), `voyage` (Voyage AI).
@@ -211,6 +219,59 @@ Embedding provider. Choices: `local` (BGE), `voyage` (Voyage AI).
 `--project-first` is orthogonal to the search mode: it changes the fetch-pool
 composition (own-project rows first, then a global fill) and applies to every
 PostgreSQL mode above. The SQLite backend ignores it and fetches globally.
+
+## Recall Event Log
+
+Every recall (except `--json-full` benchmarking) appends one row to the
+`recall_log` table (issue #140) so cross-project recall mis-scope frequency
+(issue #130) is measurable. The recalled rows' projects are captured
+point-in-time via `UPDATE archival_memory ... RETURNING id, project`, so no
+extra round trip is added.
+
+### Schema
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | `BIGINT` identity | Primary key |
+| `caller_project` | `TEXT` | Canonicalized caller project; `NULL` = no project context |
+| `recalled_ids` | `UUID[]` | Ids of the rows whose counters were bumped |
+| `recalled_projects` | `TEXT[]` | Parallel to `recalled_ids`; `NULL` elements = unattributed memories |
+| `result_count` | `INTEGER` | Number of recalled rows (length of the arrays) |
+| `source` | `TEXT` | Short caller label from `--source` (`hook`/`mcp`/`cli`); `NULL` = unknown |
+| `created_at` | `TIMESTAMPTZ` | Event time, defaults to `NOW()` |
+
+### Write semantics
+
+- **Skipped entirely** for `--json-full` (benchmark mode), the SQLite backend
+  (no project/log columns — logs a debug line and returns), and when the
+  counter UPDATE matches no rows (e.g. concurrently deleted ids).
+- **Best-effort:** the INSERT runs as a separate autocommitted statement after
+  the counter UPDATE (not a CTE or transaction). On a pre-migration DB that
+  lacks `recall_log`, the INSERT fails alone, is swallowed (debug log), and the
+  counter UPDATE still persists.
+- **Never raises:** the whole path is wrapped so recall can never break.
+- **No query text, ever:** only project labels, ids, a count, and a source
+  label are stored (privacy — see issue #139).
+
+### Mis-scope analysis (answers issue #130)
+
+```sql
+SELECT caller_project,
+       COUNT(*) AS recalled_rows,
+       COUNT(*) FILTER (WHERE rp IS NULL) AS unattributed_rows,
+       COUNT(*) FILTER (WHERE rp IS NOT NULL AND rp <> caller_project) AS mis_scoped_rows,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE rp IS NOT NULL AND rp <> caller_project) / COUNT(*), 1) AS mis_scope_pct
+FROM recall_log
+CROSS JOIN LATERAL unnest(recalled_projects) AS rp
+WHERE caller_project IS NOT NULL
+GROUP BY caller_project ORDER BY mis_scope_pct DESC;
+```
+
+Prune old events periodically, e.g.:
+
+```sql
+DELETE FROM recall_log WHERE created_at < NOW() - INTERVAL '90 days';
+```
 
 ## Error Response
 

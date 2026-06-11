@@ -631,6 +631,90 @@ async def project_column_available(conn: Any) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# embedding_model column capability probe (issue #151, round 1 FIX 1)
+#
+# The model filter (AND embedding_model = $N) and the explicit store-time
+# column write both assume the embedding_model column exists. On a
+# pre-migration DB it may not, so recall would raise UndefinedColumnError (a
+# hard failure, not degradation) and stores would fail. Mirror the #139
+# project-column probe: probe once, cache only definitive answers, and when
+# the column is absent bind model_label=None (filter off, SQL byte-identical
+# to the pre-#151 path). Apply scripts/migrations/add_embedding_hnsw.sql to
+# add the column.
+# ---------------------------------------------------------------------------
+
+_embedding_model_column_cache: bool | None = None
+
+_EMBEDDING_MODEL_COLUMN_PROBE_SQL = (
+    "SELECT embedding_model FROM archival_memory LIMIT 0"
+)
+
+_EMBEDDING_MODEL_COLUMN_ERROR_RE = re.compile(
+    r'column\s+"?(?:[\w]+\.)?"?embedding_model"?\s+does not exist',
+    re.IGNORECASE,
+)
+
+
+def _is_embedding_model_capability_error(exc: BaseException) -> bool:
+    """True only when exc says the embedding_model column (or table) lacks."""
+    errors = _missing_relation_errors()
+    if not errors or not isinstance(exc, errors):
+        return False
+    try:
+        from asyncpg.exceptions import UndefinedTableError
+    except ImportError:  # pragma: no cover - asyncpg absent
+        return False
+    if isinstance(exc, UndefinedTableError):
+        return True
+    return bool(_EMBEDDING_MODEL_COLUMN_ERROR_RE.search(str(exc)))
+
+
+def reset_embedding_model_column_cache() -> None:
+    """Clear the cached embedding_model capability probe (test isolation)."""
+    global _embedding_model_column_cache
+    _embedding_model_column_cache = None
+
+
+def _set_embedding_model_column_cache_for_tests(value: bool | None) -> None:
+    """Force the embedding_model probe cache to a value (test-only)."""
+    global _embedding_model_column_cache
+    _embedding_model_column_cache = value
+
+
+async def embedding_model_column_available(conn: Any) -> bool:
+    """Check (once per process) whether archival_memory.embedding_model exists.
+
+    Only definitive answers are cached. A transient probe failure degrades
+    THIS call to the unfiltered (pre-#151) path but leaves the cache unset so
+    the next recall retries — one hiccup must not disable the model filter for
+    the process lifetime.
+    """
+    global _embedding_model_column_cache
+    if _embedding_model_column_cache is not None:
+        return _embedding_model_column_cache
+    try:
+        await conn.fetch(_EMBEDDING_MODEL_COLUMN_PROBE_SQL)
+    except _missing_relation_errors():
+        logger.warning(
+            "archival_memory.embedding_model column missing — recall/store "
+            "running in degraded unfiltered mode (cross-space recall not "
+            "prevented, issue #151). Apply "
+            "scripts/migrations/add_embedding_hnsw.sql to enable."
+        )
+        _embedding_model_column_cache = False
+        return False
+    except Exception:
+        logger.warning(
+            "embedding_model column probe failed transiently; degrading this "
+            "recall to unfiltered SQL and retrying the probe on the next call",
+            exc_info=True,
+        )
+        return False
+    _embedding_model_column_cache = True
+    return True
+
+
 async def search_learnings_text_only_postgres(
     query: str, k: int = _recall_cfg.default_k, *, project: str | None = None,
 ) -> list[dict[str, Any]]:
@@ -868,6 +952,16 @@ async def search_learnings_hybrid_rrf(
                 await embedder.aclose()
             except Exception:  # noqa: BLE001 - cleanup is best-effort
                 logger.debug("embedder close failed", exc_info=True)
+
+    # FIX 1 (issue #151): probe the embedding_model column once up front. On a
+    # pre-migration DB drop the model filter everywhere downstream (query
+    # expansion neighbors and both vector legs) so recall degrades to the
+    # byte-identical pre-#151 SQL instead of raising UndefinedColumnError. The
+    # probe result is cached, so the later pool.acquire() reuses it for free.
+    if model_label is not None:
+        async with pool.acquire() as probe_conn:
+            if not await embedding_model_column_available(probe_conn):
+                model_label = None
 
     text_query = query
     use_tsquery = False
@@ -1132,6 +1226,10 @@ async def search_learnings_postgres(
             from scripts.core.db.postgres_pool import init_pgvector
             await init_pgvector(conn)
             has_project = await project_column_available(conn)
+            # FIX 1 (issue #151): no model filter on a pre-migration DB —
+            # degrade to the byte-identical pre-#151 SQL, never raise.
+            if model_label is not None and not await embedding_model_column_available(conn):
+                model_label = None
 
             if recency_weight > 0:
                 rows = await _fetch_branch(

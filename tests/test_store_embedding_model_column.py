@@ -29,6 +29,10 @@ class TestStoreWritesEmbeddingModelColumn:
         ), patch(
             "scripts.core.db.memory_service_pg.init_pgvector",
             AsyncMock(),
+        ), patch(
+            "scripts.core.db.memory_service_pg."
+            "embedding_model_column_available",
+            AsyncMock(return_value=True),
         ):
             await svc.store(
                 "fact",

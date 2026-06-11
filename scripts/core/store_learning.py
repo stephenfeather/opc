@@ -683,18 +683,27 @@ async def store_learning_v2(
         # 'bge' column default and mislabeling rows.
         embedding_model = getattr(embedder, "model_label", None)
 
-        # Semantic dedup check
+        # Semantic dedup check. FIX 2 (issue #151): pin the dedup probe to the
+        # SAME embedding space that will be written with the row, so a new
+        # voyage embedding is compared only against voyage rows. Without this,
+        # during the split-corpus state a spurious cross-space match would
+        # silently SKIP the write (data loss). Only postgres carries the label
+        # and the embedding_model column.
+        dedup_model = embedding_model if backend == "postgres" else None
         threshold = _dedup_threshold()
         try:
             if hasattr(memory, "search_vector_global"):
                 existing = await memory.search_vector_global(
-                    embedding, threshold=threshold, limit=1
+                    embedding, threshold=threshold, limit=1,
+                    embedding_model=dedup_model,
                 )
             else:
                 logger.debug(
                     "search_vector_global unavailable, using session-scoped dedup"
                 )
-                existing = await memory.search_vector(embedding, limit=1)
+                existing = await memory.search_vector(
+                    embedding, limit=1, embedding_model=dedup_model,
+                )
 
             dedup = check_dedup_result(
                 existing=existing, threshold=threshold, default_session=session_id

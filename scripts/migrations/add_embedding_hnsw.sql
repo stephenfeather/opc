@@ -43,6 +43,19 @@
 -- space, a partial index `WHERE embedding_model = 'voyage-code-3'` is
 -- marginally tighter, but for ~6k rows the global index below is sufficient.
 
+-- STEP 1 (issue #151, round 1 FIX 1): ensure the embedding_model column
+-- exists BEFORE anything filters on it. The recall model filter
+-- (AND embedding_model = $N) and the explicit store-time column write both
+-- key on this column; on a pre-migration DB the runtime degrades to
+-- unfiltered SQL, but applying this ADD COLUMN turns the filter on. The
+-- DEFAULT matches docker/init-schema.sql so existing rows are labeled 'bge'
+-- (the historical space) until re-embedded. IF NOT EXISTS keeps reruns
+-- idempotent; this is a plain (non-CONCURRENT) ALTER and so may run inside
+-- the same psql -f invocation as the index build below.
+ALTER TABLE archival_memory
+    ADD COLUMN IF NOT EXISTS embedding_model TEXT DEFAULT 'bge';
+
+-- STEP 2: the HNSW index itself.
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_archival_embedding_hnsw
     ON archival_memory
     USING hnsw(embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);

@@ -57,6 +57,11 @@ logger = logging.getLogger(__name__)
 # Load config defaults for search methods.
 from scripts.core.config import get_config as _get_config
 
+# Capability probe for the embedding_model column (issue #151, round 1 FIX 1).
+# Deferred import (matches the config import above) and circular-safe:
+# recall_backends does not import this module.
+from scripts.core.recall_backends import embedding_model_column_available
+
 _recall_cfg = _get_config().recall
 _db_cfg = _get_config().database
 
@@ -288,7 +293,13 @@ class MemoryServicePG:
                 await init_pgvector(conn)
                 # Issue #151: bind embedding_model explicitly so the recall
                 # filter keys on the real space. Omit the column when no label
-                # is provided so the DB default ('bge') still applies.
+                # is provided so the DB default ('bge') still applies. FIX 1
+                # (round 1): on a pre-migration DB the column may not exist —
+                # probe and skip the explicit bind so the legacy INSERT shape
+                # still works instead of raising UndefinedColumnError.
+                write_model = bool(embedding_model)
+                if write_model and not await embedding_model_column_available(conn):
+                    write_model = False
                 base_cols = (
                     "id, session_id, agent_id, content, "
                     "metadata, embedding, content_hash, host_id, project"
@@ -304,8 +315,8 @@ class MemoryServicePG:
                     host_id,
                     project,
                 ]
-                model_col = ", embedding_model" if embedding_model else ""
-                model_val = [embedding_model] if embedding_model else []
+                model_col = ", embedding_model" if write_model else ""
+                model_val = [embedding_model] if write_model else []
                 if source_time is not None:
                     cols = f"{base_cols}{model_col}, created_at"
                     vals = [*base_vals, *model_val, source_time]
@@ -424,17 +435,27 @@ class MemoryServicePG:
         limit: int = _recall_cfg.default_search_limit,
         start_date: datetime | None = None,
         end_date: datetime | None = None,
+        embedding_model: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Search archival memory with vector similarity."""
+        """Search archival memory with vector similarity.
+
+        ``embedding_model`` (issue #151, round 1 FIX 2): the session-scoped
+        dedup fallback pins to one space, mirroring search_vector_global. The
+        capability probe drops the filter on a pre-migration DB.
+        """
         has_col = await self._check_superseded_column()
         padded_query = pad_embedding(query_embedding)
-        sql, params = build_vector_search_sql(
-            self.session_id, self.agent_id, padded_query, limit,
-            start_date=start_date, end_date=end_date,
-            include_active_filter=has_col,
-        )
         async with get_connection() as conn:
             await init_pgvector(conn)
+            model_label = embedding_model
+            if model_label and not await embedding_model_column_available(conn):
+                model_label = None
+            sql, params = build_vector_search_sql(
+                self.session_id, self.agent_id, padded_query, limit,
+                start_date=start_date, end_date=end_date,
+                include_active_filter=has_col,
+                embedding_model=model_label,
+            )
             rows = await conn.fetch(sql, *params)
             return format_rows(rows, extra_fields=["similarity"])
 
@@ -506,13 +527,28 @@ class MemoryServicePG:
         query_embedding: list[float],
         threshold: float = 0.92,
         limit: int = 5,
+        embedding_model: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Search archival memory globally (all sessions) with similarity threshold."""
+        """Search archival memory globally (all sessions) with similarity threshold.
+
+        ``embedding_model`` (issue #151, round 1 FIX 2): when supplied, the
+        cross-session search — used by store-time semantic dedup — is pinned
+        to the same embedding space that will be written with the row, so a
+        new voyage embedding is never compared against bge rows (a spurious
+        cross-space match would silently skip the write). The filter binds at
+        $4, after the existing $1/$2/$3. The capability probe drops the filter
+        on a pre-migration DB so the SQL stays byte-identical to pre-#151.
+        """
         has_col = await self._check_superseded_column()
         active_filter = f"AND {ACTIVE_ROW_FILTER}" if has_col else ""
         padded_query = pad_embedding(query_embedding)
+        params: list[Any] = [padded_query, threshold, limit]
         async with get_connection() as conn:
             await init_pgvector(conn)
+            model_filter = ""
+            if embedding_model and await embedding_model_column_available(conn):
+                model_filter = f"AND embedding_model = ${len(params) + 1}"
+                params.append(embedding_model)
             rows = await conn.fetch(
                 f"""
                 SELECT id, session_id, content, metadata, created_at,
@@ -521,10 +557,11 @@ class MemoryServicePG:
                 WHERE embedding IS NOT NULL
                 {active_filter}
                 AND (1 - (embedding <=> $1::vector)) >= $2
+                {model_filter}
                 ORDER BY embedding <=> $1::vector
                 LIMIT $3
                 """,
-                padded_query, threshold, limit,
+                *params,
             )
             return format_rows(
                 rows, extra_fields=["session_id", "similarity"]

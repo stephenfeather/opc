@@ -750,8 +750,13 @@ async def search_learnings_hybrid_rrf(
 
     pool = await get_pool()
 
-    embedder = EmbeddingService(provider=provider)
+    # embedder is constructed inside the guarded try so that constructor
+    # failures (e.g. VoyageEmbeddingProvider raising when VOYAGE_API_KEY is
+    # absent, or a local model load error) degrade like embed() failures
+    # rather than bypassing the fallback (review round 1).
+    embedder: EmbeddingService | None = None
     try:
+        embedder = EmbeddingService(provider=provider)
         query_embedding = await embedder.embed(query, input_type="query")
     except Exception as exc:  # noqa: BLE001 - degrade, do not crash recall
         # Issue #53: the memory-awareness hook now calls hybrid (no
@@ -777,7 +782,8 @@ async def search_learnings_hybrid_rrf(
             query, k, project=project,
         )
     finally:
-        await embedder.aclose()
+        if embedder is not None:
+            await embedder.aclose()
 
     text_query = query
     use_tsquery = False

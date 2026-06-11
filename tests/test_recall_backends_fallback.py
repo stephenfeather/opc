@@ -44,6 +44,20 @@ class _OkEmbedder:
     async def aclose(self) -> None: ...
 
 
+class _ConstructRaisingEmbedder:
+    """EmbeddingService stand-in whose __init__ raises (e.g. Voyage with no
+    VOYAGE_API_KEY, or a local model load error during construction)."""
+
+    def __init__(self, *a: Any, **kw: Any) -> None:
+        raise ValueError(
+            "VOYAGE_API_KEY environment variable required "
+            "(postgresql://user:secret@dbhost:5432/memdb)"
+        )
+
+    async def aclose(self) -> None:  # pragma: no cover - never constructed
+        raise AssertionError("aclose must not run when __init__ failed")
+
+
 def _patch_embedder(monkeypatch, embedder_cls: type) -> None:
     import scripts.core.db.embedding_service as emb_mod
 
@@ -197,3 +211,77 @@ class TestHybridEmbedFallback:
         assert set(degraded[0].keys()) == set(_TEXT_RESULT.keys())
         for rrf_only in ("fts_rank", "vec_rank", "raw_rrf_score"):
             assert rrf_only not in degraded[0]
+
+    async def test_constructor_failure_returns_text_only_results(self, monkeypatch):
+        """Round 1 fix: EmbeddingService(...) construction failure (e.g. Voyage
+        with no key) is guarded too — degrade to text-only, no aclose crash."""
+        from scripts.core import recall_backends as rb
+
+        _patch_embedder(monkeypatch, _ConstructRaisingEmbedder)
+        _patch_pool(monkeypatch)
+
+        captured: dict[str, Any] = {}
+
+        async def fake_text_only(query, k=10, *, project=None):
+            captured["query"] = query
+            captured["k"] = k
+            captured["project"] = project
+            return [dict(_TEXT_RESULT)]
+
+        monkeypatch.setattr(rb, "search_learnings_text_only_postgres", fake_text_only)
+
+        results = await rb.search_learnings_hybrid_rrf(
+            "what time is it", k=3, project="opc",
+        )
+
+        assert results == [dict(_TEXT_RESULT)]
+        assert captured == {"query": "what time is it", "k": 3, "project": "opc"}
+
+    async def test_constructor_failure_emits_redacted_warning(self, monkeypatch, capsys):
+        from scripts.core import recall_backends as rb
+
+        _patch_embedder(monkeypatch, _ConstructRaisingEmbedder)
+        _patch_pool(monkeypatch)
+
+        async def fake_text_only(query, k=10, *, project=None):
+            return [dict(_TEXT_RESULT)]
+
+        monkeypatch.setattr(rb, "search_learnings_text_only_postgres", fake_text_only)
+
+        await rb.search_learnings_hybrid_rrf("secret query phrase", k=3)
+
+        err = capsys.readouterr().err
+        assert "warning" in err.lower()
+        assert "text-only" in err.lower()
+        # DSN credentials embedded in the constructor error are redacted.
+        assert "secret" not in err
+        assert "user:secret@" not in err
+        # The query text is never echoed into the warning.
+        assert "secret query phrase" not in err
+
+    async def test_real_voyage_construction_without_key_degrades(
+        self, monkeypatch,
+    ):
+        """Hermetic constructor-path test against the REAL EmbeddingService:
+        provider='voyage' with VOYAGE_API_KEY unset raises ValueError in
+        __init__ (pure env check, no network/model deps), which the guard
+        must catch and degrade to text-only.
+
+        VoyageEmbeddingProvider.__init__ only reads os.environ and constructs
+        an httpx client lazily after the key check — so this needs no API call
+        and no model download. The text-only backend is patched, so no DB.
+        """
+        from scripts.core import recall_backends as rb
+
+        monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+        _patch_pool(monkeypatch)
+
+        async def fake_text_only(query, k=10, *, project=None):
+            return [dict(_TEXT_RESULT)]
+
+        monkeypatch.setattr(rb, "search_learnings_text_only_postgres", fake_text_only)
+
+        results = await rb.search_learnings_hybrid_rrf(
+            "query terms", k=3, provider="voyage",
+        )
+        assert results == [dict(_TEXT_RESULT)]

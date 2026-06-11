@@ -269,13 +269,22 @@ _SOURCE_TIME_MAX_FUTURE_SKEW = timedelta(minutes=5)
 def resolve_source_time(arg: str | None, env: dict[str, str]) -> str | None:
     """Resolve the raw source-time string from CLI arg or env fallback.
 
-    Pure function. The ``--source-time`` flag wins; otherwise fall back to
-    ``CLAUDE_SOURCE_TIME`` (injected by backfill pipelines into the extractor
-    subprocess env, since the memory-extractor agent calls this script itself
-    and cannot be made to pass the flag). Returns None when neither is set.
+    Pure function. The ``--source-time`` flag is for explicit operator use and
+    is trusted unconditionally -- it wins whenever present. The
+    ``CLAUDE_SOURCE_TIME`` env fallback exists so the memory-extractor agent
+    (a headless ``claude -p`` subprocess that calls this script itself and
+    cannot be made to pass the flag) can stamp the source session time. That
+    fallback is trusted ONLY inside the extraction subprocess, identified by
+    the ``CLAUDE_MEMORY_EXTRACTION=1`` marker the backfill pipeline injects
+    alongside the computed source time. Without the marker an ambient or
+    user-set ``CLAUDE_SOURCE_TIME`` is ignored, so a stale value cannot
+    silently backdate a live store (issue #52, trust boundary). Returns None
+    when neither a flag nor a marker-gated env value is available.
     """
     if arg:
         return arg
+    if env.get("CLAUDE_MEMORY_EXTRACTION") != "1":
+        return None
     env_val = env.get("CLAUDE_SOURCE_TIME")
     return env_val or None
 

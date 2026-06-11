@@ -79,11 +79,18 @@ def parse_s3_listing(
         if project_filter and project_filter not in project:
             continue
 
-        sessions.append({
-            "s3_key": f"s3://{bucket}/{key}",
-            "uuid": uuid,
-            "project": project,
-        })
+        # Issue #52: preserve the S3 object LastModified ("DATE TIME" in the
+        # first two fields) as a trusted source-time fallback. It is the
+        # archive write time, which approximates the original session time --
+        # unlike the freshly-downloaded temp file's mtime (extraction time).
+        sessions.append(
+            {
+                "s3_key": f"s3://{bucket}/{key}",
+                "uuid": uuid,
+                "project": project,
+                "s3_last_modified": _parse_s3_timestamp(parts[0], parts[1]),
+            }
+        )
 
     return sessions
 
@@ -151,6 +158,11 @@ def build_extraction_env(
     env["CLAUDE_MEMORY_EXTRACTION"] = "1"
     if project_dir:
         env["CLAUDE_PROJECT_DIR"] = project_dir
+    # Fix 2 (trust boundary): never pass through an inherited/ambient
+    # CLAUDE_SOURCE_TIME. Drop it first, then inject ONLY the computed value
+    # (if any). Injection is idempotent -- the child sees the daemon-owned
+    # value or nothing, never a stale parent-shell value.
+    env.pop("CLAUDE_SOURCE_TIME", None)
     if source_time is not None:
         env["CLAUDE_SOURCE_TIME"] = source_time.isoformat()
     return env
@@ -325,6 +337,29 @@ def lookup_session_id(uuid: str, conn) -> str | None:
         return None
 
 
+def lookup_session_exited_at(uuid: str, conn) -> datetime | None:
+    """Look up sessions.exited_at for a backfilled session (issue #52).
+
+    Returns the recorded session end time (the most authoritative source-time)
+    or None when the row/column is absent. Failures degrade gracefully so the
+    caller falls back to the S3 LastModified provenance.
+    """
+    if not _is_valid_uuid(uuid):
+        return None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT exited_at FROM sessions WHERE transcript_path LIKE %s LIMIT 1",
+            (f"%{uuid}%",),
+        )
+        row = cur.fetchone()
+        return row[0] if row and row[0] else None
+    except Exception as e:
+        _log(f"exited_at lookup failed for {safe(uuid)}: {safe(e)}")
+        conn.rollback()
+        return None
+
+
 def is_session_extracted(uuid: str, conn) -> bool:
     """Check if this session UUID has a terminal-success or in-progress row.
 
@@ -429,10 +464,48 @@ def download_and_decompress(
     return jsonl_path
 
 
+def _parse_s3_timestamp(date_str: str, time_str: str) -> datetime | None:
+    """Parse the ``aws s3 ls`` "DATE TIME" fields into an aware UTC datetime.
+
+    Pure function. ``aws s3 ls`` emits UTC timestamps. Returns None on any
+    parse failure so a malformed listing degrades to the next provenance
+    source rather than crashing the backfill.
+    """
+    try:
+        return datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=UTC
+        )
+    except (ValueError, TypeError):
+        return None
+
+
+def resolve_backfill_source_time(
+    *,
+    exited_at: datetime | None,
+    s3_last_modified: datetime | None,
+    local_mtime: datetime | None,
+) -> datetime | None:
+    """Choose the most trustworthy source session time (issue #52).
+
+    Pure function. Preference order, most-to-least authoritative:
+      1. ``sessions.exited_at`` -- the recorded session end time (JSONL mtime
+         captured at archive time by backfill_sessions.py).
+      2. S3 object LastModified -- the archive write time.
+      3. local JSONL mtime -- LAST resort; only meaningful for already-local
+         files where mtime IS the session time, never for freshly-downloaded
+         temp files (whose mtime is extraction time, the issue #52 bug).
+    Returns None when no source is available (store keeps the DB default).
+    """
+    return exited_at or s3_last_modified or local_mtime
+
+
 def _jsonl_source_time(jsonl_path: Path) -> datetime | None:
     """Return the JSONL file mtime as an aware UTC datetime, or None on error.
 
-    Used as the source session time for created_at stamping (issue #52).
+    Used only as the LAST-resort provenance source (issue #52). NOTE: for the
+    S3 backfill path the JSONL is a freshly-downloaded temp file whose mtime is
+    extraction time, NOT session time -- callers there must prefer
+    ``sessions.exited_at`` / S3 LastModified via resolve_backfill_source_time.
     """
     try:
         return datetime.fromtimestamp(jsonl_path.stat().st_mtime, tz=UTC)
@@ -448,13 +521,17 @@ def run_extraction(
     max_turns: int,
     timeout: int,
     project_dir: str | None,
+    source_time: datetime | None = None,
 ) -> dict:
-    """Run headless extraction subprocess. Returns result dict with status."""
+    """Run headless extraction subprocess. Returns result dict with status.
+
+    ``source_time`` is the trusted origin timestamp for the session (resolved
+    by the caller from sessions.exited_at / S3 LastModified -- issue #52). It
+    is passed explicitly rather than derived from ``jsonl_path`` here because
+    in the S3 path ``jsonl_path`` is a freshly-downloaded temp file whose mtime
+    is extraction time, which would recreate the recency bias this fix removes.
+    """
     cmd = build_extraction_cmd(jsonl_path, session_id, agent_prompt, model, max_turns)
-    # Issue #52: stamp created_at from the source session time. The downloaded
-    # JSONL's mtime approximates session end; if the stat fails, fall back to
-    # no override (default NOW()).
-    source_time = _jsonl_source_time(jsonl_path)
     env = build_extraction_env(project_dir, source_time=source_time)
 
     try:
@@ -521,8 +598,23 @@ def _process_one(
             }
 
         file_size = jsonl_path.stat().st_size
+        # Issue #52: trusted source time resolved on the main thread (DB
+        # exited_at + S3 LastModified). The temp JSONL's mtime is extraction
+        # time, so it is used only as a last resort inside the resolver.
+        source_time = resolve_backfill_source_time(
+            exited_at=session.get("exited_at"),
+            s3_last_modified=session.get("s3_last_modified"),
+            local_mtime=_jsonl_source_time(jsonl_path),
+        )
         extraction = run_extraction(
-            jsonl_path, session_id, agent_prompt, model, max_turns, timeout, project
+            jsonl_path,
+            session_id,
+            agent_prompt,
+            model,
+            max_turns,
+            timeout,
+            project,
+            source_time=source_time,
         )
         return {
             "uuid": uuid,
@@ -600,6 +692,10 @@ def main() -> int:
             continue
 
         session["session_id"] = effective_id
+        # Issue #52: attach the trusted session end time (when available) so
+        # the worker stamps created_at from it rather than the temp-file mtime.
+        if conn and db_session_id:
+            session["exited_at"] = lookup_session_exited_at(uuid, conn)
         to_process.append(session)
 
     _log(

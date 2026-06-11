@@ -94,12 +94,39 @@ class TestResolveSourceTime:
     """CLI flag takes precedence; env var is the fallback for agent subprocs."""
 
     def test_arg_wins_over_env(self) -> None:
+        # The --source-time flag is for explicit operator use and is trusted
+        # unconditionally; it wins even without the extraction marker.
+        env = {
+            "CLAUDE_SOURCE_TIME": "2020-01-01T00:00:00",
+            "CLAUDE_MEMORY_EXTRACTION": "1",
+        }
+        assert resolve_source_time("2026-01-01T00:00:00", env) == "2026-01-01T00:00:00"
+
+    def test_arg_wins_even_without_marker(self) -> None:
         env = {"CLAUDE_SOURCE_TIME": "2020-01-01T00:00:00"}
         assert resolve_source_time("2026-01-01T00:00:00", env) == "2026-01-01T00:00:00"
 
-    def test_env_used_when_arg_absent(self) -> None:
-        env = {"CLAUDE_SOURCE_TIME": "2020-01-01T00:00:00"}
+    def test_env_used_when_arg_absent_and_marker_set(self) -> None:
+        # The env fallback is trusted ONLY inside the extractor subprocess,
+        # which the backfill pipeline marks with CLAUDE_MEMORY_EXTRACTION=1.
+        env = {
+            "CLAUDE_SOURCE_TIME": "2020-01-01T00:00:00",
+            "CLAUDE_MEMORY_EXTRACTION": "1",
+        }
         assert resolve_source_time(None, env) == "2020-01-01T00:00:00"
+
+    def test_env_ignored_without_marker(self) -> None:
+        # Fix 2 (trust boundary): an ambient/user-set CLAUDE_SOURCE_TIME with
+        # no extraction marker must NOT backdate a live store.
+        env = {"CLAUDE_SOURCE_TIME": "2020-01-01T00:00:00"}
+        assert resolve_source_time(None, env) is None
+
+    def test_env_ignored_when_marker_not_one(self) -> None:
+        env = {
+            "CLAUDE_SOURCE_TIME": "2020-01-01T00:00:00",
+            "CLAUDE_MEMORY_EXTRACTION": "0",
+        }
+        assert resolve_source_time(None, env) is None
 
     def test_none_when_neither_present(self) -> None:
         assert resolve_source_time(None, {}) is None
@@ -302,3 +329,148 @@ class TestBackfillInjectsSourceTime:
         from scripts.core.backfill_learnings import _is_env_allowed
 
         assert _is_env_allowed("CLAUDE_SOURCE_TIME") is True
+
+    def test_build_extraction_env_strips_inherited_source_time(self) -> None:
+        # Fix 2: an ambient CLAUDE_SOURCE_TIME in the parent env must NOT pass
+        # through. Injection is idempotent — only the computed value (or none)
+        # reaches the child.
+        import os
+        from unittest.mock import patch as _patch
+
+        from scripts.core.backfill_learnings import build_extraction_env
+
+        with _patch.dict(os.environ, {"CLAUDE_SOURCE_TIME": "1999-01-01T00:00:00"}):
+            env = build_extraction_env("/proj")
+        assert "CLAUDE_SOURCE_TIME" not in env
+
+    def test_build_extraction_env_inherited_replaced_by_computed(self) -> None:
+        import os
+        from unittest.mock import patch as _patch
+
+        from scripts.core.backfill_learnings import build_extraction_env
+
+        src = datetime(2026, 1, 1, 8, 30, 0, tzinfo=UTC)
+        with _patch.dict(os.environ, {"CLAUDE_SOURCE_TIME": "1999-01-01T00:00:00"}):
+            env = build_extraction_env("/proj", source_time=src)
+        assert env["CLAUDE_SOURCE_TIME"] == src.isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Fix 1: source-time provenance — never trust the freshly-downloaded temp file
+# ---------------------------------------------------------------------------
+
+
+class TestResolveBackfillSourceTime:
+    """Pure preference-order helper: exited_at > S3 LastModified > local mtime."""
+
+    EXITED = datetime(2026, 3, 29, 20, 50, 0, tzinfo=UTC)
+    S3_MOD = datetime(2026, 3, 30, 14, 4, 34, tzinfo=UTC)
+    LOCAL = datetime(2026, 6, 11, 0, 0, 0, tzinfo=UTC)
+
+    def test_prefers_exited_at(self) -> None:
+        from scripts.core.backfill_learnings import resolve_backfill_source_time
+
+        got = resolve_backfill_source_time(
+            exited_at=self.EXITED, s3_last_modified=self.S3_MOD, local_mtime=self.LOCAL
+        )
+        assert got == self.EXITED
+
+    def test_falls_back_to_s3_last_modified(self) -> None:
+        from scripts.core.backfill_learnings import resolve_backfill_source_time
+
+        got = resolve_backfill_source_time(
+            exited_at=None, s3_last_modified=self.S3_MOD, local_mtime=self.LOCAL
+        )
+        assert got == self.S3_MOD
+
+    def test_local_mtime_last_resort(self) -> None:
+        from scripts.core.backfill_learnings import resolve_backfill_source_time
+
+        got = resolve_backfill_source_time(
+            exited_at=None, s3_last_modified=None, local_mtime=self.LOCAL
+        )
+        assert got == self.LOCAL
+
+    def test_none_when_no_source(self) -> None:
+        from scripts.core.backfill_learnings import resolve_backfill_source_time
+
+        got = resolve_backfill_source_time(
+            exited_at=None, s3_last_modified=None, local_mtime=None
+        )
+        assert got is None
+
+
+class TestParseS3ListingPreservesDate:
+    SAMPLE = (
+        "2026-03-30 14:04:34     192400 sessions/-Users-stephenfeather-opc/"
+        "d0f60cd7-65e8-4a30-a1fc-345ec418a1ec.jsonl.zst\n"
+    )
+
+    def test_s3_last_modified_captured(self) -> None:
+        from scripts.core.backfill_learnings import parse_s3_listing
+
+        rows = parse_s3_listing(self.SAMPLE, "b", project_filter=None)
+        assert len(rows) == 1
+        assert rows[0]["s3_last_modified"] == datetime(
+            2026, 3, 30, 14, 4, 34, tzinfo=UTC
+        )
+
+
+class TestRunExtractionTrustsExplicitSourceTime:
+    def test_uses_passed_source_time_not_temp_file_mtime(self) -> None:
+        # Regression for Fix 1: the temp JSONL was freshly downloaded so its
+        # mtime is extraction time. run_extraction must stamp CLAUDE_SOURCE_TIME
+        # from the explicit session source_time, never from the file.
+        from unittest.mock import MagicMock
+        from unittest.mock import patch as _patch
+
+        from scripts.core.backfill_learnings import run_extraction
+
+        session_time = datetime(2026, 3, 29, 20, 50, 0, tzinfo=UTC)
+        captured: dict[str, str] = {}
+
+        def fake_run(cmd, **kwargs):  # noqa: ANN001, ANN003
+            captured.update(kwargs.get("env", {}))
+            return MagicMock(returncode=0, stdout="Learnings stored: 0\n", stderr="")
+
+        with _patch("scripts.core.backfill_learnings.subprocess") as mock_sub:
+            mock_sub.run.side_effect = fake_run
+            run_extraction(
+                jsonl_path=Path("/tmp/abc.jsonl"),
+                session_id="s-abc",
+                agent_prompt="Extract",
+                model="sonnet",
+                max_turns=15,
+                timeout=300,
+                project_dir=None,
+                source_time=session_time,
+            )
+
+        assert captured["CLAUDE_SOURCE_TIME"] == session_time.isoformat()
+
+    def test_no_source_time_omits_env(self) -> None:
+        from unittest.mock import MagicMock
+        from unittest.mock import patch as _patch
+
+        from scripts.core.backfill_learnings import run_extraction
+
+        captured: dict[str, str] = {}
+
+        def fake_run(cmd, **kwargs):  # noqa: ANN001, ANN003
+            captured.update(kwargs.get("env", {}))
+            return MagicMock(returncode=0, stdout="Learnings stored: 0\n", stderr="")
+
+        with _patch("scripts.core.backfill_learnings.subprocess") as mock_sub:
+            mock_sub.run.side_effect = fake_run
+            run_extraction(
+                jsonl_path=Path("/tmp/abc.jsonl"),
+                session_id="s-abc",
+                agent_prompt="Extract",
+                model="sonnet",
+                max_turns=15,
+                timeout=300,
+                project_dir=None,
+                source_time=None,
+            )
+
+        assert "CLAUDE_SOURCE_TIME" not in captured

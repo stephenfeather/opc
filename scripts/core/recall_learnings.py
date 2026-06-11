@@ -740,14 +740,21 @@ async def _dispatch_search_project_first(
     """
     scope = params.get("project_scope")
 
+    from scripts.core.db.postgres_pool import sanitize_log_message
+
     own: list[dict[str, Any]] = []
     own_failed = False
     try:
         own = await _dispatch_search(params, project=scope)
     except Exception as exc:  # noqa: BLE001 - degrade, do not crash recall
         own_failed = True
+        # exc text can embed a DSN/host/path; recall stderr is injected into
+        # the model context by hooks, so redact before printing and keep the
+        # full traceback in the debug log only (aegis MEDIUM-2).
+        logger.debug("--project-first scoped pass failed", exc_info=True)
         print(
-            f"warning: --project-first scoped pass failed ({exc}); "
+            "warning: --project-first scoped pass failed "
+            f"({sanitize_log_message(str(exc))}); "
             "continuing with global results only.",
             file=sys.stderr,
         )
@@ -758,8 +765,10 @@ async def _dispatch_search_project_first(
         if own_failed:
             # Both passes failed — surface the error like the default path.
             raise
+        logger.debug("--project-first global pass failed", exc_info=True)
         print(
-            f"warning: --project-first global pass failed ({exc}); "
+            "warning: --project-first global pass failed "
+            f"({sanitize_log_message(str(exc))}); "
             "returning project-scoped results only.",
             file=sys.stderr,
         )

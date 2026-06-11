@@ -716,3 +716,50 @@ class TestDispatchProjectFirstFailureIsolation:
         params = {"mode": "text_only", "query": "q", "k": 10, "project_scope": "opc"}
         with pytest.raises(RuntimeError):
             await rl._dispatch_search_project_first(params)
+
+
+
+# ============== Aegis MEDIUM-2: redact credentials in degrade warnings =======
+
+
+class TestDispatchProjectFirstWarningRedaction:
+    """Degradation warnings reach hook-captured stderr; raw exception text can
+    embed a DSN (postgresql://user:secret@host/db). The credential must be
+    redacted before printing (aegis MEDIUM-2)."""
+
+    _DSN = "postgresql://user:secret@dbhost:5432/memdb"
+
+    async def test_global_pass_failure_redacts_dsn(self, monkeypatch, capsys):
+        import scripts.core.recall_learnings as rl
+
+        async def fake_dispatch(params, *, project=None):
+            if project is None:
+                raise RuntimeError(f"connection to {self._DSN} refused")
+            return [{"id": "own1"}]
+
+        monkeypatch.setattr(rl, "_dispatch_search", fake_dispatch)
+        params = {"mode": "text_only", "query": "q", "k": 10, "project_scope": "opc"}
+        results = await rl._dispatch_search_project_first(params)
+        assert [r["id"] for r in results] == ["own1"]
+        err = capsys.readouterr().err
+        assert "secret" not in err, "DSN password leaked into stderr"
+        assert "user:secret@" not in err
+        # The degraded-pass phrasing must survive redaction.
+        assert "global" in err.lower()
+
+    async def test_scoped_pass_failure_redacts_dsn(self, monkeypatch, capsys):
+        import scripts.core.recall_learnings as rl
+
+        async def fake_dispatch(params, *, project=None):
+            if project is not None:
+                raise RuntimeError(f"connection to {self._DSN} refused")
+            return [{"id": "glob1"}]
+
+        monkeypatch.setattr(rl, "_dispatch_search", fake_dispatch)
+        params = {"mode": "text_only", "query": "q", "k": 10, "project_scope": "opc"}
+        results = await rl._dispatch_search_project_first(params)
+        assert [r["id"] for r in results] == ["glob1"]
+        err = capsys.readouterr().err
+        assert "secret" not in err, "DSN password leaked into stderr"
+        assert "user:secret@" not in err
+        assert "scoped" in err.lower()

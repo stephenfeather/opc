@@ -29,7 +29,7 @@ ADD_PROJECT_MIGRATION = (
 # matters: Postgres only uses a functional index when the query expression
 # matches the indexed expression (LOWER(project)).
 _LOWER_PROJECT_INDEX_RE = re.compile(
-    r"CREATE\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?\w+\s+"
+    r"CREATE\s+INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?\w+\s+"
     r"ON\s+archival_memory\s*\(\s*LOWER\s*\(\s*project\s*\)\s*\)",
     re.IGNORECASE,
 )
@@ -72,7 +72,7 @@ def test_lower_project_index_is_idempotent() -> None:
     """Both LOWER(project) index statements must use IF NOT EXISTS so reruns
     are safe."""
     idempotent_re = re.compile(
-        r"CREATE\s+INDEX\s+IF\s+NOT\s+EXISTS\s+\w+\s+"
+        r"CREATE\s+INDEX\s+(?:CONCURRENTLY\s+)?IF\s+NOT\s+EXISTS\s+\w+\s+"
         r"ON\s+archival_memory\s*\(\s*LOWER\s*\(\s*project\s*\)\s*\)",
         re.IGNORECASE,
     )
@@ -82,3 +82,42 @@ def test_lower_project_index_is_idempotent() -> None:
             f"{path.name}: LOWER(project) index must use "
             "CREATE INDEX IF NOT EXISTS for idempotent reruns."
         )
+
+
+# Aegis MEDIUM-1: a plain CREATE INDEX on a populated table takes a SHARE lock
+# that blocks all writes for the build. The migration runs against existing
+# (populated) DBs, so every archival_memory index it builds must use
+# CONCURRENTLY. init-schema.sql runs on a fresh empty DB and stays plain.
+
+# Any CREATE INDEX on archival_memory in the migration, capturing whether the
+# CONCURRENTLY keyword is present.
+_MIGRATION_ARCHIVAL_INDEX_RE = re.compile(
+    r"CREATE\s+INDEX\s+(CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?"
+    r"\w+\s+ON\s+archival_memory",
+    re.IGNORECASE,
+)
+
+
+def test_migration_indexes_are_concurrent() -> None:
+    """Every archival_memory CREATE INDEX in the migration must be CONCURRENTLY
+    so applying it to a populated DB does not block writes (aegis MEDIUM-1)."""
+    sql = _strip_comments(ADD_PROJECT_MIGRATION.read_text())
+    matches = _MIGRATION_ARCHIVAL_INDEX_RE.findall(sql)
+    assert matches, "expected archival_memory index statements in the migration"
+    # findall returns the CONCURRENTLY capture group ("" when absent).
+    assert all(grp.strip() for grp in matches), (
+        "both archival_memory indexes (idx_archival_project and "
+        "idx_archival_project_lower) must use CREATE INDEX CONCURRENTLY in the "
+        "migration (aegis MEDIUM-1: avoid blocking writes on a populated table)."
+    )
+    assert len(matches) >= 2, "expected at least two archival_memory indexes"
+
+
+def test_init_schema_indexes_stay_non_concurrent() -> None:
+    """init-schema.sql runs against a fresh empty DB; CONCURRENTLY there would
+    add no benefit and cannot run inside a transaction. Keep it plain."""
+    sql = _strip_comments(INIT_SCHEMA.read_text())
+    assert "CONCURRENTLY" not in sql.upper(), (
+        "docker/init-schema.sql should not use CREATE INDEX CONCURRENTLY "
+        "(empty table at bootstrap; CONCURRENTLY cannot run in a txn block)."
+    )

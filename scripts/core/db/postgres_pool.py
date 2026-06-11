@@ -83,6 +83,14 @@ def _sanitize_log_message(msg: str) -> str:
     return re.sub(r"://[^@]+@", "://***@", msg)
 
 
+# Public alias so other modules (e.g. recall_learnings degrade warnings, which
+# reach hook-captured stderr) can redact exception text without importing a
+# private name. Same behavior; do not diverge (aegis MEDIUM-2).
+def sanitize_log_message(msg: str) -> str:
+    """Public redactor: strip credentials from connection strings in a message."""
+    return _sanitize_log_message(msg)
+
+
 def _encode_vector(v: list[float] | str) -> str:
     """Encode a vector for pgvector.
 

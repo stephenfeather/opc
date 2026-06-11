@@ -168,11 +168,25 @@ rows are never surfaced. Use `--project-first` to change the fetch composition.
 ### `--project-first`
 
 Opt-in fetch-time project scoping (issue #139). Runs a **two-pass fetch**:
-pass 1 is scoped to the resolved project via a SQL `AND project = $N` clause,
-pass 2 fetches globally; the two are merged own-project-first, deduped by id,
-and truncated to the rerank pool size. This guarantees own-project rows are in
-the pool when they exist — complementary to `--project`'s rerank signal, not a
-replacement.
+pass 1 is scoped to the resolved project via a case-insensitive SQL
+`AND LOWER(project) = $N` clause, pass 2 fetches globally; the two are merged
+own-project-first (with a reserved global quota of ~half the pool so the global
+pass is never fully starved), deduped by id, and truncated to the rerank pool
+size. This guarantees own-project rows are in the pool when they exist —
+complementary to `--project`'s rerank signal, not a replacement.
+
+**Legacy data prerequisite:** the scoped predicate is case-insensitive, so
+un-migrated rows stored as `OPC`/`Opc` still match the canonical `opc` bind.
+But alias and flattened-path legacy values (which the canonicalizer collapses,
+e.g. `operations-digitalocean` → `digitalocean`) are *not* matched by the
+scoped pass — they are only surfaced via the global fill pass and the
+`project_match` rerank signal. Run `scripts/migrations/normalize_project_values.py`
+to canonicalize stored project values for full `--project-first` effectiveness
+on legacy data.
+
+If one pass fails transiently, the other pass's results are still returned (a
+warning naming the degraded pass is printed to stderr); recall only errors when
+both passes fail.
 
 The project is resolved from `--project` if given, otherwise auto-detected
 from `CLAUDE_PROJECT_DIR` (worktree-aware), then canonicalized before the SQL

@@ -307,15 +307,25 @@ def render_recall_sql(
 def project_filter_clause(
     project: str | None, *, has_project: bool, param_index: int,
 ) -> str:
-    """Build the optional 'AND project = $N' scoping clause (issue #139).
+    """Build the optional 'AND LOWER(project) = $N' scoping clause (issue #139).
 
     Returns "" — leaving the SQL byte-identical to the global path — when no
     project was requested or the column is unavailable (pre-migration DB).
     The caller binds ``project`` as the ``param_index``-th positional arg.
+
+    The predicate is case-insensitive (review round 2): un-migrated DBs may
+    still hold case variants like 'OPC'/'Opc'. The bind value is lowercase by
+    construction (project_naming.canonicalize_project lowercases), so
+    LOWER(project) = $N compares lower-to-lower and matches every case
+    variant of the same project. Legacy alias/flattened-path values that the
+    canonicalizer would collapse remain covered by the global fill pass and
+    the project_match rerank signal; run scripts/migrations/
+    normalize_project_values.py for full project-first effectiveness on
+    legacy data.
     """
     if not project or not has_project:
         return ""
-    return f"AND project = ${param_index}"
+    return f"AND LOWER(project) = ${param_index}"
 
 
 # ---------------------------------------------------------------------------

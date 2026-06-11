@@ -109,24 +109,57 @@ def merge_project_first(
 ) -> list[dict[str, Any]]:
     """Merge a project-scoped pass with the global pass, own-project first.
 
-    Two-pass fetch for ``--project-first`` (issue #139): own-project rows
-    lead, then global rows backfill, deduped by ``id`` (the own copy wins
-    on collision), and the whole list is truncated to ``fetch_k`` so the
-    rerank pool stays the same size as the single-pass path. Pure: inputs
+    Two-pass fetch for ``--project-first`` (issue #139). Reserves a global
+    quota so an own-project pass that returns ``fetch_k`` rows cannot starve
+    global candidates entirely — important with ``--no-rerank`` where
+    ``fetch_k == k`` would otherwise make recall project-only (review round
+    2). Composition:
+
+    1. Own rows lead, capped at ``ceil(fetch_k / 2)`` (the own quota).
+    2. Global rows then fill the remaining slots, deduped by ``id`` against
+       the own rows already chosen.
+    3. Any slots global could not fill are backfilled from the leftover own
+       rows (those beyond the quota), keeping the result own-before-global
+       ordered.
+
+    Deduped by ``id`` (the own copy wins on collision); truncated to
+    ``fetch_k`` so the rerank pool matches the single-pass path. Pure: inputs
     are not mutated.
     """
-    merged: list[dict[str, Any]] = []
+    own_quota = fetch_k - (fetch_k // 2)  # ceil(fetch_k / 2)
+
     seen: set[str] = set()
-    for row in [*own, *global_]:
+    lead: list[dict[str, Any]] = []  # own rows within the quota
+    own_leftover: list[dict[str, Any]] = []  # own rows beyond the quota
+    for row in own:
         rid = row.get("id")
-        if rid in seen:
+        if rid is not None and rid in seen:
             continue
         if rid is not None:
             seen.add(rid)
-        merged.append(row)
-        if len(merged) >= fetch_k:
+        if len(lead) < own_quota:
+            lead.append(row)
+        else:
+            own_leftover.append(row)
+
+    # Global rows fill the slots the own quota did not consume.
+    global_fill: list[dict[str, Any]] = []
+    global_budget = fetch_k - len(lead)
+    for row in global_:
+        if len(global_fill) >= global_budget:
             break
-    return merged
+        rid = row.get("id")
+        if rid is not None and rid in seen:
+            continue
+        if rid is not None:
+            seen.add(rid)
+        global_fill.append(row)
+
+    # Backfill any remaining slots from leftover own rows (own-first ordered).
+    remaining = fetch_k - len(lead) - len(global_fill)
+    backfill = own_leftover[:remaining] if remaining > 0 else []
+
+    return [*lead, *backfill, *global_fill][:fetch_k]
 
 
 def determine_retrieval_mode(
@@ -696,10 +729,42 @@ async def _dispatch_search_project_first(
     truncated to ``params["k"]`` (the over-fetched rerank pool size) by
     ``merge_project_first``. The reranker's project_match signal still runs
     downstream — this only changes the fetch pool composition.
+
+    Each pass is isolated (review round 2): a transient failure in one pass
+    must not discard the other pass's results. A scoped-pass failure degrades
+    to global-only; a global-pass failure (after the scoped pass succeeded)
+    returns the scoped rows alone; both failing re-raises the global error,
+    preserving the default path's error behavior. The degraded pass is named
+    on stderr. Tradeoff: for vector/hybrid modes the embedding/expansion is
+    computed once per pass (twice total) — accepted for now.
     """
     scope = params.get("project_scope")
-    own = await _dispatch_search(params, project=scope)
-    global_ = await _dispatch_search(params, project=None)
+
+    own: list[dict[str, Any]] = []
+    own_failed = False
+    try:
+        own = await _dispatch_search(params, project=scope)
+    except Exception as exc:  # noqa: BLE001 - degrade, do not crash recall
+        own_failed = True
+        print(
+            f"warning: --project-first scoped pass failed ({exc}); "
+            "continuing with global results only.",
+            file=sys.stderr,
+        )
+
+    try:
+        global_ = await _dispatch_search(params, project=None)
+    except Exception as exc:  # noqa: BLE001 - degrade if the scoped pass held
+        if own_failed:
+            # Both passes failed — surface the error like the default path.
+            raise
+        print(
+            f"warning: --project-first global pass failed ({exc}); "
+            "returning project-scoped results only.",
+            file=sys.stderr,
+        )
+        return own
+
     return merge_project_first(own, global_, params["k"])
 
 

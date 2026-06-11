@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 # ==================== Unit 1: render_recall_sql project filter ====================
 
 
@@ -157,14 +159,16 @@ class TestMergeProjectFirst:
         merged = merge_project_first(own, global_, fetch_k=3)
         assert [r["id"] for r in merged] == ["a", "b", "c"]
 
-    def test_own_overflow_is_truncated(self):
-        """Even own rows are capped at fetch_k — the pool size is bounded."""
+    def test_own_overflow_respects_global_quota(self):
+        """The pool is capped at fetch_k AND a global slot is reserved
+        (Finding 2): with fetch_k=2 the own quota is ceil(2/2)=1, so own
+        contributes 'a' and global keeps its slot with 'd'."""
         from scripts.core.recall_learnings import merge_project_first
 
         own = [_row("a"), _row("b"), _row("c")]
         global_ = [_row("d")]
         merged = merge_project_first(own, global_, fetch_k=2)
-        assert [r["id"] for r in merged] == ["a", "b"]
+        assert [r["id"] for r in merged] == ["a", "d"]
 
     def test_empty_own(self):
         from scripts.core.recall_learnings import merge_project_first
@@ -437,9 +441,10 @@ class TestTextOnlyProjectScopedFetch:
             "query terms", k=3, project="opc",
         )
         assert results, "scoped pass should return rows"
-        # At least one executed query must carry the project predicate, and
-        # the canonical project value must be bound as a positional arg.
-        scoped = [c for c in conn.calls if "project =" in c[0]]
+        # At least one executed query must carry the case-tolerant project
+        # predicate, and the canonical project value must be bound as a
+        # positional arg (Finding 1: LOWER(project) = $N).
+        scoped = [c for c in conn.calls if "LOWER(project) =" in c[0]]
         assert scoped, "expected a project-bound scoped query"
         sql, args = scoped[0]
         assert "opc" in args
@@ -455,7 +460,7 @@ class TestTextOnlyProjectScopedFetch:
         await rb.search_learnings_text_only_postgres("query terms", k=3)
         assert conn.calls, "expected SQL to run"
         for sql, _args in conn.calls:
-            assert "project =" not in sql
+            assert "LOWER(project)" not in sql
 
 
 class TestProjectScopedDegradesOnOldDb:
@@ -477,7 +482,7 @@ class TestProjectScopedDegradesOnOldDb:
         assert results == []
         assert conn.calls, "expected fallback SQL to run"
         for sql, _args in conn.calls:
-            assert "project =" not in sql, sql[:120]
+            assert "LOWER(project)" not in sql, sql[:120]
 
 
 class TestDispatchProjectFirst:
@@ -553,3 +558,161 @@ class TestMainDegradesWithWarning:
         assert dispatched["first"] is False
         err = capsys.readouterr().err
         assert "--project-first" in err and "global recall" in err
+
+
+
+# ==================== Round-2 Finding 1: case-tolerant scoped predicate ======
+
+
+class TestProjectFilterCaseTolerant:
+    """The scoped predicate must be case-insensitive (LOWER(project) = $N) so
+    un-migrated DBs holding 'OPC'/'Opc' still match the canonical 'opc' bind,
+    matching the reranker's case tolerance (issue #139 review round 2)."""
+
+    def test_clause_uses_lower(self):
+        from scripts.core.recall_backends import project_filter_clause
+
+        clause = project_filter_clause("opc", has_project=True, param_index=3)
+        assert clause == "AND LOWER(project) = $3"
+
+    def test_no_clause_when_unscoped(self):
+        from scripts.core.recall_backends import project_filter_clause
+
+        assert project_filter_clause(None, has_project=True, param_index=3) == ""
+        assert project_filter_clause("opc", has_project=False, param_index=3) == ""
+
+    def test_canonicalize_project_yields_lowercase_bind(self):
+        """The bind value is lowercase by construction, so LOWER(project)=$N
+        compares lower-to-lower (review round 2 assertion)."""
+        from scripts.core.project_naming import canonicalize_project
+
+        for raw in ("OPC", "Opc", "  oPc  ", "opc"):
+            assert canonicalize_project(raw) == "opc"
+
+
+# ==================== Round-2 Finding 2: global quota in merge ===============
+
+
+class TestMergeProjectFirstGlobalQuota:
+    """merge_project_first must reserve a global quota so an own-project pass
+    that returns fetch_k rows cannot starve global candidates entirely
+    (issue #139 review round 2)."""
+
+    def test_global_survives_when_own_overflows(self):
+        from scripts.core.recall_learnings import merge_project_first
+
+        # 6 own rows, fetch_k=6 — without a quota all 6 slots are own.
+        own = [_row(f"o{i}") for i in range(6)]
+        global_ = [_row(f"g{i}") for i in range(6)]
+        merged = merge_project_first(own, global_, fetch_k=6)
+        ids = [r["id"] for r in merged]
+        assert len(ids) == 6
+        # own gets ceil(half)=3, global fills the rest -> at least 3 global rows.
+        assert sum(1 for i in ids if i.startswith("g")) >= 3
+        assert sum(1 for i in ids if i.startswith("o")) >= 3
+
+    def test_own_first_ordering_preserved(self):
+        from scripts.core.recall_learnings import merge_project_first
+
+        own = [_row(f"o{i}") for i in range(6)]
+        global_ = [_row(f"g{i}") for i in range(6)]
+        merged = merge_project_first(own, global_, fetch_k=6)
+        ids = [r["id"] for r in merged]
+        # Every own row that made the cut must precede every global row.
+        last_own = max(i for i, x in enumerate(ids) if x.startswith("o"))
+        first_glob = min(i for i, x in enumerate(ids) if x.startswith("g"))
+        assert last_own < first_glob
+
+    def test_global_empty_own_fills_all(self):
+        from scripts.core.recall_learnings import merge_project_first
+
+        own = [_row(f"o{i}") for i in range(6)]
+        merged = merge_project_first(own, [], fetch_k=6)
+        assert [r["id"] for r in merged] == [f"o{i}" for i in range(6)]
+
+    def test_own_empty_pure_global(self):
+        from scripts.core.recall_learnings import merge_project_first
+
+        global_ = [_row(f"g{i}") for i in range(4)]
+        merged = merge_project_first([], global_, fetch_k=6)
+        assert [r["id"] for r in merged] == [f"g{i}" for i in range(4)]
+
+    def test_backfill_from_leftover_own_when_global_short(self):
+        from scripts.core.recall_learnings import merge_project_first
+
+        # fetch_k=6 -> own quota 3, global has only 1 -> 2 slots backfilled
+        # from leftover own rows (o3, o4), all own-first ordered.
+        own = [_row(f"o{i}") for i in range(6)]
+        global_ = [_row("g0")]
+        merged = merge_project_first(own, global_, fetch_k=6)
+        ids = [r["id"] for r in merged]
+        assert len(ids) == 6
+        assert ids[-1] == "g0"
+        assert ids[:5] == ["o0", "o1", "o2", "o3", "o4"]
+
+    def test_overlap_dedupe_by_id(self):
+        from scripts.core.recall_learnings import merge_project_first
+
+        own = [{"id": "a", "src": "own"}]
+        global_ = [{"id": "a", "src": "global"}, {"id": "b", "src": "global"}]
+        merged = merge_project_first(own, global_, fetch_k=10)
+        assert [r["id"] for r in merged] == ["a", "b"]
+        assert merged[0]["src"] == "own"  # own copy wins on collision
+
+    def test_does_not_mutate_inputs_quota(self):
+        from scripts.core.recall_learnings import merge_project_first
+
+        own = [_row("o0"), _row("o1")]
+        global_ = [_row("g0")]
+        merge_project_first(own, global_, fetch_k=2)
+        assert [r["id"] for r in own] == ["o0", "o1"]
+        assert [r["id"] for r in global_] == ["g0"]
+
+
+# ==================== Round-2 Finding 3: independent pass failure isolation ==
+
+
+class TestDispatchProjectFirstFailureIsolation:
+    """A failure in one pass must not discard the other pass's results
+    (issue #139 review round 2)."""
+
+    async def test_global_pass_failure_returns_scoped(self, monkeypatch, capsys):
+        import scripts.core.recall_learnings as rl
+
+        async def fake_dispatch(params, *, project=None):
+            if project is None:
+                raise RuntimeError("global pass boom")
+            return [{"id": "own1"}, {"id": "own2"}]
+
+        monkeypatch.setattr(rl, "_dispatch_search", fake_dispatch)
+        params = {"mode": "text_only", "query": "q", "k": 10, "project_scope": "opc"}
+        results = await rl._dispatch_search_project_first(params)
+        assert [r["id"] for r in results] == ["own1", "own2"]
+        err = capsys.readouterr().err
+        assert "global" in err.lower()
+
+    async def test_scoped_pass_failure_returns_global(self, monkeypatch, capsys):
+        import scripts.core.recall_learnings as rl
+
+        async def fake_dispatch(params, *, project=None):
+            if project is not None:
+                raise RuntimeError("scoped pass boom")
+            return [{"id": "glob1"}, {"id": "glob2"}]
+
+        monkeypatch.setattr(rl, "_dispatch_search", fake_dispatch)
+        params = {"mode": "text_only", "query": "q", "k": 10, "project_scope": "opc"}
+        results = await rl._dispatch_search_project_first(params)
+        assert [r["id"] for r in results] == ["glob1", "glob2"]
+        err = capsys.readouterr().err
+        assert "scoped" in err.lower()
+
+    async def test_both_passes_fail_propagates(self, monkeypatch):
+        import scripts.core.recall_learnings as rl
+
+        async def fake_dispatch(params, *, project=None):
+            raise RuntimeError("both boom")
+
+        monkeypatch.setattr(rl, "_dispatch_search", fake_dispatch)
+        params = {"mode": "text_only", "query": "q", "k": 10, "project_scope": "opc"}
+        with pytest.raises(RuntimeError):
+            await rl._dispatch_search_project_first(params)

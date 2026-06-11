@@ -197,6 +197,22 @@ class TestBuildExtractionEnv:
         assert "CLAUDE_MEMORY_EXTRACTION" in env
         assert env["PATH"] == "/usr/bin"
 
+    def test_strips_inherited_source_time(self):
+        # Issue #52 Round 3 (trust boundary): LIVE extraction sets the
+        # CLAUDE_MEMORY_EXTRACTION=1 trust marker, so an inherited/ambient
+        # CLAUDE_SOURCE_TIME from the daemon's launch env would silently
+        # backdate live learnings. The live builder must NEVER carry a source
+        # time -- only the backfill builder injects one deliberately.
+        base = {"CLAUDE_SOURCE_TIME": "2020-01-01T00:00:00Z", "PATH": "/usr/bin"}
+        env = build_extraction_env(base, "/tmp/proj")
+        assert env["CLAUDE_MEMORY_EXTRACTION"] == "1"
+        assert "CLAUDE_SOURCE_TIME" not in env
+
+    def test_strip_source_time_does_not_mutate_base_env(self):
+        base = {"CLAUDE_SOURCE_TIME": "2020-01-01T00:00:00Z"}
+        build_extraction_env(base, None)
+        assert base["CLAUDE_SOURCE_TIME"] == "2020-01-01T00:00:00Z"
+
 
 # ── strip_yaml_frontmatter ────────────────────────────────────────
 

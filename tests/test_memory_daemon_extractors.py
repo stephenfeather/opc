@@ -155,6 +155,45 @@ class TestExtractMemoriesImpl:
         assert 999 in ae
         mock_popen.assert_called_once()
 
+    def test_live_extraction_env_lacks_inherited_source_time(self, tmp_path):
+        # Issue #52 Round 3: a daemon launched with a stale CLAUDE_SOURCE_TIME
+        # in its environment must NOT pass it to live extraction (which sets the
+        # CLAUDE_MEMORY_EXTRACTION=1 trust marker), or live learnings would be
+        # backdated. Assert the subprocess env carries the marker but no source
+        # time.
+        import os
+
+        from scripts.core.memory_daemon_extractors import extract_memories_impl
+
+        jsonl = tmp_path / "session.jsonl"
+        jsonl.write_text('{"type":"msg"}\n')
+        mock_proc = MagicMock()
+        mock_proc.pid = 1001
+        mock_popen = MagicMock(return_value=mock_proc)
+        cfg = MagicMock()
+        cfg.extraction_model = "sonnet"
+        cfg.extraction_max_turns = 10
+
+        with patch.dict(os.environ, {"CLAUDE_SOURCE_TIME": "2020-01-01T00:00:00Z"}):
+            extract_memories_impl(
+                session_id="s1",
+                project_dir=str(tmp_path),
+                transcript_path=str(jsonl),
+                active_extractions={},
+                subprocess_popen=mock_popen,
+                is_blocked_fn=lambda _: False,
+                mark_extracted_fn=MagicMock(),
+                mark_failed_fn=MagicMock(),
+                log_fn=MagicMock(),
+                daemon_cfg=cfg,
+                allowed_models=frozenset({"sonnet", "haiku", "opus"}),
+                strip_frontmatter_fn=lambda c: c,
+            )
+
+        passed_env = mock_popen.call_args.kwargs["env"]
+        assert passed_env["CLAUDE_MEMORY_EXTRACTION"] == "1"
+        assert "CLAUDE_SOURCE_TIME" not in passed_env
+
 
 # ---------------------------------------------------------------------------
 # Step 4.2 — archive_session_jsonl

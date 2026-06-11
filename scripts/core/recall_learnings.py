@@ -45,6 +45,13 @@ from dotenv import load_dotenv
 
 _FAULT_LOG_FILE = None
 
+# Hard upper bound on best-effort recall-event logging (issue #140). Well under
+# the memory-awareness hook's 5s spawnSync budget (spawnSync waits for process
+# EXIT, so a slow DB write would otherwise burn the whole budget). Telemetry is
+# best-effort and cancellation-safe: on timeout the asyncio.wait_for cancels
+# record_recall and the pool.acquire() context manager releases the connection.
+RECORD_RECALL_TIMEOUT = 2.0
+
 
 def _enable_faulthandler() -> None:
     """Enable faulthandler without breaking imports if log dir is missing."""
@@ -1067,16 +1074,24 @@ async def main() -> int:
     # output under the memory-awareness hook's 5s spawn timeout (issue #140).
     print(_format_output(results, output_mode=output_mode, structured=args.structured))
 
-    # Record recall (skip benchmarking mode)
+    # Record recall (skip benchmarking mode). Bounded by RECORD_RECALL_TIMEOUT
+    # so a slow DB write can't burn the hook's spawn budget; telemetry is
+    # best-effort and cancellation-safe (issue #140).
     if not args.json_full:
         caller_project = resolve_caller_project(
             args.project, os.environ.get("CLAUDE_PROJECT_DIR")
         )
-        await record_recall(
-            [r["id"] for r in results],
-            caller_project=caller_project,
-            source=args.source,
-        )
+        try:
+            await asyncio.wait_for(
+                record_recall(
+                    [r["id"] for r in results],
+                    caller_project=caller_project,
+                    source=args.source,
+                ),
+                timeout=RECORD_RECALL_TIMEOUT,
+            )
+        except TimeoutError:
+            logger.debug("record_recall timed out; recall event dropped")
 
     return 0
 

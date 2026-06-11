@@ -11,7 +11,9 @@ Validates that:
 
 from __future__ import annotations
 
+import asyncio
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -533,6 +535,61 @@ class TestMainWiring:
         rc = await rl.main()
         assert rc == 0
         assert order == ["format", "record"]
+
+    async def test_record_recall_timeout_does_not_block_main(self, monkeypatch):
+        # Hard latency bound: spawnSync waits for process EXIT, so a slow
+        # record_recall would burn the hook's 5s budget. main() must bound it
+        # with asyncio.wait_for, still print output, and return 0 promptly
+        # (issue #140 r3).
+        import scripts.core.recall_learnings as rl
+
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        monkeypatch.setattr(
+            rl.sys,
+            "argv",
+            [
+                "recall_learnings.py",
+                "--query",
+                "x",
+                "--source",
+                "hook",
+                "--text-only",
+                "--json",
+                "--no-rerank",
+            ],
+            raising=False,
+        )
+
+        async def fake_dispatch(params, *, project=None):
+            return [{"id": str(uuid.uuid4()), "content": "x", "similarity": 0.5}]
+
+        monkeypatch.setattr(rl, "_dispatch_search", fake_dispatch)
+        monkeypatch.setattr(rl, "get_backend", lambda: "postgres")
+        # Tiny injected bound so the test is fast.
+        monkeypatch.setattr(rl, "RECORD_RECALL_TIMEOUT", 0.05)
+
+        printed: list[str] = []
+
+        def fake_format(*a, **k):
+            return "formatted-output"
+
+        monkeypatch.setattr(rl, "_format_output", fake_format, raising=False)
+        monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(a[0] if a else ""))
+
+        async def slow_record(ids, *, caller_project=None, source=None):
+            await asyncio.sleep(5)  # far longer than the injected 0.05 bound
+
+        monkeypatch.setattr(rl, "record_recall", slow_record)
+
+        start = time.monotonic()
+        rc = await rl.main()
+        elapsed = time.monotonic() - start
+
+        assert rc == 0
+        # Generous margin for loaded CI machines; what matters is that the
+        # 5s sleep was cancelled, so anything well under 5s proves the bound.
+        assert elapsed < 3.0
+        assert printed  # output was still produced before the timeout
 
 
 if __name__ == "__main__":

@@ -195,7 +195,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_unique_per_session
 -- so cross-project mis-scope frequency (issue #130) is measurable. Zero-result
 -- recalls are logged too (empty arrays, result_count = 0) -- finding nothing
 -- signals over-restrictive scoping. Never stores raw query text (privacy).
--- See scripts/migrations/add_recall_log.sql.
+-- Retention: manual until automated pruning lands (follow-up issue) -- prune
+-- with `DELETE FROM recall_log WHERE created_at < NOW() - INTERVAL '90 days'`.
+-- Analysis queries (time-scoped, e.g. INTERVAL '30 days', using the
+-- created_at DESC index) live in scripts/migrations/add_recall_log.sql.
 CREATE TABLE IF NOT EXISTS recall_log (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     caller_project TEXT,                 -- canonicalized; NULL = no project context

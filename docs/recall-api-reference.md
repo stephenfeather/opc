@@ -276,6 +276,12 @@ analysis source of truth.
   dropped to `NULL`. This is deliberately *not* a DB `CHECK` constraint — a
   CHECK violation would abort the whole INSERT and silently drop the entire log
   row, losing the recall event.
+- **Latency-bounded:** the call is wrapped in `asyncio.wait_for(...,
+  timeout=RECORD_RECALL_TIMEOUT)` (2.0s, well under the memory-awareness hook's
+  5s `spawnSync` budget, which waits for process exit). On timeout the write is
+  cancelled (cancellation-safe — the `pool.acquire()` context manager releases
+  the connection) and the event is dropped with a debug log; output is already
+  printed by then.
 - **Never raises:** the whole path is wrapped so recall can never break.
 - **No query text, ever:** only project labels, ids, a count, and a source
   label are stored (privacy — see issue #139).
@@ -291,22 +297,28 @@ SELECT caller_project,
 FROM recall_log
 CROSS JOIN LATERAL unnest(recalled_projects) AS rp
 WHERE caller_project IS NOT NULL
+  -- time-scope to a recent window; the created_at DESC index
+  -- (idx_recall_log_created) supports this range scan
+  AND created_at > NOW() - INTERVAL '30 days'
 GROUP BY caller_project ORDER BY mis_scope_pct DESC;
 ```
 
 The `LATERAL unnest` drops zero-result rows automatically (an empty
 `recalled_projects` array yields no rows), which is correct for per-row
-mis-scope analysis. Count those events separately as a scoping-pressure signal:
+mis-scope analysis. Count those events separately as a scoping-pressure signal
+(same recent window, same index):
 
 ```sql
 SELECT caller_project,
        COUNT(*) FILTER (WHERE result_count = 0) AS empty_recalls,
        COUNT(*) AS total_recalls
 FROM recall_log
+WHERE created_at > NOW() - INTERVAL '30 days'
 GROUP BY caller_project ORDER BY empty_recalls DESC;
 ```
 
-Prune old events periodically, e.g.:
+**Retention:** manual until automated pruning lands (follow-up issue). Pruning
+is operator-owned for now — run the documented `DELETE` periodically, e.g.:
 
 ```sql
 DELETE FROM recall_log WHERE created_at < NOW() - INTERVAL '90 days';

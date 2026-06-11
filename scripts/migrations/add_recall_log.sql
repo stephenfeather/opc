@@ -14,8 +14,10 @@
 -- keeps the migration idempotent and safe to re-run.
 --
 -- Volume: ~1 row per user prompt (the memory-awareness hook fires per
--- prompt). At that rate the table grows slowly; prune old rows periodically,
--- e.g.:
+-- prompt). At that rate the table grows slowly.
+--
+-- Retention: manual until automated pruning lands (follow-up issue). For now
+-- pruning is operator-owned -- run the documented DELETE periodically, e.g.:
 --   DELETE FROM recall_log WHERE created_at < NOW() - INTERVAL '90 days';
 --
 -- Privacy: this table NEVER stores raw query text. Only canonical project
@@ -37,6 +39,9 @@
 --   FROM recall_log
 --   CROSS JOIN LATERAL unnest(recalled_projects) AS rp
 --   WHERE caller_project IS NOT NULL
+--     -- time-scope to a recent window; idx_recall_log_created (created_at
+--     -- DESC) supports this range scan:
+--     AND created_at > NOW() - INTERVAL '30 days'
 --   GROUP BY caller_project
 --   ORDER BY mis_scope_pct DESC;
 --
@@ -48,6 +53,7 @@
 --          COUNT(*) FILTER (WHERE result_count = 0) AS empty_recalls,
 --          COUNT(*) AS total_recalls
 --   FROM recall_log
+--   WHERE created_at > NOW() - INTERVAL '30 days'  -- idx_recall_log_created
 --   GROUP BY caller_project
 --   ORDER BY empty_recalls DESC;
 

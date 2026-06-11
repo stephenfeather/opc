@@ -11,9 +11,11 @@ Each returns list[dict] with keys: id, session_id, content, metadata, created_at
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+import sys
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +24,24 @@ from typing import Any
 from scripts.core.config import get_config as _get_config
 
 logger = logging.getLogger(__name__)
+
+# Issue #53: hybrid recall degrades to text-only by design when the query
+# embedding is unavailable (this is the contract — the memory-awareness hook
+# relies on it for the missing-key case). To keep that quiet path from
+# spamming hook-captured stderr, the human-readable warning is latched to at
+# most once per process; logger.debug still fires on every degrade. The hook
+# spawns a fresh process per prompt, so this caps it at one warning per prompt.
+_EMBED_DEGRADE_WARNED = False
+
+# Issue #53: a recall-specific deadline on the hybrid query-embed. The voyage
+# provider uses httpx timeout=30.0 with retries, so a network stall would
+# otherwise take ~90s+ to raise — long past the memory-awareness hook's 5s
+# spawnSync budget, so the text-only fallback would never run and the recall
+# output would be lost. 2.0s leaves ~3s for the text-only query + reranking +
+# output. Same bounded-best-effort pattern as RECORD_RECALL_TIMEOUT in
+# recall_learnings.py (issue #140); asyncio.wait_for cancels the in-flight
+# embed on timeout (cancelling an httpx request is safe).
+QUERY_EMBED_TIMEOUT = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -749,11 +769,61 @@ async def search_learnings_hybrid_rrf(
 
     pool = await get_pool()
 
-    embedder = EmbeddingService(provider=provider)
+    # embedder is constructed inside the guarded try so that constructor
+    # failures (e.g. VoyageEmbeddingProvider raising when VOYAGE_API_KEY is
+    # absent, or a local model load error) degrade like embed() failures
+    # rather than bypassing the fallback (review round 1).
+    embedder: EmbeddingService | None = None
     try:
-        query_embedding = await embedder.embed(query, input_type="query")
+        # Construction is non-network (provider __init__ only reads env), so
+        # it stays outside wait_for and remains visible to the finally below.
+        embedder = EmbeddingService(provider=provider)
+        query_embedding = await asyncio.wait_for(
+            embedder.embed(query, input_type="query"),
+            timeout=QUERY_EMBED_TIMEOUT,
+        )
+    except Exception as exc:  # noqa: BLE001 - degrade, do not crash recall
+        # Issue #53: the memory-awareness hook now calls hybrid (no
+        # --text-only). If the query-embed is unavailable (missing API key,
+        # model load error, network timeout), degrade to the text-only
+        # backend instead of aborting — same pool/k/project semantics and
+        # an identical result shape to --text-only. exc text can embed a
+        # DSN/host; recall stderr is injected into the model context by
+        # hooks, so redact and never echo the query (#139 redactor; aegis).
+        global _EMBED_DEGRADE_WARNED
+        from scripts.core.db.postgres_pool import sanitize_log_message
+
+        # TimeoutError (from the QUERY_EMBED_TIMEOUT wait_for) has an empty
+        # str(); surface a stable reason so the message stays informative.
+        reason = sanitize_log_message(str(exc)) or type(exc).__name__
+        logger.debug(
+            "hybrid query-embed failed (provider %r); degrading to text-only",
+            provider,
+            exc_info=True,
+        )
+        if not _EMBED_DEGRADE_WARNED:
+            # Latch the human-readable warning to once per process so the
+            # --project-first second pass (and repeated recalls) stay quiet.
+            _EMBED_DEGRADE_WARNED = True
+            print(
+                "warning: hybrid recall degraded to text-only "
+                f"(provider {provider!r} unavailable or timed out: "
+                f"{reason}); "
+                "set the provider API key or pass --text-only to silence.",
+                file=sys.stderr,
+            )
+        return await search_learnings_text_only_postgres(
+            query, k, project=project,
+        )
     finally:
-        await embedder.aclose()
+        if embedder is not None:
+            # A raise here would override the pending fallback return
+            # (FIX A): cleanup failure must never abort recall. Swallow it
+            # to the debug log only.
+            try:
+                await embedder.aclose()
+            except Exception:  # noqa: BLE001 - cleanup is best-effort
+                logger.debug("embedder close failed", exc_info=True)
 
     text_query = query
     use_tsquery = False

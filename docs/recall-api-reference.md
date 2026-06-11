@@ -223,6 +223,51 @@ Embedding provider. Choices: `local` (BGE), `voyage` (Voyage AI).
 composition (own-project rows first, then a global fill) and applies to every
 PostgreSQL mode above. The SQLite backend ignores it and fetches globally.
 
+### Hybrid → text-only degradation (issue #53)
+
+Hybrid RRF needs a query embedding. When that embedding cannot be produced —
+a missing API key, a model load error, or a network/provider timeout — the
+hybrid path does **not** error out. It degrades to the text-only backend for
+that one query, with the same `k` and `--project` semantics, and returns
+results whose shape is identical to `--text-only` (no `fts_rank` / `vec_rank`
+/ decay keys). This lets the memory-awareness hook call hybrid (instead of
+hardcoding `--text-only`) without risking a hard failure when no embedding
+provider is reachable: in that case behavior is identical to today's
+`--text-only`.
+
+**Trigger:** any exception from the query-embed call inside
+`search_learnings_hybrid_rrf`, including a `QUERY_EMBED_TIMEOUT` (2.0s)
+deadline. The deadline exists because providers carry their own long
+timeouts (e.g. Voyage: httpx 30s + retries ≈ 90s+); without it a network
+stall would blow the hook's 5s budget and the fallback would never run.
+2.0s leaves ~3s for the text-only query, reranking, and output. The warning
+says "unavailable or timed out" since both land in this path.
+
+**Warning:** a single redacted line is printed to stderr (where the
+memory-awareness hook captures it into model context):
+
+```
+warning: hybrid recall degraded to text-only (provider 'voyage' unavailable or timed out: <redacted reason>); set the provider API key or pass --text-only to silence.
+```
+
+The reason text is passed through the `#139` credential redactor
+(`sanitize_log_message`), so DSN passwords never leak, and the **query text is
+never included** in the warning. The full traceback is kept in the debug log
+only. If the text-only fallback itself also fails, that fallback's
+exception propagates (the embedding failure stays attached as the chained
+`__context__`), so recall still fails loudly when neither path works.
+
+**This degrade is deliberate, not an error.** The contract is to fall back
+quietly so the hook keeps working in the exact missing-key case the feature
+targets; config problems are not made fatal. To reduce noise, the
+human-readable stderr warning is **latched to once per process**
+(`_EMBED_DEGRADE_WARNED`) — under `--project-first` the second (global) pass
+does not reprint it, and repeated recalls in a long-lived process warn only
+once. `logger.debug` still records every degrade. Because the
+memory-awareness hook spawns a fresh process per prompt, the practical cap is
+one warning per prompt. Embedder-cleanup (`aclose`) failures during the
+degrade are swallowed to the debug log so they cannot abort the fallback.
+
 ## Recall Event Log
 
 Every recall (except `--json-full` benchmarking) appends one row to the

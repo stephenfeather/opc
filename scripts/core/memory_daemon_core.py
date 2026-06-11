@@ -232,6 +232,13 @@ def build_extraction_env(base_env: dict, project_dir: str | None) -> dict:
     env.pop("CLAUDE_PROJECT_DIR", None)
     if project_dir:
         env["CLAUDE_PROJECT_DIR"] = project_dir
+    # Issue #52 trust boundary: LIVE extraction sets the
+    # CLAUDE_MEMORY_EXTRACTION=1 marker that store_learning.py uses to trust
+    # CLAUDE_SOURCE_TIME. A stale/ambient value inherited from the daemon's
+    # launch env would silently backdate live learnings, so it is dropped
+    # unconditionally here. Only the deliberate backfill builder
+    # (backfill_learnings.build_extraction_env) injects a source time.
+    env.pop("CLAUDE_SOURCE_TIME", None)
     # Issue #96 + Codex Round 3: DEBUG-gated diagnostic log.
     # SECURITY-LOAD-BEARING — reveals daemon-owned information only.
     # The previous iteration dumped ``sorted(env.keys())`` which was

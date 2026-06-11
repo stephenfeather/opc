@@ -45,7 +45,7 @@ import json
 import logging
 import os
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -260,6 +260,62 @@ def parse_tags(tags_str: str | None) -> list[str] | None:
     return tags if tags else None
 
 
+# Maximum future clock skew tolerated for --source-time (issue #52). A value
+# stamped slightly ahead of wall-clock (NTP jitter, fast backfill host) is
+# accepted; anything further in the future is treated as garbage and ignored.
+_SOURCE_TIME_MAX_FUTURE_SKEW = timedelta(minutes=5)
+_SOURCE_TIME_MIN = datetime(2024, 1, 1, tzinfo=UTC)
+
+
+def resolve_source_time(arg: str | None, env: dict[str, str]) -> str | None:
+    """Resolve the raw source-time string from CLI arg or env fallback.
+
+    Pure function. The ``--source-time`` flag is for explicit operator use and
+    is trusted unconditionally -- it wins whenever present. The
+    ``CLAUDE_SOURCE_TIME`` env fallback exists so the memory-extractor agent
+    (a headless ``claude -p`` subprocess that calls this script itself and
+    cannot be made to pass the flag) can stamp the source session time. That
+    fallback is trusted ONLY inside the extraction subprocess, identified by
+    the ``CLAUDE_MEMORY_EXTRACTION=1`` marker the backfill pipeline injects
+    alongside the computed source time. Without the marker an ambient or
+    user-set ``CLAUDE_SOURCE_TIME`` is ignored, so a stale value cannot
+    silently backdate a live store (issue #52, trust boundary). Returns None
+    when neither a flag nor a marker-gated env value is available.
+    """
+    if arg:
+        return arg
+    if env.get("CLAUDE_MEMORY_EXTRACTION") != "1":
+        return None
+    env_val = env.get("CLAUDE_SOURCE_TIME")
+    return env_val or None
+
+
+def validate_source_time(raw: str | None, *, now: datetime | None = None) -> datetime | None:
+    """Parse and validate a source-time string into an aware datetime.
+
+    Pure function. Returns a timezone-aware ``datetime`` on success, or None
+    when ``raw`` is empty, unparseable, more than five minutes in the future
+    (clock-skew guard), or before 2024-01-01 (implausibility floor matching
+    fix_backfill_created_at.sql -- no real session predates the system).
+    Naive ISO8601 timestamps are interpreted as UTC. Callers treat None as
+    "no override" and warn on rejected input.
+    """
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    reference = now or datetime.now(UTC)
+    if parsed > reference + _SOURCE_TIME_MAX_FUTURE_SKEW:
+        return None
+    if parsed < _SOURCE_TIME_MIN:
+        return None
+    return parsed
+
+
 def format_output(result: dict[str, Any], *, json_mode: bool) -> str:
     """Format a store result dict for CLI output.
 
@@ -312,6 +368,19 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # Host identification
     parser.add_argument("--host-id", help="Machine identifier for multi-system support")
+
+    # Source time override (issue #52): stamp created_at from the originating
+    # session time (e.g. backfill JSONL mtime) instead of the DB NOW() default.
+    parser.add_argument(
+        "--source-time",
+        help=(
+            "ISO8601 timestamp for created_at (backfill/source session time). "
+            "Naive values are treated as UTC; garbage, >5min-future, or "
+            "pre-2024-01-01 values are ignored with a warning. Falls back to "
+            "CLAUDE_SOURCE_TIME env (honored only inside the extraction "
+            "subprocess, i.e. with CLAUDE_MEMORY_EXTRACTION=1)."
+        ),
+    )
 
     # Learning chains
     parser.add_argument("--supersedes", help="UUID of older learning this one replaces (v2)")
@@ -577,6 +646,7 @@ async def store_learning_v2(
     supersedes: str | None = None,
     project: str | None = None,
     auto_classify: bool = False,
+    source_time: datetime | None = None,
 ) -> dict[str, Any]:
     """Store learning with v2 metadata schema and deduplication.
 
@@ -701,6 +771,7 @@ async def store_learning_v2(
             supersedes=supersedes if backend == "postgres" else None,
             tags=tags if backend == "postgres" else None,
             project=project if backend == "postgres" else None,
+            source_time=source_time if backend == "postgres" else None,
         )
 
         # content_hash dedup returns empty string
@@ -822,6 +893,17 @@ async def main() -> None:
         args.project, env_project_dir=os.environ.get("CLAUDE_PROJECT_DIR", ""),
     )
 
+    # Resolve created_at override from --source-time or CLAUDE_SOURCE_TIME
+    # env (issue #52). Invalid/future values are ignored with a warning so the
+    # store still succeeds with the default created_at.
+    raw_source_time = resolve_source_time(args.source_time, dict(os.environ))
+    source_time = validate_source_time(raw_source_time)
+    if raw_source_time and source_time is None:
+        logger.warning(
+            "Ignoring invalid --source-time/CLAUDE_SOURCE_TIME %r; using default created_at",
+            raw_source_time,
+        )
+
     # Determine which mode to use: v2 if --content is provided, else legacy
     if args.content:
         tags = parse_tags(args.tags)
@@ -836,6 +918,7 @@ async def main() -> None:
             supersedes=args.supersedes,
             project=project,
             auto_classify=args.auto_classify,
+            source_time=source_time,
         )
     else:
         result = await store_learning(

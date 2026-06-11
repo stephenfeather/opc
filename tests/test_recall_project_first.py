@@ -1,8 +1,8 @@
 """Tests for issue #139 — fetch-time project scoping (--project-first).
 
-Opt-in two-pass fetch: pass 1 scoped via SQL `AND project = $N`, pass 2 global,
-merged own-first with id-dedupe and fetch_k truncation. Default path (no flag)
-must stay byte-identical to today.
+Opt-in two-pass fetch: pass 1 scoped via SQL `AND LOWER(project) = $N`, pass 2
+global, merged own-first with id-dedupe and fetch_k truncation. Default path
+(no flag) must stay byte-identical to today.
 """
 
 from __future__ import annotations
@@ -15,10 +15,12 @@ import pytest
 
 
 class TestRecallSqlProjectFilter:
-    """render_recall_sql renders an optional `AND project = $N` clause.
+    """render_recall_sql renders an optional `AND LOWER(project) = $N` clause.
 
     None (default) => SQL byte-identical to today; a clause string =>
-    the clause is injected into the WHERE block (issue #139).
+    the clause is injected into the WHERE block (issue #139). The
+    assertions below pass a representative clause literal to exercise the
+    generic rendering mechanism.
     """
 
     def _simple_templates(self):
@@ -667,6 +669,35 @@ class TestMergeProjectFirstGlobalQuota:
         merge_project_first(own, global_, fetch_k=2)
         assert [r["id"] for r in own] == ["o0", "o1"]
         assert [r["id"] for r in global_] == ["g0"]
+
+    def test_backfill_does_not_duplicate_shared_id(self):
+        """Dedupe-on-backfill guarantee: when a leftover own row's id also
+        appears in global_, and global_ is short enough to trigger backfill,
+        the shared id appears exactly once (the own copy) — never duplicated
+        across own_leftover and the global fill (Copilot PR #143 comment 1)."""
+        from scripts.core.recall_learnings import merge_project_first
+
+        # fetch_k=4 -> own_quota=2 -> lead=[o0, o1], leftover=[shared, o3].
+        # global_ holds the same 'shared' id plus one fresh row; it is too
+        # short (after dedupe) to fill the 2 non-lead slots, so backfill pulls
+        # 'shared' from own_leftover.
+        own = [
+            _row("o0"),
+            _row("o1"),
+            {"id": "shared", "src": "own"},
+            _row("o3"),
+        ]
+        global_ = [{"id": "shared", "src": "global"}, _row("g0")]
+
+        merged = merge_project_first(own, global_, fetch_k=4)
+        ids = [r["id"] for r in merged]
+
+        assert len(ids) == len(set(ids)), f"duplicate ids in merge: {ids}"
+        assert ids.count("shared") == 1
+        shared_row = next(r for r in merged if r["id"] == "shared")
+        assert shared_row.get("src") == "own"  # own copy wins, not the global one
+        # Sanity: backfill actually engaged (shared made the cut via leftover).
+        assert "shared" in ids and "g0" in ids
 
 
 # ==================== Round-2 Finding 3: independent pass failure isolation ==

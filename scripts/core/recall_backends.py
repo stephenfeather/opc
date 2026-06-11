@@ -292,10 +292,10 @@ def render_recall_sql(
 
     ``project_filter`` is the optional fetch-time scoping clause for
     ``--project-first`` (issue #139). It is the fully-formed predicate the
-    backend computed (e.g. ``"AND project = $3"`` — bound last so the
-    existing positional params keep their numbers). ``None`` renders the
-    ``{project_filter}`` placeholder empty, leaving the SQL byte-identical
-    to today.
+    backend computed (e.g. ``"AND LOWER(project) = $3"`` — bound last so
+    the existing positional params keep their numbers). ``None`` renders
+    the ``{project_filter}`` placeholder empty, leaving the SQL
+    byte-identical to today.
     """
     return template.format(
         project_col=project_expr if include_project else "",
@@ -583,8 +583,9 @@ async def search_learnings_text_only_postgres(
     Falls back to ILIKE if tsquery fails (e.g., all stopwords).
 
     ``project`` (issue #139) scopes the fetch to one project via an
-    ``AND project = $3`` clause bound last; ``None`` (or a pre-migration DB
-    lacking the column) leaves the query byte-identical to the global path.
+    ``AND LOWER(project) = $3`` clause bound last; ``None`` (or a
+    pre-migration DB lacking the column) leaves the query byte-identical
+    to the global path.
     """
     from scripts.core.db.postgres_pool import get_pool
     from scripts.core.query_expansion import STOPWORDS

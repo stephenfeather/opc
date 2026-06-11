@@ -64,6 +64,31 @@ def _patch_embedder(monkeypatch, embedder_cls: type) -> None:
     monkeypatch.setattr(emb_mod, "EmbeddingService", embedder_cls)
 
 
+class _RaiseEmbedAndCloseEmbedder:
+    """embed() raises AND aclose() raises — cleanup failure must not abort
+    the pending text-only fallback (review round 2, FIX A)."""
+
+    def __init__(self, *a: Any, **kw: Any) -> None: ...
+
+    async def embed(self, *_a: Any, **_kw: Any) -> list[float]:
+        raise RuntimeError(
+            "connection to postgresql://user:secret@dbhost:5432/memdb refused"
+        )
+
+    async def aclose(self) -> None:
+        raise RuntimeError("aclose blew up")
+
+
+@pytest.fixture(autouse=True)
+def _reset_degrade_latch():
+    """The once-per-process stderr warning latch must not leak across tests."""
+    from scripts.core import recall_backends as rb
+
+    rb._EMBED_DEGRADE_WARNED = False
+    yield
+    rb._EMBED_DEGRADE_WARNED = False
+
+
 def _patch_pool(monkeypatch) -> None:
     """Patch get_pool/init_pgvector so the hybrid path needs no real DB."""
     import scripts.core.db.postgres_pool as pool_mod
@@ -285,3 +310,78 @@ class TestHybridEmbedFallback:
             "query terms", k=3, provider="voyage",
         )
         assert results == [dict(_TEXT_RESULT)]
+
+    async def test_aclose_failure_does_not_abort_fallback(self, monkeypatch):
+        """FIX A: a raise from aclose() in finally must not override the pending
+        text-only fallback return — results still come back, warning still fires."""
+        from scripts.core import recall_backends as rb
+
+        _patch_embedder(monkeypatch, _RaiseEmbedAndCloseEmbedder)
+        _patch_pool(monkeypatch)
+
+        async def fake_text_only(query, k=10, *, project=None):
+            return [dict(_TEXT_RESULT)]
+
+        monkeypatch.setattr(rb, "search_learnings_text_only_postgres", fake_text_only)
+
+        # No exception leaks even though aclose() raises.
+        results = await rb.search_learnings_hybrid_rrf("query terms", k=3)
+        assert results == [dict(_TEXT_RESULT)]
+
+    async def test_aclose_failure_still_emits_warning(self, monkeypatch, capsys):
+        from scripts.core import recall_backends as rb
+
+        _patch_embedder(monkeypatch, _RaiseEmbedAndCloseEmbedder)
+        _patch_pool(monkeypatch)
+
+        async def fake_text_only(query, k=10, *, project=None):
+            return [dict(_TEXT_RESULT)]
+
+        monkeypatch.setattr(rb, "search_learnings_text_only_postgres", fake_text_only)
+
+        await rb.search_learnings_hybrid_rrf("query terms", k=3)
+        err = capsys.readouterr().err
+        assert "text-only" in err.lower()
+
+    async def test_warning_latched_once_per_process(self, monkeypatch, capsys):
+        """FIX B(1): two consecutive degraded searches in one process emit
+        exactly one stderr warning (logger.debug still fires every time)."""
+        from scripts.core import recall_backends as rb
+
+        _patch_embedder(monkeypatch, _RaisingEmbedder)
+        _patch_pool(monkeypatch)
+
+        async def fake_text_only(query, k=10, *, project=None):
+            return [dict(_TEXT_RESULT)]
+
+        monkeypatch.setattr(rb, "search_learnings_text_only_postgres", fake_text_only)
+
+        await rb.search_learnings_hybrid_rrf("first query", k=3)
+        await rb.search_learnings_hybrid_rrf("second query", k=3)
+
+        err = capsys.readouterr().err
+        assert err.lower().count("warning") == 1, err
+
+    async def test_warning_includes_provider_name_and_is_redacted(
+        self, monkeypatch, capsys,
+    ):
+        """FIX B(2): warning names the provider and stays redacted."""
+        from scripts.core import recall_backends as rb
+
+        _patch_embedder(monkeypatch, _RaisingEmbedder)
+        _patch_pool(monkeypatch)
+
+        async def fake_text_only(query, k=10, *, project=None):
+            return [dict(_TEXT_RESULT)]
+
+        monkeypatch.setattr(rb, "search_learnings_text_only_postgres", fake_text_only)
+
+        await rb.search_learnings_hybrid_rrf(
+            "secret query phrase", k=3, provider="voyage",
+        )
+        err = capsys.readouterr().err
+        assert "voyage" in err.lower()
+        # Redaction intact: DSN password gone, query text never echoed.
+        assert "secret" not in err
+        assert "user:secret@" not in err
+        assert "secret query phrase" not in err

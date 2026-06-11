@@ -24,6 +24,14 @@ from scripts.core.config import get_config as _get_config
 
 logger = logging.getLogger(__name__)
 
+# Issue #53: hybrid recall degrades to text-only by design when the query
+# embedding is unavailable (this is the contract — the memory-awareness hook
+# relies on it for the missing-key case). To keep that quiet path from
+# spamming hook-captured stderr, the human-readable warning is latched to at
+# most once per process; logger.debug still fires on every degrade. The hook
+# spawns a fresh process per prompt, so this caps it at one warning per prompt.
+_EMBED_DEGRADE_WARNED = False
+
 
 # ---------------------------------------------------------------------------
 # Pure functions — no I/O, no side effects
@@ -766,24 +774,37 @@ async def search_learnings_hybrid_rrf(
         # an identical result shape to --text-only. exc text can embed a
         # DSN/host; recall stderr is injected into the model context by
         # hooks, so redact and never echo the query (#139 redactor; aegis).
+        global _EMBED_DEGRADE_WARNED
         from scripts.core.db.postgres_pool import sanitize_log_message
 
         logger.debug(
-            "hybrid query-embed failed; degrading to text-only", exc_info=True,
+            "hybrid query-embed failed (provider %r); degrading to text-only",
+            provider,
+            exc_info=True,
         )
-        print(
-            "warning: hybrid recall query-embed failed "
-            f"({sanitize_log_message(str(exc))}); "
-            "degrading to text-only search for this query.",
-            file=sys.stderr,
-        )
-        # finally below runs on return and closes the embedder.
+        if not _EMBED_DEGRADE_WARNED:
+            # Latch the human-readable warning to once per process so the
+            # --project-first second pass (and repeated recalls) stay quiet.
+            _EMBED_DEGRADE_WARNED = True
+            print(
+                "warning: hybrid recall degraded to text-only "
+                f"(provider {provider!r} unavailable: "
+                f"{sanitize_log_message(str(exc))}); "
+                "set the provider API key or pass --text-only to silence.",
+                file=sys.stderr,
+            )
         return await search_learnings_text_only_postgres(
             query, k, project=project,
         )
     finally:
         if embedder is not None:
-            await embedder.aclose()
+            # A raise here would override the pending fallback return
+            # (FIX A): cleanup failure must never abort recall. Swallow it
+            # to the debug log only.
+            try:
+                await embedder.aclose()
+            except Exception:  # noqa: BLE001 - cleanup is best-effort
+                logger.debug("embedder close failed", exc_info=True)
 
     text_query = query
     use_tsquery = False

@@ -20,6 +20,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts.core.recall_learnings import (  # noqa: E402
+    _sanitize_source,
     record_recall,
     resolve_caller_project,
 )
@@ -254,6 +255,96 @@ class TestRecordRecallLogging:
 
         assert conn.fetch_calls == []
         assert conn.execute_calls == []
+
+    async def test_missing_project_column_falls_back_to_counter_update(self, monkeypatch):
+        # Version skew: temporal-decay columns exist but add_project_column.sql
+        # was never applied, so UPDATE ... RETURNING project raises. The
+        # counter UPDATE must still happen via a project-free fallback, and the
+        # recall_log INSERT must be skipped. Must not raise (issue #140 r1).
+        from asyncpg.exceptions import UndefinedColumnError
+
+        rid = str(uuid.uuid4())
+        conn = _CapturingConn(
+            fetch_error=UndefinedColumnError('column "project" does not exist'),
+        )
+        _patch_postgres(monkeypatch)
+        _patch_pool(monkeypatch, conn)
+
+        await record_recall([rid], caller_project="opc", source="cli")
+
+        # The RETURNING fetch was attempted...
+        assert len(conn.fetch_calls) == 1
+        assert "RETURNING id, project" in conn.fetch_calls[0][0]
+        # ...then the counter-only fallback ran via execute (no RETURNING).
+        assert len(conn.execute_calls) == 1
+        fallback_sql, fallback_args = conn.execute_calls[0]
+        assert "recall_count = recall_count + 1" in fallback_sql
+        assert "last_recalled = NOW()" in fallback_sql
+        assert "RETURNING" not in fallback_sql
+        assert "recall_log" not in fallback_sql
+        assert fallback_args[0] == [rid]
+
+    async def test_invalid_source_label_bound_as_null(self, monkeypatch):
+        # A non-conforming source label must be dropped to NULL, not stored.
+        rid = str(uuid.uuid4())
+        conn = _CapturingConn(fetch_rows=[_row(rid, "opc")])
+        _patch_postgres(monkeypatch)
+        _patch_pool(monkeypatch, conn)
+
+        await record_recall([rid], caller_project="opc", source="Hook With Spaces")
+
+        assert len(conn.execute_calls) == 1
+        insert_args = conn.execute_calls[0][1]
+        assert insert_args[4] is None  # invalid source dropped to NULL
+
+    async def test_valid_source_label_preserved(self, monkeypatch):
+        rid = str(uuid.uuid4())
+        conn = _CapturingConn(fetch_rows=[_row(rid, "opc")])
+        _patch_postgres(monkeypatch)
+        _patch_pool(monkeypatch, conn)
+
+        await record_recall([rid], caller_project="opc", source="mcp")
+
+        assert conn.execute_calls[0][1][4] == "mcp"
+
+
+# ---------------------------------------------------------------------------
+# _sanitize_source
+# ---------------------------------------------------------------------------
+
+
+class TestSanitizeSource:
+    """Source labels are validated label-only at the writer (no DB CHECK)."""
+
+    def test_valid_labels_pass_through(self):
+        for label in ("hook", "mcp", "cli", "a", "session-start", "x_y-9"):
+            assert _sanitize_source(label) == label
+
+    def test_none_stays_none(self):
+        assert _sanitize_source(None) is None
+
+    def test_uppercase_dropped(self):
+        assert _sanitize_source("Hook") is None
+
+    def test_spaces_dropped(self):
+        assert _sanitize_source("hook path") is None
+
+    def test_leading_non_alpha_dropped(self):
+        assert _sanitize_source("1hook") is None
+        assert _sanitize_source("-hook") is None
+
+    def test_too_long_dropped(self):
+        # 33 chars (max is 32: leading alpha + up to 31 trailing).
+        assert _sanitize_source("a" * 33) is None
+
+    def test_max_length_passes(self):
+        assert _sanitize_source("a" * 32) == "a" * 32
+
+    def test_prompt_like_text_dropped(self):
+        assert _sanitize_source("how do I reset my password?") is None
+
+    def test_empty_string_dropped(self):
+        assert _sanitize_source("") is None
 
 
 # ---------------------------------------------------------------------------

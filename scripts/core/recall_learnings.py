@@ -33,6 +33,7 @@ import faulthandler
 import json
 import logging
 import os
+import re
 import sys
 import uuid
 from pathlib import Path
@@ -417,6 +418,29 @@ def get_backend() -> str:
 # ---------------------------------------------------------------------------
 
 
+# Source labels are validated here (writer-side) instead of with a DB CHECK
+# constraint: recall_log is append-only and a CHECK violation would abort the
+# whole INSERT, silently dropping the entire log row (losing the recall event).
+# Validating in Python lets us drop just the bad label to NULL and still log.
+_SOURCE_LABEL_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+
+
+def _sanitize_source(source: str | None) -> str | None:
+    """Validate a recall ``source`` label (issue #140).
+
+    Labels are documented as fixed call-site identifiers (``hook``/``mcp``/
+    ``cli``), never prompt-derived text. A value that does not match
+    ``^[a-z][a-z0-9_-]{0,31}$`` is dropped to ``None`` so arbitrary text can't
+    leak into the append-only log. Pure function.
+    """
+    if source is None:
+        return None
+    if _SOURCE_LABEL_RE.match(source):
+        return source
+    logger.debug("invalid recall source label dropped")
+    return None
+
+
 async def record_recall(
     result_ids: list[str],
     caller_project: str | None = None,
@@ -432,7 +456,11 @@ async def record_recall(
     The INSERT is wrapped in its own try/except so a pre-migration DB (no
     ``recall_log`` table) still gets the counter UPDATE committed — both run
     as separate autocommitted statements in the same acquire, NOT a CTE or
-    transaction. The whole body never raises (recall must not break).
+    transaction. If ``archival_memory.project`` itself is missing (temporal-
+    decay columns applied but not add_project_column.sql), the RETURNING fetch
+    raises ``UndefinedColumnError``; we fall back to the original counter-only
+    UPDATE so counters never silently stop, and skip the recall_log INSERT.
+    The whole body never raises (recall must not break).
 
     ``caller_project`` and ``source`` are accepted for SQLite parity but
     unused there: SQLite has no project/log columns, so it skips entirely.
@@ -446,21 +474,44 @@ async def record_recall(
         )
         return
 
+    source = _sanitize_source(source)
+
     try:
+        from asyncpg.exceptions import UndefinedColumnError
+
         from scripts.core.db.postgres_pool import get_pool
 
         pool = await get_pool()
         async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                UPDATE archival_memory
-                SET last_recalled = NOW(),
-                    recall_count = recall_count + 1
-                WHERE id = ANY($1::uuid[])
-                RETURNING id, project
-                """,
-                result_ids,
-            )
+            try:
+                rows = await conn.fetch(
+                    """
+                    UPDATE archival_memory
+                    SET last_recalled = NOW(),
+                        recall_count = recall_count + 1
+                    WHERE id = ANY($1::uuid[])
+                    RETURNING id, project
+                    """,
+                    result_ids,
+                )
+            except UndefinedColumnError:
+                # archival_memory.project absent: keep counters working and
+                # skip recall_log entirely (point-in-time projects unknown).
+                logger.debug(
+                    "archival_memory.project missing; "
+                    "counters updated, recall_log skipped"
+                )
+                await conn.execute(
+                    """
+                    UPDATE archival_memory
+                    SET last_recalled = NOW(),
+                        recall_count = recall_count + 1
+                    WHERE id = ANY($1::uuid[])
+                    """,
+                    result_ids,
+                )
+                return
+
             if not rows:
                 return
 
@@ -887,7 +938,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--source",
         help=(
             "Short caller label for recall-event logging (e.g. hook|mcp|cli). "
-            "Label-only -- never prompt-derived text (issue #140)."
+            "Label-only -- never prompt-derived text. Must match "
+            "^[a-z][a-z0-9_-]{0,31}$; invalid labels are dropped to NULL "
+            "(issue #140)."
         ),
     )
     return parser

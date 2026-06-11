@@ -43,6 +43,11 @@ CREATE TABLE IF NOT EXISTS recall_log (
     recalled_ids UUID[] NOT NULL,
     recalled_projects TEXT[] NOT NULL,   -- NULL elements = unattributed memories
     result_count INTEGER NOT NULL,
+    -- source is validated at the writer (record_recall) against the regex
+    -- ^[a-z][a-z0-9_-]{0,31}$, NOT with a DB CHECK constraint: a CHECK
+    -- violation would abort the whole INSERT and silently drop the entire
+    -- append-only log row (losing the recall event). Invalid labels are
+    -- dropped to NULL in Python instead, so the event is still recorded.
     source TEXT,                         -- short caller label (hook|mcp|cli); NULL = unknown
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

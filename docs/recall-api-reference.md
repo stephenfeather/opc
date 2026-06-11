@@ -201,8 +201,11 @@ column and always degrades to a global fetch.
 Short caller label recorded with each recall event in the `recall_log` table
 (issue #140), e.g. `hook`, `mcp`, or `cli`. Optional; defaults to `NULL`
 (unknown). **Label-only** — pass a fixed identifier for the call site, never
-prompt-derived or user text. No query text is ever logged (privacy). See the
-[Recall Event Log](#recall-event-log) section.
+prompt-derived or user text. The label is validated at the writer against
+`^[a-z][a-z0-9_-]{0,31}$`; any value that does not match (uppercase, spaces,
+over 32 chars, prompt-like text) is **dropped to `NULL`** rather than stored,
+so arbitrary text cannot leak into the append-only log. No query text is ever
+logged (privacy). See the [Recall Event Log](#recall-event-log) section.
 
 ### `--provider` (default: local)
 
@@ -237,7 +240,7 @@ extra round trip is added.
 | `recalled_ids` | `UUID[]` | Ids of the rows whose counters were bumped |
 | `recalled_projects` | `TEXT[]` | Parallel to `recalled_ids`; `NULL` elements = unattributed memories |
 | `result_count` | `INTEGER` | Number of recalled rows (length of the arrays) |
-| `source` | `TEXT` | Short caller label from `--source` (`hook`/`mcp`/`cli`); `NULL` = unknown |
+| `source` | `TEXT` | Short caller label from `--source` (`hook`/`mcp`/`cli`); validated `^[a-z][a-z0-9_-]{0,31}$` at the writer, invalid → `NULL`; `NULL` = unknown |
 | `created_at` | `TIMESTAMPTZ` | Event time, defaults to `NOW()` |
 
 ### Write semantics
@@ -249,6 +252,16 @@ extra round trip is added.
   the counter UPDATE (not a CTE or transaction). On a pre-migration DB that
   lacks `recall_log`, the INSERT fails alone, is swallowed (debug log), and the
   counter UPDATE still persists.
+- **Version-skew safe:** if `archival_memory.project` itself is missing
+  (temporal-decay columns applied but `add_project_column.sql` not), the
+  `RETURNING project` fetch raises `UndefinedColumnError`; recall falls back to
+  the original counter-only `UPDATE` (no `RETURNING`) so counters never
+  silently stop, and skips the `recall_log` INSERT for that event.
+- **Source validated at the writer:** `source` is checked against
+  `^[a-z][a-z0-9_-]{0,31}$` in Python before the INSERT; an invalid label is
+  dropped to `NULL`. This is deliberately *not* a DB `CHECK` constraint — a
+  CHECK violation would abort the whole INSERT and silently drop the entire log
+  row, losing the recall event.
 - **Never raises:** the whole path is wrapped so recall can never break.
 - **No query text, ever:** only project labels, ids, a count, and a source
   label are stored (privacy — see issue #139).

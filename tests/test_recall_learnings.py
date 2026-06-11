@@ -504,10 +504,18 @@ class TestRecordRecall:
             await record_recall(["abc"])  # should not raise
 
     @pytest.mark.asyncio
-    async def test_postgres_calls_execute(self):
+    async def test_postgres_updates_counters_and_logs_event(self):
         from scripts.core.recall_learnings import record_recall
 
         mock_conn = AsyncMock()
+        # Counter UPDATE now uses fetch(... RETURNING id, project); the
+        # recall_log INSERT is the execute() call (issue #140).
+        mock_conn.fetch = AsyncMock(
+            return_value=[
+                {"id": "id-1", "project": None},
+                {"id": "id-2", "project": "opc"},
+            ]
+        )
         mock_pool = _make_pool_mock(mock_conn)
 
         with (
@@ -515,7 +523,12 @@ class TestRecordRecall:
             _patch_pool(mock_pool),
         ):
             await record_recall(["id-1", "id-2"])
-            mock_conn.execute.assert_called_once()
+            mock_conn.fetch.assert_called_once()  # counter UPDATE ... RETURNING
+            mock_conn.execute.assert_called_once()  # recall_log INSERT
+            update_sql = mock_conn.fetch.call_args[0][0]
+            assert "UPDATE archival_memory" in update_sql
+            insert_sql = mock_conn.execute.call_args[0][0]
+            assert "INSERT INTO recall_log" in insert_sql
 
     @pytest.mark.asyncio
     async def test_db_error_graceful(self):

@@ -538,7 +538,9 @@ async def record_recall(
                 conn, caller_project, recalled_ids, recalled_projects, source
             )
     except Exception:
-        pass
+        # Best-effort telemetry must never break recall, but failures (e.g.
+        # pool acquisition) should still be observable at debug level.
+        logger.debug("record_recall failed", exc_info=True)
 
 
 async def _insert_recall_log(

@@ -26,6 +26,7 @@ import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import UTC, datetime
 from pathlib import Path
 
 from scripts.core.log_safety import safe
@@ -131,17 +132,27 @@ def _is_env_allowed(key: str) -> bool:
     return any(key.startswith(prefix) for prefix in _ALLOW_ENV_PREFIXES)
 
 
-def build_extraction_env(project_dir: str | None) -> dict[str, str]:
+def build_extraction_env(
+    project_dir: str | None, source_time: datetime | None = None
+) -> dict[str, str]:
     """Build allowlisted environment dict for extraction subprocess.
 
     Only passes env vars matching known-safe exact names or prefixes.
     This prevents leaking DB credentials, API keys, or tokens to the
     LLM process.
+
+    Issue #52: when ``source_time`` is provided (the backfilled session's
+    JSONL mtime / end time), inject it as ``CLAUDE_SOURCE_TIME`` so the
+    extractor agent's ``store_learning.py`` calls stamp ``created_at`` from
+    the original session time instead of the NOW() default. The ``CLAUDE_``
+    prefix is already on the allowlist, so the value survives filtering.
     """
     env = {k: v for k, v in os.environ.items() if _is_env_allowed(k)}
     env["CLAUDE_MEMORY_EXTRACTION"] = "1"
     if project_dir:
         env["CLAUDE_PROJECT_DIR"] = project_dir
+    if source_time is not None:
+        env["CLAUDE_SOURCE_TIME"] = source_time.isoformat()
     return env
 
 
@@ -418,6 +429,17 @@ def download_and_decompress(
     return jsonl_path
 
 
+def _jsonl_source_time(jsonl_path: Path) -> datetime | None:
+    """Return the JSONL file mtime as an aware UTC datetime, or None on error.
+
+    Used as the source session time for created_at stamping (issue #52).
+    """
+    try:
+        return datetime.fromtimestamp(jsonl_path.stat().st_mtime, tz=UTC)
+    except OSError:
+        return None
+
+
 def run_extraction(
     jsonl_path: Path,
     session_id: str,
@@ -429,7 +451,11 @@ def run_extraction(
 ) -> dict:
     """Run headless extraction subprocess. Returns result dict with status."""
     cmd = build_extraction_cmd(jsonl_path, session_id, agent_prompt, model, max_turns)
-    env = build_extraction_env(project_dir)
+    # Issue #52: stamp created_at from the source session time. The downloaded
+    # JSONL's mtime approximates session end; if the stat fails, fall back to
+    # no override (default NOW()).
+    source_time = _jsonl_source_time(jsonl_path)
+    env = build_extraction_env(project_dir, source_time=source_time)
 
     try:
         proc = subprocess.run(

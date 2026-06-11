@@ -265,6 +265,7 @@ class MemoryServicePG:
         host_id: str | None = None,
         supersedes: str | None = None,
         project: str | None = None,
+        source_time: datetime | None = None,
     ) -> str:
         """Store a fact in archival memory.
 
@@ -279,34 +280,93 @@ class MemoryServicePG:
         async with get_transaction() as conn:
             if padded_embedding is not None:
                 await init_pgvector(conn)
-                result = await conn.execute(
-                    """
-                    INSERT INTO archival_memory
-                        (id, session_id, agent_id, content,
-                         metadata, embedding, content_hash, host_id, project)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                    ON CONFLICT (content_hash)
-                        WHERE content_hash IS NOT NULL
-                        DO NOTHING
-                    """,
-                    memory_id, self.session_id, self.agent_id, content,
-                    json.dumps(metadata or {}), padded_embedding,
-                    content_hash, host_id, project,
-                )
+                if source_time is not None:
+                    result = await conn.execute(
+                        """
+                        INSERT INTO archival_memory
+                            (id, session_id, agent_id, content,
+                             metadata, embedding, content_hash, host_id,
+                             project, created_at)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                        ON CONFLICT (content_hash)
+                            WHERE content_hash IS NOT NULL
+                            DO NOTHING
+                        """,
+                        memory_id,
+                        self.session_id,
+                        self.agent_id,
+                        content,
+                        json.dumps(metadata or {}),
+                        padded_embedding,
+                        content_hash,
+                        host_id,
+                        project,
+                        source_time,
+                    )
+                else:
+                    result = await conn.execute(
+                        """
+                        INSERT INTO archival_memory
+                            (id, session_id, agent_id, content,
+                             metadata, embedding, content_hash, host_id, project)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        ON CONFLICT (content_hash)
+                            WHERE content_hash IS NOT NULL
+                            DO NOTHING
+                        """,
+                        memory_id,
+                        self.session_id,
+                        self.agent_id,
+                        content,
+                        json.dumps(metadata or {}),
+                        padded_embedding,
+                        content_hash,
+                        host_id,
+                        project,
+                    )
             else:
-                result = await conn.execute(
-                    """
-                    INSERT INTO archival_memory
-                        (id, session_id, agent_id, content,
-                         metadata, content_hash, host_id, project)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                    ON CONFLICT (content_hash)
-                        WHERE content_hash IS NOT NULL
-                        DO NOTHING
-                    """,
-                    memory_id, self.session_id, self.agent_id, content,
-                    json.dumps(metadata or {}), content_hash, host_id, project,
-                )
+                if source_time is not None:
+                    result = await conn.execute(
+                        """
+                        INSERT INTO archival_memory
+                            (id, session_id, agent_id, content,
+                             metadata, content_hash, host_id, project,
+                             created_at)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        ON CONFLICT (content_hash)
+                            WHERE content_hash IS NOT NULL
+                            DO NOTHING
+                        """,
+                        memory_id,
+                        self.session_id,
+                        self.agent_id,
+                        content,
+                        json.dumps(metadata or {}),
+                        content_hash,
+                        host_id,
+                        project,
+                        source_time,
+                    )
+                else:
+                    result = await conn.execute(
+                        """
+                        INSERT INTO archival_memory
+                            (id, session_id, agent_id, content,
+                             metadata, content_hash, host_id, project)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                        ON CONFLICT (content_hash)
+                            WHERE content_hash IS NOT NULL
+                            DO NOTHING
+                        """,
+                        memory_id,
+                        self.session_id,
+                        self.agent_id,
+                        content,
+                        json.dumps(metadata or {}),
+                        content_hash,
+                        host_id,
+                        project,
+                    )
 
             if result == "INSERT 0 0":
                 return ""

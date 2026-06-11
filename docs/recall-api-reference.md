@@ -463,6 +463,36 @@ Auto-classify learning type via LLM judge. Requires `BRAINTRUST_API_KEY`. Only r
 
 Machine identifier for multi-system support.
 
+### `--source-time` (issue #52)
+
+ISO8601 timestamp used to stamp `created_at` from the originating session time
+instead of the database `NOW()` default. This exists so backfilled learnings
+(extracted long after the session occurred) do not masquerade as age-zero and
+inflate the reranker's recency score.
+
+- Naive timestamps (no offset) are interpreted as **UTC**.
+- Garbage or more-than-5-minutes-in-the-future values are **ignored with a
+  warning** — the store still succeeds with the default `created_at`.
+- When omitted, behavior is unchanged (the DB default applies).
+- Falls back to the `CLAUDE_SOURCE_TIME` environment variable when the flag is
+  absent. The backfill pipeline (`backfill_learnings.py`) injects the source
+  session's JSONL mtime via this env var so the memory-extractor agent's
+  `store_learning.py` calls stamp the correct time without needing to pass the
+  flag itself.
+
+```bash
+uv run python scripts/core/store_learning.py \
+  --session-id "session-1" \
+  --content "Pattern X works for Y" \
+  --source-time "2026-03-29T20:50:15+00:00"
+```
+
+**Retroactive repair:** existing backfilled rows are fixed by the migration
+`scripts/migrations/fix_backfill_created_at.sql`, which sets
+`archival_memory.created_at` from `sessions.exited_at` for sessions with
+`working_on = 'backfill'`, only ever moving the timestamp *earlier*. Run the
+dry-run `SELECT` in the migration header before applying.
+
 ### `--json`
 
 Output as JSON instead of human-readable text.

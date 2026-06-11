@@ -203,8 +203,6 @@ def create_provider(
         dim = dimension if dimension is not None else MockEmbeddingProvider.DEFAULT_DIMENSION
         return MockEmbeddingProvider(dimension=dim)
 
-    import os
-
     api_key = kwargs.get("api_key", None)
 
     if name == "openai":
@@ -217,11 +215,18 @@ def create_provider(
         )
 
     if name == "voyage":
+        # Single source of truth (issue #151): the config default is the
+        # canonical 'voyage-code-3' and already folds in the
+        # VOYAGE_EMBEDDING_MODEL env override (config _ENV_OVERRIDES), so an
+        # explicit model arg wins, otherwise the canonical/overridden config
+        # value is used — never a divergent 'voyage-3' literal that would
+        # query a third embedding space.
+        from scripts.core.config import get_config
         from scripts.core.db.embedding_providers import VoyageEmbeddingProvider
 
         voyage_model = (
             model if model is not None
-            else os.getenv("VOYAGE_EMBEDDING_MODEL", "voyage-3")
+            else get_config().embedding.voyage_model
         )
         return VoyageEmbeddingProvider(
             model=voyage_model,

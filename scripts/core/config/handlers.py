@@ -24,6 +24,7 @@ _ENV_OVERRIDES: list[tuple[str, str, str, type]] = [
     ("PATTERN_DETECTION_INTERVAL_HOURS", "daemon", "pattern_detection_interval_hours", int),
     ("OLLAMA_EMBED_MODEL", "embedding", "ollama_model", str),
     ("OLLAMA_HOST", "embedding", "ollama_host", str),
+    ("VOYAGE_EMBEDDING_MODEL", "embedding", "voyage_model", str),
     ("AGENTICA_MAX_POOL_SIZE", "database", "max_pool_size", int),
 ]
 

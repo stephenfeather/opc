@@ -1,10 +1,17 @@
 -- Migration: HNSW index on archival_memory.embedding (issue #151)
 --
--- Enables approximate nearest-neighbor search for every vector query path
--- (hybrid RRF vector ranking, --mode vector, recency-weighted vector, query
--- expansion neighbors, and the store-time dedup probe). Without it,
--- ORDER BY embedding <=> $1::vector falls back to a sequential scan over the
--- whole corpus.
+-- Accelerates the BOUNDED vector query paths — those shaped
+-- `ORDER BY embedding <=> $1::vector LIMIT k`: --mode vector search,
+-- recency-weighted vector, query-expansion neighbors, and the store-time
+-- dedup probes. pgvector's HNSW only speeds up bounded ORDER-BY-distance-LIMIT
+-- queries.
+--
+-- NOTE: the hybrid RRF vector leg is NOT one of those shapes — it is a
+-- windowed unbounded rank, `ROW_NUMBER() OVER (ORDER BY embedding <=> $2)`
+-- with no LIMIT inside the CTE, so it remains a sequential rank over the
+-- (model-filtered, currently ~6k-row) corpus regardless of this index. That
+-- is cheap at today's corpus size; reshaping the RRF leg into a bounded
+-- ANN-friendly form is tracked as a follow-up issue.
 --
 -- WHY THIS IS A SEPARATE FILE FROM add_archival_embedding_hnsw.sql:
 -- The original migration uses a plain (blocking) CREATE INDEX and predates

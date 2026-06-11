@@ -134,6 +134,12 @@ class EmbeddingConfig:
     ollama_model: str = "nomic-embed-text"
     ollama_host: str = "http://localhost:11434"
     re_embed_batch_size: int = 64
+    # Single source of truth for the canonical Voyage embedding space
+    # (issue #151). The model-filtered recall corpus, re_embed_voyage.py's
+    # TARGET_MODEL, and the default voyage provider all read this so they
+    # never disagree (a default of 'voyage-3' would query a third space the
+    # 'voyage-code-3' corpus has no rows in). Override via VOYAGE_EMBEDDING_MODEL.
+    voyage_model: str = "voyage-code-3"
 
 
 @dataclass(frozen=True)

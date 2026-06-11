@@ -448,10 +448,15 @@ async def record_recall(
 ) -> None:
     """Update last_recalled/recall_count and log the recall event (issue #140).
 
-    Batch-updates all returned results in a single ``UPDATE ... RETURNING id,
+    Batch-updates the recalled rows in a single ``UPDATE ... RETURNING id,
     project`` (point-in-time truth, zero extra round trips), then best-effort
     appends one ``recall_log`` row with parallel ``recalled_ids`` /
     ``recalled_projects`` arrays plus the caller's project and source label.
+
+    A **zero-result** recall (empty ``result_ids``) skips the counter UPDATE
+    (nothing to update) but STILL logs a recall_log row with empty arrays and
+    ``result_count = 0`` — empty results are the signature of over-restrictive
+    project scoping (#130), so they must be observable.
 
     The INSERT is wrapped in its own try/except so a pre-migration DB (no
     ``recall_log`` table) still gets the counter UPDATE committed — both run
@@ -465,9 +470,6 @@ async def record_recall(
     ``caller_project`` and ``source`` are accepted for SQLite parity but
     unused there: SQLite has no project/log columns, so it skips entirely.
     """
-    if not result_ids:
-        return
-
     if get_backend() != "postgres":
         logger.debug(
             "record_recall: sqlite backend, skipping recall-event logging"
@@ -483,6 +485,12 @@ async def record_recall(
 
         pool = await get_pool()
         async with pool.acquire() as conn:
+            # Zero-result recall: no rows to bump, but log the event so
+            # over-restrictive scoping (#130) is visible.
+            if not result_ids:
+                await _insert_recall_log(conn, caller_project, [], [], source)
+                return
+
             try:
                 rows = await conn.fetch(
                     """
@@ -512,30 +520,50 @@ async def record_recall(
                 )
                 return
 
+            # ids were supplied but matched nothing (e.g. concurrent deletion):
+            # skip the INSERT — this is a stale-id event, not a zero-result one.
             if not rows:
                 return
 
             recalled_ids = [str(r["id"]) for r in rows]
             recalled_projects = [r["project"] for r in rows]
-            try:
-                await conn.execute(
-                    """
-                    INSERT INTO recall_log (
-                        caller_project, recalled_ids, recalled_projects,
-                        result_count, source
-                    )
-                    VALUES ($1, $2, $3, $4, $5)
-                    """,
-                    caller_project,
-                    recalled_ids,
-                    recalled_projects,
-                    len(rows),
-                    source,
-                )
-            except Exception:
-                logger.debug("recall_log insert failed", exc_info=True)
+            await _insert_recall_log(
+                conn, caller_project, recalled_ids, recalled_projects, source
+            )
     except Exception:
         pass
+
+
+async def _insert_recall_log(
+    conn: Any,
+    caller_project: str | None,
+    recalled_ids: list[str],
+    recalled_projects: list[str | None],
+    source: str | None,
+) -> None:
+    """Best-effort append one recall_log row (issue #140).
+
+    Runs as a separate autocommitted statement after the counter UPDATE (NOT a
+    CTE or transaction) so a pre-migration DB lacking ``recall_log`` fails here
+    alone — the failure is swallowed (debug log) and the counter UPDATE stands.
+    """
+    try:
+        await conn.execute(
+            """
+            INSERT INTO recall_log (
+                caller_project, recalled_ids, recalled_projects,
+                result_count, source
+            )
+            VALUES ($1, $2, $3, $4, $5)
+            """,
+            caller_project,
+            recalled_ids,
+            recalled_projects,
+            len(recalled_ids),
+            source,
+        )
+    except Exception:
+        logger.debug("recall_log insert failed", exc_info=True)
 
 
 async def _fetch_pattern_rows(result_ids: list[str]) -> list[dict[str, Any]]:
@@ -1035,6 +1063,10 @@ async def main() -> int:
 
         results = rerank(results, ctx, k=args.k)
 
+    # Output FIRST: best-effort recall logging must never delay user-visible
+    # output under the memory-awareness hook's 5s spawn timeout (issue #140).
+    print(_format_output(results, output_mode=output_mode, structured=args.structured))
+
     # Record recall (skip benchmarking mode)
     if not args.json_full:
         caller_project = resolve_caller_project(
@@ -1046,8 +1078,6 @@ async def main() -> int:
             source=args.source,
         )
 
-    # Output
-    print(_format_output(results, output_mode=output_mode, structured=args.structured))
     return 0
 
 

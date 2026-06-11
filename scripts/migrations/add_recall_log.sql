@@ -3,6 +3,9 @@
 -- mis-scope happen" (issue #130) is answerable with real data. Each recall
 -- event writes ONE row with parallel arrays of the recalled rows' ids and
 -- their projects (point-in-time, captured via UPDATE ... RETURNING).
+-- Zero-result recalls are logged too -- with empty arrays and
+-- result_count = 0 -- because finding nothing is the signature of
+-- over-restrictive project scoping (#130).
 --
 -- Apply with `psql -f` (autocommit). This creates a NEW, empty table, so a
 -- plain CREATE INDEX is fine -- there are no existing rows to lock and no
@@ -36,6 +39,17 @@
 --   WHERE caller_project IS NOT NULL
 --   GROUP BY caller_project
 --   ORDER BY mis_scope_pct DESC;
+--
+-- The LATERAL unnest above drops zero-result rows automatically (an empty
+-- recalled_projects array yields no rows), which is correct for per-row
+-- mis-scope analysis. Count those events separately as a scoping-pressure
+-- signal, e.g.:
+--   SELECT caller_project,
+--          COUNT(*) FILTER (WHERE result_count = 0) AS empty_recalls,
+--          COUNT(*) AS total_recalls
+--   FROM recall_log
+--   GROUP BY caller_project
+--   ORDER BY empty_recalls DESC;
 
 CREATE TABLE IF NOT EXISTS recall_log (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

@@ -192,8 +192,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_unique_per_session
 
 -- Recall Log: Append-only per-recall-event log (issue #140). One row per
 -- recall event with parallel arrays of the recalled rows' ids and projects,
--- so cross-project mis-scope frequency (issue #130) is measurable. Never
--- stores raw query text (privacy). See scripts/migrations/add_recall_log.sql.
+-- so cross-project mis-scope frequency (issue #130) is measurable. Zero-result
+-- recalls are logged too (empty arrays, result_count = 0) -- finding nothing
+-- signals over-restrictive scoping. Never stores raw query text (privacy).
+-- See scripts/migrations/add_recall_log.sql.
 CREATE TABLE IF NOT EXISTS recall_log (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     caller_project TEXT,                 -- canonicalized; NULL = no project context

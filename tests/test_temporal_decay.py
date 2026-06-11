@@ -77,16 +77,21 @@ class TestRecordRecall:
         assert "RETURNING id, project" in sql
         assert call_args[0][1] == ids
 
-    async def test_skips_empty_ids(self, mock_pool):
-        """record_recall does nothing for empty ID list."""
+    async def test_empty_ids_skips_counter_but_logs_zero_result(self, mock_pool):
+        """Empty IDs: no counter UPDATE, but a zero-result recall_log row is
+        logged so over-restrictive scoping is observable (issue #140 r2)."""
         pool, conn = mock_pool
 
         with patch("scripts.core.recall_learnings.get_backend", return_value="postgres"), \
              patch("scripts.core.db.postgres_pool.get_pool", return_value=pool):
             await record_recall([])
 
+        # No counter UPDATE (nothing to update)...
         conn.fetch.assert_not_called()
-        conn.execute.assert_not_called()
+        # ...but a zero-result event is logged.
+        conn.execute.assert_called_once()
+        insert_sql = conn.execute.call_args[0][0]
+        assert "INSERT INTO recall_log" in insert_sql
 
     async def test_skips_sqlite_backend(self, mock_pool):
         """record_recall does nothing for sqlite backend."""

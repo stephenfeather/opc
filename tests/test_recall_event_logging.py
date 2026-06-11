@@ -246,9 +246,60 @@ class TestRecordRecallLogging:
         assert conn.fetch_calls == []
         assert conn.execute_calls == []
 
-    async def test_empty_ids_skips_entirely(self, monkeypatch):
+    async def test_empty_ids_postgres_logs_zero_result_event(self, monkeypatch):
+        # A recall that found nothing is precisely the over-restrictive-scoping
+        # signature (#130): skip the counter UPDATE (nothing to update) but
+        # still log a zero-result recall_log row (issue #140 r2).
         conn = _CapturingConn(fetch_rows=[])
         _patch_postgres(monkeypatch)
+        _patch_pool(monkeypatch, conn)
+
+        await record_recall([], caller_project="opc", source="cli")
+
+        # No counter UPDATE (no ids to update)...
+        assert conn.fetch_calls == []
+        # ...but a zero-result event is logged with empty parallel arrays.
+        assert len(conn.execute_calls) == 1
+        insert_sql, args = conn.execute_calls[0]
+        assert "INSERT INTO recall_log" in insert_sql
+        assert args[0] == "opc"  # caller_project
+        assert args[1] == []  # recalled_ids
+        assert args[2] == []  # recalled_projects
+        assert args[3] == 0  # result_count
+        assert args[4] == "cli"  # source
+
+    async def test_empty_ids_postgres_sanitizes_source(self, monkeypatch):
+        conn = _CapturingConn(fetch_rows=[])
+        _patch_postgres(monkeypatch)
+        _patch_pool(monkeypatch, conn)
+
+        await record_recall([], caller_project="opc", source="Bad Label")
+
+        assert len(conn.execute_calls) == 1
+        assert conn.execute_calls[0][1][4] is None  # invalid source dropped
+
+    async def test_empty_ids_postgres_insert_failure_swallowed(self, monkeypatch):
+        # Pre-migration DB without recall_log: the zero-result INSERT raises
+        # and must be swallowed without re-raising.
+        from asyncpg.exceptions import UndefinedTableError
+
+        conn = _CapturingConn(
+            fetch_rows=[],
+            execute_error=UndefinedTableError('relation "recall_log" does not exist'),
+        )
+        _patch_postgres(monkeypatch)
+        _patch_pool(monkeypatch, conn)
+
+        await record_recall([], caller_project="opc", source="cli")  # must not raise
+
+        assert conn.fetch_calls == []
+        assert len(conn.execute_calls) == 1
+
+    async def test_empty_ids_sqlite_skips_entirely(self, monkeypatch):
+        import scripts.core.recall_learnings as rl
+
+        monkeypatch.setattr(rl, "get_backend", lambda: "sqlite")
+        conn = _CapturingConn(fetch_rows=[])
         _patch_pool(monkeypatch, conn)
 
         await record_recall([], caller_project="opc", source="cli")
@@ -437,6 +488,51 @@ class TestMainWiring:
         rc = await rl.main()
         assert rc == 0
         assert called["record"] is False
+
+    async def test_output_printed_before_record_recall(self, monkeypatch):
+        # Best-effort logging must never delay user-visible output under the
+        # memory-awareness hook's 5s spawn timeout: format/print first, then
+        # record_recall (issue #140 r2).
+        import scripts.core.recall_learnings as rl
+
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        monkeypatch.setattr(
+            rl.sys,
+            "argv",
+            [
+                "recall_learnings.py",
+                "--query",
+                "x",
+                "--source",
+                "hook",
+                "--text-only",
+                "--json",
+                "--no-rerank",
+            ],
+            raising=False,
+        )
+
+        async def fake_dispatch(params, *, project=None):
+            return [{"id": str(uuid.uuid4()), "content": "x", "similarity": 0.5}]
+
+        monkeypatch.setattr(rl, "_dispatch_search", fake_dispatch)
+        monkeypatch.setattr(rl, "get_backend", lambda: "postgres")
+
+        order: list[str] = []
+
+        def fake_format(*a, **k):
+            order.append("format")
+            return ""
+
+        async def fake_record(ids, *, caller_project=None, source=None):
+            order.append("record")
+
+        monkeypatch.setattr(rl, "_format_output", fake_format, raising=False)
+        monkeypatch.setattr(rl, "record_recall", fake_record)
+
+        rc = await rl.main()
+        assert rc == 0
+        assert order == ["format", "record"]
 
 
 if __name__ == "__main__":

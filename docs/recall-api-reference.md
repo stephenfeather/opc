@@ -229,7 +229,17 @@ Every recall (except `--json-full` benchmarking) appends one row to the
 `recall_log` table (issue #140) so cross-project recall mis-scope frequency
 (issue #130) is measurable. The recalled rows' projects are captured
 point-in-time via `UPDATE archival_memory ... RETURNING id, project`, so no
-extra round trip is added.
+extra round trip is added. **Zero-result recalls are logged too** — with empty
+`recalled_ids`/`recalled_projects` arrays and `result_count = 0` — because
+finding nothing is the signature of over-restrictive project scoping (#130).
+
+**Counters and the log are decoupled by design.** The counter columns
+(`recall_count` / `last_recalled` on `archival_memory`) and `recall_log` are
+written as **two separate autocommitted statements**, not a transaction or CTE,
+so a pre-migration DB keeps working counters even when the log INSERT fails. A
+consequence: a transient INSERT failure can bump counters without writing a log
+row. Treat counters as a coarse popularity signal and `recall_log` as the
+analysis source of truth.
 
 ### Schema
 
@@ -245,9 +255,13 @@ extra round trip is added.
 
 ### Write semantics
 
-- **Skipped entirely** for `--json-full` (benchmark mode), the SQLite backend
-  (no project/log columns — logs a debug line and returns), and when the
-  counter UPDATE matches no rows (e.g. concurrently deleted ids).
+- **Skipped entirely** for `--json-full` (benchmark mode) and the SQLite
+  backend (no project/log columns — logs a debug line and returns).
+- **Zero-result vs. stale-id:** an empty `result_ids` (the recall found
+  nothing) skips the counter UPDATE but still logs a `result_count = 0` row.
+  This is distinct from supplying ids that match no rows (e.g. concurrently
+  deleted ids) — that is a stale-id event and the INSERT is skipped, since the
+  recall did surface candidates.
 - **Best-effort:** the INSERT runs as a separate autocommitted statement after
   the counter UPDATE (not a CTE or transaction). On a pre-migration DB that
   lacks `recall_log`, the INSERT fails alone, is swallowed (debug log), and the
@@ -278,6 +292,18 @@ FROM recall_log
 CROSS JOIN LATERAL unnest(recalled_projects) AS rp
 WHERE caller_project IS NOT NULL
 GROUP BY caller_project ORDER BY mis_scope_pct DESC;
+```
+
+The `LATERAL unnest` drops zero-result rows automatically (an empty
+`recalled_projects` array yields no rows), which is correct for per-row
+mis-scope analysis. Count those events separately as a scoping-pressure signal:
+
+```sql
+SELECT caller_project,
+       COUNT(*) FILTER (WHERE result_count = 0) AS empty_recalls,
+       COUNT(*) AS total_recalls
+FROM recall_log
+GROUP BY caller_project ORDER BY empty_recalls DESC;
 ```
 
 Prune old events periodically, e.g.:

@@ -78,6 +78,16 @@ class TestNoRerankFlag:
                 new_callable=AsyncMock,
                 return_value=fake_results,
             ),
+            patch(
+                "scripts.core.recall_learnings.enrich_with_kg_context",
+                new_callable=AsyncMock,
+                side_effect=lambda rs: rs,
+            ),
+            patch(
+                "scripts.core.recall_learnings.enrich_with_pattern_strength",
+                new_callable=AsyncMock,
+                side_effect=lambda rs: rs,
+            ),
             patch("scripts.core.recall_learnings.record_recall", new_callable=AsyncMock) as mock_record,
             patch("scripts.core.reranker.rerank") as mock_rerank,
             patch("sys.argv", ["recall", "--query", "test", "--k", "3", "--no-rerank", "--json"]),
@@ -257,6 +267,16 @@ class TestRecordRecallAfterTrim:
                 new_callable=AsyncMock,
                 return_value=fake_results,
             ),
+            patch(
+                "scripts.core.recall_learnings.enrich_with_kg_context",
+                new_callable=AsyncMock,
+                side_effect=lambda rs: rs,
+            ),
+            patch(
+                "scripts.core.recall_learnings.enrich_with_pattern_strength",
+                new_callable=AsyncMock,
+                side_effect=lambda rs: rs,
+            ),
             patch("scripts.core.recall_learnings.record_recall", new_callable=AsyncMock) as mock_record,
             patch("sys.argv", ["recall", "--query", "test", "--k", "3", "--json"]),
         ):
@@ -280,6 +300,16 @@ class TestRecordRecallAfterTrim:
                 "scripts.core.recall_learnings.search_learnings_postgres",
                 new_callable=AsyncMock,
                 return_value=fake_results,
+            ),
+            patch(
+                "scripts.core.recall_learnings.enrich_with_kg_context",
+                new_callable=AsyncMock,
+                side_effect=lambda rs: rs,
+            ),
+            patch(
+                "scripts.core.recall_learnings.enrich_with_pattern_strength",
+                new_callable=AsyncMock,
+                side_effect=lambda rs: rs,
             ),
             patch("scripts.core.recall_learnings.record_recall", new_callable=AsyncMock) as mock_record,
         ):

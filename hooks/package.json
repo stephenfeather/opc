@@ -5,9 +5,7 @@
     "private": true,
     "type": "module",
     "scripts": {
-        "prebuild": "rm -rf ./dist.tmp",
-        "build": "esbuild src/*.ts --bundle --platform=node --format=esm --outdir=dist.tmp --out-extension:.js=.mjs --external:better-sqlite3 --legal-comments=inline",
-        "postbuild": "rm -rf ./dist && mv ./dist.tmp ./dist && ../scripts/deploy_hooks.sh --auto",
+        "build": "bash ../scripts/build_hooks.sh --auto",
         "deploy": "../scripts/deploy_hooks.sh",
         "check": "tsc --noEmit",
         "dev": "npm run build && npm run check",

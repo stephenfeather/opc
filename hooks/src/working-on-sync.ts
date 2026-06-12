@@ -84,7 +84,9 @@ export function deriveWorkingOn(
   };
 
   if (tool === 'TodoWrite') {
-    return { workingOn: pickTodoInProgress(ti.todos), cache: next };
+    const todo = pickTodoInProgress(ti.todos);
+    if (todo) next.currentId = null;
+    return { workingOn: todo, cache: next };
   }
 
   if (tool === 'TaskCreate') {

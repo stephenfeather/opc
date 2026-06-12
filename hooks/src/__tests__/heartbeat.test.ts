@@ -223,7 +223,7 @@ describe('heartbeat hook', () => {
         ...actual,
         readFileSync: vi.fn((fd: unknown, ...rest: unknown[]) => {
           if (fd === 0) return '{}';
-          return actual.readFileSync(fd as string, ...rest as [string]);
+          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
         }),
       };
     });
@@ -240,7 +240,7 @@ describe('heartbeat hook', () => {
     const { main } = await import('../heartbeat.js');
     main();
 
-    const output = consoleSpy.mock.calls.map(c => c[0]).join('');
+    const output = consoleSpy.mock.calls.map((c: unknown[]) => c[0]).join('');
     expect(output).toContain('"result":"continue"');
   });
 
@@ -258,7 +258,7 @@ describe('heartbeat hook', () => {
         ...actual,
         readFileSync: vi.fn((fd: unknown, ...rest: unknown[]) => {
           if (fd === 0) return '{}';
-          return actual.readFileSync(fd as string, ...rest as [string]);
+          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
         }),
       };
     });
@@ -275,7 +275,7 @@ describe('heartbeat hook', () => {
     main();
 
     expect(mockUpdate).not.toHaveBeenCalled();
-    const output = consoleSpy.mock.calls.map(c => c[0]).join('');
+    const output = consoleSpy.mock.calls.map((c: unknown[]) => c[0]).join('');
     expect(output).toContain('"result":"continue"');
   });
 
@@ -288,7 +288,7 @@ describe('heartbeat hook', () => {
         ...actual,
         readFileSync: vi.fn((fd: unknown, ...rest: unknown[]) => {
           if (fd === 0) return JSON.stringify({ session_id: 's-fromstdin' });
-          return actual.readFileSync(fd as string, ...rest as [string]);
+          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
         }),
       };
     });
@@ -315,7 +315,7 @@ describe('heartbeat hook', () => {
         ...actual,
         readFileSync: vi.fn((fd: unknown, ...rest: unknown[]) => {
           if (fd === 0) return '{}';
-          return actual.readFileSync(fd as string, ...rest as [string]);
+          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
         }),
       };
     });
@@ -332,7 +332,7 @@ describe('heartbeat hook', () => {
     const { main } = await import('../heartbeat.js');
     main();
 
-    const output = consoleSpy.mock.calls.map(c => c[0]).join('');
+    const output = consoleSpy.mock.calls.map((c: unknown[]) => c[0]).join('');
     expect(output).toContain('"result":"continue"');
   });
 });

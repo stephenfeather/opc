@@ -104,7 +104,7 @@ describe('smart-search-router daemon migration', () => {
     });
 
     it('should handle empty results from daemon', () => {
-      const daemonResponse = { status: 'ok', results: [] };
+      const daemonResponse: { status: string; results: Array<{ file: string }> } = { status: 'ok', results: [] };
 
       const parseSearchResults = (response: typeof daemonResponse) => {
         if (response.status !== 'ok' || !response.results) {
@@ -187,7 +187,7 @@ describe('signature-helper daemon migration', () => {
     });
 
     it('should return null when function not found', () => {
-      const daemonResponse = { status: 'ok', results: [] };
+      const daemonResponse: { status: string; results: Array<{ file: string }> } = { status: 'ok', results: [] };
 
       const findFunctionFile = (response: typeof daemonResponse): string | null => {
         if (response.status !== 'ok' || !response.results || response.results.length === 0) {
@@ -237,7 +237,7 @@ describe('signature-helper daemon migration', () => {
     });
 
     it('should handle missing result gracefully', () => {
-      const daemonResponse = { status: 'ok', result: { functions: [] } };
+      const daemonResponse: { status: string; result: { functions: Array<{ name: string; signature: string }> } } = { status: 'ok', result: { functions: [] } };
 
       const findSignature = (funcName: string, response: typeof daemonResponse): string | null => {
         const funcs = response?.result?.functions || [];

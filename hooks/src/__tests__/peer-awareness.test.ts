@@ -28,7 +28,7 @@ describe('peer-awareness hook', () => {
           if (fd === 0) {
             return JSON.stringify({ session_id: 's-my-session' });
           }
-          return actual.readFileSync(fd as string, ...rest as [string]);
+          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
         }),
       };
     });
@@ -55,7 +55,7 @@ describe('peer-awareness hook', () => {
     const { main } = await import('../peer-awareness.js');
     main();
 
-    const output = consoleSpy.mock.calls.map(c => c[0]).join('');
+    const output = consoleSpy.mock.calls.map((c: unknown[]) => c[0]).join('');
     // Should show peer but not self
     expect(output).toContain('s-peer-1');
     expect(output).not.toContain('s-my-session');
@@ -68,7 +68,7 @@ describe('peer-awareness hook', () => {
         ...actual,
         readFileSync: vi.fn((fd: unknown, ...rest: unknown[]) => {
           if (fd === 0) return '{}';
-          return actual.readFileSync(fd as string, ...rest as [string]);
+          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
         }),
       };
     });
@@ -100,7 +100,7 @@ describe('peer-awareness hook', () => {
         ...actual,
         readFileSync: vi.fn((fd: unknown, ...rest: unknown[]) => {
           if (fd === 0) return JSON.stringify({ session_id: 's-test' });
-          return actual.readFileSync(fd as string, ...rest as [string]);
+          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
         }),
       };
     });
@@ -133,7 +133,7 @@ describe('peer-awareness hook', () => {
         ...actual,
         readFileSync: vi.fn((fd: unknown, ...rest: unknown[]) => {
           if (fd === 0) return JSON.stringify({ session_id: 's-test' });
-          return actual.readFileSync(fd as string, ...rest as [string]);
+          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
         }),
       };
     });

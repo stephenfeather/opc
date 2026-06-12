@@ -165,6 +165,7 @@ function writeCache(sessionId: string, cache: WorkingOnCache): void {
     const tmp = `${p}.tmp.${process.pid}`;
     writeFileSync(tmp, JSON.stringify(cache), 'utf-8');
     renameSync(tmp, p);
+  } catch {
     // Cache is best-effort; a write failure must never break the hook.
   }
 }

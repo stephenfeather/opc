@@ -75,6 +75,26 @@ describe("working-on-sync CLI", () => {
     expect(cache.tasks["1"]).toBe("Backporting");
   });
 
+  it("still emits continue (exit 0) on a DB-writing event when no DB URL is set", () => {
+    // Review r1: updateWorkingOnDetached -> getPgConnectionString() throws on
+    // missing DB env; the hook must swallow it and never fail the tool call.
+    run(
+      {
+        session_id: SESSION,
+        tool_name: "TaskCreate",
+        tool_input: { activeForm: "Backporting" },
+        tool_response: "Task #1 created",
+      },
+      home,
+    );
+    const res = run(
+      { session_id: SESSION, tool_name: "TaskUpdate", tool_input: { taskId: "1", status: "in_progress" } },
+      home,
+    );
+    expect(res.status).toBe(0);
+    expect(JSON.parse(res.stdout.trim()).result).toBe("continue");
+  });
+
   it("ignores an invalid session id", () => {
     const res = run({ session_id: "../etc", tool_name: "TaskCreate", tool_input: {} }, home);
     expect(res.status).toBe(0);

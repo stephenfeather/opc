@@ -228,7 +228,10 @@ function main() {
   const { workingOn, cache: nextCache } = deriveWorkingOn(input, cache);
   writeCache(sessionId, nextCache);
   if (workingOn !== null) {
-    updateWorkingOnDetached(sessionId, getProject(), workingOn);
+    try {
+      updateWorkingOnDetached(sessionId, getProject(), workingOn);
+    } catch {
+    }
   }
   console.log(JSON.stringify({ result: "continue" }));
 }

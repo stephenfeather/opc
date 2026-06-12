@@ -174,7 +174,12 @@ export function main(): void {
   writeCache(sessionId, nextCache);
 
   if (workingOn !== null) {
-    updateWorkingOnDetached(sessionId, getProject(), workingOn);
+    try {
+      updateWorkingOnDetached(sessionId, getProject(), workingOn);
+    } catch {
+      // Best-effort: a missing DB URL or spawn failure must never break the
+      // hook. PostToolUse must always emit continue (issue #65 review r1).
+    }
   }
 
   console.log(JSON.stringify({ result: 'continue' }));

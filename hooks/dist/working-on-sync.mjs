@@ -154,7 +154,9 @@ function deriveWorkingOn(input, cache) {
     currentId: cache.currentId
   };
   if (tool === "TodoWrite") {
-    return { workingOn: pickTodoInProgress(ti.todos), cache: next };
+    const todo = pickTodoInProgress(ti.todos);
+    if (todo) next.currentId = null;
+    return { workingOn: todo, cache: next };
   }
   if (tool === "TaskCreate") {
     const id = parseCreatedTaskId(input.tool_response);
@@ -214,7 +216,7 @@ function writeCache(sessionId, cache) {
   try {
     const dir = join2(p, "..");
     if (!existsSync2(dir)) mkdirSync(dir, { recursive: true });
-    const tmp = `${p}.tmp`;
+    const tmp = `${p}.tmp.${process.pid}`;
     writeFileSync(tmp, JSON.stringify(cache), "utf-8");
     renameSync(tmp, p);
   } catch {

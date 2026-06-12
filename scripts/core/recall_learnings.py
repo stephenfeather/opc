@@ -889,6 +889,8 @@ async def _dispatch_search(
 
 async def _dispatch_search_project_first(
     params: dict[str, Any],
+    *,
+    capture: Any | None = None,
 ) -> list[dict[str, Any]]:
     """Two-pass fetch for ``--project-first`` (issue #139).
 
@@ -905,6 +907,14 @@ async def _dispatch_search_project_first(
     preserving the default path's error behavior. The degraded pass is named
     on stderr. Tradeoff: for vector/hybrid modes the embedding/expansion is
     computed once per pass (twice total) — accepted for now.
+
+    ``capture`` (issue #54, finding 3): the SAME SearchCapture is threaded
+    through both passes so the type-affinity signal works under --project-first
+    (the path the memory-awareness hook now deploys). The first pass whose
+    hybrid backend embeds successfully populates it; the second pass embeds the
+    same query and the backend only fills an empty capture, so a successful
+    first fill is never clobbered and no extra embed is done for the capture's
+    sake. ``None`` keeps the call signature pre-#54 identical.
     """
     scope = params.get("project_scope")
 
@@ -913,7 +923,7 @@ async def _dispatch_search_project_first(
     own: list[dict[str, Any]] = []
     own_failed = False
     try:
-        own = await _dispatch_search(params, project=scope)
+        own = await _dispatch_search(params, project=scope, capture=capture)
     except Exception as exc:  # noqa: BLE001 - degrade, do not crash recall
         own_failed = True
         # exc text can embed a DSN/host/path; recall stderr is injected into
@@ -928,7 +938,7 @@ async def _dispatch_search_project_first(
         )
 
     try:
-        global_ = await _dispatch_search(params, project=None)
+        global_ = await _dispatch_search(params, project=None, capture=capture)
     except Exception as exc:  # noqa: BLE001 - degrade if the scoped pass held
         if own_failed:
             # Both passes failed — surface the error like the default path.
@@ -1061,16 +1071,20 @@ async def main() -> int:
 
         # Issue #54: a SearchCapture lets the hybrid backend surface the query
         # embedding it already computes, so the type-affinity reranker signal
-        # needs no second embed. Only the single-dispatch hybrid path captures;
-        # --project-first re-embeds per pass and is left on the neutral path.
+        # needs no second embed. Both the single-dispatch and --project-first
+        # hybrid paths capture (finding 3: the hook now deploys --project-first,
+        # so that path must get the signal too). The capture is threaded through
+        # both project-first passes and only the first successful embed fills it.
         search_capture = None
-        if project_scope is not None:
-            results = await _dispatch_search_project_first(params)
-        else:
-            if params["mode"] == "hybrid_rrf" and not args.no_rerank:
-                from scripts.core.recall_backends import SearchCapture
+        if params["mode"] == "hybrid_rrf" and not args.no_rerank:
+            from scripts.core.recall_backends import SearchCapture
 
-                search_capture = SearchCapture()
+            search_capture = SearchCapture()
+        if project_scope is not None:
+            results = await _dispatch_search_project_first(
+                params, capture=search_capture
+            )
+        else:
             results = await _dispatch_search(params, capture=search_capture)
     except Exception as e:
         if output_mode != "human":

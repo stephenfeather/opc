@@ -17,6 +17,8 @@ import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import pytest
+
 # ---------------------------------------------------------------------------
 # Pure inference wrapper
 # ---------------------------------------------------------------------------
@@ -86,6 +88,41 @@ class TestCentroidCacheRoundTrip:
         path = tmp_path / "partial.json"
         path.write_text(json.dumps({"centroids": {"A": [1.0]}}))  # no label/computed_at
         assert read_centroid_cache(path) is None
+
+    def test_read_oversized_file_returns_none(self, tmp_path):
+        """Finding 2 (round 1): an oversized cache file is rejected as corrupt
+        before json.load, so a runaway/hostile file can't burn the recall
+        budget parsing megabytes."""
+        from scripts.core.type_affinity import MAX_CACHE_BYTES, read_centroid_cache
+
+        path = tmp_path / "huge.json"
+        # Valid JSON envelope, but padded past the size cap.
+        padding = "x" * (MAX_CACHE_BYTES + 1)
+        path.write_text(
+            json.dumps(
+                {
+                    "model_label": "voyage-code-3",
+                    "computed_at": "2026-01-01T00:00:00+00:00",
+                    "centroids": {"A": [1.0]},
+                    "_pad": padding,
+                }
+            )
+        )
+        assert path.stat().st_size > MAX_CACHE_BYTES
+        assert read_centroid_cache(path) is None
+
+    def test_read_at_size_cap_still_parses(self, tmp_path):
+        """A normal-sized cache (well under the cap) parses fine."""
+        from scripts.core.type_affinity import (
+            MAX_CACHE_BYTES,
+            read_centroid_cache,
+            write_centroid_cache,
+        )
+
+        path = tmp_path / "ok.json"
+        write_centroid_cache(path, model_label="voyage-code-3", centroids={"A": [1.0]})
+        assert path.stat().st_size < MAX_CACHE_BYTES
+        assert read_centroid_cache(path) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +239,66 @@ class TestFetchCentroids:
         # The model label is bound as a parameter (model-filtered aggregate).
         assert "voyage-code-3" in conn.captured_args
         assert "embedding_model" in (conn.captured_sql or "")
+
+    async def test_aggregate_mirrors_recall_corpus_predicates(self, monkeypatch):
+        """Finding 1 (round 1): centroids must be trained on exactly the rows
+        the RRF recall corpus can return — session_learning, non-superseded,
+        non-null learning_type — so they never reflect rows that never appear
+        in results."""
+        from scripts.core import type_affinity as ta
+
+        conn = _FakeConn(rows=[{"ltype": "USER_PREFERENCE", "centroid": "[0.1, 0.2]"}])
+
+        async def fake_get_pool():
+            return _FakePool(conn)
+
+        monkeypatch.setattr("scripts.core.db.postgres_pool.get_pool", fake_get_pool)
+
+        await ta.fetch_type_centroids("voyage-code-3")
+
+        sql = conn.captured_sql or ""
+        # Recall's authoritative predicates (recall_backends.py CTEs / tails).
+        assert "session_learning" in sql
+        assert "superseded_by IS NULL" in sql
+        # Null learning_type rows are excluded server-side, not just in parsing.
+        assert "learning_type" in sql
+        assert "IS NOT NULL" in sql
+
+    async def test_missing_superseded_column_degrades(self, monkeypatch):
+        """Finding 1: a pre-migration DB without superseded_by must not crash
+        the aggregate — it retries without that predicate, mirroring recall's
+        chain-filter fallback, instead of returning None."""
+        from asyncpg.exceptions import UndefinedColumnError
+
+        from scripts.core import type_affinity as ta
+
+        class _ChainFallbackConn:
+            """First fetch (with superseded_by) raises UndefinedColumnError;
+            the retry (without it) succeeds."""
+
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            async def fetch(self, sql: str, *args: Any) -> list[Any]:
+                self.calls.append(sql)
+                if "superseded_by" in sql:
+                    raise UndefinedColumnError("column superseded_by does not exist")
+                return [{"ltype": "ERROR_FIX", "centroid": "[0.5, 0.6]"}]
+
+        conn = _ChainFallbackConn()
+
+        async def fake_get_pool():
+            return _FakePool(conn)
+
+        monkeypatch.setattr("scripts.core.db.postgres_pool.get_pool", fake_get_pool)
+
+        centroids = await ta.fetch_type_centroids("voyage-code-3")
+
+        assert centroids == {"ERROR_FIX": [0.5, 0.6]}
+        # It tried the full-predicate SQL first, then the degraded one.
+        assert len(conn.calls) == 2
+        assert "superseded_by" in conn.calls[0]
+        assert "superseded_by" not in conn.calls[1]
 
     async def test_db_failure_returns_none(self, monkeypatch):
         from scripts.core import type_affinity as ta
@@ -365,3 +462,35 @@ class TestLoadOrComputeCentroids:
             "voyage-code-3", cache_path=path, ttl_seconds=86400,
         )
         assert out is None
+
+    async def test_blocking_cache_read_is_preemptible(self, monkeypatch, tmp_path):
+        """Finding 2 (round 1): the synchronous cache read must run off the
+        event loop so asyncio.wait_for can preempt a slow/locked file. We block
+        the read for longer than the deadline and assert wait_for times out
+        promptly instead of waiting for the blocking read to finish."""
+        import asyncio
+        import time
+
+        from scripts.core import type_affinity as ta
+
+        block_seconds = 5.0  # far longer than the deadline below
+        deadline = 0.3
+
+        def blocking_read(_path):
+            time.sleep(block_seconds)  # sync block (simulates a locked/slow file)
+            return None
+
+        monkeypatch.setattr(ta, "read_centroid_cache", blocking_read)
+
+        start = time.monotonic()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                ta.load_or_compute_centroids(
+                    "voyage-code-3", cache_path=tmp_path / "c.json", ttl_seconds=86400,
+                ),
+                timeout=deadline,
+            )
+        elapsed = time.monotonic() - start
+        # Generous bound (flake lesson): the deadline must fire well before the
+        # 5s block — proving the read was awaited off-thread and is preemptible.
+        assert elapsed < 3.0

@@ -971,7 +971,11 @@ async def search_learnings_hybrid_rrf(
     # model_label may be None here (pre-#151 DB without the embedding_model
     # column); the caller must then skip model-filtered centroids rather than
     # cosine across embedding spaces.
-    if capture is not None:
+    #
+    # Finding 3 (round 1): under --project-first the SAME capture is passed to
+    # both fetch passes. Only fill an empty capture so the first successful
+    # embed wins and the second pass (identical query) never clobbers it.
+    if capture is not None and capture.query_embedding is None:
         capture.query_embedding = query_embedding
         capture.model_label = model_label
 

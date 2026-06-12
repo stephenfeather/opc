@@ -710,7 +710,7 @@ class TestDispatchProjectFirstFailureIsolation:
     async def test_global_pass_failure_returns_scoped(self, monkeypatch, capsys):
         import scripts.core.recall_learnings as rl
 
-        async def fake_dispatch(params, *, project=None):
+        async def fake_dispatch(params, *, project=None, capture=None):
             if project is None:
                 raise RuntimeError("global pass boom")
             return [{"id": "own1"}, {"id": "own2"}]
@@ -725,7 +725,7 @@ class TestDispatchProjectFirstFailureIsolation:
     async def test_scoped_pass_failure_returns_global(self, monkeypatch, capsys):
         import scripts.core.recall_learnings as rl
 
-        async def fake_dispatch(params, *, project=None):
+        async def fake_dispatch(params, *, project=None, capture=None):
             if project is not None:
                 raise RuntimeError("scoped pass boom")
             return [{"id": "glob1"}, {"id": "glob2"}]
@@ -740,13 +740,132 @@ class TestDispatchProjectFirstFailureIsolation:
     async def test_both_passes_fail_propagates(self, monkeypatch):
         import scripts.core.recall_learnings as rl
 
-        async def fake_dispatch(params, *, project=None):
+        async def fake_dispatch(params, *, project=None, capture=None):
             raise RuntimeError("both boom")
 
         monkeypatch.setattr(rl, "_dispatch_search", fake_dispatch)
         params = {"mode": "text_only", "query": "q", "k": 10, "project_scope": "opc"}
         with pytest.raises(RuntimeError):
             await rl._dispatch_search_project_first(params)
+
+
+# ============== Round-1 (#54) Finding 3: project-first gets type affinity =====
+
+
+class TestProjectFirstThreadsCapture:
+    """Finding 3 (round 1 adversarial review): the memory-awareness hook now
+    deploys --project-first, so the project-first path is exactly the one that
+    must surface the query embedding for the type-affinity signal. The capture
+    threads through both passes (shared object), and the first successful embed
+    populates it without embedding twice for the capture's sake."""
+
+    async def test_capture_threaded_to_both_passes(self, monkeypatch):
+        import scripts.core.recall_learnings as rl
+        from scripts.core.recall_backends import SearchCapture
+
+        seen: list[object] = []
+
+        async def fake_dispatch(params, *, project=None, capture=None):
+            seen.append(capture)
+            return []
+
+        monkeypatch.setattr(rl, "_dispatch_search", fake_dispatch)
+        cap = SearchCapture()
+        params = {"mode": "hybrid_rrf", "query": "q", "k": 10, "project_scope": "opc"}
+        await rl._dispatch_search_project_first(params, capture=cap)
+
+        # Both passes received the SAME capture object (one embed populates it).
+        assert len(seen) == 2
+        assert seen[0] is cap
+        assert seen[1] is cap
+
+    async def test_first_pass_fill_survives_when_passes_share_capture(
+        self, monkeypatch
+    ):
+        """If the scoped pass fills the capture, the global pass (same query,
+        same embedding) must not erase it — the merged path still has a
+        populated capture for type affinity."""
+        import scripts.core.recall_learnings as rl
+        from scripts.core.recall_backends import SearchCapture
+
+        async def fake_dispatch(params, *, project=None, capture=None):
+            # Emulate the hybrid backend filling the capture on a successful
+            # embed. Both passes embed the same query -> identical fill.
+            if capture is not None and capture.query_embedding is None:
+                capture.query_embedding = [0.1, 0.2]
+                capture.model_label = "voyage-code-3"
+            return []
+
+        monkeypatch.setattr(rl, "_dispatch_search", fake_dispatch)
+        cap = SearchCapture()
+        params = {"mode": "hybrid_rrf", "query": "q", "k": 10, "project_scope": "opc"}
+        await rl._dispatch_search_project_first(params, capture=cap)
+
+        assert cap.query_embedding == [0.1, 0.2]
+        assert cap.model_label == "voyage-code-3"
+
+    async def test_main_project_first_hybrid_populates_type_probabilities(
+        self, monkeypatch
+    ):
+        """End-to-end: hybrid --project-first with reranking passes non-None
+        type_probabilities into make_recall_context."""
+        import scripts.core.recall_learnings as rl
+
+        monkeypatch.setattr(rl, "get_backend", lambda: "postgres")
+        monkeypatch.setattr(
+            rl.sys, "argv",
+            ["recall_learnings.py", "--query", "what time", "--project-first",
+             "--project", "opc", "--json"],
+            raising=False,
+        )
+
+        async def fake_first(params, *, capture=None):
+            # Simulate a successful hybrid embed filling the shared capture.
+            if capture is not None:
+                capture.query_embedding = [1.0, 0.0]
+                capture.model_label = "voyage-code-3"
+            return [{"id": "r1", "session_id": "s1", "content": "x",
+                     "created_at": None, "similarity": 0.5,
+                     "metadata": {"learning_type": "USER_PREFERENCE"}}]
+
+        monkeypatch.setattr(rl, "_dispatch_search_project_first", fake_first)
+
+        async def fake_compute(capture, **_kw):
+            # The capture must arrive populated from the project-first passes.
+            assert capture is not None
+            assert capture.query_embedding == [1.0, 0.0]
+            return {"USER_PREFERENCE": 0.9, "ERROR_FIX": 0.1}
+
+        import scripts.core.type_affinity as ta
+        monkeypatch.setattr(ta, "compute_type_probabilities", fake_compute)
+
+        captured_ctx: dict = {}
+        real_make = rl.make_recall_context
+
+        def spy_make(*a, **kw):
+            captured_ctx["type_probabilities"] = kw.get("type_probabilities")
+            return real_make(*a, **kw)
+
+        monkeypatch.setattr(rl, "make_recall_context", spy_make)
+        monkeypatch.setattr(rl, "enrich_with_pattern_strength",
+                            lambda r: _identity_async(r))
+        monkeypatch.setattr(rl, "enrich_with_kg_context",
+                            lambda r: _identity_async(r))
+
+        async def noop_record(_ids, *, caller_project=None, source=None):
+            return None
+
+        monkeypatch.setattr(rl, "record_recall", noop_record)
+
+        rc = await rl.main()
+        assert rc == 0
+        assert captured_ctx["type_probabilities"] == {
+            "USER_PREFERENCE": 0.9, "ERROR_FIX": 0.1,
+        }
+
+
+async def _identity_async(results):
+    return results
 
 
 
@@ -763,7 +882,7 @@ class TestDispatchProjectFirstWarningRedaction:
     async def test_global_pass_failure_redacts_dsn(self, monkeypatch, capsys):
         import scripts.core.recall_learnings as rl
 
-        async def fake_dispatch(params, *, project=None):
+        async def fake_dispatch(params, *, project=None, capture=None):
             if project is None:
                 raise RuntimeError(f"connection to {self._DSN} refused")
             return [{"id": "own1"}]
@@ -781,7 +900,7 @@ class TestDispatchProjectFirstWarningRedaction:
     async def test_scoped_pass_failure_redacts_dsn(self, monkeypatch, capsys):
         import scripts.core.recall_learnings as rl
 
-        async def fake_dispatch(params, *, project=None):
+        async def fake_dispatch(params, *, project=None, capture=None):
             if project is not None:
                 raise RuntimeError(f"connection to {self._DSN} refused")
             return [{"id": "glob1"}]

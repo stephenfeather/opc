@@ -25,6 +25,7 @@ DB aggregate) per the project's FP conventions.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass
@@ -43,15 +44,43 @@ logger = logging.getLogger(__name__)
 # current. Override via the ``ttl_seconds`` argument / config if needed.
 DEFAULT_CENTROID_TTL_SECONDS = 24 * 60 * 60
 
+# Hard cap on the centroid cache file size (finding 2, round 1). The envelope is
+# a handful of type centroids (7 types x ~1k floats ~= a few hundred KB worst
+# case); anything above 4 MB is treated as corrupt/hostile and rejected before
+# json.load so a runaway file can't burn the recall budget parsing megabytes.
+MAX_CACHE_BYTES = 4 * 1024 * 1024
+
 # Server-side centroid aggregate. Model-filtered (issue #151 single-space
 # contract): never average embeddings across embedding spaces. ``::text`` casts
 # the pgvector ``avg`` result to a JSON-array-like string the caller parses.
-_CENTROID_SQL = """
+#
+# Finding 1 (round 1 adversarial review): the centroids MUST be trained on
+# exactly the corpus the RRF recall path can return, otherwise type affinity is
+# computed from rows that never appear in results. The authoritative recall
+# predicates (recall_backends.py CTEs / text tails) are:
+#   metadata->>'type' = 'session_learning'   (session learnings only)
+#   superseded_by IS NULL                     (the "chain filter")
+# We also drop null learning_type rows server-side (they cannot match any
+# result's type anyway). ``{chain_filter}`` lets us degrade exactly like recall
+# on a pre-migration DB that lacks the superseded_by column.
+_CENTROID_SQL_TEMPLATE = """
 SELECT metadata->>'learning_type' AS ltype, avg(embedding)::text AS centroid
 FROM archival_memory
-WHERE embedding IS NOT NULL AND embedding_model = $1
+WHERE embedding IS NOT NULL
+    AND embedding_model = $1
+    AND metadata->>'type' = 'session_learning'
+    AND metadata->>'learning_type' IS NOT NULL{chain_filter}
 GROUP BY 1
 """
+
+# The full-predicate aggregate (mirrors recall's chain=True CTE).
+_CENTROID_SQL = _CENTROID_SQL_TEMPLATE.format(
+    chain_filter="\n    AND superseded_by IS NULL"
+)
+# Degraded aggregate for a pre-migration DB without the superseded_by column,
+# mirroring recall's chain=False fallback. Only used after the full query
+# raises UndefinedColumnError.
+_CENTROID_SQL_NO_CHAIN = _CENTROID_SQL_TEMPLATE.format(chain_filter="")
 
 
 # ---------------------------------------------------------------------------
@@ -131,11 +160,20 @@ def default_cache_path() -> Path:
 
 
 def read_centroid_cache(path: str | Path) -> CentroidCache | None:
-    """Read a centroid cache envelope. Returns None if missing/corrupt/partial."""
+    """Read a centroid cache envelope. Returns None if missing/corrupt/partial.
+
+    An oversized file (> ``MAX_CACHE_BYTES``) is rejected as corrupt before
+    json.load so a runaway/hostile cache can't burn the recall budget parsing
+    megabytes (finding 2). This function is synchronous; callers on the recall
+    hot path must run it off the event loop (see ``load_or_compute_centroids``).
+    """
     p = Path(path)
     if not p.exists():
         return None
     try:
+        if p.stat().st_size > MAX_CACHE_BYTES:
+            logger.debug("centroid cache oversized (%d bytes); rejecting", p.stat().st_size)
+            return None
         with open(p) as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError):
@@ -215,19 +253,43 @@ def _parse_centroid_rows(rows: list) -> dict[str, list[float]]:
     return out
 
 
+def _is_missing_column_error(exc: Exception) -> bool:
+    """True for the asyncpg UndefinedColumnError raised when superseded_by is
+    absent on a pre-migration DB. Imported lazily so type_affinity stays usable
+    without asyncpg installed (e.g. unit tests that never hit the DB path)."""
+    try:
+        from asyncpg.exceptions import UndefinedColumnError
+    except ImportError:  # pragma: no cover - asyncpg always present in prod
+        return False
+    return isinstance(exc, UndefinedColumnError)
+
+
 async def fetch_type_centroids(model_label: str) -> dict[str, list[float]] | None:
     """Compute model-filtered type centroids server-side. None on any failure.
 
-    One aggregate query over ~6k rows (fast). Any DB error, an empty result, or
-    a fully unparseable result returns None so the caller degrades to neutral
-    reranking instead of crashing recall.
+    The aggregate mirrors the RRF recall corpus exactly (session_learning,
+    non-superseded, non-null learning_type) so centroids reflect only rows that
+    can appear in results (finding 1). One query over ~6k rows (fast). On a
+    pre-migration DB lacking superseded_by it retries without that predicate,
+    mirroring recall's chain-filter fallback. Any other DB error, an empty
+    result, or a fully unparseable result returns None so the caller degrades
+    to neutral reranking instead of crashing recall.
     """
     try:
         from scripts.core.db.postgres_pool import get_pool
 
         pool = await get_pool()
         async with pool.acquire() as conn:
-            rows = await conn.fetch(_CENTROID_SQL, model_label)
+            try:
+                rows = await conn.fetch(_CENTROID_SQL, model_label)
+            except Exception as exc:  # noqa: BLE001 - only the column case retries
+                if not _is_missing_column_error(exc):
+                    raise
+                logger.debug(
+                    "centroid aggregate: superseded_by absent, degrading",
+                    exc_info=True,
+                )
+                rows = await conn.fetch(_CENTROID_SQL_NO_CHAIN, model_label)
     except Exception:  # noqa: BLE001 - degrade, never crash recall
         logger.debug("type-centroid aggregate failed", exc_info=True)
         return None
@@ -256,7 +318,11 @@ async def load_or_compute_centroids(
     """
     path = Path(cache_path) if cache_path is not None else default_cache_path()
 
-    cache = read_centroid_cache(path)
+    # Finding 2 (round 1): read the cache off the event loop so the caller's
+    # asyncio.wait_for deadline can preempt a slow/locked/oversized file. A
+    # synchronous read here would block before the first await, making the
+    # TYPE_AFFINITY_TIMEOUT unenforceable.
+    cache = await asyncio.to_thread(read_centroid_cache, path)
     if is_cache_fresh(cache, model_label=model_label, ttl_seconds=ttl_seconds):
         # mypy: is_cache_fresh guarantees cache is not None here.
         return cache.centroids  # type: ignore[union-attr]

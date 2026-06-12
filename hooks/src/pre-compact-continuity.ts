@@ -58,8 +58,8 @@ function getMemoryPushContext(): string {
 }
 
 const MINI_HANDOFF_SCRIPT = path.join(
-  process.env.HOME || '',
-  'opc', 'scripts', 'core', 'generate_mini_handoff.py'
+  process.env.CLAUDE_OPC_DIR || path.join(process.env.HOME || '', 'opc'),
+  'scripts', 'core', 'generate_mini_handoff.py'
 );
 
 const NARRATIVE_PROMPT_TEMPLATE = `You are running headless. Read the JSONL transcript at {TRANSCRIPT_PATH} once, then write a narrative YAML handoff to {OUTPUT_PATH} using the Write tool.

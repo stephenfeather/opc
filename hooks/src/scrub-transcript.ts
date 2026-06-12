@@ -103,14 +103,17 @@ async function scrub(transcriptPath: string): Promise<void> {
       out.end((err: Error | null | undefined) => (err ? reject(err) : resolve()));
     });
 
-    // Atomic swap.
-    fs.renameSync(tmpPath, transcriptPath);
-
     if (redactionCount > 0) {
+      // Atomic swap — only when something changed. A no-op rename would
+      // refresh the transcript mtime and defeat scrub-sweep's watermark,
+      // turning incremental sweeps into perpetual full rescans.
+      fs.renameSync(tmpPath, transcriptPath);
       process.stderr.write(
         `scrub-transcript: ${redactionCount} redaction(s) in ${transcriptPath}\n`,
       );
       appendAudit(transcriptPath, perRule);
+    } else {
+      try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
     }
   } catch (err) {
     // Leave original intact; clean up tmp.

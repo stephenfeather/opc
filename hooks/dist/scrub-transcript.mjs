@@ -443,13 +443,18 @@ async function scrub(transcriptPath) {
     await new Promise((resolve, reject) => {
       out.end((err) => err ? reject(err) : resolve());
     });
-    fs.renameSync(tmpPath, transcriptPath);
     if (redactionCount > 0) {
+      fs.renameSync(tmpPath, transcriptPath);
       process.stderr.write(
         `scrub-transcript: ${redactionCount} redaction(s) in ${transcriptPath}
 `
       );
       appendAudit(transcriptPath, perRule);
+    } else {
+      try {
+        fs.unlinkSync(tmpPath);
+      } catch {
+      }
     }
   } catch (err) {
     try {

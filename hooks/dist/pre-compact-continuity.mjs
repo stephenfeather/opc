@@ -28,8 +28,7 @@ ${pushLines}`;
   }
 }
 var MINI_HANDOFF_SCRIPT = path.join(
-  process.env.HOME || "",
-  "opc",
+  process.env.CLAUDE_OPC_DIR || path.join(process.env.HOME || "", "opc"),
   "scripts",
   "core",
   "generate_mini_handoff.py"

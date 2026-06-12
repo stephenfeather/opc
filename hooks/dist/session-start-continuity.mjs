@@ -280,6 +280,17 @@ async function main() {
   const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const sessionType = input.source || input.type;
   const daemonStatus = ensureMemoryDaemon();
+  if (process.env.CLAUDE_AGENT_ID && sessionType === "clear") {
+    const output2 = { result: "continue" };
+    if (daemonStatus) {
+      output2.hookSpecificOutput = {
+        hookEventName: "SessionStart",
+        additionalContext: daemonStatus
+      };
+    }
+    console.log(JSON.stringify(output2));
+    return;
+  }
   let message = "";
   let additionalContext = "";
   let usedHandoffLedger = false;

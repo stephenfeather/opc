@@ -1,7 +1,7 @@
 //! @hook PreCompact @preserve
 import * as fs from 'fs';
 import * as path from 'path';
-import { parseTranscript, generateAutoHandoff } from './transcript-parser.js';
+import { spawnSync, spawn } from 'child_process';
 
 interface PreCompactInput {
   trigger: 'manual' | 'auto';
@@ -57,86 +57,191 @@ function getMemoryPushContext(): string {
   }
 }
 
+const MINI_HANDOFF_SCRIPT = path.join(
+  process.env.HOME || '',
+  'opc', 'scripts', 'core', 'generate_mini_handoff.py'
+);
+
+const NARRATIVE_PROMPT_TEMPLATE = `You are running headless. Read the JSONL transcript at {TRANSCRIPT_PATH} once, then write a narrative YAML handoff to {OUTPUT_PATH} using the Write tool.
+
+Required YAML shape (exact field names — statusline parser depends on goal: and now:):
+---
+session: {SESSION_NAME}
+session_uuid: {SESSION_UUID}
+date: {DATE}
+status: partial
+outcome: PARTIAL_PLUS
+---
+
+goal: <1-2 sentences: what the session accomplished>
+now: <first INCOMPLETE next action — must not appear in done_this_session>
+test: <command or manual step to verify>
+
+done_this_session:
+  - task: <narrative task, not a raw path>
+    files: [<relevant file paths>]
+
+blockers: []
+questions: []
+
+decisions:
+  - <label>: <rationale>
+
+findings:
+  - <finding>: <details>
+
+worked:
+  - Problem → Solution — <what worked and why>
+failed:
+  - <what broke, why to avoid it>
+
+next:
+  - <first concrete next step>
+
+files:
+  created: [...]
+  modified: [...]
+
+Rules:
+1. Read the transcript ONCE. No exploration, no grep, no other files.
+2. Write the YAML ONCE via the Write tool.
+3. Do not run Bash, TaskCreate, or any other tool.
+4. Keep fields concise. No code blocks. Prefer file.ext:line refs.
+5. If the session accomplished nothing meaningful, set status: blocked and explain in goal.
+6. Exit immediately after the Write succeeds.`;
+
+function runMechanicalHandoff(
+  transcriptPath: string,
+  sessionId: string,
+  projectDir: string
+): { ok: boolean; outputPath: string; error?: string } {
+  const outputPath = path.join(
+    projectDir, 'thoughts', 'shared', 'handoffs', 'auto', `${sessionId}.yaml`
+  );
+
+  if (!fs.existsSync(MINI_HANDOFF_SCRIPT)) {
+    return { ok: false, outputPath, error: `generate_mini_handoff.py not found at ${MINI_HANDOFF_SCRIPT}` };
+  }
+
+  const result = spawnSync('python3', [
+    MINI_HANDOFF_SCRIPT,
+    '--jsonl', transcriptPath,
+    '--session-id', sessionId,
+    '--project-dir', projectDir,
+    '--output', outputPath,
+    '--format', 'yaml',
+  ], { encoding: 'utf-8', timeout: 10_000 });
+
+  if (result.status !== 0) {
+    return {
+      ok: false,
+      outputPath,
+      error: (result.stderr || result.error?.message || `exit ${result.status}`).toString().slice(0, 300)
+    };
+  }
+
+  return { ok: true, outputPath };
+}
+
+function spawnNarrativeHandoff(
+  transcriptPath: string,
+  sessionId: string,
+  projectDir: string
+): string {
+  const outputPath = path.join(
+    projectDir, 'thoughts', 'shared', 'handoffs', 'auto', `${sessionId}.narrative.yaml`
+  );
+
+  const today = new Date().toISOString().slice(0, 10);
+  const sessionName = path.basename(projectDir);
+  const prompt = NARRATIVE_PROMPT_TEMPLATE
+    .replace('{TRANSCRIPT_PATH}', transcriptPath)
+    .replace('{OUTPUT_PATH}', outputPath)
+    .replace('{SESSION_NAME}', sessionName)
+    .replace('{SESSION_UUID}', sessionId)
+    .replace('{DATE}', today);
+
+  const logDir = path.join(process.env.HOME || '', '.claude', 'cache', 'pre-compact-narrative');
+  fs.mkdirSync(logDir, { recursive: true });
+  const logPath = path.join(logDir, `${sessionId}.log`);
+  const logFd = fs.openSync(logPath, 'a');
+
+  const child = spawn('claude', ['-p', prompt, '--permission-mode', 'auto'], {
+    detached: true,
+    stdio: ['ignore', logFd, logFd],
+    env: { ...process.env, CLAUDE_PRECOMPACT_CHILD: '1' },
+  });
+  child.unref();
+  return outputPath;
+}
+
 async function main() {
   const input: PreCompactInput = JSON.parse(await readStdin());
   const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  const pushContext = getMemoryPushContext();
+  const lines: string[] = [];
 
-  // Find existing ledger files
+  // Optional ledger append (only if ledger exists)
   const ledgerDir = path.join(projectDir, 'thoughts', 'ledgers');
-  const ledgerFiles = fs.readdirSync(ledgerDir)
-    .filter(f => f.startsWith('CONTINUITY_CLAUDE-') && f.endsWith('.md'));
+  let ledgerPath: string | null = null;
+  if (fs.existsSync(ledgerDir)) {
+    const ledgerFiles = fs.readdirSync(ledgerDir)
+      .filter(f => f.startsWith('CONTINUITY_CLAUDE-') && f.endsWith('.md'));
+    if (ledgerFiles.length > 0) {
+      const mostRecent = ledgerFiles.sort((a, b) => {
+        const statA = fs.statSync(path.join(ledgerDir, a));
+        const statB = fs.statSync(path.join(ledgerDir, b));
+        return statB.mtime.getTime() - statA.mtime.getTime();
+      })[0];
+      ledgerPath = path.join(ledgerDir, mostRecent);
+    }
+  }
 
-  if (ledgerFiles.length === 0) {
-    // No ledger - just remind to create one
-    const output: HookOutput = {
-      continue: true,
-      systemMessage: '[PreCompact] No ledger found. Create one? /continuity_ledger'
-    };
-    console.log(JSON.stringify(output));
+  if (input.trigger !== 'auto') {
+    // Manual compact: just inform, don't generate handoffs
+    const msg = ledgerPath
+      ? `[PreCompact:manual] Consider updating ledger: ${path.basename(ledgerPath)}`
+      : `[PreCompact:manual] Compaction starting.`;
+    console.log(JSON.stringify({ continue: true, systemMessage: msg + pushContext }));
     return;
   }
 
-  // Get most recent ledger
-  const mostRecent = ledgerFiles.sort((a, b) => {
-    const statA = fs.statSync(path.join(ledgerDir, a));
-    const statB = fs.statSync(path.join(ledgerDir, b));
-    return statB.mtime.getTime() - statA.mtime.getTime();
-  })[0];
-
-  const ledgerPath = path.join(ledgerDir, mostRecent);
-
-  if (input.trigger === 'auto') {
-    // Auto-compact: Use transcript parser to generate full handoff
-    const sessionName = mostRecent.replace('CONTINUITY_CLAUDE-', '').replace('.md', '');
-    let handoffFile = '';
-
-    if (input.transcript_path && fs.existsSync(input.transcript_path)) {
-      // Parse transcript and generate handoff
-      const summary = parseTranscript(input.transcript_path);
-      const handoffContent = generateAutoHandoff(summary, sessionName);
-
-      // Ensure handoff directory exists (thoughts/shared/handoffs is tracked in git)
-      const handoffDir = path.join(projectDir, 'thoughts', 'shared', 'handoffs', sessionName);
-      fs.mkdirSync(handoffDir, { recursive: true });
-
-      // Write handoff with timestamp (YAML format for session-start injection)
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-      handoffFile = `auto-handoff-${timestamp}.yaml`;
-      const handoffPath = path.join(handoffDir, handoffFile);
-      fs.writeFileSync(handoffPath, handoffContent);
-
-      // Also append brief summary to ledger for visibility
-      const briefSummary = generateAutoSummary(projectDir, input.session_id);
-      if (briefSummary) {
-        appendToLedger(ledgerPath, briefSummary);
-      }
+  // Auto-compact: always try mechanical handoff (synchronous, deterministic)
+  if (input.transcript_path && fs.existsSync(input.transcript_path)) {
+    const mech = runMechanicalHandoff(input.transcript_path, input.session_id, projectDir);
+    if (mech.ok) {
+      lines.push(`[PreCompact:auto] Mechanical handoff → ${path.relative(projectDir, mech.outputPath)}`);
     } else {
-      // Fallback: no transcript, use legacy summary
-      const briefSummary = generateAutoSummary(projectDir, input.session_id);
-      if (briefSummary) {
-        appendToLedger(ledgerPath, briefSummary);
-      }
+      lines.push(`[PreCompact:auto] Mechanical handoff failed: ${mech.error}`);
     }
 
-    const message = handoffFile
-      ? `[PreCompact:auto] Created YAML handoff: thoughts/shared/handoffs/${sessionName}/${handoffFile}`
-      : `[PreCompact:auto] Session summary auto-appended to ${mostRecent}`;
-
-    const pushContext = getMemoryPushContext();
-    const output: HookOutput = {
-      continue: true,
-      systemMessage: message + pushContext
-    };
-    console.log(JSON.stringify(output));
+    // Narrative handoff (opt-in via env var — spawns detached claude -p subprocess)
+    if (process.env.CLAUDE_PRECOMPACT_NARRATIVE === '1' && !process.env.CLAUDE_PRECOMPACT_CHILD) {
+      try {
+        const narrativePath = spawnNarrativeHandoff(input.transcript_path, input.session_id, projectDir);
+        lines.push(`[PreCompact:auto] Narrative handoff spawned → ${path.relative(projectDir, narrativePath)} (async)`);
+      } catch (err) {
+        lines.push(`[PreCompact:auto] Narrative spawn failed: ${(err as Error).message}`);
+      }
+    }
   } else {
-    // Manual compact: warn user (cannot block, just inform)
-    const pushContext = getMemoryPushContext();
-    const output: HookOutput = {
-      continue: true,
-      systemMessage: `[PreCompact] Consider updating ledger before compacting: /continuity_ledger\nLedger: ${mostRecent}` + pushContext
-    };
-    console.log(JSON.stringify(output));
+    lines.push(`[PreCompact:auto] No transcript available — skipping handoff generation.`);
   }
+
+  // Append brief summary to ledger if one exists
+  if (ledgerPath) {
+    const briefSummary = generateAutoSummary(projectDir, input.session_id);
+    if (briefSummary) {
+      appendToLedger(ledgerPath, briefSummary);
+      lines.push(`[PreCompact:auto] Appended summary to ${path.basename(ledgerPath)}`);
+    }
+  }
+
+  const output: HookOutput = {
+    continue: true,
+    systemMessage: lines.join('\n') + pushContext,
+  };
+  console.log(JSON.stringify(output));
 }
 
 function generateAutoSummary(projectDir: string, sessionId: string): string | null {

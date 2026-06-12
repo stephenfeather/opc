@@ -34,7 +34,7 @@ fi
 # Rule 3: Block curl/wget posting to non-whitelisted domains
 # >>> CUSTOMIZE: Add your own domains to this whitelist <<<
 if echo "$CMD" | grep -qiE '(curl|wget).*(-X\s*POST|--data|--upload|-d\s)'; then
-    if ! echo "$CMD" | grep -qiE '(api\.anthropic\.com|github\.com|registry\.npmjs\.org|localhost|127\.0\.0\.1|100\.(6[4-9]|[7-9][0-9]|1[0-2][0-7])\.|stephenfeather\.com)'; then
+    if ! echo "$CMD" | grep -qiE '(api\.anthropic\.com|github\.com|registry\.npmjs\.org|localhost|127\.0\.0\.1|100\.(6[4-9]|[7-9][0-9]|1[0-2][0-7])\.|stephenfeather\.com|100\.98\.16\.42)'; then
         echo "BLOCKED: POST/upload to non-whitelisted domain. Add to whitelist in security-guard.sh if legitimate." >&2
         exit 2
     fi

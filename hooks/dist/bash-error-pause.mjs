@@ -47,16 +47,12 @@ var FALSE_POSITIVE_PATTERNS = [
   /no warning/i
 ];
 function extractResponseText(response) {
-  if (typeof response === "string") return response;
   if (response && typeof response === "object") {
     const resp = response;
-    const parts = [];
-    if (typeof resp.stdout === "string") parts.push(resp.stdout);
-    if (typeof resp.stderr === "string") parts.push(resp.stderr);
-    if (parts.length > 0) return parts.join("\n");
-    return JSON.stringify(response);
+    if (typeof resp.stderr === "string") return resp.stderr;
+    return "";
   }
-  return String(response ?? "");
+  return "";
 }
 function hasNonFalsePositiveMatch(text, patterns) {
   for (const pattern of patterns) {

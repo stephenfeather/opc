@@ -72,16 +72,15 @@ const FALSE_POSITIVE_PATTERNS: RegExp[] = [
 ];
 
 function extractResponseText(response: unknown): string {
-  if (typeof response === 'string') return response;
+  // Scan stderr only. stdout is data (file listings, grep matches, code snippets)
+  // and produces false positives when filenames/identifiers contain "error",
+  // "warning", "exception", etc. Real diagnostics go to stderr.
   if (response && typeof response === 'object') {
     const resp = response as Record<string, unknown>;
-    const parts: string[] = [];
-    if (typeof resp.stdout === 'string') parts.push(resp.stdout);
-    if (typeof resp.stderr === 'string') parts.push(resp.stderr);
-    if (parts.length > 0) return parts.join('\n');
-    return JSON.stringify(response);
+    if (typeof resp.stderr === 'string') return resp.stderr;
+    return '';
   }
-  return String(response ?? '');
+  return '';
 }
 
 function hasNonFalsePositiveMatch(text: string, patterns: RegExp[]): boolean {

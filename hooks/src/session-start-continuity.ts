@@ -402,6 +402,22 @@ async function main() {
   // Ensure memory daemon is running (extracts learnings from stale sessions)
   const daemonStatus = ensureMemoryDaemon();
 
+  // Subagent /clear: parent will reprime the teammate with a fresh role.
+  // Autoloading a stale handoff scoped to the worktree pollutes that priming.
+  // Skip continuity restore in this case. Subagent crash recovery still works
+  // via `resume` (which we do NOT short-circuit).
+  if (process.env.CLAUDE_AGENT_ID && sessionType === 'clear') {
+    const output: Record<string, unknown> = { result: 'continue' };
+    if (daemonStatus) {
+      output.hookSpecificOutput = {
+        hookEventName: 'SessionStart',
+        additionalContext: daemonStatus,
+      };
+    }
+    console.log(JSON.stringify(output));
+    return;
+  }
+
   let message = '';
   let additionalContext = '';
   let usedHandoffLedger = false;

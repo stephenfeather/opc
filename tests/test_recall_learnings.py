@@ -199,6 +199,25 @@ class TestMakeRecallContext:
         assert ctx.project is None
         assert ctx.tags_hint is None
 
+    def test_type_probabilities_passed_through(self):
+        """Issue #54: an explicit type distribution lands on the context so the
+        reranker's type_match signal can use it."""
+        probs = {"USER_PREFERENCE": 0.8, "ERROR_FIX": 0.2}
+        ctx = make_recall_context(
+            project="opc",
+            tags=None,
+            retrieval_mode="hybrid_rrf",
+            type_probabilities=probs,
+        )
+        assert ctx.type_probabilities == probs
+
+    def test_type_probabilities_defaults_to_none(self):
+        """Omitting type affinity leaves the neutral 0.5 type_match behavior."""
+        ctx = make_recall_context(
+            project="opc", tags=None, retrieval_mode="hybrid_rrf",
+        )
+        assert ctx.type_probabilities is None
+
 
 # ---------------------------------------------------------------------------
 # get_backend: env-dependent (test with patches)

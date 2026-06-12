@@ -52,6 +52,13 @@ _FAULT_LOG_FILE = None
 # record_recall and the pool.acquire() context manager releases the connection.
 RECORD_RECALL_TIMEOUT = 2.0
 
+# Issue #54: hard bound on type-affinity inference (centroid cache read or a
+# one-shot server-side aggregate). Like RECORD_RECALL_TIMEOUT, this protects the
+# memory-awareness hook's 5s spawn budget — a cache hit is a single file read,
+# but a cold cache runs the aggregate, so cap it. On timeout the wait_for
+# cancels the inference and reranking proceeds with neutral type_match.
+TYPE_AFFINITY_TIMEOUT = 1.5
+
 
 def _enable_faulthandler() -> None:
     """Enable faulthandler without breaking imports if log dir is missing."""
@@ -244,6 +251,7 @@ def make_recall_context(
     tags: list[str] | None,
     retrieval_mode: str,
     query: str | None = None,
+    type_probabilities: dict[str, float] | None = None,
 ) -> Any:
     """Construct a RecallContext for the reranker.
 
@@ -251,6 +259,11 @@ def make_recall_context(
     ``query_entities`` via ``kg_extractor.extract_entities`` for the
     ``kg_overlap`` signal. Non-fatal: any extractor failure yields no
     query entities.
+
+    ``type_probabilities`` (issue #54) is the per-query soft type distribution
+    that drives the reranker's ``type_match`` signal. ``None`` (the default,
+    and the value on every text-only / sqlite / degraded path) preserves the
+    neutral 0.5 ``type_match`` behavior.
     """
     from scripts.core.reranker import RecallContext
 
@@ -277,6 +290,7 @@ def make_recall_context(
         tags_hint=tags,
         retrieval_mode=retrieval_mode,
         query_entities=query_entities,
+        type_probabilities=type_probabilities,
     )
 
 
@@ -815,13 +829,21 @@ async def search_learnings(
 
 
 async def _dispatch_search(
-    params: dict[str, Any], *, project: str | None = None,
+    params: dict[str, Any],
+    *,
+    project: str | None = None,
+    capture: Any | None = None,
 ) -> list[dict[str, Any]]:
     """Dispatch a search call based on resolved params dict.
 
     ``project`` (issue #139) optionally fetch-scopes the backend query.
     ``None`` (the default) leaves every backend call byte-identical to the
     pre-#139 path.
+
+    ``capture`` (issue #54) is an optional ``SearchCapture`` out-param. Only
+    the hybrid backend fills it (with the query embedding it already computes);
+    the text-only / sqlite / vector modes ignore it, so those paths leave type
+    affinity disabled. ``None`` keeps every call signature pre-#54 identical.
     """
     mode = params["mode"]
     # Only forward project= when scoping is active so the default path stays
@@ -850,6 +872,9 @@ async def _dispatch_search(
         from scripts.core.query_expansion import get_idf_index
 
         await get_idf_index(force_rebuild=True)
+    # Forward the capture only when present so the default signature stays
+    # byte-identical to the pre-#54 call (issue #54).
+    capture_kw: dict[str, Any] = {"capture": capture} if capture is not None else {}
     return await search_learnings_hybrid_rrf(
         query=params["query"],
         k=params["k"],
@@ -858,6 +883,7 @@ async def _dispatch_search(
         expand=params.get("expand", True),
         max_expansion_terms=params.get("max_expansion_terms", 5),
         **project_kw,
+        **capture_kw,
     )
 
 
@@ -1033,10 +1059,19 @@ async def main() -> int:
         if backend == "sqlite" and output_mode == "human" and not args.text_only:
             print("  (SQLite backend - using text search)")
 
+        # Issue #54: a SearchCapture lets the hybrid backend surface the query
+        # embedding it already computes, so the type-affinity reranker signal
+        # needs no second embed. Only the single-dispatch hybrid path captures;
+        # --project-first re-embeds per pass and is left on the neutral path.
+        search_capture = None
         if project_scope is not None:
             results = await _dispatch_search_project_first(params)
         else:
-            results = await _dispatch_search(params)
+            if params["mode"] == "hybrid_rrf" and not args.no_rerank:
+                from scripts.core.recall_backends import SearchCapture
+
+                search_capture = SearchCapture()
+            results = await _dispatch_search(params, capture=search_capture)
     except Exception as e:
         if output_mode != "human":
             from scripts.core.recall_formatters import get_api_version
@@ -1061,12 +1096,31 @@ async def main() -> int:
         )
         from scripts.core.project_naming import project_from_path
 
+        # Issue #54: infer the query's soft type distribution from the captured
+        # embedding + model-filtered centroids. Returns None on every failure
+        # mode (no capture/embedding/label, DB error, stale cache), keeping the
+        # neutral 0.5 type_match behavior. Bounded so a slow centroid aggregate
+        # can't blow the memory-awareness hook's 5s budget.
+        type_probabilities = None
+        if search_capture is not None:
+            try:
+                from scripts.core.type_affinity import compute_type_probabilities
+
+                type_probabilities = await asyncio.wait_for(
+                    compute_type_probabilities(search_capture),
+                    timeout=TYPE_AFFINITY_TIMEOUT,
+                )
+            except Exception:  # noqa: BLE001 - degrade to neutral type_match
+                # Covers TimeoutError (from wait_for) and any inference error.
+                logger.debug("type-affinity inference failed/timed out", exc_info=True)
+
         ctx = make_recall_context(
             project=args.project
             or project_from_path(os.environ.get("CLAUDE_PROJECT_DIR") or None),
             tags=args.tags,
             retrieval_mode=retrieval_mode,
             query=args.query,
+            type_probabilities=type_probabilities,
         )
         from scripts.core.reranker import rerank
 

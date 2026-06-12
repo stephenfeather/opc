@@ -369,10 +369,19 @@ def compute_type_centroids(rows: list[dict]) -> dict[str, list[float]]:
 def infer_query_type(
     query_embedding: list[float],
     centroids: dict[str, list[float]],
+    *,
+    temperature: float | None = None,
 ) -> dict[str, float]:
     """Infer query type as soft probability distribution over learning types.
 
     Uses cosine similarity to each type centroid, then softmax.
+
+    Issue #54: real type centroids cluster tightly in cosine space, so a plain
+    softmax over raw sims is near-uniform and ``type_match`` cannot
+    differentiate. ``temperature`` divides the sims before softmax: a low value
+    (e.g. 0.05) sharpens the distribution to peak on the closest type. A value
+    of ``None`` or ``<= 0`` disables sharpening, preserving the pre-#54 plain
+    softmax exactly (backward compatible).
 
     Returns:
         Dict mapping learning_type to probability (sums to ~1.0).
@@ -381,6 +390,12 @@ def infer_query_type(
         return {}
 
     sims = {lt: _cosine_similarity(query_embedding, c) for lt, c in centroids.items()}
+
+    # Temperature sharpening (issue #54). Only applied for a positive,
+    # finite temperature; otherwise the raw sims pass through unchanged so
+    # the pre-#54 behavior is byte-for-byte preserved.
+    if temperature is not None and temperature > 0.0:
+        sims = {lt: s / temperature for lt, s in sims.items()}
 
     # Softmax with max-subtraction for numerical stability
     max_sim = max(sims.values())

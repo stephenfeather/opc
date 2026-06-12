@@ -537,7 +537,7 @@ class TestMainDegradesWithWarning:
 
         dispatched: dict[str, bool] = {"global": False, "first": False}
 
-        async def fake_global(params, *, project=None):
+        async def fake_global(params, *, project=None, capture=None):
             dispatched["global"] = True
             return []
 

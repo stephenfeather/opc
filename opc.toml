@@ -58,11 +58,17 @@ log_backup_count = 0
 
 
 [reranker]
-# Contextual signal weights (should sum to ~0.35).
-project_weight = 0.15
+# Contextual signal weights (should sum to ~0.26).
+# Issue #54: damped from 0.15. With RRF calibration de-saturated (see
+# rrf_scale_factor below), a substring project match (0.5) no longer needs to
+# outweigh a strictly superior retrieval hit from a sibling project. An exact
+# match still contributes strongly.
+project_weight = 0.09
 recency_weight = 0.05
 confidence_weight = 0.05
-recall_weight = 0.05
+# Issue #54: damped from 0.05 so the heavily-recalled tail no longer wins the
+# tie-break over a strong retrieval hit. Freed weight flows to retrieval.
+recall_weight = 0.02
 type_affinity_weight = 0.05
 tag_overlap_weight = 0.05
 pattern_weight = 0.05
@@ -71,10 +77,22 @@ pattern_weight = 0.05
 recency_half_life_days = 45
 
 # Recall count normalizer: recall_count of 2^N scores as 1.0.
-recall_log2_normalizer = 4
+# Issue #54: raised from 4 to 10 so recall_score grows slowly and does not
+# saturate at count~=15, giving light new rows headroom against the 600+ tail.
+recall_log2_normalizer = 10
 
 # Scale-up factor for hybrid_rrf raw scores in calibration.
-rrf_scale_factor = 60
+# Issue #54: lowered from 60 to 25. calibrate_score multiplies a top RRF raw
+# score (~0.02-0.04) by this and clamps to [0, 1]; at 60 every top hit clamped
+# to >=1.0, erasing the retrieval ranking so contextual signals (and the
+# heavily-recalled tail) decided everything. 25 keeps the top band in (0, 1).
+rrf_scale_factor = 25
+
+# Issue #54: softmax temperature for query-type inference (type_match signal).
+# Raw cosine sims across the 7 type centroids cluster tightly; a low
+# temperature sharpens the distribution so type affinity actually
+# differentiates. Lower -> peakier. Set <= 0 to disable sharpening.
+type_softmax_temperature = 0.05
 
 
 [patterns]

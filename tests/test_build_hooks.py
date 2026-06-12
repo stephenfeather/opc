@@ -8,6 +8,7 @@ FAKE_ESBUILD_FAIL.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -141,7 +142,7 @@ class TestBuildAndSwap:
         dist.mkdir(parents=True)
         (dist / "existing.mjs").write_text("console.log('old');\n")
 
-        lock_dir = tmp_path / "tmp" / "opc-build-hooks.lock.d"
+        lock_dir = tmp_path / "tmp" / f"opc-build-hooks.{os.getuid()}.lock.d"
         (tmp_path / "tmp").mkdir(exist_ok=True)
         lock_dir.mkdir(parents=True)
         holder = subprocess.Popen(["sleep", "30"])
@@ -158,7 +159,7 @@ class TestBuildAndSwap:
 
     def test_stale_lock_from_dead_pid_is_reclaimed(self, tmp_path: Path) -> None:
         opc_root, build_script = _build_fixture(tmp_path)
-        lock_dir = tmp_path / "tmp" / "opc-build-hooks.lock.d"
+        lock_dir = tmp_path / "tmp" / f"opc-build-hooks.{os.getuid()}.lock.d"
         (tmp_path / "tmp").mkdir(exist_ok=True)
         lock_dir.mkdir(parents=True)
         (lock_dir / "pid").write_text("4000000\n")  # beyond macOS pid range

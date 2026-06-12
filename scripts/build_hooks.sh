@@ -26,7 +26,9 @@ OPC_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HOOKS_DIR="$OPC_ROOT/hooks"
 STAGING="$HOOKS_DIR/dist.tmp.$$"
 
-BUILD_LOCK_DIR="${TMPDIR:-/tmp}/opc-build-hooks.lock.d"
+# aegis: namespace the lock by uid so a shared /tmp on multi-user hosts
+# cannot be squatted by another user to DoS builds.
+BUILD_LOCK_DIR="${TMPDIR:-/tmp}/opc-build-hooks.$(id -u).lock.d"
 _build_lock_acquired=0
 
 _build_cleanup() {
@@ -83,9 +85,23 @@ fi
 
 cd "$HOOKS_DIR"
 
+# aegis: $$ is guessable, so a pre-created dist.tmp.<pid> (or a symlink to
+# elsewhere) could redirect esbuild output. Clear anything squatting on the
+# staging path, then refuse if a symlink still manages to appear there.
+rm -rf "$STAGING" 2>/dev/null || true
+if [ -e "$STAGING" ] || [ -L "$STAGING" ]; then
+    echo "build_hooks: staging path $STAGING already exists and cannot be cleared - aborting" >&2
+    exit 1
+fi
+
 npx esbuild src/*.ts --bundle --platform=node --format=esm \
     --outdir="$STAGING" --out-extension:.js=.mjs \
     --external:better-sqlite3 --legal-comments=inline
+
+if [ -L "$STAGING" ]; then
+    echo "build_hooks: staging path $STAGING is a symlink - refusing to publish" >&2
+    exit 1
+fi
 
 if [ ! -d "$STAGING" ] || [ -z "$(ls -A "$STAGING" 2>/dev/null)" ]; then
     echo "build_hooks: esbuild produced no output in $STAGING - aborting" >&2

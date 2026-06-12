@@ -62,7 +62,10 @@ async function scrub(transcriptPath: string): Promise<void> {
   // Clean stale tmp from a prior crashed run.
   try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
 
-  const out = fs.createWriteStream(tmpPath, { flags: "wx" });
+  // Preserve the transcript's mode: a default-mode temp file renamed over a
+  // 0600 transcript would widen access to freshly-redacted session history.
+  const srcMode = fs.statSync(transcriptPath).mode & 0o7777;
+  const out = fs.createWriteStream(tmpPath, { flags: "wx", mode: srcMode });
   const reader = readline.createInterface({
     input: fs.createReadStream(transcriptPath, { encoding: "utf8" }),
     crlfDelay: Infinity,
@@ -107,6 +110,8 @@ async function scrub(transcriptPath: string): Promise<void> {
       // Atomic swap — only when something changed. A no-op rename would
       // refresh the transcript mtime and defeat scrub-sweep's watermark,
       // turning incremental sweeps into perpetual full rescans.
+      // chmod again: the umask may have stripped bits at create time.
+      fs.chmodSync(tmpPath, srcMode);
       fs.renameSync(tmpPath, transcriptPath);
       process.stderr.write(
         `scrub-transcript: ${redactionCount} redaction(s) in ${transcriptPath}\n`,

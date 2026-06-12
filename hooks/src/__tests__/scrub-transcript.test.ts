@@ -51,6 +51,17 @@ describe("scrub-transcript CLI", () => {
     expect(fs.existsSync(`${p}.scrub.tmp`)).toBe(false);
   });
 
+  it("preserves a restrictive file mode across the scrub rewrite", () => {
+    const p = makeTranscript([
+      JSON.stringify({ role: "user", content: `token is ${FAKE_DO_TOKEN}` }),
+    ]);
+    fs.chmodSync(p, 0o600);
+    const res = runScrub(p);
+    expect(res.status).toBe(0);
+    expect(fs.readFileSync(p, "utf-8")).toContain("[REDACTED:");
+    expect(fs.statSync(p).mode & 0o777).toBe(0o600);
+  });
+
   it("is idempotent: scrubbing twice leaves the file stable", () => {
     const p = makeTranscript([
       JSON.stringify({ role: "user", content: `token is ${FAKE_DO_TOKEN}` }),

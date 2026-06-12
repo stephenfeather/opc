@@ -71,7 +71,10 @@ const CONFIG_JSON_DIRS = [
   /\.kube\//,
 ];
 
-function classify(filePath: string): { description: string } | null {
+function classify(rawPath: string): { description: string } | null {
+  // Normalize Windows separators first — slash-anchored rules must not be
+  // bypassable with backslash paths (C:\Users\x\.config\gh\hosts.yml).
+  const filePath = rawPath.replace(/\\/g, '/');
   const name = basename(filePath);
   for (const rule of SECRET_FILE_RULES) {
     if (rule.pattern.test(filePath) || rule.pattern.test(name)) {

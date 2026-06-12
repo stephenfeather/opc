@@ -412,7 +412,8 @@ async function scrub(transcriptPath) {
     fs.unlinkSync(tmpPath);
   } catch {
   }
-  const out = fs.createWriteStream(tmpPath, { flags: "wx" });
+  const srcMode = fs.statSync(transcriptPath).mode & 4095;
+  const out = fs.createWriteStream(tmpPath, { flags: "wx", mode: srcMode });
   const reader = readline.createInterface({
     input: fs.createReadStream(transcriptPath, { encoding: "utf8" }),
     crlfDelay: Infinity
@@ -444,6 +445,7 @@ async function scrub(transcriptPath) {
       out.end((err) => err ? reject(err) : resolve());
     });
     if (redactionCount > 0) {
+      fs.chmodSync(tmpPath, srcMode);
       fs.renameSync(tmpPath, transcriptPath);
       process.stderr.write(
         `scrub-transcript: ${redactionCount} redaction(s) in ${transcriptPath}

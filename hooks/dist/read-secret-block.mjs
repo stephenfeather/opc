@@ -45,7 +45,8 @@ var CONFIG_JSON_DIRS = [
   /\.docker\//,
   /\.kube\//
 ];
-function classify(filePath) {
+function classify(rawPath) {
+  const filePath = rawPath.replace(/\\/g, "/");
   const name = basename(filePath);
   for (const rule of SECRET_FILE_RULES) {
     if (rule.pattern.test(filePath) || rule.pattern.test(name)) {

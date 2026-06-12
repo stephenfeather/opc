@@ -166,8 +166,8 @@ function deriveWorkingOn(input, cache) {
     const id = ti.taskId;
     if (!id) return { workingOn: null, cache: next };
     if (ti.status === "in_progress") {
-      const label = next.tasks[id];
-      if (!label) return { workingOn: null, cache: next };
+      const label = Object.prototype.hasOwnProperty.call(next.tasks, id) ? next.tasks[id] : void 0;
+      if (typeof label !== "string" || !label) return { workingOn: null, cache: next };
       next.currentId = id;
       return { workingOn: label, cache: next };
     }
@@ -195,8 +195,14 @@ function readCache(sessionId) {
   try {
     const raw = readFileSync2(cachePath(sessionId), "utf-8");
     const parsed = JSON.parse(raw);
+    const tasks = {};
+    if (parsed.tasks && typeof parsed.tasks === "object") {
+      for (const [k, v] of Object.entries(parsed.tasks)) {
+        if (typeof v === "string") tasks[k] = v;
+      }
+    }
     return {
-      tasks: parsed.tasks && typeof parsed.tasks === "object" ? parsed.tasks : {},
+      tasks,
       currentId: typeof parsed.currentId === "string" ? parsed.currentId : null
     };
   } catch {

@@ -98,8 +98,12 @@ export function deriveWorkingOn(
     const id = ti.taskId;
     if (!id) return { workingOn: null, cache: next };
     if (ti.status === 'in_progress') {
-      const label = next.tasks[id];
-      if (!label) return { workingOn: null, cache: next };
+      // hasOwnProperty + typeof guard: a crafted id like "__proto__" would
+      // otherwise resolve to Object.prototype (truthy, non-string). (aegis #65)
+      const label = Object.prototype.hasOwnProperty.call(next.tasks, id)
+        ? next.tasks[id]
+        : undefined;
+      if (typeof label !== 'string' || !label) return { workingOn: null, cache: next };
       next.currentId = id;
       return { workingOn: label, cache: next };
     }
@@ -134,8 +138,16 @@ function readCache(sessionId: string): WorkingOnCache {
   try {
     const raw = readFileSync(cachePath(sessionId), 'utf-8');
     const parsed = JSON.parse(raw) as Partial<WorkingOnCache>;
+    // Keep only string-valued task entries — a tampered/corrupt cache must
+    // not feed a non-string label into the DB write path. (aegis #65)
+    const tasks: Record<string, string> = {};
+    if (parsed.tasks && typeof parsed.tasks === 'object') {
+      for (const [k, v] of Object.entries(parsed.tasks)) {
+        if (typeof v === 'string') tasks[k] = v;
+      }
+    }
     return {
-      tasks: parsed.tasks && typeof parsed.tasks === 'object' ? parsed.tasks : {},
+      tasks,
       currentId: typeof parsed.currentId === 'string' ? parsed.currentId : null,
     };
   } catch {

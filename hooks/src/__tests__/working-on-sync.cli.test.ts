@@ -119,6 +119,25 @@ describe("working-on-sync CLI", () => {
     expect(cache.tasks["2"]).toBe("Fixing 65");
   });
 
+  it("tolerates a corrupt cache (non-string task values) without crashing", () => {
+    const dir = path.join(home, ".claude", "cache", "working-on");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      cacheFile(home),
+      JSON.stringify({ tasks: { "1": { nested: "obj" }, "2": "Real" }, currentId: null }),
+    );
+    const res = run(
+      { session_id: SESSION, tool_name: "TaskUpdate", tool_input: { taskId: "1", status: "in_progress" } },
+      home,
+    );
+    expect(res.status).toBe(0);
+    expect(JSON.parse(res.stdout.trim()).result).toBe("continue");
+    // the non-string entry was dropped on read; the good one survives the rewrite
+    const cache = JSON.parse(fs.readFileSync(cacheFile(home), "utf-8"));
+    expect(cache.tasks["1"]).toBeUndefined();
+    expect(cache.tasks["2"]).toBe("Real");
+  });
+
   it("ignores an invalid session id", () => {
     const res = run({ session_id: "../etc", tool_name: "TaskCreate", tool_input: {} }, home);
     expect(res.status).toBe(0);

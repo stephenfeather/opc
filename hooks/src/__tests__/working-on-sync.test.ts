@@ -142,6 +142,14 @@ describe("deriveWorkingOn — native Task tools", () => {
     expect(r.cache.tasks["2"]).toBe("Fixing 65"); // active task retained
   });
 
+  it("does not resolve a label for a crafted '__proto__' taskId", () => {
+    const r = deriveWorkingOn(
+      { tool_name: "TaskUpdate", tool_input: { taskId: "__proto__", status: "in_progress" } },
+      EMPTY,
+    );
+    expect(r.workingOn).toBeNull();
+  });
+
   it("does not mutate the input cache (immutability)", () => {
     const cache = { tasks: { "1": "A" }, currentId: null };
     deriveWorkingOn(

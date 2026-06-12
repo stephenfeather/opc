@@ -1012,3 +1012,20 @@ class TestRound2Hardening:
         assert "mirrored src/, dist/, and top-level runtime files" not in stdout
         # lock must be cleaned up so future deploys are not wedged
         assert not (tmp_path / "tmp" / "opc-deploy-hooks.lock.d").exists()
+
+    def test_poisoned_manifest_directory_entry_is_skipped(
+        self, tmp_path: Path
+    ) -> None:
+        """aegis M2: a manifest entry naming a directory (src/dist) must be
+        skipped, not abort the deploy via rm -f failing under set -e."""
+        opc_root, script, target = _build_fixture(tmp_path)
+        (opc_root / "hooks" / "guard.sh").write_text("#!/bin/sh\\n")
+        target.mkdir(parents=True)
+        (target / "src").mkdir()
+        (target / ".opc-managed-toplevel").write_text("src\\ndist\\nghost.sh\\n")
+
+        result = _run(script, target)
+
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        assert (target / "src").is_dir()
+        assert (target / "guard.sh").exists()

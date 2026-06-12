@@ -319,6 +319,9 @@ fi
 # conventional 128+N codes, which fires the EXIT trap exactly once.
 _cleanup() {
     rm -f "${_toplevel_manifest_new:-}" 2>/dev/null || true
+    # aegis M1: the staged in-target manifest must not survive a signal
+    # between its mktemp and the atomic mv, or it litters the runtime tree.
+    rm -f "${_manifest_staged:-}" 2>/dev/null || true
     _release_lock
 }
 trap _cleanup EXIT
@@ -397,6 +400,10 @@ if [ -f "$TOPLEVEL_MANIFEST_TARGET" ]; then
         case "$_old" in
             '' | . | .. | */* | -*) continue ;;
         esac
+        # aegis M2: a poisoned manifest entry naming a directory would make
+        # rm -f return non-zero and abort the deploy under set -e. Retire
+        # regular files only.
+        [ -f "$TARGET_ABS/$_old" ] || continue
         if ! grep -qxF "$_old" "$_toplevel_manifest_new"; then
             rm -f "$TARGET_ABS/$_old"
             echo "deploy_hooks: retired stale top-level file: $_old"

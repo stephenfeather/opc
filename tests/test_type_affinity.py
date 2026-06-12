@@ -14,10 +14,10 @@ aggregate are exercised with fakes (no real DB, no network).
 from __future__ import annotations
 
 import json
+import os
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
-
-import pytest
 
 # ---------------------------------------------------------------------------
 # Pure inference wrapper
@@ -173,10 +173,66 @@ class TestCacheFreshness:
             None, model_label="voyage-code-3", ttl_seconds=86400,
         ) is False
 
+    def test_ttl_jitter_is_deterministic_and_bounded(self):
+        """Round 3 finding 2: the effective TTL carries a deterministic ±10%
+        jitter keyed on a stable string (NOT random at import), so concurrent
+        hosts don't all expire on the same tick (thundering herd). Same key ->
+        same factor; the factor stays within [0.9, 1.1]."""
+        from scripts.core.type_affinity import _ttl_jitter_factor
+
+        f1 = _ttl_jitter_factor("voyage-code-3:/home/u/.config/opc/type_centroids.json")
+        f2 = _ttl_jitter_factor("voyage-code-3:/home/u/.config/opc/type_centroids.json")
+        assert f1 == f2  # deterministic
+        assert 0.9 <= f1 <= 1.1
+        other = _ttl_jitter_factor("voyage-3:/different/path.json")
+        assert 0.9 <= other <= 1.1
+
+    def test_jitter_key_shifts_freshness_boundary(self):
+        """is_cache_fresh applies the jitter when a jitter_key is supplied: an
+        age just past the bare TTL can still be fresh (or not) depending on the
+        deterministic factor, but the bare-TTL behavior is unchanged when no
+        key is given (existing callers/tests)."""
+        from scripts.core.type_affinity import _ttl_jitter_factor, is_cache_fresh
+
+        ttl = 1000.0
+        key = "voyage-code-3:/x.json"
+        factor = _ttl_jitter_factor(key)
+        effective = ttl * factor
+        # An age strictly inside the jittered window is fresh.
+        cache = self._cache(label="voyage-code-3", age_seconds=effective - 1)
+        assert is_cache_fresh(
+            cache, model_label="voyage-code-3", ttl_seconds=ttl, jitter_key=key,
+        ) is True
+        # An age strictly past it is stale.
+        cache2 = self._cache(label="voyage-code-3", age_seconds=effective + 1)
+        assert is_cache_fresh(
+            cache2, model_label="voyage-code-3", ttl_seconds=ttl, jitter_key=key,
+        ) is False
+
+
+class TestCacheSizeCap:
+    def test_max_cache_bytes_is_1mb(self):
+        """Round 3 redesign: cap lowered to 1 MB. The read is now synchronous on
+        the loop thread, so a tight cap keeps it microsecond-fast (7 types x
+        ~1024 floats ~= 100 KB)."""
+        from scripts.core.type_affinity import MAX_CACHE_BYTES
+
+        assert MAX_CACHE_BYTES == 1024 * 1024
+
 
 # ---------------------------------------------------------------------------
 # DB aggregate: model-filtered, failures -> None
 # ---------------------------------------------------------------------------
+
+
+class _FakeTransaction:
+    """Async-context-manager stand-in for asyncpg's conn.transaction()."""
+
+    async def __aenter__(self) -> _FakeTransaction:
+        return self
+
+    async def __aexit__(self, *_exc: Any) -> bool:
+        return False
 
 
 class _FakeConn:
@@ -184,6 +240,15 @@ class _FakeConn:
         self._rows = rows
         self.captured_sql: str | None = None
         self.captured_args: tuple = ()
+        self.executed: list[str] = []
+
+    def transaction(self) -> _FakeTransaction:
+        return _FakeTransaction()
+
+    async def execute(self, sql: str, *_args: Any) -> str:
+        # Captures SET LOCAL statement_timeout (round 3) — not a row fetch.
+        self.executed.append(sql)
+        return "SET"
 
     async def fetch(self, sql: str, *args: Any) -> list[Any]:
         self.captured_sql = sql
@@ -239,6 +304,9 @@ class TestFetchCentroids:
         # The model label is bound as a parameter (model-filtered aggregate).
         assert "voyage-code-3" in conn.captured_args
         assert "embedding_model" in (conn.captured_sql or "")
+        # Round 3 finding 2: the aggregate is bounded by a server-side
+        # statement_timeout set within the transaction.
+        assert any("statement_timeout" in s for s in conn.executed)
 
     async def test_aggregate_mirrors_recall_corpus_predicates(self, monkeypatch):
         """Finding 1 (round 1): centroids must be trained on exactly the rows
@@ -278,6 +346,12 @@ class TestFetchCentroids:
 
             def __init__(self) -> None:
                 self.calls: list[str] = []
+
+            def transaction(self) -> _FakeTransaction:
+                return _FakeTransaction()
+
+            async def execute(self, sql: str, *_args: Any) -> str:
+                return "SET"
 
             async def fetch(self, sql: str, *args: Any) -> list[Any]:
                 self.calls.append(sql)
@@ -495,10 +569,10 @@ class TestComputeTypeProbabilities:
         from scripts.core import type_affinity as ta
         from scripts.core.recall_backends import SearchCapture
 
-        async def fake_load_or_compute(*_a, **_kw):
-            return None  # DB failure / no rows / unreadable cache
+        def fake_resolve(*_a, **_kw):
+            return None  # cold cache / unreadable cache
 
-        monkeypatch.setattr(ta, "load_or_compute_centroids", fake_load_or_compute)
+        monkeypatch.setattr(ta, "resolve_centroids", fake_resolve)
 
         cap = SearchCapture(query_embedding=[1.0, 0.0], model_label="voyage-code-3")
         assert await ta.compute_type_probabilities(cap) is None
@@ -507,11 +581,11 @@ class TestComputeTypeProbabilities:
         from scripts.core import type_affinity as ta
         from scripts.core.recall_backends import SearchCapture
 
-        async def fake_load_or_compute(model_label, **_kw):
+        def fake_resolve(model_label, **_kw):
             assert model_label == "voyage-code-3"
             return {"USER_PREFERENCE": [1.0, 0.05], "ERROR_FIX": [1.0, 0.5]}
 
-        monkeypatch.setattr(ta, "load_or_compute_centroids", fake_load_or_compute)
+        monkeypatch.setattr(ta, "resolve_centroids", fake_resolve)
 
         cap = SearchCapture(query_embedding=[1.0, 0.0], model_label="voyage-code-3")
         probs = await ta.compute_type_probabilities(cap)
@@ -523,168 +597,258 @@ class TestComputeTypeProbabilities:
 
 
 # ---------------------------------------------------------------------------
-# load_or_compute_centroids: cache-hit vs miss/stale
+# Round 3 redesign: resolve_centroids — synchronous read, stale-while-revalidate,
+# single-flight background refresh (NEVER runs the aggregate inline on recall).
 # ---------------------------------------------------------------------------
 
 
-class TestLoadOrComputeCentroids:
-    async def test_fresh_cache_hit_skips_db(self, monkeypatch, tmp_path):
+class TestResolveCentroids:
+    def test_fresh_cache_returns_centroids_no_refresh(self, monkeypatch, tmp_path):
         from scripts.core import type_affinity as ta
 
         path = tmp_path / "centroids.json"
-        ta.write_centroid_cache(
-            path, model_label="voyage-code-3", centroids={"A": [1.0, 0.0]},
-        )
+        ta.write_centroid_cache(path, model_label="voyage-code-3", centroids={"A": [1.0, 0.0]})
 
-        async def boom(*_a, **_kw):
-            raise AssertionError("fresh cache must not hit the DB")
+        def boom(*_a, **_kw):
+            raise AssertionError("fresh cache must not trigger a refresh")
 
-        monkeypatch.setattr(ta, "fetch_type_centroids", boom)
+        monkeypatch.setattr(ta, "_trigger_background_refresh", boom)
 
-        out = await ta.load_or_compute_centroids(
+        out = ta.resolve_centroids(
             "voyage-code-3", cache_path=path, ttl_seconds=86400,
         )
         assert out == {"A": [1.0, 0.0]}
 
-    async def test_miss_recomputes_and_writes(self, monkeypatch, tmp_path):
-        from scripts.core import type_affinity as ta
+    def test_stale_label_match_serves_stale_and_refreshes(self, monkeypatch, tmp_path):
+        """Stale-while-revalidate: an expired-but-label-matched envelope is
+        USED for this call AND a background refresh is triggered exactly once."""
+        from datetime import UTC, datetime, timedelta
 
-        path = tmp_path / "centroids.json"  # does not exist yet
-
-        async def fake_fetch(model_label):
-            return {"B": [0.5, 0.5]}
-
-        monkeypatch.setattr(ta, "fetch_type_centroids", fake_fetch)
-
-        out = await ta.load_or_compute_centroids(
-            "voyage-code-3", cache_path=path, ttl_seconds=86400,
-        )
-        assert out == {"B": [0.5, 0.5]}
-        # The recomputed centroids were persisted with the right label.
-        cache = ta.read_centroid_cache(path)
-        assert cache is not None
-        assert cache.model_label == "voyage-code-3"
-        assert cache.centroids == {"B": [0.5, 0.5]}
-
-    async def test_stale_label_forces_recompute(self, monkeypatch, tmp_path):
         from scripts.core import type_affinity as ta
 
         path = tmp_path / "centroids.json"
+        old = datetime.now(UTC) - timedelta(seconds=999999)  # well past TTL
         ta.write_centroid_cache(
-            path, model_label="voyage-3", centroids={"OLD": [9.0]},
+            path, model_label="voyage-code-3", centroids={"A": [1.0, 0.0]}, now=old,
         )
 
-        async def fake_fetch(model_label):
-            assert model_label == "voyage-code-3"
-            return {"NEW": [0.5, 0.5]}
+        triggers: list[str] = []
+        monkeypatch.setattr(
+            ta, "_trigger_background_refresh",
+            lambda model_label, cache_path: triggers.append(model_label),
+        )
 
-        monkeypatch.setattr(ta, "fetch_type_centroids", fake_fetch)
-
-        out = await ta.load_or_compute_centroids(
+        out = ta.resolve_centroids(
             "voyage-code-3", cache_path=path, ttl_seconds=86400,
         )
-        assert out == {"NEW": [0.5, 0.5]}
+        # Served the stale-but-valid centroids this call.
+        assert out == {"A": [1.0, 0.0]}
+        # Refresh fired exactly once.
+        assert triggers == ["voyage-code-3"]
 
-    async def test_db_failure_on_miss_returns_none(self, monkeypatch, tmp_path):
+    def test_cold_cache_returns_none_and_refreshes(self, monkeypatch, tmp_path):
+        """No envelope at all -> neutral (None) this call, refresh in background."""
         from scripts.core import type_affinity as ta
 
-        path = tmp_path / "centroids.json"
+        path = tmp_path / "centroids.json"  # does not exist
+        triggers: list[str] = []
+        monkeypatch.setattr(
+            ta, "_trigger_background_refresh",
+            lambda model_label, cache_path: triggers.append(model_label),
+        )
 
-        async def fake_fetch(model_label):
-            return None  # DB down
-
-        monkeypatch.setattr(ta, "fetch_type_centroids", fake_fetch)
-
-        out = await ta.load_or_compute_centroids(
+        out = ta.resolve_centroids(
             "voyage-code-3", cache_path=path, ttl_seconds=86400,
         )
         assert out is None
+        assert triggers == ["voyage-code-3"]
 
-    async def test_blocking_cache_read_is_preemptible(self, monkeypatch, tmp_path):
-        """Finding 2 (round 1): the synchronous cache read must run off the
-        event loop so asyncio.wait_for can preempt a slow/locked file. We block
-        the read for longer than the deadline and assert wait_for times out
-        promptly instead of waiting for the blocking read to finish."""
-        import asyncio
-        import time
-
-        from scripts.core import type_affinity as ta
-
-        block_seconds = 5.0  # far longer than the deadline below
-        deadline = 0.3
-
-        def blocking_read(_path):
-            time.sleep(block_seconds)  # sync block (simulates a locked/slow file)
-            return None
-
-        monkeypatch.setattr(ta, "read_centroid_cache", blocking_read)
-
-        start = time.monotonic()
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(
-                ta.load_or_compute_centroids(
-                    "voyage-code-3", cache_path=tmp_path / "c.json", ttl_seconds=86400,
-                ),
-                timeout=deadline,
-            )
-        elapsed = time.monotonic() - start
-        # Generous bound (flake lesson): the deadline must fire well before the
-        # 5s block — proving the read was awaited off-thread and is preemptible.
-        assert elapsed < 3.0
-
-    async def test_write_failure_still_returns_centroids(self, monkeypatch, tmp_path):
-        """Finding 1 (round 2): a cache write failure is not an inference
-        failure. The freshly computed centroids must still be returned even if
-        persisting them raises."""
+    def test_label_mismatch_returns_none_and_refreshes(self, monkeypatch, tmp_path):
+        """A label-mismatched envelope must NOT be served (no cosine across
+        spaces, #151) -> None + refresh."""
         from scripts.core import type_affinity as ta
 
         path = tmp_path / "centroids.json"
+        ta.write_centroid_cache(path, model_label="voyage-3", centroids={"A": [1.0, 0.0]})
 
-        async def fake_fetch(model_label):
-            return {"USER_PREFERENCE": [0.1, 0.2]}
+        triggers: list[str] = []
+        monkeypatch.setattr(
+            ta, "_trigger_background_refresh",
+            lambda model_label, cache_path: triggers.append(model_label),
+        )
 
-        def boom_write(*_a, **_kw):
-            raise OSError("disk full")
-
-        monkeypatch.setattr(ta, "fetch_type_centroids", fake_fetch)
-        monkeypatch.setattr(ta, "write_centroid_cache", boom_write)
-
-        out = await ta.load_or_compute_centroids(
+        out = ta.resolve_centroids(
             "voyage-code-3", cache_path=path, ttl_seconds=86400,
         )
-        assert out == {"USER_PREFERENCE": [0.1, 0.2]}
+        assert out is None
+        assert triggers == ["voyage-code-3"]
 
-    async def test_blocking_cache_write_is_preemptible(self, monkeypatch, tmp_path):
-        """Finding 1 (round 2): the cache write must also run off the event loop
-        so a slow/blocking write stays inside the wait_for deadline."""
-        import asyncio
-        import time
+    def test_resolve_never_runs_aggregate_inline(self, monkeypatch, tmp_path):
+        """The recall hot path must NEVER call the DB aggregate inline."""
+        from scripts.core import type_affinity as ta
+
+        async def boom(*_a, **_kw):
+            raise AssertionError("aggregate must not run on the recall path")
+
+        monkeypatch.setattr(ta, "fetch_type_centroids", boom)
+        monkeypatch.setattr(ta, "_trigger_background_refresh", lambda *a, **k: None)
+
+        # cold path
+        assert ta.resolve_centroids(
+            "voyage-code-3", cache_path=tmp_path / "nope.json", ttl_seconds=86400,
+        ) is None
+
+    def test_resolve_is_synchronous(self):
+        """resolve_centroids is a plain sync function (no coroutine) — the read
+        is a capped local-file read on the loop thread, no to_thread."""
+        import inspect
 
         from scripts.core import type_affinity as ta
 
-        path = tmp_path / "centroids.json"
-        block_seconds = 5.0
-        deadline = 0.3
+        assert not inspect.iscoroutinefunction(ta.resolve_centroids)
+
+
+# ---------------------------------------------------------------------------
+# Round 3: single-flight background refresh (lockfile + detached subprocess)
+# ---------------------------------------------------------------------------
+
+
+class TestBackgroundRefreshSingleFlight:
+    def test_winner_spawns_detached_subprocess(self, monkeypatch, tmp_path):
+        from scripts.core import type_affinity as ta
+
+        cache_path = tmp_path / "centroids.json"
+        spawned: list[dict] = []
+
+        class FakePopen:
+            def __init__(self, cmd, **kwargs):
+                spawned.append({"cmd": cmd, "kwargs": kwargs})
+
+        monkeypatch.setattr(ta.subprocess, "Popen", FakePopen)
+
+        ta._trigger_background_refresh("voyage-code-3", cache_path=cache_path)
+
+        assert len(spawned) == 1
+        cmd = spawned[0]["cmd"]
+        kwargs = spawned[0]["kwargs"]
+        # Detached: new session, devnull streams.
+        assert kwargs.get("start_new_session") is True
+        assert kwargs.get("stdin") == ta.subprocess.DEVNULL
+        assert kwargs.get("stdout") == ta.subprocess.DEVNULL
+        assert kwargs.get("stderr") == ta.subprocess.DEVNULL
+        # Runs the module refresh entrypoint with the label + cache path.
+        assert "-m" in cmd
+        assert "scripts.core.type_affinity" in cmd
+        assert "--refresh" in cmd
+        assert "voyage-code-3" in cmd
+
+    def test_second_caller_while_lock_held_does_not_spawn(self, monkeypatch, tmp_path):
+        from scripts.core import type_affinity as ta
+
+        cache_path = tmp_path / "centroids.json"
+        spawned: list[int] = []
+
+        class FakePopen:
+            def __init__(self, cmd, **kwargs):
+                spawned.append(1)
+
+        monkeypatch.setattr(ta.subprocess, "Popen", FakePopen)
+
+        # First caller acquires the lock and spawns.
+        ta._trigger_background_refresh("voyage-code-3", cache_path=cache_path)
+        # Second caller finds the lock held (fresh) -> no spawn.
+        ta._trigger_background_refresh("voyage-code-3", cache_path=cache_path)
+
+        assert sum(spawned) == 1
+
+    def test_stale_lock_is_reclaimed(self, monkeypatch, tmp_path):
+        from scripts.core import type_affinity as ta
+
+        cache_path = tmp_path / "centroids.json"
+        lock_path = ta._refresh_lock_path(cache_path)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        # Create a lock and backdate it past the stale threshold.
+        lock_path.write_text("99999")
+        old = time.time() - (ta.REFRESH_LOCK_STALE_SECONDS + 60)
+        os.utime(lock_path, (old, old))
+
+        spawned: list[int] = []
+
+        class FakePopen:
+            def __init__(self, cmd, **kwargs):
+                spawned.append(1)
+
+        monkeypatch.setattr(ta.subprocess, "Popen", FakePopen)
+
+        ta._trigger_background_refresh("voyage-code-3", cache_path=cache_path)
+        # The stale lock was reclaimed and a fresh refresh spawned.
+        assert sum(spawned) == 1
+
+    def test_spawn_failure_releases_lock(self, monkeypatch, tmp_path):
+        """If Popen raises, the lock must be released so the next call retries."""
+        from scripts.core import type_affinity as ta
+
+        cache_path = tmp_path / "centroids.json"
+        lock_path = ta._refresh_lock_path(cache_path)
+
+        class BoomPopen:
+            def __init__(self, cmd, **kwargs):
+                raise OSError("spawn failed")
+
+        monkeypatch.setattr(ta.subprocess, "Popen", BoomPopen)
+        ta._trigger_background_refresh("voyage-code-3", cache_path=cache_path)
+        # Lock was released after the failed spawn.
+        assert not lock_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# Round 3: refresh entrypoint (computes aggregate, validates, writes, unlocks)
+# ---------------------------------------------------------------------------
+
+
+class TestRefreshEntrypoint:
+    async def test_refresh_writes_validated_centroids_and_unlocks(
+        self, monkeypatch, tmp_path
+    ):
+        from scripts.core import type_affinity as ta
+
+        cache_path = tmp_path / "centroids.json"
+        lock_path = ta._refresh_lock_path(cache_path)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text("123")  # simulate the lock the spawner created
 
         async def fake_fetch(model_label):
-            return {"USER_PREFERENCE": [0.1, 0.2]}
-
-        def blocking_write(*_a, **_kw):
-            time.sleep(block_seconds)
+            assert model_label == "voyage-code-3"
+            return {"A": [1.0, 0.0], "B": [0.0, 1.0]}
 
         monkeypatch.setattr(ta, "fetch_type_centroids", fake_fetch)
-        monkeypatch.setattr(ta, "write_centroid_cache", blocking_write)
 
-        start = time.monotonic()
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(
-                ta.load_or_compute_centroids(
-                    "voyage-code-3", cache_path=path, ttl_seconds=86400,
-                ),
-                timeout=deadline,
-            )
-        elapsed = time.monotonic() - start
-        assert elapsed < 3.0
+        await ta._run_refresh("voyage-code-3", cache_path=cache_path)
+
+        cache = ta.read_centroid_cache(cache_path)
+        assert cache is not None
+        assert cache.model_label == "voyage-code-3"
+        assert cache.centroids == {"A": [1.0, 0.0], "B": [0.0, 1.0]}
+        # Lock released in finally.
+        assert not lock_path.exists()
+
+    async def test_refresh_db_failure_unlocks_and_no_write(self, monkeypatch, tmp_path):
+        from scripts.core import type_affinity as ta
+
+        cache_path = tmp_path / "centroids.json"
+        lock_path = ta._refresh_lock_path(cache_path)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text("123")
+
+        async def fake_fetch(model_label):
+            return None  # DB down / invalid aggregate
+
+        monkeypatch.setattr(ta, "fetch_type_centroids", fake_fetch)
+
+        await ta._run_refresh("voyage-code-3", cache_path=cache_path)
+
+        assert ta.read_centroid_cache(cache_path) is None  # nothing written
+        assert not lock_path.exists()  # lock still released
 
 
 # ---------------------------------------------------------------------------

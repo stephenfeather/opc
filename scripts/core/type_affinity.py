@@ -13,11 +13,36 @@ module that distribution was never computed — ``type_match`` returned a neutra
 3. ``compute_type_probabilities`` infers the distribution via the reranker's
    temperature-sharpened softmax.
 
+Hot-path design (round 3 adversarial review — perf/process-budget):
+
+- The recall path NEVER runs the expensive ``avg(embedding)`` aggregate inline.
+  ``resolve_centroids`` does a synchronous, size-capped local-file read (no
+  thread machinery — a capped read is microseconds, and ``asyncio.to_thread``
+  left a worker running past a cancelled ``wait_for``, defeating the process
+  budget) and decides:
+    * fresh + label-matched envelope  -> use it;
+    * stale (expired) but label-matched -> STALE-WHILE-REVALIDATE: serve the
+      stale centroids this call AND trigger an out-of-process refresh;
+    * cold / label-mismatch / unreadable -> return ``None`` (neutral) this call
+      and trigger a background refresh; the next recall is warm.
+- The refresh runs in a DETACHED subprocess (``python -m scripts.core.type_affinity
+  --refresh``) guarded by a single-flight lockfile so that at TTL expiry only
+  ONE process recomputes the aggregate (with a server-side statement_timeout),
+  validates all-or-nothing, and atomically publishes the cache.
+- TTL carries a deterministic ±10% jitter (keyed on label+path) so a fleet of
+  hosts does not all expire on the same tick.
+
 Every failure mode — no embedding, no model label, DB error, no rows, stale or
 unreadable cache, or a cache whose label disagrees with the query's embedding
 space (never cosine across spaces, issue #151) — collapses to ``None``. The
 reranker then keeps its neutral 0.5 ``type_match`` behavior, so this feature is
 strictly additive and degrades safely.
+
+First run on a cold cache is neutral by design (the refresh fires in the
+background). To warm the cache deterministically — e.g. before an acceptance
+check — invoke the refresh entrypoint once and wait for it to finish::
+
+    python -m scripts.core.type_affinity --refresh --model-label <label>
 
 Pure logic (inference, freshness) is separated from I/O (cache read/write, the
 DB aggregate) per the project's FP conventions.
@@ -25,12 +50,17 @@ DB aggregate) per the project's FP conventions.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import math
 import os
+import subprocess
+import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -47,11 +77,20 @@ logger = logging.getLogger(__name__)
 # current. Override via the ``ttl_seconds`` argument / config if needed.
 DEFAULT_CENTROID_TTL_SECONDS = 24 * 60 * 60
 
-# Hard cap on the centroid cache file size (finding 2, round 1). The envelope is
-# a handful of type centroids (7 types x ~1k floats ~= a few hundred KB worst
-# case); anything above 4 MB is treated as corrupt/hostile and rejected before
-# json.load so a runaway file can't burn the recall budget parsing megabytes.
-MAX_CACHE_BYTES = 4 * 1024 * 1024
+# Hard cap on the centroid cache file size (round 3: lowered to 1 MB). A handful
+# of type centroids (7 types x ~1024 floats ~= 100 KB) never approaches this;
+# anything larger is corrupt/hostile and is rejected before json.load. The cap
+# is what makes the now-synchronous read safe on the event-loop thread.
+MAX_CACHE_BYTES = 1024 * 1024
+
+# A refresh lock older than this is treated as stale and reclaimed: the holder
+# (a detached subprocess) likely died before releasing it. 5 minutes comfortably
+# exceeds a healthy aggregate + write (sub-second to a few seconds at 50k rows).
+REFRESH_LOCK_STALE_SECONDS = 5 * 60
+
+# Server-side statement timeout for the refresh aggregate, so a pathological
+# plan or lock contention can't run unbounded in the background process.
+REFRESH_STATEMENT_TIMEOUT = "10s"
 
 # Server-side centroid aggregate. Model-filtered (issue #151 single-space
 # contract): never average embeddings across embedding spaces. ``::text`` casts
@@ -161,18 +200,38 @@ def infer_type_probabilities(
     return probs or None
 
 
+def _ttl_jitter_factor(key: str) -> float:
+    """Deterministic ±10% TTL jitter factor in [0.9, 1.1] for ``key``.
+
+    Round 3 finding 2: jittering the effective TTL spreads cache expiry across a
+    fleet so hosts don't all recompute on the same tick (thundering herd). The
+    jitter must be DETERMINISTIC (same key -> same factor) so tests are stable
+    and a given host's expiry is consistent — hence a hash of the key, not
+    ``random``. The key is typically ``"<model_label>:<cache_path>"``.
+    """
+    digest = hashlib.sha256(key.encode("utf-8")).digest()
+    # Map the first 4 bytes to [0, 1), then to [-0.1, +0.1].
+    fraction = int.from_bytes(digest[:4], "big") / 2**32
+    return 1.0 + (fraction * 0.2 - 0.1)
+
+
 def is_cache_fresh(
     cache: CentroidCache | None,
     *,
     model_label: str,
     ttl_seconds: float,
     now: datetime | None = None,
+    jitter_key: str | None = None,
 ) -> bool:
     """Return True only when the cache is non-None, within TTL, and label-matched.
 
     A label mismatch is treated as stale even when the timestamp is fresh:
     cosine similarity is only meaningful within a single embedding space
     (issue #151), so centroids from another space must be recomputed.
+
+    When ``jitter_key`` is given, the effective TTL is scaled by a deterministic
+    ±10% factor (round 3 finding 2) so concurrent hosts don't expire in lockstep.
+    Without it, the bare TTL is used (unchanged behavior for existing callers).
     """
     if cache is None:
         return False
@@ -183,7 +242,10 @@ def is_cache_fresh(
     if computed.tzinfo is None:
         computed = computed.replace(tzinfo=UTC)
     age_seconds = (current - computed).total_seconds()
-    return 0.0 <= age_seconds <= ttl_seconds
+    effective_ttl = ttl_seconds
+    if jitter_key is not None:
+        effective_ttl = ttl_seconds * _ttl_jitter_factor(jitter_key)
+    return 0.0 <= age_seconds <= effective_ttl
 
 
 # ---------------------------------------------------------------------------
@@ -353,16 +415,24 @@ async def fetch_type_centroids(model_label: str) -> dict[str, list[float]] | Non
 
         pool = await get_pool()
         async with pool.acquire() as conn:
-            try:
-                rows = await conn.fetch(_CENTROID_SQL, model_label)
-            except Exception as exc:  # noqa: BLE001 - only the column case retries
-                if not _is_missing_column_error(exc):
-                    raise
-                logger.debug(
-                    "centroid aggregate: superseded_by absent, degrading",
-                    exc_info=True,
+            # Round 3 finding 2: bound the aggregate with a server-side
+            # statement_timeout so a pathological plan or lock contention can't
+            # run unbounded even in the background refresh process. SET LOCAL is
+            # scoped to the transaction, so it cannot leak to other pooled users.
+            async with conn.transaction():
+                await conn.execute(
+                    f"SET LOCAL statement_timeout = '{REFRESH_STATEMENT_TIMEOUT}'"
                 )
-                rows = await conn.fetch(_CENTROID_SQL_NO_CHAIN, model_label)
+                try:
+                    rows = await conn.fetch(_CENTROID_SQL, model_label)
+                except Exception as exc:  # noqa: BLE001 - only column case retries
+                    if not _is_missing_column_error(exc):
+                        raise
+                    logger.debug(
+                        "centroid aggregate: superseded_by absent, degrading",
+                        exc_info=True,
+                    )
+                    rows = await conn.fetch(_CENTROID_SQL_NO_CHAIN, model_label)
     except Exception:  # noqa: BLE001 - degrade, never crash recall
         logger.debug("type-centroid aggregate failed", exc_info=True)
         return None
@@ -372,49 +442,149 @@ async def fetch_type_centroids(model_label: str) -> dict[str, list[float]] | Non
 
 
 # ---------------------------------------------------------------------------
-# Cache-aware centroid resolution (lazy refresh)
+# Single-flight background refresh (lockfile + detached subprocess)
 # ---------------------------------------------------------------------------
 
 
-async def load_or_compute_centroids(
+def _refresh_lock_path(cache_path: str | Path) -> Path:
+    """Sibling lockfile guarding the single-flight refresh for ``cache_path``."""
+    p = Path(cache_path)
+    return p.with_name(p.name + ".refresh.lock")
+
+
+def _trigger_background_refresh(
+    model_label: str, *, cache_path: str | Path,
+) -> None:
+    """Spawn ONE detached refresh subprocess, guarded by a single-flight lock.
+
+    Round 3 finding 2: at TTL expiry many concurrent recall processes would each
+    run the expensive ``avg(embedding)`` aggregate. Instead the first caller to
+    create the lockfile (``os.open`` with ``O_CREAT | O_EXCL`` — atomic) wins and
+    spawns a detached subprocess to recompute; concurrent callers find the lock
+    held and return immediately. A lock older than ``REFRESH_LOCK_STALE_SECONDS``
+    is reclaimed (the previous holder likely died). The detached child removes
+    the lock in a ``finally`` (see ``_run_refresh``); if the spawn itself fails
+    we release the lock so the next call can retry. Best-effort throughout — any
+    error here leaves recall on the neutral path.
+    """
+    lock_path = _refresh_lock_path(cache_path)
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Reclaim a stale lock (holder died before releasing).
+        try:
+            age = time.time() - lock_path.stat().st_mtime
+            if age > REFRESH_LOCK_STALE_SECONDS:
+                lock_path.unlink(missing_ok=True)
+        except FileNotFoundError:
+            pass
+
+        # Atomically acquire: O_EXCL fails if the lock already exists.
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            return  # another process is already refreshing
+        try:
+            os.write(fd, str(os.getpid()).encode("ascii"))
+        finally:
+            os.close(fd)
+    except OSError:
+        logger.debug("refresh lock acquisition failed", exc_info=True)
+        return
+
+    # Lock held; spawn the detached refresh worker. On spawn failure, release
+    # the lock so a later recall can retry instead of waiting out the stale TTL.
+    try:
+        subprocess.Popen(  # noqa: S603 - fixed argv, no shell
+            [
+                sys.executable, "-m", "scripts.core.type_affinity",
+                "--refresh",
+                "--model-label", model_label,
+                "--cache-path", str(cache_path),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:  # noqa: BLE001 - spawn failure must not abort recall
+        logger.debug("refresh subprocess spawn failed; releasing lock", exc_info=True)
+        try:
+            lock_path.unlink(missing_ok=True)
+        except OSError:
+            logger.debug("refresh lock release failed", exc_info=True)
+
+
+async def _run_refresh(model_label: str, *, cache_path: str | Path) -> None:
+    """Recompute, validate, and atomically publish centroids; always unlock.
+
+    The detached refresh entrypoint's body. Runs the (statement-timeout-bounded)
+    aggregate, and on success atomically writes the validated envelope. The
+    single-flight lock is ALWAYS released in the ``finally`` so a crash mid-way
+    never wedges future refreshes (a stale lock would also be reclaimed by age,
+    but releasing promptly is cleaner).
+    """
+    lock_path = _refresh_lock_path(cache_path)
+    try:
+        centroids = await fetch_type_centroids(model_label)
+        if centroids is None:
+            logger.debug("refresh: aggregate returned no valid centroids")
+            return
+        write_centroid_cache(
+            cache_path, model_label=model_label, centroids=centroids,
+        )
+    except Exception:  # noqa: BLE001 - background worker must not crash loudly
+        logger.debug("centroid refresh failed", exc_info=True)
+    finally:
+        try:
+            lock_path.unlink(missing_ok=True)
+        except OSError:
+            logger.debug("refresh lock release failed", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Hot-path centroid resolution (synchronous read + stale-while-revalidate)
+# ---------------------------------------------------------------------------
+
+
+def resolve_centroids(
     model_label: str,
     *,
     cache_path: str | Path | None = None,
     ttl_seconds: float = DEFAULT_CENTROID_TTL_SECONDS,
 ) -> dict[str, list[float]] | None:
-    """Return centroids from a fresh cache, else recompute and persist.
+    """Resolve centroids for the recall hot path WITHOUT running the aggregate.
 
-    Lazy refresh: a cache hit (fresh + label-matched) is a single file read; a
-    miss / stale / label-mismatch runs the aggregate and writes the result.
-    Returns None when the cache is unusable AND the recompute fails, so the
-    caller degrades to neutral reranking.
+    Synchronous by design (round 3): the cache read is a size-capped local-file
+    read — microseconds — so it runs directly on the loop thread; ``to_thread``
+    is avoided because a cancelled ``wait_for`` left its worker running and the
+    default executor is joined at interpreter shutdown, defeating the hook's
+    process budget.
+
+    Decision table (never runs ``fetch_type_centroids`` inline):
+      * fresh + label-matched   -> return the centroids;
+      * stale + label-matched   -> STALE-WHILE-REVALIDATE: return the stale
+                                    centroids AND trigger a background refresh;
+      * cold / label-mismatch / unreadable -> trigger a background refresh and
+                                    return ``None`` (neutral) for this call.
     """
     path = Path(cache_path) if cache_path is not None else default_cache_path()
+    jitter_key = f"{model_label}:{path}"
 
-    # Finding 2 (round 1): read the cache off the event loop so the caller's
-    # asyncio.wait_for deadline can preempt a slow/locked/oversized file. A
-    # synchronous read here would block before the first await, making the
-    # TYPE_AFFINITY_TIMEOUT unenforceable.
-    cache = await asyncio.to_thread(read_centroid_cache, path)
-    if is_cache_fresh(cache, model_label=model_label, ttl_seconds=ttl_seconds):
-        # mypy: is_cache_fresh guarantees cache is not None here.
+    cache = read_centroid_cache(path)
+
+    if is_cache_fresh(
+        cache, model_label=model_label, ttl_seconds=ttl_seconds, jitter_key=jitter_key,
+    ):
         return cache.centroids  # type: ignore[union-attr]
 
-    centroids = await fetch_type_centroids(model_label)
-    if centroids is None:
-        return None
-
-    # Finding 1 (round 2): persist off the event loop so a slow/blocking write
-    # stays inside the caller's wait_for deadline. A write failure must NOT
-    # become an inference failure — we already have the centroids in memory, so
-    # swallow any write error and still return them.
-    try:
-        await asyncio.to_thread(
-            write_centroid_cache, path, model_label=model_label, centroids=centroids,
-        )
-    except Exception:  # noqa: BLE001 - write is best-effort; inference succeeded
-        logger.debug("centroid cache persist failed; returning in-memory", exc_info=True)
-    return centroids
+    # Not fresh. If we have a label-matched (but expired) envelope, serve it
+    # while a background refresh runs (stale-while-revalidate). Otherwise the
+    # cache is cold / wrong-space / unreadable -> neutral this call.
+    _trigger_background_refresh(model_label, cache_path=path)
+    if cache is not None and cache.model_label == model_label:
+        return cache.centroids
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -428,13 +598,18 @@ async def compute_type_probabilities(
     config: RerankerConfig | None = None,
     cache_path: str | Path | None = None,
 ) -> dict[str, float] | None:
-    """End-to-end: SearchCapture -> model-filtered centroids -> type distribution.
+    """End-to-end: SearchCapture -> cached centroids -> type distribution.
 
     Returns None (neutral reranking) unless the capture carries both a query
-    embedding AND a model-space label, the centroids load/compute succeeds, and
-    the resulting distribution is non-empty. The label gate enforces the
-    single-space contract (#151): without it we would risk cosine across
-    embedding spaces.
+    embedding AND a model-space label, ``resolve_centroids`` yields a usable
+    (fresh or stale-but-valid) cache, and the resulting distribution is
+    non-empty. The label gate enforces the single-space contract (#151).
+
+    ``resolve_centroids`` NEVER runs the DB aggregate inline — a cold/stale cache
+    triggers an out-of-process refresh and this call stays neutral — so this
+    coroutine is cheap (a capped local read + softmax) and keeps the ``async``
+    signature only for its existing call site. Remains a coroutine for API
+    stability with recall_learnings' ``await``.
     """
     if capture is None:
         return None
@@ -447,10 +622,12 @@ async def compute_type_probabilities(
         from scripts.core.reranker import _default_config
 
         config = _default_config()
-    ttl_seconds = float(getattr(config, "centroid_cache_ttl_seconds", DEFAULT_CENTROID_TTL_SECONDS))
+    ttl_seconds = float(
+        getattr(config, "centroid_cache_ttl_seconds", DEFAULT_CENTROID_TTL_SECONDS)
+    )
     temperature = getattr(config, "type_softmax_temperature", None)
 
-    centroids = await load_or_compute_centroids(
+    centroids = resolve_centroids(
         model_label, cache_path=cache_path, ttl_seconds=ttl_seconds,
     )
     if not centroids:
@@ -459,3 +636,48 @@ async def compute_type_probabilities(
     return infer_type_probabilities(
         query_embedding, centroids, temperature=temperature,
     )
+
+
+# ---------------------------------------------------------------------------
+# Refresh entrypoint (run in a detached subprocess by _trigger_background_refresh)
+# ---------------------------------------------------------------------------
+
+
+def _parse_refresh_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="python -m scripts.core.type_affinity",
+        description=(
+            "Recompute and cache type-affinity centroids out-of-process. "
+            "Invoked detached by the recall path at cache TTL expiry; also "
+            "runnable manually to warm a cold cache before an acceptance check."
+        ),
+    )
+    parser.add_argument(
+        "--refresh", action="store_true",
+        help="Run the centroid refresh (recompute aggregate, validate, cache).",
+    )
+    parser.add_argument(
+        "--model-label", required=True,
+        help="Embedding-space label to filter the centroid corpus by (#151).",
+    )
+    parser.add_argument(
+        "--cache-path", default=None,
+        help="Cache file path (defaults to the user config-dir location).",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Module entrypoint: ``python -m scripts.core.type_affinity --refresh``."""
+    args = _parse_refresh_args(argv)
+    if not args.refresh:
+        # Nothing else to do without --refresh; keep the surface minimal.
+        print("nothing to do (pass --refresh)", file=sys.stderr)
+        return 2
+    cache_path = args.cache_path or default_cache_path()
+    asyncio.run(_run_refresh(args.model_label, cache_path=cache_path))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

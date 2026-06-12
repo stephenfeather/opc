@@ -58,6 +58,7 @@ class TestRerankerConfig:
         assert cfg.recall_weight == 0.02
         assert cfg.recall_log2_normalizer == 10.0
         assert cfg.type_softmax_temperature == 0.05
+        assert cfg.type_signal_alpha == 1.5  # round 3 finding 3
 
     def test_total_signal_weight(self):
         cfg = RerankerConfig()

@@ -72,6 +72,13 @@ class RerankerConfig:
     # near-uniform ~0.14 per type. Lower -> peakier. Tuned empirically against
     # the acceptance + regression queries. None/<=0 disables sharpening.
     type_softmax_temperature: float = 0.05
+    # Round 3 finding 3: type_match maps a softmax probability p to a [0,1]
+    # signal centered on the neutral 0.5 via clamp01(0.5 + alpha*(p - 1/N)),
+    # where N = len(distribution). Without this, a softmax prob (which sums to 1
+    # across ~7 types, so a legit best type is often < 0.5) was used as the raw
+    # score, letting an unknown type's 0.5 fallback outrank an evidenced type.
+    # alpha scales the deviation from neutral; tuned empirically (benchmark A/B).
+    type_signal_alpha: float = 1.5
 
     def __post_init__(self) -> None:
         """Enforce the ranking-math invariant: retrieval_weight >= 0.

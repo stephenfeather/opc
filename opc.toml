@@ -94,6 +94,12 @@ rrf_scale_factor = 25
 # differentiates. Lower -> peakier. Set <= 0 to disable sharpening.
 type_softmax_temperature = 0.05
 
+# Round 3 finding 3: type_match maps a softmax prob p to a [0,1] signal around
+# the neutral 0.5 via clamp01(0.5 + alpha*(p - 1/N)). Without this, a prob that
+# sums to 1 across ~7 types (so a best type is often < 0.5) let an unknown
+# type's 0.5 fallback outrank an evidenced one. alpha scales the deviation.
+type_signal_alpha = 1.5
+
 
 [patterns]
 # HDBSCAN clustering parameters.

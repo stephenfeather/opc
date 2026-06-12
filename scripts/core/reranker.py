@@ -201,29 +201,53 @@ def recall_score(
     return min(1.0, math.log2(1 + count) / normalizer)
 
 
-def type_match(result: dict, ctx: RecallContext) -> float:
-    """Score based on type affinity from soft distribution.
+def type_match(
+    result: dict,
+    ctx: RecallContext,
+    *,
+    config: RerankerConfig | None = None,
+) -> float:
+    """Score type affinity on a CONSISTENT neutral scale (round 3 finding 3).
 
-    Neutral (0.5) when no distribution is available. An untyped result keeps
-    its 0.0 (it carries no type to score against — unchanged contract).
+    A softmax distribution sums to 1 across N types, so a legitimately
+    best-matching type often has p < 0.5. Using p directly let an unknown
+    type's 0.5 fallback outrank an evidenced type, and inverted the intended
+    ranking. Instead we map p to a [0, 1] signal centered on the neutral 0.5:
 
-    Finding 2 (round 2): a learning_type that IS present on the result but
-    ABSENT from a non-None distribution falls back to NEUTRAL (0.5), not 0.0.
-    The corpus can legitimately gain a new learning_type between centroid
-    refreshes (the cache TTL window), and the centroid aggregate validates
-    all-or-nothing — so a missing key means "unknown", not "irrelevant".
-    Scoring it 0.0 would penalize every result of that type by the full type
-    weight, biasing ranking against new types and contradicting the
-    fail-to-neutral contract.
+        clamp01(0.5 + alpha * (p - 1/N))
+
+    so a type with above-average mass scores > 0.5 and below-average < 0.5,
+    with the average type landing exactly on neutral. ``alpha``
+    (config.type_signal_alpha) scales the deviation.
+
+    Neutral (0.5) cases:
+    - no distribution available (``type_probabilities is None``);
+    - the result's learning_type is ABSENT from a non-None distribution
+      ("unknown", e.g. a type the corpus gained within the cache TTL window —
+      never penalized);
+    - the result is UNTYPED while a distribution is present. This is a
+      deliberate contract change from the old 0.0: an untyped row carries no
+      type evidence either way, so once inference succeeds it must not be
+      penalized relative to neutral.
     """
     if ctx.type_probabilities is None:
         return 0.5
 
     learning_type = result.get("metadata", {}).get("learning_type")
     if not learning_type:
-        return 0.0
+        return 0.5
 
-    return ctx.type_probabilities.get(learning_type, 0.5)
+    distribution = ctx.type_probabilities
+    if learning_type not in distribution:
+        return 0.5
+
+    n = len(distribution)
+    if n <= 0:
+        return 0.5
+    cfg = config if config is not None else _default_config()
+    p = distribution[learning_type]
+    signal = 0.5 + cfg.type_signal_alpha * (p - 1.0 / n)
+    return max(0.0, min(1.0, signal))
 
 
 def tag_overlap(result: dict, ctx: RecallContext) -> float:
@@ -507,7 +531,7 @@ def rerank(
         sig_recency = recency_score(result, ctx, config=config)
         sig_confidence = confidence_score(result)
         sig_recall = recall_score(result, config=config)
-        sig_type = type_match(result, ctx)
+        sig_type = type_match(result, ctx, config=config)
         sig_tags = tag_overlap(result, ctx)
         sig_pattern = pattern_score(result, ctx)
         if kg_active and query_map:

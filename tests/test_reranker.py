@@ -212,7 +212,25 @@ class TestRecallScore:
 # ---------------------------------------------------------------------------
 
 class TestTypeMatch:
-    def test_type_match_with_probabilities(self):
+    """Round 3 finding 3: type_match is recalibrated around a CONSISTENT
+    neutral. Softmax probs sum to 1 across N types, so a legit best-type prob
+    is often < 0.5; scoring it as the raw prob let an absent type's 0.5 fallback
+    outrank an evidenced type. New contract:
+
+        known type      -> clamp01(0.5 + alpha * (p - 1/N))
+        absent type     -> 0.5 (unknown, not penalized)
+        untyped result  -> 0.5 (no type evidence either way; deliberate change
+                                 from the old 0.0 once a distribution exists)
+        no distribution -> 0.5 (unchanged)
+    """
+
+    def test_no_probabilities_is_neutral(self):
+        result = _make_result(learning_type="WORKING_SOLUTION")
+        ctx = RecallContext()
+        assert type_match(result, ctx) == 0.5
+
+    def test_above_average_type_scores_above_neutral(self):
+        # N=3, 1/N ~= 0.333; p=0.7 is above average -> > 0.5.
         result = _make_result(learning_type="WORKING_SOLUTION")
         ctx = RecallContext(
             type_probabilities={
@@ -221,35 +239,70 @@ class TestTypeMatch:
                 "CODEBASE_PATTERN": 0.1,
             }
         )
-        assert type_match(result, ctx) == 0.7
+        cfg = RerankerConfig()
+        expected = max(0.0, min(1.0, 0.5 + cfg.type_signal_alpha * (0.7 - 1 / 3)))
+        assert abs(type_match(result, ctx, config=cfg) - expected) < 1e-9
+        assert type_match(result, ctx, config=cfg) > 0.5
 
-    def test_type_match_no_probabilities(self):
-        result = _make_result(learning_type="WORKING_SOLUTION")
-        ctx = RecallContext()
-        assert type_match(result, ctx) == 0.5
-
-    def test_type_match_missing_type_in_result(self):
-        result = _make_result()  # no learning_type
-        ctx = RecallContext(
-            type_probabilities={"WORKING_SOLUTION": 0.7}
-        )
-        assert type_match(result, ctx) == 0.0
-
-    def test_type_absent_from_distribution_is_neutral(self):
-        """Finding 2 (round 2): a learning_type that is genuinely typed but
-        absent from a non-None distribution must fall back to NEUTRAL (0.5),
-        not 0.0. The corpus can legitimately gain a new learning_type between
-        centroid refreshes (cache TTL window); penalizing every result of that
-        type by the full type weight would contradict the fail-to-neutral
-        contract and bias ranking against new types."""
-        result = _make_result(learning_type="BRAND_NEW_TYPE")
+    def test_below_average_type_scores_below_neutral(self):
+        # p=0.1 is below 1/N=0.333 -> < 0.5.
+        result = _make_result(learning_type="CODEBASE_PATTERN")
         ctx = RecallContext(
             type_probabilities={
                 "WORKING_SOLUTION": 0.7,
-                "ERROR_FIX": 0.3,
+                "ERROR_FIX": 0.2,
+                "CODEBASE_PATTERN": 0.1,
             }
         )
-        assert type_match(result, ctx) == 0.5
+        cfg = RerankerConfig()
+        score = type_match(result, ctx, config=cfg)
+        assert score < 0.5
+        assert score >= 0.0  # clamped
+
+    def test_average_type_is_neutral(self):
+        # p == 1/N -> exactly 0.5 regardless of alpha.
+        result = _make_result(learning_type="A")
+        ctx = RecallContext(
+            type_probabilities={"A": 0.5, "B": 0.5}
+        )
+        assert abs(type_match(result, ctx, config=RerankerConfig()) - 0.5) < 1e-9
+
+    def test_known_type_outranks_absent_type(self):
+        """The core fix: an above-average evidenced type must score strictly
+        higher than an unknown (absent) type's 0.5 neutral."""
+        cfg = RerankerConfig()
+        dist = {"WORKING_SOLUTION": 0.6, "ERROR_FIX": 0.2, "CODEBASE_PATTERN": 0.2}
+        evidenced = type_match(
+            _make_result(learning_type="WORKING_SOLUTION"),
+            RecallContext(type_probabilities=dist), config=cfg,
+        )
+        unknown = type_match(
+            _make_result(learning_type="BRAND_NEW_TYPE"),
+            RecallContext(type_probabilities=dist), config=cfg,
+        )
+        assert unknown == 0.5
+        assert evidenced > unknown
+
+    def test_absent_type_is_neutral(self):
+        result = _make_result(learning_type="BRAND_NEW_TYPE")
+        ctx = RecallContext(type_probabilities={"WORKING_SOLUTION": 0.7, "ERROR_FIX": 0.3})
+        assert type_match(result, ctx, config=RerankerConfig()) == 0.5
+
+    def test_untyped_result_is_neutral_when_distribution_present(self):
+        """Deliberate contract change (round 3 finding 3): an untyped row
+        carries no type evidence either way, so it is NEUTRAL (0.5) once a
+        distribution exists — not the old hard 0.0 that penalized it the moment
+        inference succeeded."""
+        result = _make_result()  # no learning_type
+        ctx = RecallContext(type_probabilities={"WORKING_SOLUTION": 0.7})
+        assert type_match(result, ctx, config=RerankerConfig()) == 0.5
+
+    def test_score_is_clamped_to_unit_interval(self):
+        # A dominant prob with a large alpha must clamp at 1.0, not exceed it.
+        result = _make_result(learning_type="A")
+        ctx = RecallContext(type_probabilities={"A": 0.99, "B": 0.01})
+        cfg = RerankerConfig(type_signal_alpha=100.0)
+        assert type_match(result, ctx, config=cfg) == 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -845,6 +898,12 @@ class TestRerankerDampedDefaults:
         no longer outweighs a clearly superior retrieval hit from a sibling
         project. An exact match still contributes meaningfully."""
         assert RerankerConfig().project_weight == 0.09
+
+    def test_type_signal_alpha_default(self):
+        """Round 3 finding 3: type_match maps a softmax prob to a [0,1] signal
+        around 0.5 via 0.5 + alpha*(p - 1/N). alpha scales how strongly an
+        above/below-average type deviates from neutral."""
+        assert RerankerConfig().type_signal_alpha == 1.5
 
     def test_rrf_calibration_no_longer_saturates_top_hits(self):
         """A spread of top RRF raw scores must map to a spread of calibrated

@@ -742,6 +742,73 @@ class TestBackgroundRefreshSingleFlight:
         assert "--refresh" in cmd
         assert "voyage-code-3" in cmd
 
+    def test_refresh_env_is_minimized_whitelist(self, monkeypatch, tmp_path):
+        """Security MEDIUM-1: the detached refresh only needs the DB; it must
+        NOT inherit the full parent env (no embedding-provider API keys). The
+        child gets an explicit whitelist: DB-resolution vars are forwarded,
+        secret API keys are dropped."""
+        from scripts.core import type_affinity as ta
+
+        cache_path = tmp_path / "centroids.json"
+
+        # Parent holds both DB config and provider secrets.
+        monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+        monkeypatch.setenv("VOYAGE_API_KEY", "voyage-secret-should-not-leak")
+        monkeypatch.setenv("OPENAI_API_KEY", "openai-secret-should-not-leak")
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+        captured: dict = {}
+
+        class FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured["env"] = kwargs.get("env")
+
+        monkeypatch.setattr(ta.subprocess, "Popen", FakePopen)
+
+        ta._trigger_background_refresh("voyage-code-3", cache_path=cache_path)
+
+        env = captured["env"]
+        # An explicit env was passed (not None -> not full inheritance).
+        assert env is not None
+        # The refresh resolves the DB from DATABASE_URL: forwarded.
+        assert env.get("DATABASE_URL") == "postgresql://u:p@localhost:5432/db"
+        # PATH is needed to find the interpreter: forwarded.
+        assert env.get("PATH") == "/usr/bin:/bin"
+        # Provider secrets the refresh never uses: dropped.
+        assert "VOYAGE_API_KEY" not in env
+        assert "OPENAI_API_KEY" not in env
+
+    def test_refresh_env_forwards_db_and_config_resolution_vars(
+        self, monkeypatch, tmp_path
+    ):
+        """All DB/config-resolution vars the child needs are forwarded when set;
+        absent ones are simply omitted (no None values)."""
+        from scripts.core import type_affinity as ta
+
+        cache_path = tmp_path / "centroids.json"
+        monkeypatch.setenv("CONTINUOUS_CLAUDE_DB_URL", "postgresql://c/db")
+        monkeypatch.setenv("OPC_CONFIG", "/tmp/opc.toml")
+        monkeypatch.setenv("AGENTICA_MAX_POOL_SIZE", "4")
+        # A var that is NOT in the whitelist must be dropped.
+        monkeypatch.setenv("SOME_UNRELATED_VAR", "x")
+
+        captured: dict = {}
+
+        class FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured["env"] = kwargs.get("env")
+
+        monkeypatch.setattr(ta.subprocess, "Popen", FakePopen)
+        ta._trigger_background_refresh("voyage-code-3", cache_path=cache_path)
+
+        env = captured["env"]
+        assert env.get("CONTINUOUS_CLAUDE_DB_URL") == "postgresql://c/db"
+        assert env.get("OPC_CONFIG") == "/tmp/opc.toml"
+        assert env.get("AGENTICA_MAX_POOL_SIZE") == "4"
+        assert "SOME_UNRELATED_VAR" not in env
+        # No key maps to None (whitelist omits unset vars).
+        assert all(v is not None for v in env.values())
+
     def test_second_caller_while_lock_held_does_not_spawn(self, monkeypatch, tmp_path):
         from scripts.core import type_affinity as ta
 

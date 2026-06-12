@@ -446,6 +446,52 @@ async def fetch_type_centroids(model_label: str) -> dict[str, list[float]] | Non
 # ---------------------------------------------------------------------------
 
 
+# Security MEDIUM-1 (aegis): the detached refresh child only needs to resolve
+# the DB and config, run the aggregate, and write a local file. It performs NO
+# embedding, so it must NOT inherit the parent's full environment (which carries
+# VOYAGE_API_KEY / OPENAI_API_KEY etc.). Only these variables are forwarded —
+# everything the DB/config layer actually reads, plus runtime basics:
+#   - DB resolution (postgres_pool.get_connection_string / _get_pool_config):
+#       DATABASE_URL, CONTINUOUS_CLAUDE_DB_URL, OPC_POSTGRES_URL,
+#       AGENTICA_ENV, AGENTICA_MAX_POOL_SIZE
+#   - config discovery (config.handlers.discover_config_paths): OPC_CONFIG
+#   - interpreter + module resolution: PATH, PYTHONPATH, VIRTUAL_ENV, PYTHONHOME
+#   - sane I/O encoding: HOME, LANG, LC_ALL, LC_CTYPE
+# CLAUDE_PROJECT_DIR is deliberately NOT forwarded: the entrypoint resolves the
+# cache path from its --cache-path arg (or Path.home()) and never reads it, so
+# the child stays independent of the parent's project context.
+_REFRESH_ENV_WHITELIST: tuple[str, ...] = (
+    "DATABASE_URL",
+    "CONTINUOUS_CLAUDE_DB_URL",
+    "OPC_POSTGRES_URL",
+    "AGENTICA_ENV",
+    "AGENTICA_MAX_POOL_SIZE",
+    "OPC_CONFIG",
+    "PATH",
+    "PYTHONPATH",
+    "VIRTUAL_ENV",
+    "PYTHONHOME",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+)
+
+
+def _refresh_subprocess_env() -> dict[str, str]:
+    """Build the minimized env for the detached refresh child (MEDIUM-1).
+
+    Returns only the whitelisted variables that are actually set in the parent;
+    unset ones are omitted (never mapped to ``None``). Provider API keys and any
+    other parent secrets are dropped because the refresh never embeds.
+    """
+    return {
+        name: os.environ[name]
+        for name in _REFRESH_ENV_WHITELIST
+        if name in os.environ
+    }
+
+
 def _refresh_lock_path(cache_path: str | Path) -> Path:
     """Sibling lockfile guarding the single-flight refresh for ``cache_path``."""
     p = Path(cache_path)
@@ -506,6 +552,9 @@ def _trigger_background_refresh(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
+            # Security MEDIUM-1: pass a minimized whitelist env so the child
+            # never inherits provider API keys it doesn't use.
+            env=_refresh_subprocess_env(),
         )
     except Exception:  # noqa: BLE001 - spawn failure must not abort recall
         logger.debug("refresh subprocess spawn failed; releasing lock", exc_info=True)

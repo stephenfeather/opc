@@ -8,6 +8,7 @@
  * Removed: writeSessionId(), readSessionId(), getSessionIdFile()
  */
 
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
   generateSessionId,
   getSessionId,

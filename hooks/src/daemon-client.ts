@@ -143,6 +143,10 @@ export interface DaemonResponse {
   results?: any[];
   result?: any;
   callers?: any[];
+  // Import/importer lookup responses (issue #156: consumed by importsDaemon,
+  // importersDaemon, edit-context-inject, impact-refactor)
+  imports?: any[];
+  importers?: any[];
   error?: string;
   indexing?: boolean;
   message?: string;

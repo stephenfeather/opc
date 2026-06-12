@@ -311,7 +311,19 @@ if ! _acquire_lock; then
     echo "deploy_hooks: another deploy is in progress ($LOCK_DIR) - skipping" >&2
     exit 5
 fi
-trap _release_lock EXIT INT TERM
+
+# Codex #157 round-2 finding: a bare INT/TERM handler returns control to
+# the script after running, so a signal could release the lock while the
+# deploy keeps mutating the target - exactly the concurrent-write hole the
+# lock exists to close. Cleanup lives on EXIT only; INT/TERM exit with the
+# conventional 128+N codes, which fires the EXIT trap exactly once.
+_cleanup() {
+    rm -f "${_toplevel_manifest_new:-}" 2>/dev/null || true
+    _release_lock
+}
+trap _cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Defense-in-depth: re-check the target (and its subdirs) is still not a
 # symlink right before each filesystem mutation. Closes the TOCTOU window
@@ -356,8 +368,18 @@ _managed_toplevel() {
 }
 
 TOPLEVEL_MANIFEST_TARGET="$TARGET_ABS/.opc-managed-toplevel"
+
+# Codex #157 round-2 finding: -f and cp both follow symlinks, so a
+# symlinked manifest would let a deploy clobber an arbitrary same-user
+# file outside the runtime tree. Refuse outright; the final write below
+# is an atomic in-target mv, which replaces a symlink rather than
+# following it.
+if [ -L "$TOPLEVEL_MANIFEST_TARGET" ]; then
+    echo "deploy_hooks: refusing - '$TOPLEVEL_MANIFEST_TARGET' is a symlink" >&2
+    exit 4
+fi
+
 _toplevel_manifest_new="$(mktemp "${TMPDIR:-/tmp}/opc-toplevel-manifest.XXXXXX")"
-trap 'rm -f "$_toplevel_manifest_new" 2>/dev/null; _release_lock' EXIT INT TERM
 _managed_toplevel >"$_toplevel_manifest_new"
 
 _assert_target_not_symlink
@@ -381,7 +403,11 @@ if [ -f "$TOPLEVEL_MANIFEST_TARGET" ]; then
         fi
     done <"$TOPLEVEL_MANIFEST_TARGET"
 fi
-cp "$_toplevel_manifest_new" "$TOPLEVEL_MANIFEST_TARGET"
+# Atomic in-target replace: mv/rename never follows an existing symlink
+# at the destination, and readers see either the old or new manifest.
+_manifest_staged="$(mktemp "$TARGET_ABS/.opc-managed-toplevel.tmp.XXXXXX")"
+cat "$_toplevel_manifest_new" >"$_manifest_staged"
+mv -f "$_manifest_staged" "$TOPLEVEL_MANIFEST_TARGET"
 
 if ! diff -rq "$HOOKS_SRC/src/" "$TARGET_ABS/src/" >/dev/null 2>&1; then
     echo "deploy_hooks: src/ mismatch after sync:" >&2

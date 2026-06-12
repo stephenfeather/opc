@@ -942,3 +942,73 @@ class TestTopLevelRuntimeFileSync:
         assert first.returncode == 0, first.stderr
         assert second.returncode == 0, second.stderr
         assert (target / "guard.sh").exists()
+
+
+class TestRound2Hardening:
+    """Codex round-2 findings: signal-trap termination and manifest symlink."""
+
+    def test_manifest_symlink_refused(self, tmp_path: Path) -> None:
+        """A symlinked .opc-managed-toplevel must abort the deploy without
+        writing through the link (arbitrary file clobber otherwise)."""
+        opc_root, script, target = _build_fixture(tmp_path)
+        (opc_root / "hooks" / "guard.sh").write_text("#!/bin/sh\n")
+        target.mkdir(parents=True)
+        victim = tmp_path / "victim.txt"
+        victim.write_text("precious\n")
+        (target / ".opc-managed-toplevel").symlink_to(victim)
+
+        result = _run(script, target)
+
+        assert result.returncode == 4, (result.stdout, result.stderr)
+        assert victim.read_text() == "precious\n"
+
+    def test_term_signal_terminates_and_cleans_lock(self, tmp_path: Path) -> None:
+        """SIGTERM mid-deploy must stop the script (exit on signal), not let
+        it continue after releasing the lock. A slow rsync shim keeps the
+        script inside the critical section long enough to signal it."""
+        import os
+        import signal
+        import time
+
+        opc_root, script, target = _build_fixture(tmp_path)
+        (opc_root / "hooks" / "guard.sh").write_text("#!/bin/sh\n")
+
+        shim_dir = tmp_path / "shims"
+        shim_dir.mkdir()
+        shim = shim_dir / "rsync"
+        shim.write_text("#!/bin/sh\nsleep 30\nexec /usr/bin/rsync \"$@\"\n")
+        shim.chmod(0o755)
+
+        env = {
+            "DEPLOY_TARGET": str(target),
+            "HOME": "/tmp/nonexistent-home",
+            "PATH": f"{shim_dir}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
+            "TMPDIR": str(tmp_path / "tmp"),
+        }
+        (tmp_path / "tmp").mkdir()
+        proc = subprocess.Popen(
+            ["bash", str(script)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        time.sleep(1.5)  # inside the shimmed rsync sleep, lock held
+        # Signal the whole group: bash defers traps while a foreground
+        # child runs, so the child must die for the trap to fire (real
+        # TERM delivery - shutdown, kill of the npm pipeline - also
+        # targets the group).
+        os.killpg(proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            pytest.fail("script did not terminate after SIGTERM")
+
+        assert proc.returncode != 0, "TERM mid-deploy must not exit 0"
+        # the success line must never print: the deploy did not continue
+        stdout = proc.stdout.read() if proc.stdout else ""
+        assert "mirrored src/, dist/, and top-level runtime files" not in stdout
+        # lock must be cleaned up so future deploys are not wedged
+        assert not (tmp_path / "tmp" / "opc-deploy-hooks.lock.d").exists()

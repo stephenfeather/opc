@@ -4,11 +4,10 @@
  * Phase 2a TDD: These tests are written BEFORE the implementation.
  * They should FAIL until the function is implemented.
  *
- * Run with: npx tsx --test src/__tests__/extractLedgerSection.test.ts
+ * Ported from node:test to vitest (issue #156).
  */
 
-import { describe, it } from 'node:test';
-import * as assert from 'node:assert';
+import { describe, it, expect } from 'vitest';
 
 // Import the function under test
 import { extractLedgerSection } from '../session-start-continuity.js';
@@ -46,14 +45,14 @@ More context lines.
 
     const result = extractLedgerSection(handoffContent);
 
-    assert.notStrictEqual(result, null, 'Should not return null for valid handoff with Ledger section');
-    assert.ok(result!.startsWith('## Ledger'), 'Result should start with "## Ledger"');
-    assert.ok(result!.includes('**Goal:** Test the new format'), 'Should include Goal field');
-    assert.ok(result!.includes('### Now'), 'Should include Now section');
-    assert.ok(result!.includes('[->] Testing new format'), 'Should include current focus');
-    assert.ok(result!.includes('### Decisions'), 'Should include Decisions section');
-    assert.ok(!result!.includes('## Context'), 'Should NOT include Context section');
-    assert.ok(!result!.includes('Detailed context here'), 'Should NOT include context content');
+    expect(result).not.toBeNull();
+    expect(result!.startsWith('## Ledger')).toBe(true);
+    expect(result!.includes('**Goal:** Test the new format')).toBe(true);
+    expect(result!.includes('### Now')).toBe(true);
+    expect(result!.includes('[->] Testing new format')).toBe(true);
+    expect(result!.includes('### Decisions')).toBe(true);
+    expect(result!.includes('## Context')).toBe(false);
+    expect(result!.includes('Detailed context here')).toBe(false);
   });
 
   it('should return null for handoff without Ledger section', () => {
@@ -69,7 +68,7 @@ Just context directly.
 
     const result = extractLedgerSection(handoffContent);
 
-    assert.strictEqual(result, null, 'Should return null when no Ledger section exists');
+    expect(result).toBeNull();
   });
 
   it('should return null for empty file', () => {
@@ -77,7 +76,7 @@ Just context directly.
 
     const result = extractLedgerSection(handoffContent);
 
-    assert.strictEqual(result, null, 'Should return null for empty content');
+    expect(result).toBeNull();
   });
 
   it('should handle Ledger section at end of file (no --- separator)', () => {
@@ -96,12 +95,12 @@ Just context directly.
 
     const result = extractLedgerSection(handoffContent);
 
-    assert.notStrictEqual(result, null, 'Should not return null when Ledger is at end of file');
-    assert.ok(result!.startsWith('## Ledger'), 'Result should start with "## Ledger"');
-    assert.ok(result!.includes('**Goal:** Test edge case'), 'Should include Goal field');
-    assert.ok(result!.includes('### Now'), 'Should include Now section');
-    assert.ok(result!.includes('### Next'), 'Should include Next section');
-    assert.ok(result!.includes('Future task'), 'Should include the last item');
+    expect(result).not.toBeNull();
+    expect(result!.startsWith('## Ledger')).toBe(true);
+    expect(result!.includes('**Goal:** Test edge case')).toBe(true);
+    expect(result!.includes('### Now')).toBe(true);
+    expect(result!.includes('### Next')).toBe(true);
+    expect(result!.includes('Future task')).toBe(true);
   });
 
   it('should handle multiple ## headings after Ledger - stops at first ---', () => {
@@ -132,12 +131,12 @@ Blockers section.
 
     const result = extractLedgerSection(handoffContent);
 
-    assert.notStrictEqual(result, null, 'Should not return null');
-    assert.ok(result!.startsWith('## Ledger'), 'Result should start with "## Ledger"');
-    assert.ok(result!.includes('### Decisions'), 'Should include Decisions (before separator)');
-    assert.ok(!result!.includes('## Context'), 'Should NOT include Context (after separator)');
-    assert.ok(!result!.includes('## What Was Done'), 'Should NOT include What Was Done');
-    assert.ok(!result!.includes('## Blockers'), 'Should NOT include Blockers');
+    expect(result).not.toBeNull();
+    expect(result!.startsWith('## Ledger')).toBe(true);
+    expect(result!.includes('### Decisions')).toBe(true);
+    expect(result!.includes('## Context')).toBe(false);
+    expect(result!.includes('## What Was Done')).toBe(false);
+    expect(result!.includes('## Blockers')).toBe(false);
   });
 
   it('should handle Ledger with no --- but next ## heading', () => {
@@ -157,10 +156,10 @@ This is after Ledger, should not be included.
 
     const result = extractLedgerSection(handoffContent);
 
-    assert.notStrictEqual(result, null, 'Should not return null');
-    assert.ok(result!.includes('**Goal:** No separator test'), 'Should include Goal');
-    assert.ok(result!.includes('### Now'), 'Should include Now');
-    assert.ok(!result!.includes('## Context'), 'Should stop at ## Context heading');
+    expect(result).not.toBeNull();
+    expect(result!.includes('**Goal:** No separator test')).toBe(true);
+    expect(result!.includes('### Now')).toBe(true);
+    expect(result!.includes('## Context')).toBe(false);
   });
 
   it('should trim whitespace from extracted content', () => {
@@ -182,8 +181,8 @@ This is after Ledger, should not be included.
 
     const result = extractLedgerSection(handoffContent);
 
-    assert.notStrictEqual(result, null, 'Should not return null');
+    expect(result).not.toBeNull();
     // The result should be trimmed (no leading/trailing whitespace in content)
-    assert.ok(!result!.endsWith('\n\n\n'), 'Should not end with multiple newlines');
+    expect(result!.endsWith('\n\n\n')).toBe(false);
   });
 });

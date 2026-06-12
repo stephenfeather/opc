@@ -244,7 +244,12 @@ describe('heartbeat hook', () => {
     expect(output).toContain('"result":"continue"');
   });
 
-  it('calls updateHeartbeatDetached when session ID is available from file', async () => {
+  // Issue #156: the file-based readSessionId fallback was deliberately removed
+  // in commit 162106f (per #85, stdin-only session identity). This test now
+  // asserts the stdin-only contract: when stdin lacks a valid session_id, the
+  // hook outputs `continue` and never calls updateHeartbeatDetached, regardless
+  // of any (now-defunct) file-based session id.
+  it('does not call updateHeartbeatDetached when stdin lacks a valid session_id', async () => {
     const mockUpdate = vi.fn();
 
     vi.doMock('fs', async () => {
@@ -263,14 +268,15 @@ describe('heartbeat hook', () => {
       SAFE_ID_PATTERN: /^[a-zA-Z0-9_-]+$/,
     }));
     vi.doMock('../shared/session-id.js', () => ({
-      readSessionId: () => 's-filetest',
       getProject: () => '/home/user/myproject',
     }));
 
     const { main } = await import('../heartbeat.js');
     main();
 
-    expect(mockUpdate).toHaveBeenCalledWith('s-filetest', '/home/user/myproject');
+    expect(mockUpdate).not.toHaveBeenCalled();
+    const output = consoleSpy.mock.calls.map(c => c[0]).join('');
+    expect(output).toContain('"result":"continue"');
   });
 
   it('prefers stdin session_id over file-based session ID', async () => {

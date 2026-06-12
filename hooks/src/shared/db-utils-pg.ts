@@ -466,7 +466,11 @@ async def main():
             INSERT INTO sessions (id, project, working_on, claude_session_id, transcript_path, pid, started_at, last_heartbeat, exited_at)
             VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW(), NULL)
             ON CONFLICT (id) DO UPDATE SET
-                working_on = EXCLUDED.working_on,
+                -- Issue #65: SessionStart/resume re-registers with working_on=''.
+                -- COALESCE+NULLIF preserves an existing label when the new value
+                -- is blank, so the working-on-sync hook's value survives a resume;
+                -- a non-empty value still updates.
+                working_on = COALESCE(NULLIF(EXCLUDED.working_on, ''), sessions.working_on),
                 claude_session_id = EXCLUDED.claude_session_id,
                 transcript_path = EXCLUDED.transcript_path,
                 pid = EXCLUDED.pid,
@@ -1125,7 +1129,51 @@ asyncio.run(main())
   runPgQueryDetached(pythonCode, [sessionId, project]);
 }
 
+/**
+ * Update sessions.working_on in a detached background process.
+ *
+ * Issue #65: populated by the working-on-sync PostToolUse hook so peer
+ * sessions can see what each session is doing. Fire-and-forget — never
+ * adds latency to the tool call that triggered it.
+ *
+ * @param sessionId - Session identifier to update
+ * @param project - Project directory path
+ * @param workingOn - Human-readable label of current work ('' clears it)
+ */
+export function updateWorkingOnDetached(
+  sessionId: string,
+  project: string,
+  workingOn: string,
+): void {
+  const pythonCode = `
+import asyncpg
+import os
+
+session_id = sys.argv[1]
+project = sys.argv[2]
+working_on = sys.argv[3]
+pg_url = os.environ.get('CONTINUOUS_CLAUDE_DB_URL') or os.environ.get('DATABASE_URL') or os.environ.get('OPC_POSTGRES_URL')
+if not pg_url:
+    sys.exit('ERROR: Database URL not set. Set CONTINUOUS_CLAUDE_DB_URL, DATABASE_URL, or OPC_POSTGRES_URL.')
+
+async def main():
+    conn = await asyncpg.connect(pg_url)
+    try:
+        await conn.execute('''
+            UPDATE sessions SET working_on = $3, last_heartbeat = NOW()
+            WHERE id = $1 AND project = $2
+        ''', session_id, project, working_on)
+    finally:
+        await conn.close()
+
+asyncio.run(main())
+`;
+
+  runPgQueryDetached(pythonCode, [sessionId, project, workingOn]);
+}
+
 // Type definitions for sessions
+
 export interface SessionInfo {
   id: string;
   project: string;

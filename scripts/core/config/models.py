@@ -30,10 +30,20 @@ class DaemonConfig:
 
 @dataclass(frozen=True)
 class RerankerConfig:
-    project_weight: float = 0.15
+    # Issue #54: lowered from 0.15. With RRF calibration de-saturated (see
+    # rrf_scale_factor), a *substring* project match (project_match=0.5) was
+    # still enough to bury a strictly superior retrieval hit from a sibling
+    # project (e.g. "opc" caller vs an "opc-memory-mcp" result). 0.09 keeps an
+    # exact project match a strong signal without letting a partial match
+    # override clear retrieval evidence.
+    project_weight: float = 0.09
     recency_weight: float = 0.05
     confidence_weight: float = 0.05
-    recall_weight: float = 0.05
+    # Issue #54: recall-count bias damping. Halved from 0.05 so a heavily
+    # recalled row (count 600+) no longer wins the tie-break over a strong
+    # retrieval hit by a full 0.05-weight margin. The freed 0.03 flows to the
+    # retrieval term implicitly (retrieval_weight = 1 - total_signal_weight).
+    recall_weight: float = 0.02
     type_affinity_weight: float = 0.05
     tag_overlap_weight: float = 0.05
     pattern_weight: float = 0.05
@@ -45,8 +55,30 @@ class RerankerConfig:
     # removing that redirection requires fresh adversarial review.
     kg_weight: float = 0.05
     recency_half_life_days: float = 45.0
-    recall_log2_normalizer: float = 4.0
-    rrf_scale_factor: float = 60.0
+    # Issue #54: raised from 4.0 to 10.0 so recall_score grows slowly and does
+    # not saturate at count~=15. count 621 -> 0.93, count 15 -> ~0.4, count 4
+    # -> ~0.23, leaving headroom between the heavy tail and light new rows.
+    recall_log2_normalizer: float = 10.0
+    # Issue #54: lowered from 60.0. calibrate_score multiplies a hybrid_rrf raw
+    # score (~0.02-0.04 for top hits) by this factor, then clamps to [0, 1]. At
+    # 60 every top hit mapped to >=1.0, flattening the retrieval ranking so the
+    # contextual signals decided everything (and the heavily-recalled tail
+    # won). 25 keeps the top band inside (0, 1) so retrieval rank — the
+    # strongest evidence — is preserved through calibration.
+    rrf_scale_factor: float = 25.0
+    # Issue #54: softmax temperature for infer_query_type. Raw cosine sims
+    # across 7 type centroids cluster tightly; a low temperature sharpens the
+    # distribution so type_match differentiates instead of returning a
+    # near-uniform ~0.14 per type. Lower -> peakier. Tuned empirically against
+    # the acceptance + regression queries. None/<=0 disables sharpening.
+    type_softmax_temperature: float = 0.05
+    # Round 3 finding 3: type_match maps a softmax probability p to a [0,1]
+    # signal centered on the neutral 0.5 via clamp01(0.5 + alpha*(p - 1/N)),
+    # where N = len(distribution). Without this, a softmax prob (which sums to 1
+    # across ~7 types, so a legit best type is often < 0.5) was used as the raw
+    # score, letting an unknown type's 0.5 fallback outrank an evidenced type.
+    # alpha scales the deviation from neutral; tuned empirically (benchmark A/B).
+    type_signal_alpha: float = 1.5
 
     def __post_init__(self) -> None:
         """Enforce the ranking-math invariant: retrieval_weight >= 0.

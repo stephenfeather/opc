@@ -52,6 +52,13 @@ _FAULT_LOG_FILE = None
 # record_recall and the pool.acquire() context manager releases the connection.
 RECORD_RECALL_TIMEOUT = 2.0
 
+# Issue #54: hard bound on type-affinity inference (centroid cache read or a
+# one-shot server-side aggregate). Like RECORD_RECALL_TIMEOUT, this protects the
+# memory-awareness hook's 5s spawn budget — a cache hit is a single file read,
+# but a cold cache runs the aggregate, so cap it. On timeout the wait_for
+# cancels the inference and reranking proceeds with neutral type_match.
+TYPE_AFFINITY_TIMEOUT = 1.5
+
 
 def _enable_faulthandler() -> None:
     """Enable faulthandler without breaking imports if log dir is missing."""
@@ -244,6 +251,7 @@ def make_recall_context(
     tags: list[str] | None,
     retrieval_mode: str,
     query: str | None = None,
+    type_probabilities: dict[str, float] | None = None,
 ) -> Any:
     """Construct a RecallContext for the reranker.
 
@@ -251,6 +259,11 @@ def make_recall_context(
     ``query_entities`` via ``kg_extractor.extract_entities`` for the
     ``kg_overlap`` signal. Non-fatal: any extractor failure yields no
     query entities.
+
+    ``type_probabilities`` (issue #54) is the per-query soft type distribution
+    that drives the reranker's ``type_match`` signal. ``None`` (the default,
+    and the value on every text-only / sqlite / degraded path) preserves the
+    neutral 0.5 ``type_match`` behavior.
     """
     from scripts.core.reranker import RecallContext
 
@@ -277,6 +290,7 @@ def make_recall_context(
         tags_hint=tags,
         retrieval_mode=retrieval_mode,
         query_entities=query_entities,
+        type_probabilities=type_probabilities,
     )
 
 
@@ -815,13 +829,21 @@ async def search_learnings(
 
 
 async def _dispatch_search(
-    params: dict[str, Any], *, project: str | None = None,
+    params: dict[str, Any],
+    *,
+    project: str | None = None,
+    capture: Any | None = None,
 ) -> list[dict[str, Any]]:
     """Dispatch a search call based on resolved params dict.
 
     ``project`` (issue #139) optionally fetch-scopes the backend query.
     ``None`` (the default) leaves every backend call byte-identical to the
     pre-#139 path.
+
+    ``capture`` (issue #54) is an optional ``SearchCapture`` out-param. Only
+    the hybrid backend fills it (with the query embedding it already computes);
+    the text-only / sqlite / vector modes ignore it, so those paths leave type
+    affinity disabled. ``None`` keeps every call signature pre-#54 identical.
     """
     mode = params["mode"]
     # Only forward project= when scoping is active so the default path stays
@@ -850,6 +872,9 @@ async def _dispatch_search(
         from scripts.core.query_expansion import get_idf_index
 
         await get_idf_index(force_rebuild=True)
+    # Forward the capture only when present so the default signature stays
+    # byte-identical to the pre-#54 call (issue #54).
+    capture_kw: dict[str, Any] = {"capture": capture} if capture is not None else {}
     return await search_learnings_hybrid_rrf(
         query=params["query"],
         k=params["k"],
@@ -858,11 +883,14 @@ async def _dispatch_search(
         expand=params.get("expand", True),
         max_expansion_terms=params.get("max_expansion_terms", 5),
         **project_kw,
+        **capture_kw,
     )
 
 
 async def _dispatch_search_project_first(
     params: dict[str, Any],
+    *,
+    capture: Any | None = None,
 ) -> list[dict[str, Any]]:
     """Two-pass fetch for ``--project-first`` (issue #139).
 
@@ -879,6 +907,14 @@ async def _dispatch_search_project_first(
     preserving the default path's error behavior. The degraded pass is named
     on stderr. Tradeoff: for vector/hybrid modes the embedding/expansion is
     computed once per pass (twice total) — accepted for now.
+
+    ``capture`` (issue #54, finding 3): the SAME SearchCapture is threaded
+    through both passes so the type-affinity signal works under --project-first
+    (the path the memory-awareness hook now deploys). The first pass whose
+    hybrid backend embeds successfully populates it; the second pass embeds the
+    same query and the backend only fills an empty capture, so a successful
+    first fill is never clobbered and no extra embed is done for the capture's
+    sake. ``None`` keeps the call signature pre-#54 identical.
     """
     scope = params.get("project_scope")
 
@@ -887,7 +923,7 @@ async def _dispatch_search_project_first(
     own: list[dict[str, Any]] = []
     own_failed = False
     try:
-        own = await _dispatch_search(params, project=scope)
+        own = await _dispatch_search(params, project=scope, capture=capture)
     except Exception as exc:  # noqa: BLE001 - degrade, do not crash recall
         own_failed = True
         # exc text can embed a DSN/host/path; recall stderr is injected into
@@ -902,7 +938,7 @@ async def _dispatch_search_project_first(
         )
 
     try:
-        global_ = await _dispatch_search(params, project=None)
+        global_ = await _dispatch_search(params, project=None, capture=capture)
     except Exception as exc:  # noqa: BLE001 - degrade if the scoped pass held
         if own_failed:
             # Both passes failed — surface the error like the default path.
@@ -1033,10 +1069,23 @@ async def main() -> int:
         if backend == "sqlite" and output_mode == "human" and not args.text_only:
             print("  (SQLite backend - using text search)")
 
+        # Issue #54: a SearchCapture lets the hybrid backend surface the query
+        # embedding it already computes, so the type-affinity reranker signal
+        # needs no second embed. Both the single-dispatch and --project-first
+        # hybrid paths capture (finding 3: the hook now deploys --project-first,
+        # so that path must get the signal too). The capture is threaded through
+        # both project-first passes and only the first successful embed fills it.
+        search_capture = None
+        if params["mode"] == "hybrid_rrf" and not args.no_rerank:
+            from scripts.core.recall_backends import SearchCapture
+
+            search_capture = SearchCapture()
         if project_scope is not None:
-            results = await _dispatch_search_project_first(params)
+            results = await _dispatch_search_project_first(
+                params, capture=search_capture
+            )
         else:
-            results = await _dispatch_search(params)
+            results = await _dispatch_search(params, capture=search_capture)
     except Exception as e:
         if output_mode != "human":
             from scripts.core.recall_formatters import get_api_version
@@ -1061,12 +1110,31 @@ async def main() -> int:
         )
         from scripts.core.project_naming import project_from_path
 
+        # Issue #54: infer the query's soft type distribution from the captured
+        # embedding + model-filtered centroids. Returns None on every failure
+        # mode (no capture/embedding/label, DB error, stale cache), keeping the
+        # neutral 0.5 type_match behavior. Bounded so a slow centroid aggregate
+        # can't blow the memory-awareness hook's 5s budget.
+        type_probabilities = None
+        if search_capture is not None:
+            try:
+                from scripts.core.type_affinity import compute_type_probabilities
+
+                type_probabilities = await asyncio.wait_for(
+                    compute_type_probabilities(search_capture),
+                    timeout=TYPE_AFFINITY_TIMEOUT,
+                )
+            except Exception:  # noqa: BLE001 - degrade to neutral type_match
+                # Covers TimeoutError (from wait_for) and any inference error.
+                logger.debug("type-affinity inference failed/timed out", exc_info=True)
+
         ctx = make_recall_context(
             project=args.project
             or project_from_path(os.environ.get("CLAUDE_PROJECT_DIR") or None),
             tags=args.tags,
             retrieval_mode=retrieval_mode,
             query=args.query,
+            type_probabilities=type_probabilities,
         )
         from scripts.core.reranker import rerank
 

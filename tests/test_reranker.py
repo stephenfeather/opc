@@ -194,9 +194,13 @@ class TestRecallScore:
         assert recall_score(result) == 0.0
 
     def test_recall_score_moderate(self):
+        # No explicit config -> resolves opc.toml's damped normalizer (10,
+        # issue #54). Pass it explicitly to keep the assertion independent of
+        # ambient config discovery.
         result = _make_result(recall_count=3)
-        expected = min(1.0, math.log2(1 + 3) / 4)
-        assert abs(recall_score(result) - expected) < 0.01
+        config = RerankerConfig()
+        expected = min(1.0, math.log2(1 + 3) / config.recall_log2_normalizer)
+        assert abs(recall_score(result, config=config) - expected) < 0.01
 
     def test_recall_score_missing(self):
         result = _make_result()  # no recall_count
@@ -208,7 +212,25 @@ class TestRecallScore:
 # ---------------------------------------------------------------------------
 
 class TestTypeMatch:
-    def test_type_match_with_probabilities(self):
+    """Round 3 finding 3: type_match is recalibrated around a CONSISTENT
+    neutral. Softmax probs sum to 1 across N types, so a legit best-type prob
+    is often < 0.5; scoring it as the raw prob let an absent type's 0.5 fallback
+    outrank an evidenced type. New contract:
+
+        known type      -> clamp01(0.5 + alpha * (p - 1/N))
+        absent type     -> 0.5 (unknown, not penalized)
+        untyped result  -> 0.5 (no type evidence either way; deliberate change
+                                 from the old 0.0 once a distribution exists)
+        no distribution -> 0.5 (unchanged)
+    """
+
+    def test_no_probabilities_is_neutral(self):
+        result = _make_result(learning_type="WORKING_SOLUTION")
+        ctx = RecallContext()
+        assert type_match(result, ctx) == 0.5
+
+    def test_above_average_type_scores_above_neutral(self):
+        # N=3, 1/N ~= 0.333; p=0.7 is above average -> > 0.5.
         result = _make_result(learning_type="WORKING_SOLUTION")
         ctx = RecallContext(
             type_probabilities={
@@ -217,19 +239,70 @@ class TestTypeMatch:
                 "CODEBASE_PATTERN": 0.1,
             }
         )
-        assert type_match(result, ctx) == 0.7
+        cfg = RerankerConfig()
+        expected = max(0.0, min(1.0, 0.5 + cfg.type_signal_alpha * (0.7 - 1 / 3)))
+        assert abs(type_match(result, ctx, config=cfg) - expected) < 1e-9
+        assert type_match(result, ctx, config=cfg) > 0.5
 
-    def test_type_match_no_probabilities(self):
-        result = _make_result(learning_type="WORKING_SOLUTION")
-        ctx = RecallContext()
-        assert type_match(result, ctx) == 0.5
-
-    def test_type_match_missing_type_in_result(self):
-        result = _make_result()  # no learning_type
+    def test_below_average_type_scores_below_neutral(self):
+        # p=0.1 is below 1/N=0.333 -> < 0.5.
+        result = _make_result(learning_type="CODEBASE_PATTERN")
         ctx = RecallContext(
-            type_probabilities={"WORKING_SOLUTION": 0.7}
+            type_probabilities={
+                "WORKING_SOLUTION": 0.7,
+                "ERROR_FIX": 0.2,
+                "CODEBASE_PATTERN": 0.1,
+            }
         )
-        assert type_match(result, ctx) == 0.0
+        cfg = RerankerConfig()
+        score = type_match(result, ctx, config=cfg)
+        assert score < 0.5
+        assert score >= 0.0  # clamped
+
+    def test_average_type_is_neutral(self):
+        # p == 1/N -> exactly 0.5 regardless of alpha.
+        result = _make_result(learning_type="A")
+        ctx = RecallContext(
+            type_probabilities={"A": 0.5, "B": 0.5}
+        )
+        assert abs(type_match(result, ctx, config=RerankerConfig()) - 0.5) < 1e-9
+
+    def test_known_type_outranks_absent_type(self):
+        """The core fix: an above-average evidenced type must score strictly
+        higher than an unknown (absent) type's 0.5 neutral."""
+        cfg = RerankerConfig()
+        dist = {"WORKING_SOLUTION": 0.6, "ERROR_FIX": 0.2, "CODEBASE_PATTERN": 0.2}
+        evidenced = type_match(
+            _make_result(learning_type="WORKING_SOLUTION"),
+            RecallContext(type_probabilities=dist), config=cfg,
+        )
+        unknown = type_match(
+            _make_result(learning_type="BRAND_NEW_TYPE"),
+            RecallContext(type_probabilities=dist), config=cfg,
+        )
+        assert unknown == 0.5
+        assert evidenced > unknown
+
+    def test_absent_type_is_neutral(self):
+        result = _make_result(learning_type="BRAND_NEW_TYPE")
+        ctx = RecallContext(type_probabilities={"WORKING_SOLUTION": 0.7, "ERROR_FIX": 0.3})
+        assert type_match(result, ctx, config=RerankerConfig()) == 0.5
+
+    def test_untyped_result_is_neutral_when_distribution_present(self):
+        """Deliberate contract change (round 3 finding 3): an untyped row
+        carries no type evidence either way, so it is NEUTRAL (0.5) once a
+        distribution exists — not the old hard 0.0 that penalized it the moment
+        inference succeeded."""
+        result = _make_result()  # no learning_type
+        ctx = RecallContext(type_probabilities={"WORKING_SOLUTION": 0.7})
+        assert type_match(result, ctx, config=RerankerConfig()) == 0.5
+
+    def test_score_is_clamped_to_unit_interval(self):
+        # A dominant prob with a large alpha must clamp at 1.0, not exceed it.
+        result = _make_result(learning_type="A")
+        ctx = RecallContext(type_probabilities={"A": 0.99, "B": 0.01})
+        cfg = RerankerConfig(type_signal_alpha=100.0)
+        assert type_match(result, ctx, config=cfg) == 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -275,14 +348,16 @@ class TestCalibration:
         assert abs(score - 0.75) < 0.001
 
     def test_calibrate_rrf(self):
-        # 0.017 * 60 = 1.02, clamped to 1.0
-        score = calibrate_score(0.017, "hybrid_rrf", rank=0, total=5)
+        # Issue #54: default scale 25. 0.05 * 25 = 1.25, clamped to 1.0.
+        config = RerankerConfig()
+        score = calibrate_score(0.05, "hybrid_rrf", rank=0, total=5, config=config)
         assert score == 1.0
 
     def test_calibrate_rrf_normal(self):
-        # 0.01 * 60 = 0.6
-        score = calibrate_score(0.01, "hybrid_rrf", rank=0, total=5)
-        assert abs(score - 0.6) < 0.001
+        # Issue #54: default scale 25. 0.02 * 25 = 0.5 (no clamp).
+        config = RerankerConfig()
+        score = calibrate_score(0.02, "hybrid_rrf", rank=0, total=5, config=config)
+        assert abs(score - 0.5) < 0.001
 
     def test_calibrate_bm25_squash(self):
         # score / (score + 1.0) with score=1.0 => 0.5
@@ -537,6 +612,60 @@ class TestInferQueryType:
         probs = infer_query_type([0.5, 0.5], centroids)
         assert abs(probs["ONLY"] - 1.0) < 1e-6
 
+
+class TestInferQueryTypeTemperature:
+    """Issue #54: softmax temperature sharpens a near-uniform distribution.
+
+    Real type centroids sit close together in cosine space, so softmax over
+    raw sims is ~uniform and type_match cannot differentiate. A low temperature
+    divides sims before softmax, peaking the distribution on the closest type.
+    """
+
+    # Three centroids whose cosine sims to the query are close but ordered,
+    # mimicking the tight clustering of real type centroids.
+    _CENTROIDS = {
+        "NEAR": [1.0, 0.10],
+        "MID": [1.0, 0.18],
+        "FAR": [1.0, 0.30],
+    }
+    _QUERY = [1.0, 0.0]
+
+    def test_default_no_temperature_is_backward_compatible(self):
+        """No temperature arg -> identical to the pre-#54 plain softmax."""
+        probs = infer_query_type(self._QUERY, self._CENTROIDS)
+        spread = max(probs.values()) - min(probs.values())
+        # Plain softmax over near-equal sims yields a near-uniform spread.
+        assert spread < 0.05
+
+    def test_low_temperature_sharpens(self):
+        """A low temperature peaks the distribution on the closest centroid."""
+        plain = infer_query_type(self._QUERY, self._CENTROIDS)
+        sharp = infer_query_type(self._QUERY, self._CENTROIDS, temperature=0.05)
+        # The closest type's mass rises, the farthest type's mass falls:
+        # the distribution becomes strictly more peaked than plain softmax.
+        assert sharp["NEAR"] > plain["NEAR"]
+        assert sharp["FAR"] < plain["FAR"]
+        plain_spread = max(plain.values()) - min(plain.values())
+        sharp_spread = max(sharp.values()) - min(sharp.values())
+        assert sharp_spread > plain_spread
+
+    def test_high_temperature_flattens(self):
+        """A very high temperature pushes toward uniform."""
+        probs = infer_query_type(self._QUERY, self._CENTROIDS, temperature=100.0)
+        spread = max(probs.values()) - min(probs.values())
+        assert spread < 0.01
+
+    def test_temperature_still_sums_to_one(self):
+        probs = infer_query_type(self._QUERY, self._CENTROIDS, temperature=0.05)
+        assert abs(sum(probs.values()) - 1.0) < 1e-6
+
+    def test_nonpositive_temperature_disables_sharpening(self):
+        """temperature <= 0 must not divide-by-zero; falls back to plain."""
+        plain = infer_query_type(self._QUERY, self._CENTROIDS)
+        zero_t = infer_query_type(self._QUERY, self._CENTROIDS, temperature=0.0)
+        for k in plain:
+            assert abs(plain[k] - zero_t[k]) < 1e-9
+
     def test_empty_centroids(self):
         probs = infer_query_type([1.0, 0.0], {})
         assert probs == {}
@@ -653,7 +782,8 @@ class TestRerankerConfigDefaults:
 
     def test_default_project_weight(self):
         config = RerankerConfig()
-        assert config.project_weight == 0.15
+        # Issue #54: damped from 0.15 to 0.09.
+        assert config.project_weight == 0.09
 
     def test_default_recency_weight(self):
         config = RerankerConfig()
@@ -666,9 +796,10 @@ class TestRerankerConfigDefaults:
 
     def test_default_total_signal_weight(self):
         config = RerankerConfig()
-        # project + 7 secondary signals (recency, confidence, recall,
-        # type_affinity, tag_overlap, pattern, kg) -- all at default 0.05.
-        expected = 0.15 + 0.05 * 7
+        # Issue #54 damped defaults: project (0.09) + recall (0.02) + 6 other
+        # secondary signals (recency, confidence, type_affinity, tag_overlap,
+        # pattern, kg) at 0.05 each.
+        expected = 0.09 + 0.02 + 0.05 * 6
         assert abs(config.total_signal_weight - expected) < 1e-9
 
 
@@ -687,9 +818,15 @@ class TestCalibrateScoreWithConfig:
         assert score == 1.0
 
     def test_calibrate_rrf_default_without_config(self):
-        """calibrate_score without config should still work with default scale."""
-        score = calibrate_score(0.01, "hybrid_rrf", rank=0, total=5)
-        assert abs(score - 0.6) < 0.001
+        """calibrate_score without config should still work with default scale.
+
+        Issue #54: the resolved default scale is 25 (opc.toml), so 0.02 -> 0.5.
+        Pass the config explicitly to keep the assertion independent of ambient
+        config discovery.
+        """
+        config = RerankerConfig()
+        score = calibrate_score(0.02, "hybrid_rrf", rank=0, total=5, config=config)
+        assert abs(score - 0.5) < 0.001
 
 
 class TestRecencyScoreWithConfig:
@@ -733,6 +870,74 @@ class TestRecallScoreWithConfig:
         expected = min(1.0, math.log2(1 + 3) / 4.0)
         score = recall_score(result, config=config)
         assert abs(score - expected) < 0.01
+
+
+class TestRerankerDampedDefaults:
+    """Issue #54: recall-count bias damping via new RerankerConfig defaults.
+
+    The old defaults (normalizer 4.0, weight 0.05) made recall_score saturate
+    at count~=15 and gave heavily-recalled rows a full 0.05-weight edge over
+    new learnings. The damped defaults give light rows headroom against the
+    600+-recall tail so a strong retrieval hit is no longer buried.
+    """
+
+    def test_recall_log2_normalizer_default_is_10(self):
+        assert RerankerConfig().recall_log2_normalizer == 10.0
+
+    def test_recall_weight_default_is_0_02(self):
+        assert RerankerConfig().recall_weight == 0.02
+
+    def test_rrf_scale_factor_default_is_25(self):
+        """Issue #54: lowered from 60 so calibrate_score no longer clamps every
+        top RRF hit to 1.0. At 60, raw RRF ~0.02-0.04 all map to >=1.0 and the
+        retrieval ranking signal is destroyed; 25 keeps them in (0,1)."""
+        assert RerankerConfig().rrf_scale_factor == 25.0
+
+    def test_project_weight_default_is_0_09(self):
+        """Issue #54: lowered from 0.15 so a *substring* project match (0.5)
+        no longer outweighs a clearly superior retrieval hit from a sibling
+        project. An exact match still contributes meaningfully."""
+        assert RerankerConfig().project_weight == 0.09
+
+    def test_type_signal_alpha_default(self):
+        """Round 3 finding 3: type_match maps a softmax prob to a [0,1] signal
+        around 0.5 via 0.5 + alpha*(p - 1/N). alpha scales how strongly an
+        above/below-average type deviates from neutral."""
+        assert RerankerConfig().type_signal_alpha == 1.5
+
+    def test_rrf_calibration_no_longer_saturates_top_hits(self):
+        """A spread of top RRF raw scores must map to a spread of calibrated
+        scores (not all clamped to 1.0), so retrieval rank is preserved."""
+        cfg = RerankerConfig()
+        best = calibrate_score(0.038, "hybrid_rrf", rank=0, total=50, config=cfg)
+        mid = calibrate_score(0.020, "hybrid_rrf", rank=10, total=50, config=cfg)
+        assert best <= 1.0
+        assert best > mid  # discrimination is preserved
+        assert mid < 1.0
+
+    def test_heavy_row_no_longer_saturates(self):
+        """A 600+-recall row should score well under 1.0, leaving headroom."""
+        heavy = _make_result(recall_count=621)
+        score = recall_score(heavy, config=RerankerConfig())
+        # log2(622)/10 ~= 0.93 -- below the old saturated 1.0.
+        assert score < 0.95
+        assert score > 0.85
+
+    def test_light_row_has_signal(self):
+        """A count-4 row (e488075d) is no longer scored as 0.0-vs-1.0 noise."""
+        light = _make_result(recall_count=4)
+        score = recall_score(light, config=RerankerConfig())
+        # log2(5)/10 ~= 0.23 -- a real, non-saturated value.
+        assert abs(score - (math.log2(5) / 10.0)) < 1e-9
+
+    def test_heavy_minus_light_gap_narrowed(self):
+        """The weighted recall gap between a 621-row and a 4-row must shrink
+        relative to the old (1.0 - 0.0) * 0.05 = 0.05 swing."""
+        cfg = RerankerConfig()
+        heavy = recall_score(_make_result(recall_count=621), config=cfg)
+        light = recall_score(_make_result(recall_count=4), config=cfg)
+        weighted_gap = (heavy - light) * cfg.recall_weight
+        assert weighted_gap < 0.05  # strictly less than the old worst case
 
 
 # ---------------------------------------------------------------------------

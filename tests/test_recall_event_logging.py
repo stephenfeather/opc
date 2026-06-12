@@ -444,7 +444,7 @@ class TestMainWiring:
             raising=False,
         )
 
-        async def fake_dispatch(params, *, project=None):
+        async def fake_dispatch(params, *, project=None, capture=None):
             return [{"id": str(uuid.uuid4()), "content": "x", "similarity": 0.5}]
 
         monkeypatch.setattr(rl, "_dispatch_search", fake_dispatch)
@@ -487,7 +487,7 @@ class TestMainWiring:
             raising=False,
         )
 
-        async def fake_dispatch(params, *, project=None):
+        async def fake_dispatch(params, *, project=None, capture=None):
             return [{"id": str(uuid.uuid4()), "content": "x", "similarity": 0.5}]
 
         monkeypatch.setattr(rl, "_dispatch_search", fake_dispatch)
@@ -528,7 +528,7 @@ class TestMainWiring:
             raising=False,
         )
 
-        async def fake_dispatch(params, *, project=None):
+        async def fake_dispatch(params, *, project=None, capture=None):
             return [{"id": str(uuid.uuid4()), "content": "x", "similarity": 0.5}]
 
         monkeypatch.setattr(rl, "_dispatch_search", fake_dispatch)
@@ -574,7 +574,7 @@ class TestMainWiring:
             raising=False,
         )
 
-        async def fake_dispatch(params, *, project=None):
+        async def fake_dispatch(params, *, project=None, capture=None):
             return [{"id": str(uuid.uuid4()), "content": "x", "similarity": 0.5}]
 
         monkeypatch.setattr(rl, "_dispatch_search", fake_dispatch)

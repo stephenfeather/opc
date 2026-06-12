@@ -51,13 +51,20 @@ class TestDaemonConfig:
 class TestRerankerConfig:
     def test_defaults(self):
         cfg = RerankerConfig()
-        assert cfg.project_weight == 0.15
         assert cfg.recency_half_life_days == 45.0
-        assert cfg.rrf_scale_factor == 60.0
+        # Issue #54 damped / de-saturated defaults.
+        assert cfg.project_weight == 0.09
+        assert cfg.rrf_scale_factor == 25.0
+        assert cfg.recall_weight == 0.02
+        assert cfg.recall_log2_normalizer == 10.0
+        assert cfg.type_softmax_temperature == 0.05
+        assert cfg.type_signal_alpha == 1.5  # round 3 finding 3
 
     def test_total_signal_weight(self):
         cfg = RerankerConfig()
-        expected = 0.15 + 0.05 * 7  # project + 7 others (incl. kg_weight) at 0.05
+        # project (0.09) + recall (0.02, damped per #54) + 6 others
+        # (recency, confidence, type_affinity, tag_overlap, pattern, kg) at 0.05.
+        expected = 0.09 + 0.02 + 0.05 * 6
         assert abs(cfg.total_signal_weight - expected) < 1e-9
 
     def test_rejects_overweight_config(self):

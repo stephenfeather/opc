@@ -201,16 +201,53 @@ def recall_score(
     return min(1.0, math.log2(1 + count) / normalizer)
 
 
-def type_match(result: dict, ctx: RecallContext) -> float:
-    """Score based on type affinity from soft distribution."""
+def type_match(
+    result: dict,
+    ctx: RecallContext,
+    *,
+    config: RerankerConfig | None = None,
+) -> float:
+    """Score type affinity on a CONSISTENT neutral scale (round 3 finding 3).
+
+    A softmax distribution sums to 1 across N types, so a legitimately
+    best-matching type often has p < 0.5. Using p directly let an unknown
+    type's 0.5 fallback outrank an evidenced type, and inverted the intended
+    ranking. Instead we map p to a [0, 1] signal centered on the neutral 0.5:
+
+        clamp01(0.5 + alpha * (p - 1/N))
+
+    so a type with above-average mass scores > 0.5 and below-average < 0.5,
+    with the average type landing exactly on neutral. ``alpha``
+    (config.type_signal_alpha) scales the deviation.
+
+    Neutral (0.5) cases:
+    - no distribution available (``type_probabilities is None``);
+    - the result's learning_type is ABSENT from a non-None distribution
+      ("unknown", e.g. a type the corpus gained within the cache TTL window —
+      never penalized);
+    - the result is UNTYPED while a distribution is present. This is a
+      deliberate contract change from the old 0.0: an untyped row carries no
+      type evidence either way, so once inference succeeds it must not be
+      penalized relative to neutral.
+    """
     if ctx.type_probabilities is None:
         return 0.5
 
     learning_type = result.get("metadata", {}).get("learning_type")
     if not learning_type:
-        return 0.0
+        return 0.5
 
-    return ctx.type_probabilities.get(learning_type, 0.0)
+    distribution = ctx.type_probabilities
+    if learning_type not in distribution:
+        return 0.5
+
+    n = len(distribution)
+    if n <= 0:
+        return 0.5
+    cfg = config if config is not None else _default_config()
+    p = distribution[learning_type]
+    signal = 0.5 + cfg.type_signal_alpha * (p - 1.0 / n)
+    return max(0.0, min(1.0, signal))
 
 
 def tag_overlap(result: dict, ctx: RecallContext) -> float:
@@ -369,10 +406,19 @@ def compute_type_centroids(rows: list[dict]) -> dict[str, list[float]]:
 def infer_query_type(
     query_embedding: list[float],
     centroids: dict[str, list[float]],
+    *,
+    temperature: float | None = None,
 ) -> dict[str, float]:
     """Infer query type as soft probability distribution over learning types.
 
     Uses cosine similarity to each type centroid, then softmax.
+
+    Issue #54: real type centroids cluster tightly in cosine space, so a plain
+    softmax over raw sims is near-uniform and ``type_match`` cannot
+    differentiate. ``temperature`` divides the sims before softmax: a low value
+    (e.g. 0.05) sharpens the distribution to peak on the closest type. A value
+    of ``None`` or ``<= 0`` disables sharpening, preserving the pre-#54 plain
+    softmax exactly (backward compatible).
 
     Returns:
         Dict mapping learning_type to probability (sums to ~1.0).
@@ -381,6 +427,12 @@ def infer_query_type(
         return {}
 
     sims = {lt: _cosine_similarity(query_embedding, c) for lt, c in centroids.items()}
+
+    # Temperature sharpening (issue #54). Only applied for a positive,
+    # finite temperature; otherwise the raw sims pass through unchanged so
+    # the pre-#54 behavior is byte-for-byte preserved.
+    if temperature is not None and temperature > 0.0:
+        sims = {lt: s / temperature for lt, s in sims.items()}
 
     # Softmax with max-subtraction for numerical stability
     max_sim = max(sims.values())
@@ -479,7 +531,7 @@ def rerank(
         sig_recency = recency_score(result, ctx, config=config)
         sig_confidence = confidence_score(result)
         sig_recall = recall_score(result, config=config)
-        sig_type = type_match(result, ctx)
+        sig_type = type_match(result, ctx, config=config)
         sig_tags = tag_overlap(result, ctx)
         sig_pattern = pattern_score(result, ctx)
         if kg_active and query_map:

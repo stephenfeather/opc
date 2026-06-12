@@ -1,0 +1,182 @@
+{
+  "timestamp": "2026-06-12T03:33:55.914120+00:00",
+  "description": "Issue #54 reranker retune A/B: NEW defaults (branch) vs OLD pre-#54 defaults (OPC_CONFIG override), like-for-like on the same live corpus.",
+  "method": {
+    "new_config": "opc.toml on agent-54-reranker-tuning",
+    "old_config": "/tmp/opc_old_defaults.toml (project_weight=0.15, recall_weight=0.05, recall_log2_normalizer=4, rrf_scale_factor=60, type_softmax_temperature=1000 to flatten type affinity ~= pre-#54 dead wiring)",
+    "queries": 25,
+    "k": 5,
+    "primary_metric": "precision_at_k (reranked)",
+    "regression_gate": ">10% relative drop on a class's primary metric"
+  },
+  "overall_reranked": {
+    "precision_at_k": {
+      "old": 0.816,
+      "new": 0.872
+    },
+    "ndcg_at_k": {
+      "old": 0.9435,
+      "new": 0.9407
+    },
+    "mrr": {
+      "old": 0.9333,
+      "new": 0.92
+    }
+  },
+  "overall_rerank_vs_raw_precision_delta": {
+    "old": -0.088,
+    "new": -0.008
+  },
+  "per_class": {
+    "broad_ambiguous": {
+      "n": 2,
+      "precision_at_k": {
+        "old": 0.6,
+        "new": 0.6,
+        "delta": 0.0
+      },
+      "ndcg_at_k": {
+        "old": 0.75,
+        "new": 0.7153,
+        "delta": -0.0347
+      },
+      "mrr": {
+        "old": 0.6667,
+        "new": 0.625,
+        "delta": -0.0417
+      }
+    },
+    "codebase_pattern": {
+      "n": 7,
+      "precision_at_k": {
+        "old": 0.7714,
+        "new": 0.8857,
+        "delta": 0.1143
+      },
+      "ndcg_at_k": {
+        "old": 0.9723,
+        "new": 0.9954,
+        "delta": 0.0231
+      },
+      "mrr": {
+        "old": 1.0,
+        "new": 1.0,
+        "delta": 0.0
+      }
+    },
+    "cold_start": {
+      "n": 1,
+      "precision_at_k": {
+        "old": 0.6,
+        "new": 0.8,
+        "delta": 0.2
+      },
+      "ndcg_at_k": {
+        "old": 1.0,
+        "new": 0.7606,
+        "delta": -0.2394
+      },
+      "mrr": {
+        "old": 1.0,
+        "new": 0.5,
+        "delta": -0.5
+      }
+    },
+    "cross_project": {
+      "n": 1,
+      "precision_at_k": {
+        "old": 1.0,
+        "new": 1.0,
+        "delta": 0.0
+      },
+      "ndcg_at_k": {
+        "old": 1.0,
+        "new": 1.0,
+        "delta": 0.0
+      },
+      "mrr": {
+        "old": 1.0,
+        "new": 1.0,
+        "delta": 0.0
+      }
+    },
+    "project_specific": {
+      "n": 9,
+      "precision_at_k": {
+        "old": 0.8222,
+        "new": 0.8444,
+        "delta": 0.0222
+      },
+      "ndcg_at_k": {
+        "old": 0.9222,
+        "new": 0.9289,
+        "delta": 0.0067
+      },
+      "mrr": {
+        "old": 0.8889,
+        "new": 0.9167,
+        "delta": 0.0278
+      }
+    },
+    "recency_sensitive": {
+      "n": 1,
+      "precision_at_k": {
+        "old": 0.8,
+        "new": 1.0,
+        "delta": 0.2
+      },
+      "ndcg_at_k": {
+        "old": 0.9829,
+        "new": 1.0,
+        "delta": 0.0171
+      },
+      "mrr": {
+        "old": 1.0,
+        "new": 1.0,
+        "delta": 0.0
+      }
+    },
+    "tag_driven": {
+      "n": 1,
+      "precision_at_k": {
+        "old": 1.0,
+        "new": 1.0,
+        "delta": 0.0
+      },
+      "ndcg_at_k": {
+        "old": 1.0,
+        "new": 1.0,
+        "delta": 0.0
+      },
+      "mrr": {
+        "old": 1.0,
+        "new": 1.0,
+        "delta": 0.0
+      }
+    },
+    "type_targeted": {
+      "n": 3,
+      "precision_at_k": {
+        "old": 1.0,
+        "new": 1.0,
+        "delta": 0.0
+      },
+      "ndcg_at_k": {
+        "old": 1.0,
+        "new": 1.0,
+        "delta": 0.0
+      },
+      "mrr": {
+        "old": 1.0,
+        "new": 1.0,
+        "delta": 0.0
+      }
+    }
+  },
+  "material_regressions": [],
+  "notes": [
+    "cold_start (n=1): P@k improved +0.20 but NDCG/MRR fell \u2014 single-query noise; primary metric (P@k) gate not triggered.",
+    "broad_ambiguous (n=2): small NDCG/MRR dips, P@k flat; below the 10% primary-metric gate.",
+    "Apr-2026 baseline not used for A/B: corpus grew since, so absolute P@k differs (0.87 vs 0.29); the OLD-defaults run on today's corpus is the like-for-like control."
+  ]
+}

@@ -17,6 +17,7 @@ import logging
 import re
 import sys
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,25 @@ from typing import Any
 from scripts.core.config import get_config as _get_config
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SearchCapture:
+    """Mutable out-param for surfacing a backend's internal embedding (#54).
+
+    ``search_learnings_hybrid_rrf`` already embeds the query to drive the
+    vector leg of RRF. To wire the type-affinity reranker signal without a
+    second embed call, the caller passes a ``SearchCapture``; the backend fills
+    ``query_embedding`` and ``model_label`` after a *successful* embed. The
+    degraded text-only path (missing key / embed failure) and the
+    text-only/sqlite backends leave it at its ``None`` defaults, so the caller
+    keeps type affinity disabled (neutral reranking) on those paths.
+
+    Mutable by design (out-param contract); not frozen.
+    """
+
+    query_embedding: list[float] | None = None
+    model_label: str | None = None
 
 # Issue #53: hybrid recall degrades to text-only by design when the query
 # embedding is unavailable (this is the contract — the memory-awareness hook
@@ -853,6 +873,7 @@ async def search_learnings_hybrid_rrf(
     max_expansion_terms: int = _recall_cfg.max_expansion_terms,
     *,
     project: str | None = None,
+    capture: SearchCapture | None = None,
 ) -> list[dict[str, Any]]:
     """Hybrid RRF search combining text and vector rankings.
 
@@ -942,6 +963,21 @@ async def search_learnings_hybrid_rrf(
         async with pool.acquire() as probe_conn:
             if not await embedding_model_column_available(probe_conn):
                 model_label = None
+
+    # Issue #54: surface the embedding (and its now-resolved model-space label)
+    # for the type-affinity reranker signal. Only reached after a successful
+    # embed — the degraded text-only return above never gets here, so a
+    # degraded recall leaves the caller's capture at its None defaults.
+    # model_label may be None here (pre-#151 DB without the embedding_model
+    # column); the caller must then skip model-filtered centroids rather than
+    # cosine across embedding spaces.
+    #
+    # Finding 3 (round 1): under --project-first the SAME capture is passed to
+    # both fetch passes. Only fill an empty capture so the first successful
+    # embed wins and the second pass (identical query) never clobbers it.
+    if capture is not None and capture.query_embedding is None:
+        capture.query_embedding = query_embedding
+        capture.model_label = model_label
 
     text_query = query
     use_tsquery = False

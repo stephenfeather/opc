@@ -1,0 +1,179 @@
+{
+  "timestamp": "2026-06-12T03:56:15.728704+00:00",
+  "description": "Issue #54 round 3 recalibration A/B: NEW (type_signal_alpha=1.5 + de-saturated reranker) vs OLD pre-#54 defaults, like-for-like on the live corpus with a warm centroid cache.",
+  "method": {
+    "new_config": "opc.toml on agent-54-reranker-tuning (round 3)",
+    "old_config": "/tmp/opc_old_defaults.toml (project_weight=0.15, recall_weight=0.05, recall_log2_normalizer=4, rrf_scale_factor=60, type_softmax_temperature=1000 to flatten type affinity ~= pre-#54 dead wiring)",
+    "queries": 25,
+    "k": 5,
+    "primary_metric": "precision_at_k (reranked)",
+    "regression_gate": ">10% relative drop on a class primary metric",
+    "cache": "warmed via `python -m scripts.core.type_affinity --refresh --model-label voyage-code-3` before both runs"
+  },
+  "overall_reranked": {
+    "precision_at_k": {
+      "old": 0.84,
+      "new": 0.872
+    },
+    "ndcg_at_k": {
+      "old": 0.9414,
+      "new": 0.9516
+    },
+    "mrr": {
+      "old": 0.9333,
+      "new": 0.9433
+    }
+  },
+  "overall_rerank_vs_raw_precision_delta": {
+    "old": -0.064,
+    "new": -0.032
+  },
+  "per_class": {
+    "broad_ambiguous": {
+      "n": 2,
+      "precision_at_k": {
+        "old": 0.6,
+        "new": 0.6,
+        "delta": 0.0
+      },
+      "ndcg_at_k": {
+        "old": 0.75,
+        "new": 0.75,
+        "delta": 0.0
+      },
+      "mrr": {
+        "old": 0.6667,
+        "new": 0.6667,
+        "delta": 0.0
+      }
+    },
+    "codebase_pattern": {
+      "n": 7,
+      "precision_at_k": {
+        "old": 0.8,
+        "new": 0.8857,
+        "delta": 0.0857
+      },
+      "ndcg_at_k": {
+        "old": 0.9608,
+        "new": 0.9924,
+        "delta": 0.0316
+      },
+      "mrr": {
+        "old": 1.0,
+        "new": 1.0,
+        "delta": 0.0
+      }
+    },
+    "cold_start": {
+      "n": 1,
+      "precision_at_k": {
+        "old": 0.8,
+        "new": 0.8,
+        "delta": 0.0
+      },
+      "ndcg_at_k": {
+        "old": 0.9829,
+        "new": 0.9558,
+        "delta": -0.0271
+      },
+      "mrr": {
+        "old": 1.0,
+        "new": 1.0,
+        "delta": 0.0
+      }
+    },
+    "cross_project": {
+      "n": 1,
+      "precision_at_k": {
+        "old": 1.0,
+        "new": 1.0,
+        "delta": 0.0
+      },
+      "ndcg_at_k": {
+        "old": 1.0,
+        "new": 1.0,
+        "delta": 0.0
+      },
+      "mrr": {
+        "old": 1.0,
+        "new": 1.0,
+        "delta": 0.0
+      }
+    },
+    "project_specific": {
+      "n": 9,
+      "precision_at_k": {
+        "old": 0.8222,
+        "new": 0.8444,
+        "delta": 0.0222
+      },
+      "ndcg_at_k": {
+        "old": 0.9252,
+        "new": 0.9319,
+        "delta": 0.0067
+      },
+      "mrr": {
+        "old": 0.8889,
+        "new": 0.9167,
+        "delta": 0.0278
+      }
+    },
+    "recency_sensitive": {
+      "n": 1,
+      "precision_at_k": {
+        "old": 1.0,
+        "new": 1.0,
+        "delta": 0.0
+      },
+      "ndcg_at_k": {
+        "old": 1.0,
+        "new": 1.0,
+        "delta": 0.0
+      },
+      "mrr": {
+        "old": 1.0,
+        "new": 1.0,
+        "delta": 0.0
+      }
+    },
+    "tag_driven": {
+      "n": 1,
+      "precision_at_k": {
+        "old": 1.0,
+        "new": 1.0,
+        "delta": 0.0
+      },
+      "ndcg_at_k": {
+        "old": 1.0,
+        "new": 1.0,
+        "delta": 0.0
+      },
+      "mrr": {
+        "old": 1.0,
+        "new": 1.0,
+        "delta": 0.0
+      }
+    },
+    "type_targeted": {
+      "n": 3,
+      "precision_at_k": {
+        "old": 1.0,
+        "new": 1.0,
+        "delta": 0.0
+      },
+      "ndcg_at_k": {
+        "old": 1.0,
+        "new": 1.0,
+        "delta": 0.0
+      },
+      "mrr": {
+        "old": 1.0,
+        "new": 1.0,
+        "delta": 0.0
+      }
+    }
+  },
+  "material_regressions": [],
+  "type_signal_alpha": 1.5
+}

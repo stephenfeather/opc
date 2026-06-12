@@ -211,6 +211,56 @@ logged (privacy). See the [Recall Event Log](#recall-event-log) section.
 
 Embedding provider. Choices: `local` (BGE), `voyage` (Voyage AI).
 
+## Embedding-space contract (issue #151)
+
+Vector similarity is only meaningful **within a single embedding space**.
+Different providers (and different models within a provider) produce vectors
+that are not comparable even when they share a dimension — a `local`/BGE
+vector and a `voyage-code-3` vector are both 1024-dim, so PostgreSQL will
+happily cosine-compare them, but the result is semantic noise. Mixing spaces
+in one corpus ("split-brain") silently degrades recall, dedup, and query
+expansion.
+
+**Canonical space: `voyage-code-3`.** This matches the global
+`EMBEDDING_PROVIDER=voyage` default and is the space the corpus is being
+migrated to (`scripts/core/re_embed_voyage.py`, bge → voyage-code-3).
+
+**How the contract is enforced**
+
+- Each provider exposes a stable `model_label` (the value written to the
+  `archival_memory.embedding_model` column):
+
+  | Provider | `model_label` |
+  |----------|---------------|
+  | `local` (any BGE variant) | `bge` |
+  | `local` (non-BGE model) | the model name |
+  | `voyage` | the model name (e.g. `voyage-code-3`, honoring `--model`) |
+  | `openai` | `text-embedding-3-small` |
+  | `ollama` | the model name |
+  | `mock` | `mock` |
+
+- Store paths write `embedding_model` explicitly from `model_label`, so new
+  rows are labeled by their real space (previously the column silently fell
+  back to its `'bge'` default, mislabeling voyage rows).
+
+- Every vector-distance query path filters to the query provider's space via
+  `AND embedding_model = $N` (hybrid RRF vector leg, `--vector-only`,
+  recency-weighted vector, and query-expansion neighbors). The filter lives on
+  the **vector leg only** — never the FTS leg.
+
+**Post-canonicalization behavior of `--provider local`**
+
+After the corpus is canonicalized to `voyage-code-3`, a `--provider local`
+(BGE) query embeds in `bge` space and its `AND embedding_model = 'bge'`
+vector filter matches **zero rows** until/unless the corpus is re-embedded
+back to BGE. This is deliberate, not a bug: the empty vector leg makes hybrid
+RRF degrade to the text (BM25) leg (see
+[Hybrid → text-only degradation](#hybrid--text-only-degradation-issue-53)),
+so `--provider local` becomes **text-degraded** rather than returning
+cross-space noise. Use `--provider voyage` (or rely on the
+`EMBEDDING_PROVIDER=voyage` default) for full vector recall. To make `local`
+fully vector-capable again, re-embed the corpus to BGE.
+
 ## Search Modes
 
 | Flags | Search Method | Score Range |
@@ -568,6 +618,23 @@ Two layers, checked in order:
 
 1. **Semantic dedup** — Cosine similarity >= 0.92 against all existing learnings (cross-session). Returns `skipped` with `existing_id`.
 2. **Content hash dedup** — SHA-256 of exact content. Returns `skipped` without `existing_id`.
+
+### Same-space-only semantic dedup during a split corpus (issue #151)
+
+Semantic dedup is **same-embedding-space-only by design**. The probe is pinned
+to the same `embedding_model` label that will be written with the new row
+(see the [Embedding-space contract](#embedding-space-contract-issue-151)),
+because cosine similarity across different embedding spaces is meaningless — a
+voyage vector compared against bge rows produces noise, and a spurious
+cross-space "match" would silently skip a legitimate write (data loss). The
+consequence during the split-corpus window is that a cross-space **paraphrase**
+duplicate (same idea, different space) is temporarily **not** caught by
+semantic dedup. **Exact** duplicates are still caught across spaces by the
+content-hash layer (it is space-independent). This window closes once
+`scripts/core/re_embed_voyage.py` canonicalizes the corpus to a single space,
+after which every row shares one label and semantic dedup spans the whole
+corpus again. Corpus-wide retroactive duplicate cleanup is tracked separately
+in issue #58.
 
 ---
 

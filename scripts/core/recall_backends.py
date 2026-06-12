@@ -239,11 +239,31 @@ def format_vector_result(
     return result
 
 
+def model_filter_clause(model_label: str | None, *, param_index: int) -> str:
+    """Build the optional 'AND embedding_model = $N' clause (issue #151).
+
+    Pins recall to a single embedding space so voyage-space queries never
+    cross-compare cosine distance against bge-space vectors (split-brain
+    corpus). Returns "" — leaving the SQL byte-identical to the pre-#151
+    path — when no label is supplied. The caller binds ``model_label`` as the
+    ``param_index``-th positional arg.
+
+    Zero-match is intentional and degrades safely: in the RRF CTE the clause
+    lives on ``vector_ranked`` only, so a label that matches no rows empties
+    the vector leg and the FULL OUTER JOIN keeps the text (fts) leg — recall
+    becomes text-only rather than erroring.
+    """
+    if not model_label:
+        return ""
+    return f"AND embedding_model = ${param_index}"
+
+
 def build_rrf_cte(
     *,
     chain_filter: bool,
     use_tsquery: bool = False,
     project_filter: str | None = None,
+    model_filter: str | None = None,
 ) -> str:
     """Build the SQL CTE for RRF (Reciprocal Rank Fusion) queries.
 
@@ -253,6 +273,13 @@ def build_rrf_cte(
     shrinks the pool *before* ranking — filtering only the tail would rank
     the global pool and then drop rows, defeating the purpose. ``None``
     leaves the CTE byte-identical to today.
+
+    ``model_filter`` is the optional ``AND embedding_model = $N`` predicate
+    for single-space recall (issue #151). It lives in ``vector_ranked``
+    *only* — never the FTS leg — so a label matching no rows empties the
+    vector leg and the FULL OUTER JOIN degrades RRF to the text leg rather
+    than erroring. ``None`` leaves the CTE byte-identical to the pre-#151
+    path.
     """
     chain_clause = (
         "\n                AND superseded_by IS NULL" if chain_filter else ""
@@ -260,6 +287,12 @@ def build_rrf_cte(
     project_clause = (
         f"\n                {project_filter}" if project_filter else ""
     )
+    model_clause = (
+        f"\n                {model_filter}" if model_filter else ""
+    )
+    # Vector leg carries both project and model predicates; fts leg only the
+    # project predicate (issue #151: model filter is vector-only).
+    vector_extra = f"{project_clause}{model_clause}"
     tsquery_fn = "to_tsquery" if use_tsquery else "plainto_tsquery"
     return f"""
             WITH fts_ranked AS (
@@ -280,7 +313,7 @@ def build_rrf_cte(
                     id,
                     ROW_NUMBER() OVER (ORDER BY embedding <=> $2::vector) as vec_rank
                 FROM archival_memory
-                WHERE metadata->>'type' = 'session_learning'{chain_clause}{project_clause}
+                WHERE metadata->>'type' = 'session_learning'{chain_clause}{vector_extra}
                 AND embedding IS NOT NULL
             ),
             combined AS (
@@ -301,6 +334,7 @@ def render_recall_sql(
     include_project: bool,
     project_expr: str = ", project",
     project_filter: str | None = None,
+    model_filter: str | None = None,
     **fmt: str,
 ) -> str:
     """Render a recall SQL template, optionally selecting the project column.
@@ -320,6 +354,7 @@ def render_recall_sql(
     return template.format(
         project_col=project_expr if include_project else "",
         project_filter=project_filter or "",
+        model_filter=model_filter or "",
         **fmt,
     )
 
@@ -443,6 +478,7 @@ _PG_RECENCY_SQL = """
             AND embedding IS NOT NULL
             {chain_filter}
             {project_filter}
+            {model_filter}
     )
     SELECT
         id, session_id, content, metadata, created_at{project_col},
@@ -463,6 +499,7 @@ _PG_VECTOR_SQL = """
         AND embedding IS NOT NULL
         {chain_filter}
         {project_filter}
+        {model_filter}
     ORDER BY embedding <=> $1::vector
     LIMIT $2
     """
@@ -591,6 +628,70 @@ async def project_column_available(conn: Any) -> bool:
         )
         return False
     _project_column_cache = True
+    return True
+
+
+# ---------------------------------------------------------------------------
+# embedding_model column capability probe (issue #151, round 1 FIX 1)
+#
+# The model filter (AND embedding_model = $N) and the explicit store-time
+# column write both assume the embedding_model column exists. On a
+# pre-migration DB it may not, so recall would raise UndefinedColumnError (a
+# hard failure, not degradation) and stores would fail. Mirror the #139
+# project-column probe: probe once, cache only definitive answers, and when
+# the column is absent bind model_label=None (filter off, SQL byte-identical
+# to the pre-#151 path). Apply scripts/migrations/add_embedding_hnsw.sql to
+# add the column.
+# ---------------------------------------------------------------------------
+
+_embedding_model_column_cache: bool | None = None
+
+_EMBEDDING_MODEL_COLUMN_PROBE_SQL = (
+    "SELECT embedding_model FROM archival_memory LIMIT 0"
+)
+
+def reset_embedding_model_column_cache() -> None:
+    """Clear the cached embedding_model capability probe (test isolation)."""
+    global _embedding_model_column_cache
+    _embedding_model_column_cache = None
+
+
+def _set_embedding_model_column_cache_for_tests(value: bool | None) -> None:
+    """Force the embedding_model probe cache to a value (test-only)."""
+    global _embedding_model_column_cache
+    _embedding_model_column_cache = value
+
+
+async def embedding_model_column_available(conn: Any) -> bool:
+    """Check (once per process) whether archival_memory.embedding_model exists.
+
+    Only definitive answers are cached. A transient probe failure degrades
+    THIS call to the unfiltered (pre-#151) path but leaves the cache unset so
+    the next recall retries — one hiccup must not disable the model filter for
+    the process lifetime.
+    """
+    global _embedding_model_column_cache
+    if _embedding_model_column_cache is not None:
+        return _embedding_model_column_cache
+    try:
+        await conn.fetch(_EMBEDDING_MODEL_COLUMN_PROBE_SQL)
+    except _missing_relation_errors():
+        logger.warning(
+            "archival_memory.embedding_model column missing — recall/store "
+            "running in degraded unfiltered mode (cross-space recall not "
+            "prevented, issue #151). Apply "
+            "scripts/migrations/add_embedding_hnsw.sql to enable."
+        )
+        _embedding_model_column_cache = False
+        return False
+    except Exception:
+        logger.warning(
+            "embedding_model column probe failed transiently; degrading this "
+            "recall to unfiltered SQL and retrying the probe on the next call",
+            exc_info=True,
+        )
+        return False
+    _embedding_model_column_cache = True
     return True
 
 
@@ -774,10 +875,17 @@ async def search_learnings_hybrid_rrf(
     # absent, or a local model load error) degrade like embed() failures
     # rather than bypassing the fallback (review round 1).
     embedder: EmbeddingService | None = None
+    model_label: str | None = None
     try:
         # Construction is non-network (provider __init__ only reads env), so
         # it stays outside wait_for and remains visible to the finally below.
         embedder = EmbeddingService(provider=provider)
+        # Capture the embedding-space label before the finally closes the
+        # embedder; bound into the recall vector leg so the query never
+        # cross-compares spaces (issue #151). getattr guards custom embedders
+        # that predate model_label — they degrade to the unfiltered (pre-#151)
+        # path rather than erroring.
+        model_label = getattr(embedder, "model_label", None)
         query_embedding = await asyncio.wait_for(
             embedder.embed(query, input_type="query"),
             timeout=QUERY_EMBED_TIMEOUT,
@@ -825,6 +933,16 @@ async def search_learnings_hybrid_rrf(
             except Exception:  # noqa: BLE001 - cleanup is best-effort
                 logger.debug("embedder close failed", exc_info=True)
 
+    # FIX 1 (issue #151): probe the embedding_model column once up front. On a
+    # pre-migration DB drop the model filter everywhere downstream (query
+    # expansion neighbors and both vector legs) so recall degrades to the
+    # byte-identical pre-#151 SQL instead of raising UndefinedColumnError. The
+    # probe result is cached, so the later pool.acquire() reuses it for free.
+    if model_label is not None:
+        async with pool.acquire() as probe_conn:
+            if not await embedding_model_column_available(probe_conn):
+                model_label = None
+
     text_query = query
     use_tsquery = False
     if expand:
@@ -834,6 +952,7 @@ async def search_learnings_hybrid_rrf(
             expanded = await expand_query(
                 query, query_embedding,
                 max_expansion_terms=max_expansion_terms,
+                model_label=model_label,
             )
             if expanded != query:
                 text_query = expanded
@@ -869,18 +988,36 @@ async def search_learnings_hybrid_rrf(
             project, has_project=has_project, param_index=5,
         )
 
-        def _cte(*, chain: bool, ts: bool, pf: str) -> str:
-            return build_rrf_cte(chain_filter=chain, use_tsquery=ts, project_filter=pf)
+        # Model filter (issue #151) is bound *after* the project value so the
+        # #139 positional binds keep their numbers. Boosted base = $5, plain
+        # base = $4; project (when active) consumes the next slot, then the
+        # model label takes the last slot: boosted -> $7/$6, plain -> $6/$5.
+        boosted_model_idx = 7 if boosted_pf else 6
+        plain_model_idx = 6 if plain_pf else 5
+        boosted_mf = model_filter_clause(model_label, param_index=boosted_model_idx)
+        plain_mf = model_filter_clause(model_label, param_index=plain_model_idx)
 
-        # Append the project value to the args only when a filter is active.
-        boosted_extra = (project,) if boosted_pf else ()
-        plain_extra = (project,) if plain_pf else ()
+        def _cte(*, chain: bool, ts: bool, pf: str, mf: str) -> str:
+            return build_rrf_cte(
+                chain_filter=chain, use_tsquery=ts,
+                project_filter=pf, model_filter=mf,
+            )
+
+        # Append project then model values, matching the param ordering above.
+        boosted_extra = (
+            *((project,) if boosted_pf else ()),
+            *((model_label,) if boosted_mf else ()),
+        )
+        plain_extra = (
+            *((project,) if plain_pf else ()),
+            *((model_label,) if plain_mf else ()),
+        )
         boosted_args = (text_query, embedding_str, rrf_k, k * 2, boost, *boosted_extra)
         plain_args = (text_query, embedding_str, rrf_k, k * 2, *plain_extra)
 
-        cte_boosted = _cte(chain=True, ts=use_tsquery, pf=boosted_pf)
-        cte_plain_args = _cte(chain=True, ts=use_tsquery, pf=plain_pf)
-        cte_plain_nochain = _cte(chain=False, ts=use_tsquery, pf=plain_pf)
+        cte_boosted = _cte(chain=True, ts=use_tsquery, pf=boosted_pf, mf=boosted_mf)
+        cte_plain_args = _cte(chain=True, ts=use_tsquery, pf=plain_pf, mf=plain_mf)
+        cte_plain_nochain = _cte(chain=False, ts=use_tsquery, pf=plain_pf, mf=plain_mf)
 
         try:
             rows = await conn.fetch(cte_boosted + boosted_tail, *boosted_args)
@@ -903,8 +1040,8 @@ async def search_learnings_hybrid_rrf(
             logger.debug("Expanded tsquery returned no results, falling back to plainto_tsquery")
             fb_boosted = (query, embedding_str, rrf_k, k * 2, boost, *boosted_extra)
             fb_plain = (query, embedding_str, rrf_k, k * 2, *plain_extra)
-            fb_cte_boosted = _cte(chain=True, ts=False, pf=boosted_pf)
-            fb_cte_plain = _cte(chain=True, ts=False, pf=plain_pf)
+            fb_cte_boosted = _cte(chain=True, ts=False, pf=boosted_pf, mf=boosted_mf)
+            fb_cte_plain = _cte(chain=True, ts=False, pf=plain_pf, mf=plain_mf)
             try:
                 if has_decay_columns:
                     rows = await conn.fetch(fb_cte_boosted + boosted_tail, *fb_boosted)
@@ -915,7 +1052,7 @@ async def search_learnings_hybrid_rrf(
                     raise
                 logger.debug("plainto_tsquery chain fallback", exc_info=True)
                 try:
-                    no_chain_cte = _cte(chain=False, ts=False, pf=plain_pf)
+                    no_chain_cte = _cte(chain=False, ts=False, pf=plain_pf, mf=plain_mf)
                     rows = await conn.fetch(
                         no_chain_cte + plain_tail, *fb_plain,
                     )
@@ -991,9 +1128,13 @@ async def search_learnings_postgres(
             )
         has_embeddings = count_row["cnt"] > 0
 
+    # Captured before aclose() so the vector/recency branches can pin the
+    # embedding space (issue #151). None for the text-fallback branch.
+    model_label: str | None = None
     if has_embeddings:
         embedder = EmbeddingService(provider=provider)
         try:
+            model_label = getattr(embedder, "model_label", None)
             query_embedding = await embedder.embed(query, input_type="query")
         except Exception:
             logger.warning(
@@ -1013,11 +1154,19 @@ async def search_learnings_postgres(
         has_project: bool,
         args: tuple[Any, ...],
         label: str,
+        model_filter_label: str | None = None,
     ) -> list[Any]:
         pf = project_filter_clause(
             project, has_project=has_project, param_index=len(args) + 1,
         )
         scoped_args = (*args, project) if pf else args
+        # Model filter binds after the project value (issue #151), so its
+        # index follows the (possibly already appended) project arg.
+        mf = model_filter_clause(
+            model_filter_label, param_index=len(scoped_args) + 1,
+        )
+        if mf:
+            scoped_args = (*scoped_args, model_filter_label)
 
         def _sql(chain_filter: str) -> str:
             return render_recall_sql(
@@ -1025,6 +1174,7 @@ async def search_learnings_postgres(
                 include_project=has_project,
                 chain_filter=chain_filter,
                 project_filter=pf,
+                model_filter=mf,
             )
         try:
             return await conn.fetch(_sql("AND superseded_by IS NULL"), *scoped_args)
@@ -1037,17 +1187,18 @@ async def search_learnings_postgres(
     async def _fetch_branch(
         conn: Any, template: str, has_project: bool,
         args: tuple[Any, ...], label: str,
+        model_filter_label: str | None = None,
     ) -> list[Any]:
         try:
             return await _fetch_with_chain_fallback(
-                conn, template, has_project, args, label,
+                conn, template, has_project, args, label, model_filter_label,
             )
         except _missing_relation_errors() as exc:
             if not has_project or not _is_project_capability_error(exc):
                 raise
             mark_project_column_missing()
             return await _fetch_with_chain_fallback(
-                conn, template, False, args, label,
+                conn, template, False, args, label, model_filter_label,
             )
 
     if has_embeddings:
@@ -1055,16 +1206,36 @@ async def search_learnings_postgres(
             from scripts.core.db.postgres_pool import init_pgvector
             await init_pgvector(conn)
             has_project = await project_column_available(conn)
+            # FIX 1 (issue #151): no model filter on a pre-migration DB —
+            # degrade to the byte-identical pre-#151 SQL, never raise.
+            if model_label is not None and not await embedding_model_column_available(conn):
+                model_label = None
 
             if recency_weight > 0:
                 rows = await _fetch_branch(
                     conn, _PG_RECENCY_SQL, has_project,
                     (str(query_embedding), k, recency_weight), "recency",
+                    model_label,
                 )
             else:
                 rows = await _fetch_branch(
                     conn, _PG_VECTOR_SQL, has_project,
                     (str(query_embedding), k), "vector",
+                    model_label,
+                )
+
+            # FIX 4 (round 2, issue #151): a model-filtered vector query can
+            # match zero rows during a split corpus (the query's space has no
+            # rows yet). resolve_search_params() sets text_fallback=True even
+            # for --vector-only, so honor it: when the vector/recency fetch is
+            # empty AND text_fallback is on, run the ILIKE text fallback rather
+            # than returning nothing. The text fallback never touches
+            # embedding_model, so it is safe across spaces.
+            if not rows and text_fallback:
+                has_project = await project_column_available(conn)
+                rows = await _fetch_branch(
+                    conn, _PG_TEXT_FALLBACK_SQL, has_project,
+                    (query, k), "text",
                 )
     elif text_fallback:
         async with pool.acquire() as conn:

@@ -64,6 +64,7 @@ class TestReadEnvOverrides:
         monkeypatch.delenv("PATTERN_DETECTION_INTERVAL_HOURS", raising=False)
         monkeypatch.delenv("OLLAMA_EMBED_MODEL", raising=False)
         monkeypatch.delenv("OLLAMA_HOST", raising=False)
+        monkeypatch.delenv("VOYAGE_EMBEDDING_MODEL", raising=False)
         monkeypatch.delenv("AGENTICA_MAX_POOL_SIZE", raising=False)
         result = read_env_overrides()
         assert result == {}
@@ -72,6 +73,13 @@ class TestReadEnvOverrides:
         monkeypatch.setenv("OLLAMA_HOST", "http://custom:1234")
         result = read_env_overrides()
         assert result["embedding"]["ollama_host"] == "http://custom:1234"
+
+    def test_voyage_embedding_model_override(self, monkeypatch):
+        # issue #151: VOYAGE_EMBEDDING_MODEL feeds embedding.voyage_model so
+        # the canonical default stays overridable from one place.
+        monkeypatch.setenv("VOYAGE_EMBEDDING_MODEL", "voyage-3-large")
+        result = read_env_overrides()
+        assert result["embedding"]["voyage_model"] == "voyage-3-large"
 
     def test_casts_int_vars(self, monkeypatch):
         monkeypatch.setenv("PATTERN_DETECTION_INTERVAL_HOURS", "12")

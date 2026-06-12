@@ -213,6 +213,7 @@ def build_vector_search_sql(
     start_date: datetime | None = None,
     end_date: datetime | None = None,
     include_active_filter: bool = True,
+    embedding_model: str | None = None,
 ) -> tuple[str, list[Any]]:
     """Build SQL for vector similarity search on archival memory.
 
@@ -224,6 +225,11 @@ def build_vector_search_sql(
         start_date: Optional start date filter.
         end_date: Optional end date filter.
         include_active_filter: Whether to add superseded_by IS NULL filter.
+        embedding_model: Optional embedding-space label (issue #151, FIX 2).
+            When set, adds ``AND embedding_model = $N`` so the session-scoped
+            dedup fallback stays within one space. ``None`` leaves the SQL
+            byte-identical to the pre-#151 path. The caller is responsible for
+            only passing a label when the column exists (capability probe).
 
     Returns:
         Tuple of (sql_string, params_list).
@@ -242,6 +248,10 @@ def build_vector_search_sql(
     )
     conditions.extend(date_conds)
     params.extend(date_params)
+    if embedding_model:
+        conditions.append(f"embedding_model = ${next_idx}")
+        params.append(embedding_model)
+        next_idx += 1
     params.append(limit)
 
     where_clause = " AND ".join(conditions)

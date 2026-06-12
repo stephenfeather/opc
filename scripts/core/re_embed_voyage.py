@@ -51,7 +51,11 @@ from scripts.core.db.embedding_service import EmbeddingError, VoyageEmbeddingPro
 from scripts.core.db.postgres_pool import close_pool, get_connection  # noqa: E402
 
 BATCH_SIZE = _get_config().embedding.re_embed_batch_size
-TARGET_MODEL = "voyage-code-3"
+# Single source of truth for the canonical embedding space (issue #151):
+# read the same config field the default voyage provider uses so a re-embed
+# run and live recall always agree on the target space. --model still
+# overrides per-run for model-to-model migrations.
+TARGET_MODEL = _get_config().embedding.voyage_model
 
 
 # ---------------------------------------------------------------------------

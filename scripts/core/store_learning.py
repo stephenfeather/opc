@@ -676,23 +676,34 @@ async def store_learning_v2(
         embedder = EmbeddingService(provider=embed_provider)
         embedding = await embedder.embed(content)
 
-        # Determine embedding model name for metadata
-        embedding_model = None
-        if hasattr(embedder, "_provider") and hasattr(embedder._provider, "model"):
-            embedding_model = embedder._provider.model
+        # Determine embedding-space label for metadata and the
+        # embedding_model column (issue #151). Use the provider's
+        # model_label property — the old .model probe missed
+        # LocalEmbeddingProvider (.model_name), silently falling back to the
+        # 'bge' column default and mislabeling rows.
+        embedding_model = getattr(embedder, "model_label", None)
 
-        # Semantic dedup check
+        # Semantic dedup check. FIX 2 (issue #151): pin the dedup probe to the
+        # SAME embedding space that will be written with the row, so a new
+        # voyage embedding is compared only against voyage rows. Without this,
+        # during the split-corpus state a spurious cross-space match would
+        # silently SKIP the write (data loss). Only postgres carries the label
+        # and the embedding_model column.
+        dedup_model = embedding_model if backend == "postgres" else None
         threshold = _dedup_threshold()
         try:
             if hasattr(memory, "search_vector_global"):
                 existing = await memory.search_vector_global(
-                    embedding, threshold=threshold, limit=1
+                    embedding, threshold=threshold, limit=1,
+                    embedding_model=dedup_model,
                 )
             else:
                 logger.debug(
                     "search_vector_global unavailable, using session-scoped dedup"
                 )
-                existing = await memory.search_vector(embedding, limit=1)
+                existing = await memory.search_vector(
+                    embedding, limit=1, embedding_model=dedup_model,
+                )
 
             dedup = check_dedup_result(
                 existing=existing, threshold=threshold, default_session=session_id
@@ -772,6 +783,7 @@ async def store_learning_v2(
             tags=tags if backend == "postgres" else None,
             project=project if backend == "postgres" else None,
             source_time=source_time if backend == "postgres" else None,
+            embedding_model=embedding_model if backend == "postgres" else None,
         )
 
         # content_hash dedup returns empty string

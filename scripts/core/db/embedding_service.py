@@ -124,6 +124,17 @@ class EmbeddingProvider(ABC):
         """Embedding dimension."""
         ...
 
+    @property
+    def model_label(self) -> str:
+        """Stable DB label for this provider's embedding space (issue #151).
+
+        This is the value written to ``archival_memory.embedding_model`` and
+        bound into the recall-time ``AND embedding_model = $N`` filter so
+        queries never cross-compare cosine distances between distinct spaces.
+        Defaults to the class name lowercased; concrete providers override.
+        """
+        return type(self).__name__.lower()
+
 
 # ---------------------------------------------------------------------------
 # Mock provider (kept here — no external dependencies, useful for testing)
@@ -151,6 +162,10 @@ class MockEmbeddingProvider(EmbeddingProvider):
     @property
     def dimension(self) -> int:
         return self._dimension
+
+    @property
+    def model_label(self) -> str:
+        return "mock"
 
 
 # ---------------------------------------------------------------------------
@@ -188,8 +203,6 @@ def create_provider(
         dim = dimension if dimension is not None else MockEmbeddingProvider.DEFAULT_DIMENSION
         return MockEmbeddingProvider(dimension=dim)
 
-    import os
-
     api_key = kwargs.get("api_key", None)
 
     if name == "openai":
@@ -202,11 +215,18 @@ def create_provider(
         )
 
     if name == "voyage":
+        # Single source of truth (issue #151): the config default is the
+        # canonical 'voyage-code-3' and already folds in the
+        # VOYAGE_EMBEDDING_MODEL env override (config _ENV_OVERRIDES), so an
+        # explicit model arg wins, otherwise the canonical/overridden config
+        # value is used — never a divergent 'voyage-3' literal that would
+        # query a third embedding space.
+        from scripts.core.config import get_config
         from scripts.core.db.embedding_providers import VoyageEmbeddingProvider
 
         voyage_model = (
             model if model is not None
-            else os.getenv("VOYAGE_EMBEDDING_MODEL", "voyage-3")
+            else get_config().embedding.voyage_model
         )
         return VoyageEmbeddingProvider(
             model=voyage_model,
@@ -352,6 +372,11 @@ class EmbeddingService:
     @property
     def dimension(self) -> int:
         return self._provider.dimension
+
+    @property
+    def model_label(self) -> str:
+        """DB embedding-space label of the underlying provider (issue #151)."""
+        return self._provider.model_label
 
     def clear_cache(self) -> None:
         self._cache.clear()

@@ -228,6 +228,10 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
     def dimension(self) -> int:
         return self.DIMENSION
 
+    @property
+    def model_label(self) -> str:
+        return self.MODEL
+
 
 class VoyageEmbeddingProvider(EmbeddingProvider):
     """Voyage AI embedding provider.
@@ -339,6 +343,11 @@ class VoyageEmbeddingProvider(EmbeddingProvider):
     def dimension(self) -> int:
         return self._dimension
 
+    @property
+    def model_label(self) -> str:
+        # Honors --model overrides (voyage-3, voyage-3-large, voyage-code-3).
+        return self.model
+
 
 class LocalEmbeddingProvider(EmbeddingProvider):
     """Local embedding provider using sentence-transformers.
@@ -434,6 +443,15 @@ class LocalEmbeddingProvider(EmbeddingProvider):
     def dimension(self) -> int:
         return self._dimension
 
+    @property
+    def model_label(self) -> str:
+        # The legacy column default and the live corpus label BGE rows 'bge'
+        # (issue #151). Map every BGE variant to that canonical label; other
+        # local models fall back to their full model name.
+        if "bge" in self.model_name.lower():
+            return "bge"
+        return self.model_name
+
 
 class OllamaEmbeddingProvider(EmbeddingProvider):
     """Ollama embedding provider using local or remote Ollama server.
@@ -492,3 +510,7 @@ class OllamaEmbeddingProvider(EmbeddingProvider):
     @property
     def dimension(self) -> int:
         return self._dimension
+
+    @property
+    def model_label(self) -> str:
+        return self.model

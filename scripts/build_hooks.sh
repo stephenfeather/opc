@@ -40,22 +40,46 @@ trap _build_cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# Fail fast on contention; reclaim only dead owners (PID heuristic kept
-# simple here - the deploy step has its own, stricter lock).
-if ! mkdir "$BUILD_LOCK_DIR" 2>/dev/null; then
-    _owner="$(cat "$BUILD_LOCK_DIR/pid" 2>/dev/null || true)"
-    if [ -n "$_owner" ] && kill -0 "$_owner" 2>/dev/null; then
-        echo "build_hooks: another build is in progress ($BUILD_LOCK_DIR) - aborting" >&2
-        exit 5
-    fi
-    rm -rf "$BUILD_LOCK_DIR"
-    if ! mkdir "$BUILD_LOCK_DIR" 2>/dev/null; then
-        echo "build_hooks: lock contention ($BUILD_LOCK_DIR) - aborting" >&2
-        exit 5
-    fi
+# Codex #161 round-3 finding: a remove-then-recreate stale reclaim lets two
+# contenders both win (the later rm -rf deletes the earlier one's fresh
+# lock). Use the same atomic quarantine-rename pattern as deploy_hooks.sh:
+# mv/rename is atomic, so only one racer can quarantine a given stale lock,
+# and ownership counts only after our PID survives a write + re-read.
+_acquire_build_lock() {
+    local attempt=0 _owner _quarantine
+    while [ "$attempt" -lt 5 ]; do
+        attempt=$((attempt + 1))
+        if mkdir "$BUILD_LOCK_DIR" 2>/dev/null; then
+            if ! printf '%s\n' "$$" >"$BUILD_LOCK_DIR/pid" 2>/dev/null; then
+                continue
+            fi
+            if [ "$(cat "$BUILD_LOCK_DIR/pid" 2>/dev/null || true)" = "$$" ]; then
+                _build_lock_acquired=1
+                return 0
+            fi
+            continue
+        fi
+        _owner="$(cat "$BUILD_LOCK_DIR/pid" 2>/dev/null || true)"
+        if [ -z "$_owner" ]; then
+            # Grace for the mkdir-to-pid-write window of a live acquirer.
+            sleep 0.1
+            _owner="$(cat "$BUILD_LOCK_DIR/pid" 2>/dev/null || true)"
+        fi
+        if [ -n "$_owner" ] && kill -0 "$_owner" 2>/dev/null; then
+            return 1
+        fi
+        _quarantine="${BUILD_LOCK_DIR}.stale.$$.$attempt"
+        if mv "$BUILD_LOCK_DIR" "$_quarantine" 2>/dev/null; then
+            rm -rf "$_quarantine" 2>/dev/null || true
+        fi
+    done
+    return 1
+}
+
+if ! _acquire_build_lock; then
+    echo "build_hooks: another build is in progress ($BUILD_LOCK_DIR) - aborting" >&2
+    exit 5
 fi
-_build_lock_acquired=1
-printf '%s\n' "$$" >"$BUILD_LOCK_DIR/pid" 2>/dev/null || true
 
 cd "$HOOKS_DIR"
 
@@ -68,11 +92,15 @@ if [ ! -d "$STAGING" ] || [ -z "$(ls -A "$STAGING" 2>/dev/null)" ]; then
     exit 1
 fi
 
-# Publish: dist/ is updated in place and never absent. --delete prunes
-# artifacts whose source no longer exists (the #161 stale-artifact class);
-# --delay-updates batches the renames so readers see old-or-new.
+# Publish: dist/ is updated in place and never absent. --delete-delay
+# (Codex #161 round-3 finding) defers pruning until AFTER --delay-updates
+# has renamed every new file into place, so a reader never sees a
+# deletion-only intermediate tree: old bundles stay visible until their
+# replacements exist, and stale artifacts (the #161 class) are pruned last.
+# This is per-file, not a directory-atomic swap - the residual window is
+# new-and-old coexisting briefly, never neither.
 mkdir -p dist
-rsync -a --delete --delay-updates "$STAGING/" dist/
+rsync -a --delete-delay --delay-updates "$STAGING/" dist/
 rm -rf "$STAGING"
 
 echo "build_hooks: published $(ls dist | wc -l | tr -d ' ') bundles to hooks/dist/"

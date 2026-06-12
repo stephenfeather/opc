@@ -3,9 +3,13 @@
  *
  * Subprocess wrappers to call Python validation and inference scripts.
  * Provides type-safe interface between TypeScript hooks and Python logic.
+ *
+ * Invocations use execFileSync with argument arrays (no shell), so prompt and
+ * pattern text are passed as literal argv entries and shell metacharacters
+ * ($(), backticks, quotes) are never interpreted.
  */
 
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import type { ValidationResult, PatternInferenceResult, PatternType } from './pattern-selector.js';
@@ -31,15 +35,18 @@ export function callValidateComposition(
   operator: string = ';'
 ): ValidationResult {
   const expr = `${patternA} ${operator}[${scope}] ${patternB}`;
-  const cmd = `uv run python scripts/validate_composition.py --json "${expr}"`;
 
   try {
-    const stdout = execSync(cmd, {
-      cwd: PROJECT_DIR,
-      encoding: 'utf-8',
-      timeout: 10000,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    const stdout = execFileSync(
+      'uv',
+      ['run', 'python', 'scripts/validate_composition.py', '--json', expr],
+      {
+        cwd: PROJECT_DIR,
+        encoding: 'utf-8',
+        timeout: 10000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      }
+    );
 
     const result = JSON.parse(stdout);
 
@@ -70,17 +77,17 @@ export function callValidateComposition(
  * @returns PatternInferenceResult with pattern, confidence, and signals
  */
 export function callPatternInference(prompt: string): PatternInferenceResult {
-  // Escape double quotes and backslashes for shell safety
-  const escaped = prompt.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-  const cmd = `uv run python scripts/agentica_patterns/pattern_inference.py "${escaped}"`;
-
   try {
-    const stdout = execSync(cmd, {
-      cwd: PROJECT_DIR,
-      encoding: 'utf-8',
-      timeout: 10000,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    const stdout = execFileSync(
+      'uv',
+      ['run', 'python', 'scripts/agentica_patterns/pattern_inference.py', prompt],
+      {
+        cwd: PROJECT_DIR,
+        encoding: 'utf-8',
+        timeout: 10000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      }
+    );
 
     const result = JSON.parse(stdout);
 

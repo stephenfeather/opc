@@ -223,7 +223,7 @@ describe('heartbeat hook', () => {
         ...actual,
         readFileSync: vi.fn((fd: unknown, ...rest: unknown[]) => {
           if (fd === 0) return '{}';
-          return actual.readFileSync(fd as string, ...rest as [string]);
+          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
         }),
       };
     });
@@ -240,11 +240,16 @@ describe('heartbeat hook', () => {
     const { main } = await import('../heartbeat.js');
     main();
 
-    const output = consoleSpy.mock.calls.map(c => c[0]).join('');
+    const output = consoleSpy.mock.calls.map((c: unknown[]) => c[0]).join('');
     expect(output).toContain('"result":"continue"');
   });
 
-  it('calls updateHeartbeatDetached when session ID is available from file', async () => {
+  // Issue #156: the file-based readSessionId fallback was deliberately removed
+  // in commit 162106f (per #85, stdin-only session identity). This test now
+  // asserts the stdin-only contract: when stdin lacks a valid session_id, the
+  // hook outputs `continue` and never calls updateHeartbeatDetached, regardless
+  // of any (now-defunct) file-based session id.
+  it('does not call updateHeartbeatDetached when stdin lacks a valid session_id', async () => {
     const mockUpdate = vi.fn();
 
     vi.doMock('fs', async () => {
@@ -253,7 +258,7 @@ describe('heartbeat hook', () => {
         ...actual,
         readFileSync: vi.fn((fd: unknown, ...rest: unknown[]) => {
           if (fd === 0) return '{}';
-          return actual.readFileSync(fd as string, ...rest as [string]);
+          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
         }),
       };
     });
@@ -263,14 +268,15 @@ describe('heartbeat hook', () => {
       SAFE_ID_PATTERN: /^[a-zA-Z0-9_-]+$/,
     }));
     vi.doMock('../shared/session-id.js', () => ({
-      readSessionId: () => 's-filetest',
       getProject: () => '/home/user/myproject',
     }));
 
     const { main } = await import('../heartbeat.js');
     main();
 
-    expect(mockUpdate).toHaveBeenCalledWith('s-filetest', '/home/user/myproject');
+    expect(mockUpdate).not.toHaveBeenCalled();
+    const output = consoleSpy.mock.calls.map((c: unknown[]) => c[0]).join('');
+    expect(output).toContain('"result":"continue"');
   });
 
   it('prefers stdin session_id over file-based session ID', async () => {
@@ -282,7 +288,7 @@ describe('heartbeat hook', () => {
         ...actual,
         readFileSync: vi.fn((fd: unknown, ...rest: unknown[]) => {
           if (fd === 0) return JSON.stringify({ session_id: 's-fromstdin' });
-          return actual.readFileSync(fd as string, ...rest as [string]);
+          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
         }),
       };
     });
@@ -309,7 +315,7 @@ describe('heartbeat hook', () => {
         ...actual,
         readFileSync: vi.fn((fd: unknown, ...rest: unknown[]) => {
           if (fd === 0) return '{}';
-          return actual.readFileSync(fd as string, ...rest as [string]);
+          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
         }),
       };
     });
@@ -326,7 +332,7 @@ describe('heartbeat hook', () => {
     const { main } = await import('../heartbeat.js');
     main();
 
-    const output = consoleSpy.mock.calls.map(c => c[0]).join('');
+    const output = consoleSpy.mock.calls.map((c: unknown[]) => c[0]).join('');
     expect(output).toContain('"result":"continue"');
   });
 });

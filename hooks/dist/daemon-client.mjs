@@ -153,6 +153,9 @@ function isDaemonReachable(projectDir) {
   }
 }
 function tryStartDaemon(projectDir) {
+  if (process.env.TLDR_NO_AUTOSTART === "1") {
+    return false;
+  }
   try {
     if (isDaemonProcessRunning(projectDir)) {
       return true;

@@ -7,10 +7,11 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { existsSync, mkdirSync, writeFileSync, rmSync, unlinkSync } from 'fs';
-import { join } from 'path';
+import { join, resolve } from 'path';
 import { execSync, spawnSync } from 'child_process';
 import * as net from 'net';
 import * as crypto from 'crypto';
+import * as os from 'os';
 
 // Import the actual implementation
 import {
@@ -27,6 +28,17 @@ import {
 const TEST_PROJECT_DIR = '/tmp/daemon-client-test';
 const TLDR_DIR = join(TEST_PROJECT_DIR, '.tldr');
 
+// Issue #156: disable the blocking spawnSync daemon auto-start in all tests so
+// missing-socket paths resolve 'unavailable' immediately instead of timing out
+// at 5s on a 'uv run tldr daemon start' subprocess.
+beforeEach(() => {
+  process.env.TLDR_NO_AUTOSTART = '1';
+});
+
+afterEach(() => {
+  delete process.env.TLDR_NO_AUTOSTART;
+});
+
 function setupTestEnv(): void {
   if (!existsSync(TLDR_DIR)) {
     mkdirSync(TLDR_DIR, { recursive: true });
@@ -39,10 +51,20 @@ function cleanupTestEnv(): void {
   }
 }
 
-// Helper to compute socket path (mirrors the daemon logic)
+// Helper to compute socket path. Delegates to the real getSocketPath so the
+// mock server binds to exactly the path the client computes (issue #156:
+// previously hard-coded /tmp, which mismatched os.tmpdir() on macOS).
 function computeSocketPath(projectDir: string): string {
-  const hash = crypto.createHash('md5').update(projectDir).digest('hex').substring(0, 8);
-  return `/tmp/tldr-${hash}.sock`;
+  return getSocketPath(projectDir);
+}
+
+// Issue #156: compute the PID-file path the client uses (${os.tmpdir()}/tldr-
+// {md5(resolve(dir))[:8]}.pid). Writing a PID file for the current process makes
+// isDaemonReachable() short-circuit true via its PID branch, so the mock-server
+// tests do not depend on macOS `nc -U` exit behavior (which hangs and times out).
+function computePidPath(projectDir: string): string {
+  const hash = crypto.createHash('md5').update(resolve(projectDir)).digest('hex').substring(0, 8);
+  return `${os.tmpdir()}/tldr-${hash}.pid`;
 }
 
 // =============================================================================
@@ -54,10 +76,10 @@ describe('getSocketPath', () => {
     // The daemon uses: /tmp/tldr-{md5(project_path)[:8]}.sock
     const projectPath = '/Users/test/myproject';
     const expectedHash = crypto.createHash('md5')
-      .update(projectPath)
+      .update(resolve(projectPath))
       .digest('hex')
       .substring(0, 8);
-    const expectedPath = `/tmp/tldr-${expectedHash}.sock`;
+    const expectedPath = `${os.tmpdir()}/tldr-${expectedHash}.sock`;
 
     expect(getSocketPath(projectPath)).toBe(expectedPath);
   });
@@ -206,6 +228,7 @@ describe('queryDaemonSync', () => {
 describe('queryDaemon async', () => {
   let mockServer: net.Server | null = null;
   let mockSocketPath: string;
+  let mockPidPath: string;
 
   beforeEach(() => {
     setupTestEnv();
@@ -214,6 +237,11 @@ describe('queryDaemon async', () => {
     if (existsSync(mockSocketPath)) {
       unlinkSync(mockSocketPath);
     }
+    // Write a PID file for the current process so isDaemonReachable() returns
+    // true via its PID branch and queryDaemon connects to the mock server
+    // instead of attempting a (now-disabled) auto-start. (issue #156)
+    mockPidPath = computePidPath(TEST_PROJECT_DIR);
+    writeFileSync(mockPidPath, String(process.pid));
   });
 
   afterEach(async () => {
@@ -228,6 +256,11 @@ describe('queryDaemon async', () => {
     if (existsSync(mockSocketPath)) {
       try {
         unlinkSync(mockSocketPath);
+      } catch {}
+    }
+    if (existsSync(mockPidPath)) {
+      try {
+        unlinkSync(mockPidPath);
       } catch {}
     }
     cleanupTestEnv();

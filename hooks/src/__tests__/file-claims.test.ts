@@ -35,7 +35,7 @@ describe('file-claims hook', () => {
               tool_input: { file_path: '/project/src/main.ts' },
             });
           }
-          return actual.readFileSync(fd as string, ...rest as [string]);
+          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
         }),
       };
     });
@@ -73,7 +73,7 @@ describe('file-claims hook', () => {
               tool_input: { file_path: '/project/src/main.ts' },
             });
           }
-          return actual.readFileSync(fd as string, ...rest as [string]);
+          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
         }),
       };
     });
@@ -92,7 +92,7 @@ describe('file-claims hook', () => {
     expect(mockCheckClaim).not.toHaveBeenCalled();
     expect(mockClaimFile).not.toHaveBeenCalled();
 
-    const output = consoleSpy.mock.calls.map(c => c[0]).join('');
+    const output = consoleSpy.mock.calls.map((c: unknown[]) => c[0]).join('');
     expect(output).toContain('"result":"continue"');
   });
 
@@ -109,7 +109,7 @@ describe('file-claims hook', () => {
               tool_input: { file_path: '/project/file.ts' },
             });
           }
-          return actual.readFileSync(fd as string, ...rest as [string]);
+          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
         }),
       };
     });
@@ -140,7 +140,7 @@ describe('file-claims hook', () => {
               tool_input: { file_path: '/project/src/shared.ts' },
             });
           }
-          return actual.readFileSync(fd as string, ...rest as [string]);
+          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
         }),
       };
     });
@@ -155,7 +155,7 @@ describe('file-claims hook', () => {
     const { main } = await import('../file-claims.js');
     main();
 
-    const output = consoleSpy.mock.calls.map(c => c[0]).join('');
+    const output = consoleSpy.mock.calls.map((c: unknown[]) => c[0]).join('');
     expect(output).toContain('File Conflict Warning');
     expect(output).toContain('s-other');
   });
@@ -173,7 +173,7 @@ describe('file-claims hook', () => {
               tool_input: { file_path: '/project/file.ts' },
             });
           }
-          return actual.readFileSync(fd as string, ...rest as [string]);
+          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
         }),
       };
     });
@@ -188,7 +188,7 @@ describe('file-claims hook', () => {
     const { main } = await import('../file-claims.js');
     main();
 
-    const output = consoleSpy.mock.calls.map(c => c[0]).join('');
+    const output = consoleSpy.mock.calls.map((c: unknown[]) => c[0]).join('');
     expect(output).toContain('"result":"continue"');
   });
 });

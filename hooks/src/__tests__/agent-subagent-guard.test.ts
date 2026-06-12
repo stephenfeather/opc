@@ -5,7 +5,7 @@ import {
   suggestAgents,
   buildDenyResponse,
   type HookInput,
-} from "../agent-subagent-guard";
+} from "../agent-subagent-guard.js";
 
 describe("agent-subagent-guard", () => {
   describe("isSubagentTypeValid", () => {

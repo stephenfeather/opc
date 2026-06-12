@@ -143,6 +143,10 @@ export interface DaemonResponse {
   results?: any[];
   result?: any;
   callers?: any[];
+  // Import/importer lookup responses (issue #156: consumed by importsDaemon,
+  // importersDaemon, edit-context-inject, impact-refactor)
+  imports?: any[];
+  importers?: any[];
   error?: string;
   indexing?: boolean;
   message?: string;
@@ -351,6 +355,13 @@ function isDaemonReachable(projectDir: string): boolean {
  * @returns true if start was attempted successfully
  */
 export function tryStartDaemon(projectDir: string): boolean {
+  // Test seam (issue #156): allow disabling the blocking spawnSync auto-start
+  // so missing-socket paths resolve 'unavailable' immediately instead of
+  // blocking on a 'uv run tldr daemon start' subprocess. Production default
+  // (env unset) is unchanged.
+  if (process.env.TLDR_NO_AUTOSTART === '1') {
+    return false;
+  }
   try {
     // FAST CHECK: Is daemon process running? (checks PID file + kill -0)
     // This is faster and more reliable than socket ping

@@ -7,6 +7,7 @@
  * Uses terminal shell PID (great-grandparent of hook process) as stable identifier.
  */
 
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';

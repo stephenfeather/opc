@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
-# deploy_hooks.sh - Mirror hooks/src and hooks/dist into $HOME/.claude/hooks/
+# deploy_hooks.sh - Mirror hooks/src, hooks/dist, and top-level runtime
+# files into $HOME/.claude/hooks/
 #
 # Issue #105: ~/opc/hooks is the source of truth; ~/.claude/hooks is the
 # Claude Code runtime location referenced by settings.json. This script keeps
 # the runtime tree in sync via rsync --delete, then verifies with diff -rq.
+#
+# Issue #157: top-level runtime files (shell/python hook entrypoints,
+# hook_launcher.py, run-python.mjs, configs) are synced too, but WITHOUT
+# --delete: the runtime tree owns state files that must survive deploys
+# (scrub-watermark, scrub-*.log).
 #
 # Usage:
 #   deploy_hooks.sh         # unconditional deploy (manual `npm run deploy`)
@@ -26,6 +32,7 @@
 #   3  dist/ verification mismatch
 #   4  refusing to deploy to unsafe target
 #   5  another deploy is already in progress (lock contention)
+#   6  top-level runtime file verification mismatch
 
 set -euo pipefail
 
@@ -325,6 +332,19 @@ _assert_target_subdirs_not_symlinks
 echo "deploy_hooks: syncing dist/ -> $TARGET_ABS/dist/"
 rsync -a --delete --delay-updates "$HOOKS_SRC/dist/" "$TARGET_ABS/dist/"
 
+# Issue #157: sync top-level runtime files (hook entrypoint scripts, configs).
+# --exclude='*/' restricts the transfer to files directly under hooks/
+# (src/, dist/, node_modules/ are never descended into). Deliberately NO
+# --delete: the runtime tree owns state the source tree never has
+# (scrub-watermark, scrub-audit.log, scrub-sweep.log) and deleting it
+# would break the credential-scrub subsystem. Stale top-level scripts
+# removed from source therefore linger in the runtime tree until removed
+# by hand - the ownerless-artifact guard tracked in issue #161 covers
+# detection of that case.
+_assert_target_not_symlink
+echo "deploy_hooks: syncing top-level runtime files -> $TARGET_ABS/"
+rsync -a --delay-updates --exclude='*/' "$HOOKS_SRC/" "$TARGET_ABS/"
+
 if ! diff -rq "$HOOKS_SRC/src/" "$TARGET_ABS/src/" >/dev/null 2>&1; then
     echo "deploy_hooks: src/ mismatch after sync:" >&2
     diff -rq "$HOOKS_SRC/src/" "$TARGET_ABS/src/" >&2 || true
@@ -337,4 +357,19 @@ if ! diff -rq "$HOOKS_SRC/dist/" "$TARGET_ABS/dist/" >/dev/null 2>&1; then
     exit 3
 fi
 
-echo "deploy_hooks: mirrored src/ and dist/ from $HOOKS_SRC/ to $TARGET_ABS/"
+# Verify top-level files one-by-one (diff -rq of the whole dir would flag
+# the runtime-only state files as extras, which is expected and fine).
+_toplevel_mismatch=0
+for _f in "$HOOKS_SRC"/*; do
+    [ -f "$_f" ] || continue
+    _base="$(basename "$_f")"
+    if ! cmp -s "$_f" "$TARGET_ABS/$_base"; then
+        echo "deploy_hooks: top-level mismatch after sync: $_base" >&2
+        _toplevel_mismatch=1
+    fi
+done
+if [ "$_toplevel_mismatch" != "0" ]; then
+    exit 6
+fi
+
+echo "deploy_hooks: mirrored src/, dist/, and top-level runtime files from $HOOKS_SRC/ to $TARGET_ABS/"

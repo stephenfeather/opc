@@ -16,6 +16,11 @@ import * as path from "path";
 import * as readline from "readline";
 import { scanAll } from "./credential-scanner/scan-all.ts";
 
+// ReDoS bound (aegis 2026-06-12): transcript lines are attacker-influenced
+// tool output; lines beyond this cap pass through unscanned rather than
+// risking catastrophic backtracking across the roughly-45 scanner rules.
+const MAX_SCAN_LINE = 64 * 1024;
+
 const AUDIT_LOG = path.join(
   process.env.HOME || "",
   ".claude",
@@ -44,6 +49,26 @@ async function scrub(transcriptPath: string): Promise<void> {
   if (!fs.existsSync(transcriptPath)) {
     process.stderr.write(`scrub-transcript: not found: ${transcriptPath}\n`);
     process.exit(1);
+  }
+
+  // Containment (aegis 2026-06-12): this binary holds an arbitrary-file
+  // write primitive (rewrite-and-rename). Restrict it to real transcripts
+  // unless explicitly overridden (tests, manual recovery).
+  if (process.env.SCRUB_ALLOW_ANY_PATH !== "1") {
+    const projectsRoot = path.join(process.env.HOME || "", ".claude", "projects");
+    let real = "";
+    try {
+      real = fs.realpathSync(transcriptPath);
+    } catch {
+      process.stderr.write(`scrub-transcript: cannot resolve: ${transcriptPath}\n`);
+      process.exit(1);
+    }
+    if (!real.startsWith(projectsRoot + path.sep) || !real.endsWith(".jsonl")) {
+      process.stderr.write(
+        `scrub-transcript: refusing path outside ${projectsRoot} (set SCRUB_ALLOW_ANY_PATH=1 to override): ${real}\n`,
+      );
+      process.exit(1);
+    }
   }
 
   // Per-file lock (sibling of transcript) so the daily cron and SessionEnd
@@ -77,7 +102,7 @@ async function scrub(transcriptPath: string): Promise<void> {
   try {
     for await (const line of reader) {
       let scrubbed = line;
-      const findings = scanAll(line);
+      const findings = line.length <= MAX_SCAN_LINE ? scanAll(line) : [];
       for (const f of findings) {
         // Skip if the match is already a redaction marker — keeps the rule-id
         // stable across re-runs and makes the scrubber strictly idempotent.

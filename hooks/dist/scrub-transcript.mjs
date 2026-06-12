@@ -373,6 +373,7 @@ function scanAll(text) {
 }
 
 // src/scrub-transcript.ts
+var MAX_SCAN_LINE = 64 * 1024;
 var AUDIT_LOG = path.join(
   process.env.HOME || "",
   ".claude",
@@ -400,6 +401,24 @@ async function scrub(transcriptPath) {
 `);
     process.exit(1);
   }
+  if (process.env.SCRUB_ALLOW_ANY_PATH !== "1") {
+    const projectsRoot = path.join(process.env.HOME || "", ".claude", "projects");
+    let real = "";
+    try {
+      real = fs.realpathSync(transcriptPath);
+    } catch {
+      process.stderr.write(`scrub-transcript: cannot resolve: ${transcriptPath}
+`);
+      process.exit(1);
+    }
+    if (!real.startsWith(projectsRoot + path.sep) || !real.endsWith(".jsonl")) {
+      process.stderr.write(
+        `scrub-transcript: refusing path outside ${projectsRoot} (set SCRUB_ALLOW_ANY_PATH=1 to override): ${real}
+`
+      );
+      process.exit(1);
+    }
+  }
   const lockPath = `${transcriptPath}.scrub.lock`;
   let lockFd;
   try {
@@ -425,7 +444,7 @@ async function scrub(transcriptPath) {
   try {
     for await (const line of reader) {
       let scrubbed = line;
-      const findings = scanAll(line);
+      const findings = line.length <= MAX_SCAN_LINE ? scanAll(line) : [];
       for (const f of findings) {
         if (f.secretValue.startsWith("[REDACTED:")) continue;
         let secret = f.secretValue;

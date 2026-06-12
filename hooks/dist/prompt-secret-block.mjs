@@ -402,7 +402,7 @@ function main() {
   }
   const prompt = input.prompt ?? "";
   if (!prompt) process.exit(0);
-  const findings = scanAll(prompt).filter(
+  const findings = scanAll(prompt.slice(0, 64 * 1024)).filter(
     (f) => f.category === "secret"
   );
   if (findings.length === 0) process.exit(0);

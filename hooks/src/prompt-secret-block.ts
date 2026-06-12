@@ -48,7 +48,9 @@ function main(): void {
   const prompt = input.prompt ?? '';
   if (!prompt) process.exit(0);
 
-  const findings: Finding[] = scanAll(prompt).filter(
+  // ReDoS bound (aegis 2026-06-12): scan at most the first 64KB. Prompts
+  // beyond that are far outside interactive use; bounding beats backtracking.
+  const findings: Finding[] = scanAll(prompt.slice(0, 64 * 1024)).filter(
     (f: Finding) => f.category === 'secret',
   );
   if (findings.length === 0) process.exit(0);

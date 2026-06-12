@@ -8,8 +8,13 @@ import { fileURLToPath } from "url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SCRUB_BIN = path.resolve(__dirname, "..", "..", "dist", "scrub-transcript.mjs");
 
-function runScrub(transcriptPath: string) {
-  return spawnSync("node", [SCRUB_BIN, transcriptPath], { encoding: "utf-8" });
+function runScrub(transcriptPath: string, env: Record<string, string> = {}) {
+  return spawnSync("node", [SCRUB_BIN, transcriptPath], {
+    encoding: "utf-8",
+    // Tests operate on tmpdir fixtures, outside the ~/.claude/projects
+    // containment boundary enforced for real invocations.
+    env: { ...process.env, SCRUB_ALLOW_ANY_PATH: "1", ...env },
+  });
 }
 
 function makeTranscript(lines: string[]): string {
@@ -79,6 +84,33 @@ describe("scrub-transcript CLI", () => {
     expect(res.status).toBe(0);
     expect(fs.readFileSync(p, "utf-8")).toContain("[REDACTED:");
     expect(fs.statSync(p).mode & 0o777).toBe(0o600);
+  });
+
+  it("refuses paths outside ~/.claude/projects without the override", () => {
+    const p = makeTranscript([
+      JSON.stringify({ role: "user", content: `token is ${FAKE_DO_TOKEN}` }),
+    ]);
+    const before = fs.readFileSync(p, "utf-8");
+    const res = spawnSync("node", [SCRUB_BIN, p], {
+      encoding: "utf-8",
+      env: { ...process.env, SCRUB_ALLOW_ANY_PATH: "" },
+    });
+    expect(res.status).toBe(1);
+    expect(fs.readFileSync(p, "utf-8")).toBe(before); // untouched
+  });
+
+  it("passes oversized lines through unscanned instead of risking ReDoS", () => {
+    const hugeLine = JSON.stringify({
+      role: "user",
+      content: `token is ${FAKE_DO_TOKEN} ` + "A".repeat(70 * 1024),
+    });
+    const normalLine = JSON.stringify({ role: "user", content: `also ${FAKE_DO_TOKEN}` });
+    const p = makeTranscript([hugeLine, normalLine]);
+    const res = runScrub(p);
+    expect(res.status).toBe(0);
+    const after = fs.readFileSync(p, "utf-8").split("\n");
+    expect(after[0]).toBe(hugeLine); // beyond cap: untouched by design
+    expect(after[1]).toContain("[REDACTED:"); // normal line still scrubbed
   });
 
   it("is idempotent: scrubbing twice leaves the file stable", () => {

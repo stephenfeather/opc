@@ -171,9 +171,13 @@ function deriveWorkingOn(input, cache) {
       next.currentId = id;
       return { workingOn: label, cache: next };
     }
-    if ((ti.status === "completed" || ti.status === "deleted") && id === next.currentId) {
-      next.currentId = null;
-      return { workingOn: "", cache: next };
+    if (ti.status === "completed" || ti.status === "deleted") {
+      delete next.tasks[id];
+      if (id === next.currentId) {
+        next.currentId = null;
+        return { workingOn: "", cache: next };
+      }
+      return { workingOn: null, cache: next };
     }
   }
   return { workingOn: null, cache: next };

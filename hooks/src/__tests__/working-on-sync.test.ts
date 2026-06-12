@@ -132,6 +132,16 @@ describe("deriveWorkingOn — native Task tools", () => {
     expect(r.cache.currentId).toBe("2");
   });
 
+  it("prunes a task's cache entry when it completes (bounded growth)", () => {
+    const cache = { tasks: { "1": "Backporting", "2": "Fixing 65" }, currentId: "2" };
+    const r = deriveWorkingOn(
+      { tool_name: "TaskUpdate", tool_input: { taskId: "1", status: "completed" } },
+      cache,
+    );
+    expect(r.cache.tasks["1"]).toBeUndefined();
+    expect(r.cache.tasks["2"]).toBe("Fixing 65"); // active task retained
+  });
+
   it("does not mutate the input cache (immutability)", () => {
     const cache = { tasks: { "1": "A" }, currentId: null };
     deriveWorkingOn(

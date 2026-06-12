@@ -103,9 +103,15 @@ export function deriveWorkingOn(
       next.currentId = id;
       return { workingOn: label, cache: next };
     }
-    if ((ti.status === 'completed' || ti.status === 'deleted') && id === next.currentId) {
-      next.currentId = null;
-      return { workingOn: '', cache: next }; // active task finished — clear
+    if (ti.status === 'completed' || ti.status === 'deleted') {
+      // Drop the finished task's label so the cache stays bounded to the
+      // currently-active tasks rather than growing for the whole session.
+      delete next.tasks[id];
+      if (id === next.currentId) {
+        next.currentId = null;
+        return { workingOn: '', cache: next }; // active task finished — clear
+      }
+      return { workingOn: null, cache: next };
     }
   }
 

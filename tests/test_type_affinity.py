@@ -328,6 +328,143 @@ class TestFetchCentroids:
 
         assert await ta.fetch_type_centroids("voyage-code-3") is None
 
+    async def test_unparseable_row_makes_whole_aggregate_none(self, monkeypatch):
+        """Finding 2 (round 2): all-or-nothing. A single malformed centroid must
+        reject the WHOLE aggregate (return None), not silently drop one type and
+        return the rest — a partial distribution biases ranking against the
+        missing type."""
+        from scripts.core import type_affinity as ta
+
+        conn = _FakeConn(
+            rows=[
+                {"ltype": "USER_PREFERENCE", "centroid": "[0.1, 0.2]"},
+                {"ltype": "ERROR_FIX", "centroid": "not valid json"},
+            ]
+        )
+
+        async def fake_get_pool():
+            return _FakePool(conn)
+
+        monkeypatch.setattr("scripts.core.db.postgres_pool.get_pool", fake_get_pool)
+        assert await ta.fetch_type_centroids("voyage-code-3") is None
+
+    async def test_inconsistent_dimensions_make_aggregate_none(self, monkeypatch):
+        """Vectors of differing dimensionality cannot be compared by cosine —
+        reject the whole aggregate."""
+        from scripts.core import type_affinity as ta
+
+        conn = _FakeConn(
+            rows=[
+                {"ltype": "USER_PREFERENCE", "centroid": "[0.1, 0.2]"},
+                {"ltype": "ERROR_FIX", "centroid": "[0.3, 0.4, 0.5]"},
+            ]
+        )
+
+        async def fake_get_pool():
+            return _FakePool(conn)
+
+        monkeypatch.setattr("scripts.core.db.postgres_pool.get_pool", fake_get_pool)
+        assert await ta.fetch_type_centroids("voyage-code-3") is None
+
+    async def test_non_finite_value_makes_aggregate_none(self, monkeypatch):
+        """A NaN/Inf component poisons cosine similarity — reject the aggregate."""
+        from scripts.core import type_affinity as ta
+
+        conn = _FakeConn(
+            rows=[
+                {"ltype": "USER_PREFERENCE", "centroid": "[0.1, 0.2]"},
+                {"ltype": "ERROR_FIX", "centroid": "[NaN, 0.4]"},
+            ]
+        )
+
+        async def fake_get_pool():
+            return _FakePool(conn)
+
+        monkeypatch.setattr("scripts.core.db.postgres_pool.get_pool", fake_get_pool)
+        assert await ta.fetch_type_centroids("voyage-code-3") is None
+
+
+class TestCachedEnvelopeValidation:
+    """Finding 2 (round 2): a cached envelope with a corrupt/partial centroid
+    set must be rejected wholesale (None), never read as a partial distribution
+    that biases ranking. read_centroid_cache does the all-or-nothing check."""
+
+    def test_non_list_centroid_rejected(self, tmp_path):
+        import json
+
+        from scripts.core.type_affinity import read_centroid_cache
+
+        path = tmp_path / "c.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "model_label": "voyage-code-3",
+                    "computed_at": "2026-01-01T00:00:00+00:00",
+                    "centroids": {"A": [1.0, 2.0], "B": "not-a-vector"},
+                }
+            )
+        )
+        assert read_centroid_cache(path) is None
+
+    def test_inconsistent_dims_rejected(self, tmp_path):
+        import json
+
+        from scripts.core.type_affinity import read_centroid_cache
+
+        path = tmp_path / "c.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "model_label": "voyage-code-3",
+                    "computed_at": "2026-01-01T00:00:00+00:00",
+                    "centroids": {"A": [1.0, 2.0], "B": [1.0, 2.0, 3.0]},
+                }
+            )
+        )
+        assert read_centroid_cache(path) is None
+
+    def test_non_finite_rejected(self, tmp_path):
+
+        from scripts.core.type_affinity import read_centroid_cache
+
+        path = tmp_path / "c.json"
+        # json allows NaN/Infinity by default on load.
+        path.write_text(
+            '{"model_label": "voyage-code-3", '
+            '"computed_at": "2026-01-01T00:00:00+00:00", '
+            '"centroids": {"A": [1.0, 2.0], "B": [NaN, 2.0]}}'
+        )
+        assert read_centroid_cache(path) is None
+
+    def test_empty_centroids_rejected(self, tmp_path):
+        import json
+
+        from scripts.core.type_affinity import read_centroid_cache
+
+        path = tmp_path / "c.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "model_label": "voyage-code-3",
+                    "computed_at": "2026-01-01T00:00:00+00:00",
+                    "centroids": {},
+                }
+            )
+        )
+        assert read_centroid_cache(path) is None
+
+    def test_valid_consistent_envelope_accepted(self, tmp_path):
+        from scripts.core.type_affinity import read_centroid_cache, write_centroid_cache
+
+        path = tmp_path / "c.json"
+        write_centroid_cache(
+            path, model_label="voyage-code-3",
+            centroids={"A": [1.0, 2.0], "B": [3.0, 4.0]},
+        )
+        cache = read_centroid_cache(path)
+        assert cache is not None
+        assert cache.centroids == {"A": [1.0, 2.0], "B": [3.0, 4.0]}
+
 
 # ---------------------------------------------------------------------------
 # Orchestrator: compute_type_probabilities
@@ -494,3 +631,132 @@ class TestLoadOrComputeCentroids:
         # Generous bound (flake lesson): the deadline must fire well before the
         # 5s block — proving the read was awaited off-thread and is preemptible.
         assert elapsed < 3.0
+
+    async def test_write_failure_still_returns_centroids(self, monkeypatch, tmp_path):
+        """Finding 1 (round 2): a cache write failure is not an inference
+        failure. The freshly computed centroids must still be returned even if
+        persisting them raises."""
+        from scripts.core import type_affinity as ta
+
+        path = tmp_path / "centroids.json"
+
+        async def fake_fetch(model_label):
+            return {"USER_PREFERENCE": [0.1, 0.2]}
+
+        def boom_write(*_a, **_kw):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(ta, "fetch_type_centroids", fake_fetch)
+        monkeypatch.setattr(ta, "write_centroid_cache", boom_write)
+
+        out = await ta.load_or_compute_centroids(
+            "voyage-code-3", cache_path=path, ttl_seconds=86400,
+        )
+        assert out == {"USER_PREFERENCE": [0.1, 0.2]}
+
+    async def test_blocking_cache_write_is_preemptible(self, monkeypatch, tmp_path):
+        """Finding 1 (round 2): the cache write must also run off the event loop
+        so a slow/blocking write stays inside the wait_for deadline."""
+        import asyncio
+        import time
+
+        from scripts.core import type_affinity as ta
+
+        path = tmp_path / "centroids.json"
+        block_seconds = 5.0
+        deadline = 0.3
+
+        async def fake_fetch(model_label):
+            return {"USER_PREFERENCE": [0.1, 0.2]}
+
+        def blocking_write(*_a, **_kw):
+            time.sleep(block_seconds)
+
+        monkeypatch.setattr(ta, "fetch_type_centroids", fake_fetch)
+        monkeypatch.setattr(ta, "write_centroid_cache", blocking_write)
+
+        start = time.monotonic()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                ta.load_or_compute_centroids(
+                    "voyage-code-3", cache_path=path, ttl_seconds=86400,
+                ),
+                timeout=deadline,
+            )
+        elapsed = time.monotonic() - start
+        assert elapsed < 3.0
+
+
+# ---------------------------------------------------------------------------
+# Finding 1 (round 2): concurrency-safe atomic cache write
+# ---------------------------------------------------------------------------
+
+
+class TestConcurrentCacheWrite:
+    def test_write_uses_unique_temp_not_fixed_sibling(self, monkeypatch, tmp_path):
+        """The temp file must be unique per writer (mkstemp/NamedTemporaryFile),
+        never the fixed '<path>.tmp' sibling that two cold-cache processes would
+        both open and corrupt."""
+        import scripts.core.type_affinity as ta
+
+        path = tmp_path / "centroids.json"
+        fixed_sibling = path.with_suffix(path.suffix + ".tmp")
+
+        created_tmps: list[str] = []
+        real_replace = ta.os.replace
+
+        def spy_replace(src, dst):
+            created_tmps.append(str(src))
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(ta.os, "replace", spy_replace)
+
+        ta.write_centroid_cache(
+            path, model_label="voyage-code-3", centroids={"A": [1.0, 2.0]},
+        )
+
+        assert len(created_tmps) == 1
+        # The atomic source was NOT the predictable fixed sibling.
+        assert created_tmps[0] != str(fixed_sibling)
+        # Final file is the complete envelope.
+        cache = ta.read_centroid_cache(path)
+        assert cache is not None and cache.centroids == {"A": [1.0, 2.0]}
+
+    def test_concurrent_writers_leave_one_valid_envelope(self, tmp_path):
+        """Two writers racing on the same target must leave exactly one
+        complete, valid envelope — never a torn/poisoned file. Unique temp
+        files + os.replace make each publish atomic."""
+        import threading
+
+        import scripts.core.type_affinity as ta
+
+        path = tmp_path / "centroids.json"
+        barrier = threading.Barrier(2)
+
+        def writer(label: str, vec: list[float]):
+            barrier.wait()  # maximize overlap
+            for _ in range(20):
+                ta.write_centroid_cache(
+                    path, model_label=label, centroids={"A": vec},
+                )
+
+        t1 = threading.Thread(target=writer, args=("voyage-code-3", [1.0, 2.0]))
+        t2 = threading.Thread(target=writer, args=("voyage-3", [3.0, 4.0]))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        # No leftover temp files in the directory (all replaced/cleaned up).
+        leftovers = [
+            p for p in tmp_path.iterdir()
+            if p.name != "centroids.json"
+        ]
+        assert leftovers == [], f"stray temp files: {leftovers}"
+
+        # The final file is exactly one complete, valid envelope (one writer
+        # won the last replace; the other did not corrupt it).
+        cache = ta.read_centroid_cache(path)
+        assert cache is not None
+        assert cache.model_label in ("voyage-code-3", "voyage-3")
+        assert cache.centroids in ({"A": [1.0, 2.0]}, {"A": [3.0, 4.0]})

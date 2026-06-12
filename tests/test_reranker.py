@@ -235,6 +235,22 @@ class TestTypeMatch:
         )
         assert type_match(result, ctx) == 0.0
 
+    def test_type_absent_from_distribution_is_neutral(self):
+        """Finding 2 (round 2): a learning_type that is genuinely typed but
+        absent from a non-None distribution must fall back to NEUTRAL (0.5),
+        not 0.0. The corpus can legitimately gain a new learning_type between
+        centroid refreshes (cache TTL window); penalizing every result of that
+        type by the full type weight would contradict the fail-to-neutral
+        contract and bias ranking against new types."""
+        result = _make_result(learning_type="BRAND_NEW_TYPE")
+        ctx = RecallContext(
+            type_probabilities={
+                "WORKING_SOLUTION": 0.7,
+                "ERROR_FIX": 0.3,
+            }
+        )
+        assert type_match(result, ctx) == 0.5
+
 
 # ---------------------------------------------------------------------------
 # Signal Function Tests: tag_overlap

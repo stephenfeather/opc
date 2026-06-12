@@ -202,7 +202,20 @@ def recall_score(
 
 
 def type_match(result: dict, ctx: RecallContext) -> float:
-    """Score based on type affinity from soft distribution."""
+    """Score based on type affinity from soft distribution.
+
+    Neutral (0.5) when no distribution is available. An untyped result keeps
+    its 0.0 (it carries no type to score against — unchanged contract).
+
+    Finding 2 (round 2): a learning_type that IS present on the result but
+    ABSENT from a non-None distribution falls back to NEUTRAL (0.5), not 0.0.
+    The corpus can legitimately gain a new learning_type between centroid
+    refreshes (the cache TTL window), and the centroid aggregate validates
+    all-or-nothing — so a missing key means "unknown", not "irrelevant".
+    Scoring it 0.0 would penalize every result of that type by the full type
+    weight, biasing ranking against new types and contradicting the
+    fail-to-neutral contract.
+    """
     if ctx.type_probabilities is None:
         return 0.5
 
@@ -210,7 +223,7 @@ def type_match(result: dict, ctx: RecallContext) -> float:
     if not learning_type:
         return 0.0
 
-    return ctx.type_probabilities.get(learning_type, 0.0)
+    return ctx.type_probabilities.get(learning_type, 0.5)
 
 
 def tag_overlap(result: dict, ctx: RecallContext) -> float:

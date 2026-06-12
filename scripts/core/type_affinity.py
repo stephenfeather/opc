@@ -28,6 +28,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import os
+import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -95,6 +98,40 @@ class CentroidCache:
     model_label: str
     computed_at: datetime
     centroids: dict[str, list[float]]
+
+
+def validate_centroids(centroids: object) -> dict[str, list[float]] | None:
+    """All-or-nothing validation of a centroid set (finding 2, round 2).
+
+    Returns a clean ``{type: vector}`` dict only when EVERY entry is a non-empty
+    list of finite numbers AND all vectors share one dimensionality. Any single
+    defect (non-list value, empty vector, NaN/Inf, mixed dims) rejects the whole
+    set → ``None``. A partial set would let ``type_match`` penalize results of
+    the dropped type by the full type weight, biasing ranking — the opposite of
+    the fail-to-neutral contract. The empty set is also rejected (no signal).
+    """
+    if not isinstance(centroids, dict) or not centroids:
+        return None
+    out: dict[str, list[float]] = {}
+    dim: int | None = None
+    for ltype, vec in centroids.items():
+        if not ltype or not isinstance(vec, list) or not vec:
+            return None
+        clean: list[float] = []
+        for x in vec:
+            # bool is an int subclass; reject it explicitly. Strings/None raise.
+            if isinstance(x, bool) or not isinstance(x, (int, float)):
+                return None
+            fx = float(x)
+            if not math.isfinite(fx):
+                return None
+            clean.append(fx)
+        if dim is None:
+            dim = len(clean)
+        elif len(clean) != dim:
+            return None
+        out[str(ltype)] = clean
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -182,8 +219,14 @@ def read_centroid_cache(path: str | Path) -> CentroidCache | None:
         return None
     label = data.get("model_label")
     computed_raw = data.get("computed_at")
-    centroids = data.get("centroids")
-    if not label or not computed_raw or not isinstance(centroids, dict):
+    raw_centroids = data.get("centroids")
+    if not label or not computed_raw:
+        return None
+    # All-or-nothing centroid validation (finding 2, round 2): a partial or
+    # corrupt cached set is rejected wholesale so it can never be read as a
+    # partial distribution that biases ranking against a missing type.
+    centroids = validate_centroids(raw_centroids)
+    if centroids is None:
         return None
     try:
         computed_at = datetime.fromisoformat(computed_raw)
@@ -203,9 +246,18 @@ def write_centroid_cache(
 ) -> None:
     """Persist centroids with a model_label + computed_at envelope.
 
-    Best-effort: a write failure (e.g. unwritable config dir) is logged and
-    swallowed so it can never abort recall. Writes atomically via a temp file
-    + replace so a concurrent reader never observes a half-written file.
+    Concurrency-safe atomic publish (finding 1, round 2). Two cold-cache recall
+    processes can race here, so a FIXED ``<path>.tmp`` sibling is unsafe — both
+    would open the same file and produce a torn/poisoned cache. Instead each
+    writer gets a UNIQUE temp file (``mkstemp`` in the target directory),
+    write + flush + fsync + close, then ``os.replace`` (atomic rename on POSIX).
+    A reader therefore only ever sees a fully-written file, and the last writer
+    to ``replace`` wins cleanly. The unique temp is removed on any failure so no
+    stray ``.tmp`` files accumulate.
+
+    Best-effort: a write failure (unwritable dir, disk full) is logged and
+    swallowed so it can never abort recall. Synchronous by design; the recall
+    hot path runs it off the event loop (see ``load_or_compute_centroids``).
     """
     p = Path(path)
     timestamp = (now if now is not None else datetime.now(UTC)).isoformat()
@@ -214,12 +266,28 @@ def write_centroid_cache(
         "computed_at": timestamp,
         "centroids": centroids,
     }
+    tmp_name: str | None = None
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(p.suffix + ".tmp")
-        with open(tmp, "w") as f:
-            json.dump(envelope, f)
-        tmp.replace(p)
+        # Unique temp in the SAME directory so os.replace is an atomic rename
+        # (cross-filesystem rename is not atomic).
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(p.parent), prefix=p.name + ".", suffix=".tmp",
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(envelope, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_name, p)
+            tmp_name = None  # successfully published; nothing to clean up
+        finally:
+            # Remove the unique temp if replace never happened (error path).
+            if tmp_name is not None:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    logger.debug("temp centroid cache cleanup failed", exc_info=True)
     except OSError:
         logger.debug("type-centroid cache write failed", exc_info=True)
 
@@ -229,28 +297,33 @@ def write_centroid_cache(
 # ---------------------------------------------------------------------------
 
 
-def _parse_centroid_rows(rows: list) -> dict[str, list[float]]:
-    """Parse (ltype, centroid-text) rows into a centroids dict.
+def _parse_centroid_rows(rows: list) -> dict[str, list[float]] | None:
+    """Parse (ltype, centroid-text) rows into a validated centroids dict.
 
-    pgvector's ``avg(embedding)::text`` is a JSON-array-like string. Rows with
-    a null type or an unparseable centroid are skipped rather than aborting the
-    whole aggregate.
+    All-or-nothing (finding 2, round 2): pgvector's ``avg(embedding)::text`` is
+    a JSON-array-like string. A single null type, unparseable centroid, or a row
+    that fails ``validate_centroids`` (non-finite, inconsistent dims) rejects the
+    WHOLE aggregate → ``None``, so the caller degrades to neutral reranking
+    instead of producing a partial distribution that biases ranking against the
+    dropped type. An empty result is also ``None`` (no signal).
     """
-    out: dict[str, list[float]] = {}
+    raw: dict[str, list[float]] = {}
     for row in rows:
         ltype = row["ltype"] if not hasattr(row, "get") else row.get("ltype")
         centroid_text = (
             row["centroid"] if not hasattr(row, "get") else row.get("centroid")
         )
         if not ltype or centroid_text is None:
-            continue
+            return None
         try:
             vec = json.loads(centroid_text)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if isinstance(vec, list) and vec:
-            out[str(ltype)] = [float(x) for x in vec]
-    return out
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        if not isinstance(vec, list):
+            return None
+        raw[str(ltype)] = vec
+    # validate_centroids enforces finiteness, non-emptiness, and uniform dims.
+    return validate_centroids(raw)
 
 
 def _is_missing_column_error(exc: Exception) -> bool:
@@ -331,7 +404,16 @@ async def load_or_compute_centroids(
     if centroids is None:
         return None
 
-    write_centroid_cache(path, model_label=model_label, centroids=centroids)
+    # Finding 1 (round 2): persist off the event loop so a slow/blocking write
+    # stays inside the caller's wait_for deadline. A write failure must NOT
+    # become an inference failure — we already have the centroids in memory, so
+    # swallow any write error and still return them.
+    try:
+        await asyncio.to_thread(
+            write_centroid_cache, path, model_label=model_label, centroids=centroids,
+        )
+    except Exception:  # noqa: BLE001 - write is best-effort; inference succeeded
+        logger.debug("centroid cache persist failed; returning in-memory", exc_info=True)
     return centroids
 
 

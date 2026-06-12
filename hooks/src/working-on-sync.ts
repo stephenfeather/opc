@@ -160,10 +160,9 @@ function writeCache(sessionId: string, cache: WorkingOnCache): void {
   try {
     const dir = join(p, '..');
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    const tmp = `${p}.tmp`;
+    const tmp = `${p}.tmp.${process.pid}`;
     writeFileSync(tmp, JSON.stringify(cache), 'utf-8');
     renameSync(tmp, p);
-  } catch {
     // Cache is best-effort; a write failure must never break the hook.
   }
 }

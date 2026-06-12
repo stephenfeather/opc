@@ -6,10 +6,11 @@
 # Claude Code runtime location referenced by settings.json. This script keeps
 # the runtime tree in sync via rsync --delete, then verifies with diff -rq.
 #
-# Issue #157: top-level runtime files (shell/python hook entrypoints,
-# hook_launcher.py, run-python.mjs, configs) are synced too, but WITHOUT
-# --delete: the runtime tree owns state files that must survive deploys
-# (scrub-watermark, scrub-*.log).
+# Issue #157: top-level runtime files are synced too, via an explicit
+# allowlist (top-level *.sh, *.py, *.mjs). Removed entrypoints are retired
+# from the target using the .opc-managed-toplevel manifest; runtime-only
+# state (scrub-watermark, scrub-*.log) is outside the managed set and
+# always survives deploys.
 #
 # Usage:
 #   deploy_hooks.sh         # unconditional deploy (manual `npm run deploy`)
@@ -332,18 +333,55 @@ _assert_target_subdirs_not_symlinks
 echo "deploy_hooks: syncing dist/ -> $TARGET_ABS/dist/"
 rsync -a --delete --delay-updates "$HOOKS_SRC/dist/" "$TARGET_ABS/dist/"
 
-# Issue #157: sync top-level runtime files (hook entrypoint scripts, configs).
-# --exclude='*/' restricts the transfer to files directly under hooks/
-# (src/, dist/, node_modules/ are never descended into). Deliberately NO
-# --delete: the runtime tree owns state the source tree never has
-# (scrub-watermark, scrub-audit.log, scrub-sweep.log) and deleting it
-# would break the credential-scrub subsystem. Stale top-level scripts
-# removed from source therefore linger in the runtime tree until removed
-# by hand - the ownerless-artifact guard tracked in issue #161 covers
-# detection of that case.
+# Issue #157: sync top-level runtime files (hook entrypoint scripts).
+#
+# Codex round-1 findings drove this design:
+#   1. The managed set is an explicit pattern allowlist - top-level *.sh,
+#      *.py, *.mjs files. A bare directory rsync would also ship ignored
+#      local state (.env, .DS_Store, scratch files) into the runtime tree;
+#      shell globs never match dotfiles, so those cannot leak.
+#   2. Retirement is manifest-driven instead of rsync --delete: the synced
+#      file list is recorded in $TARGET_ABS/.opc-managed-toplevel, and on
+#      the next deploy any file in the PREVIOUS manifest that left the
+#      managed set is deleted from the target. Runtime-only state
+#      (scrub-watermark, scrub-*.log) is never in the manifest, so it
+#      always survives deploys.
+_managed_toplevel() {
+    local _f
+    for _f in "$HOOKS_SRC"/*.sh "$HOOKS_SRC"/*.py "$HOOKS_SRC"/*.mjs; do
+        [ -f "$_f" ] || continue   # unmatched glob literal or non-file
+        [ -L "$_f" ] && continue   # never deploy symlinked entrypoints
+        basename "$_f"
+    done
+}
+
+TOPLEVEL_MANIFEST_TARGET="$TARGET_ABS/.opc-managed-toplevel"
+_toplevel_manifest_new="$(mktemp "${TMPDIR:-/tmp}/opc-toplevel-manifest.XXXXXX")"
+trap 'rm -f "$_toplevel_manifest_new" 2>/dev/null; _release_lock' EXIT INT TERM
+_managed_toplevel >"$_toplevel_manifest_new"
+
 _assert_target_not_symlink
 echo "deploy_hooks: syncing top-level runtime files -> $TARGET_ABS/"
-rsync -a --delay-updates --exclude='*/' "$HOOKS_SRC/" "$TARGET_ABS/"
+if [ -s "$_toplevel_manifest_new" ]; then
+    rsync -a --delay-updates --files-from="$_toplevel_manifest_new" \
+        "$HOOKS_SRC/" "$TARGET_ABS/"
+fi
+
+# Retire managed files that disappeared from the source tree. Only names
+# recorded by a previous deploy are eligible; entries are constrained to
+# plain basenames so a corrupted manifest cannot delete outside TARGET_ABS.
+if [ -f "$TOPLEVEL_MANIFEST_TARGET" ]; then
+    while IFS= read -r _old; do
+        case "$_old" in
+            '' | . | .. | */* | -*) continue ;;
+        esac
+        if ! grep -qxF "$_old" "$_toplevel_manifest_new"; then
+            rm -f "$TARGET_ABS/$_old"
+            echo "deploy_hooks: retired stale top-level file: $_old"
+        fi
+    done <"$TOPLEVEL_MANIFEST_TARGET"
+fi
+cp "$_toplevel_manifest_new" "$TOPLEVEL_MANIFEST_TARGET"
 
 if ! diff -rq "$HOOKS_SRC/src/" "$TARGET_ABS/src/" >/dev/null 2>&1; then
     echo "deploy_hooks: src/ mismatch after sync:" >&2
@@ -357,17 +395,16 @@ if ! diff -rq "$HOOKS_SRC/dist/" "$TARGET_ABS/dist/" >/dev/null 2>&1; then
     exit 3
 fi
 
-# Verify top-level files one-by-one (diff -rq of the whole dir would flag
-# the runtime-only state files as extras, which is expected and fine).
+# Verify exactly the managed set (same manifest that drove the rsync, so
+# dotfile or unmanaged-extension drift is impossible by construction and
+# runtime-only state files in the target are never flagged as extras).
 _toplevel_mismatch=0
-for _f in "$HOOKS_SRC"/*; do
-    [ -f "$_f" ] || continue
-    _base="$(basename "$_f")"
-    if ! cmp -s "$_f" "$TARGET_ABS/$_base"; then
+while IFS= read -r _base; do
+    if ! cmp -s "$HOOKS_SRC/$_base" "$TARGET_ABS/$_base"; then
         echo "deploy_hooks: top-level mismatch after sync: $_base" >&2
         _toplevel_mismatch=1
     fi
-done
+done <"$_toplevel_manifest_new"
 if [ "$_toplevel_mismatch" != "0" ]; then
     exit 6
 fi

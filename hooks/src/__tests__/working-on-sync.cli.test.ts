@@ -95,6 +95,30 @@ describe("working-on-sync CLI", () => {
     expect(JSON.parse(res.stdout.trim()).result).toBe("continue");
   });
 
+  it("falls back to USERPROFILE when HOME is unset (Windows)", () => {
+    const env: Record<string, string> = {
+      ...(process.env as Record<string, string>),
+      USERPROFILE: home,
+      CONTINUOUS_CLAUDE_DB_URL: "",
+      DATABASE_URL: "",
+      OPC_POSTGRES_URL: "",
+    };
+    delete env.HOME;
+    const res = spawnSync("node", [BIN], {
+      encoding: "utf-8",
+      input: JSON.stringify({
+        session_id: SESSION,
+        tool_name: "TaskCreate",
+        tool_input: { activeForm: "Fixing 65" },
+        tool_response: "Task #2 created",
+      }),
+      env,
+    });
+    expect(res.status).toBe(0);
+    const cache = JSON.parse(fs.readFileSync(cacheFile(home), "utf-8"));
+    expect(cache.tasks["2"]).toBe("Fixing 65");
+  });
+
   it("ignores an invalid session id", () => {
     const res = run({ session_id: "../etc", tool_name: "TaskCreate", tool_input: {} }, home);
     expect(res.status).toBe(0);

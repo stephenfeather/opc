@@ -122,7 +122,7 @@ export function deriveWorkingOn(
 
 function cachePath(sessionId: string): string {
   return join(
-    process.env.HOME || '',
+    process.env.HOME || process.env.USERPROFILE || '',
     '.claude',
     'cache',
     'working-on',

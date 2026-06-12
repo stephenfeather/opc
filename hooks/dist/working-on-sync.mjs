@@ -184,7 +184,7 @@ function deriveWorkingOn(input, cache) {
 }
 function cachePath(sessionId) {
   return join2(
-    process.env.HOME || "",
+    process.env.HOME || process.env.USERPROFILE || "",
     ".claude",
     "cache",
     "working-on",

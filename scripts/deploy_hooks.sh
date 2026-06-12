@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
-# deploy_hooks.sh - Mirror hooks/src and hooks/dist into $HOME/.claude/hooks/
+# deploy_hooks.sh - Mirror hooks/src, hooks/dist, and top-level runtime
+# files into $HOME/.claude/hooks/
 #
 # Issue #105: ~/opc/hooks is the source of truth; ~/.claude/hooks is the
 # Claude Code runtime location referenced by settings.json. This script keeps
 # the runtime tree in sync via rsync --delete, then verifies with diff -rq.
+#
+# Issue #157: top-level runtime files are synced too, via an explicit
+# allowlist (top-level *.sh, *.py, *.mjs). Removed entrypoints are retired
+# from the target using the .opc-managed-toplevel manifest; runtime-only
+# state (scrub-watermark, scrub-*.log) is outside the managed set and
+# always survives deploys.
 #
 # Usage:
 #   deploy_hooks.sh         # unconditional deploy (manual `npm run deploy`)
@@ -26,6 +33,7 @@
 #   3  dist/ verification mismatch
 #   4  refusing to deploy to unsafe target
 #   5  another deploy is already in progress (lock contention)
+#   6  top-level runtime file verification mismatch
 
 set -euo pipefail
 
@@ -303,7 +311,22 @@ if ! _acquire_lock; then
     echo "deploy_hooks: another deploy is in progress ($LOCK_DIR) - skipping" >&2
     exit 5
 fi
-trap _release_lock EXIT INT TERM
+
+# Codex #157 round-2 finding: a bare INT/TERM handler returns control to
+# the script after running, so a signal could release the lock while the
+# deploy keeps mutating the target - exactly the concurrent-write hole the
+# lock exists to close. Cleanup lives on EXIT only; INT/TERM exit with the
+# conventional 128+N codes, which fires the EXIT trap exactly once.
+_cleanup() {
+    rm -f "${_toplevel_manifest_new:-}" 2>/dev/null || true
+    # aegis M1: the staged in-target manifest must not survive a signal
+    # between its mktemp and the atomic mv, or it litters the runtime tree.
+    rm -f "${_manifest_staged:-}" 2>/dev/null || true
+    _release_lock
+}
+trap _cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Defense-in-depth: re-check the target (and its subdirs) is still not a
 # symlink right before each filesystem mutation. Closes the TOCTOU window
@@ -325,6 +348,74 @@ _assert_target_subdirs_not_symlinks
 echo "deploy_hooks: syncing dist/ -> $TARGET_ABS/dist/"
 rsync -a --delete --delay-updates "$HOOKS_SRC/dist/" "$TARGET_ABS/dist/"
 
+# Issue #157: sync top-level runtime files (hook entrypoint scripts).
+#
+# Codex round-1 findings drove this design:
+#   1. The managed set is an explicit pattern allowlist - top-level *.sh,
+#      *.py, *.mjs files. A bare directory rsync would also ship ignored
+#      local state (.env, .DS_Store, scratch files) into the runtime tree;
+#      shell globs never match dotfiles, so those cannot leak.
+#   2. Retirement is manifest-driven instead of rsync --delete: the synced
+#      file list is recorded in $TARGET_ABS/.opc-managed-toplevel, and on
+#      the next deploy any file in the PREVIOUS manifest that left the
+#      managed set is deleted from the target. Runtime-only state
+#      (scrub-watermark, scrub-*.log) is never in the manifest, so it
+#      always survives deploys.
+_managed_toplevel() {
+    local _f
+    for _f in "$HOOKS_SRC"/*.sh "$HOOKS_SRC"/*.py "$HOOKS_SRC"/*.mjs; do
+        [ -f "$_f" ] || continue   # unmatched glob literal or non-file
+        [ -L "$_f" ] && continue   # never deploy symlinked entrypoints
+        basename "$_f"
+    done
+}
+
+TOPLEVEL_MANIFEST_TARGET="$TARGET_ABS/.opc-managed-toplevel"
+
+# Codex #157 round-2 finding: -f and cp both follow symlinks, so a
+# symlinked manifest would let a deploy clobber an arbitrary same-user
+# file outside the runtime tree. Refuse outright; the final write below
+# is an atomic in-target mv, which replaces a symlink rather than
+# following it.
+if [ -L "$TOPLEVEL_MANIFEST_TARGET" ]; then
+    echo "deploy_hooks: refusing - '$TOPLEVEL_MANIFEST_TARGET' is a symlink" >&2
+    exit 4
+fi
+
+_toplevel_manifest_new="$(mktemp "${TMPDIR:-/tmp}/opc-toplevel-manifest.XXXXXX")"
+_managed_toplevel >"$_toplevel_manifest_new"
+
+_assert_target_not_symlink
+echo "deploy_hooks: syncing top-level runtime files -> $TARGET_ABS/"
+if [ -s "$_toplevel_manifest_new" ]; then
+    rsync -a --delay-updates --files-from="$_toplevel_manifest_new" \
+        "$HOOKS_SRC/" "$TARGET_ABS/"
+fi
+
+# Retire managed files that disappeared from the source tree. Only names
+# recorded by a previous deploy are eligible; entries are constrained to
+# plain basenames so a corrupted manifest cannot delete outside TARGET_ABS.
+if [ -f "$TOPLEVEL_MANIFEST_TARGET" ]; then
+    while IFS= read -r _old; do
+        case "$_old" in
+            '' | . | .. | */* | -*) continue ;;
+        esac
+        # aegis M2: a poisoned manifest entry naming a directory would make
+        # rm -f return non-zero and abort the deploy under set -e. Retire
+        # regular files only.
+        [ -f "$TARGET_ABS/$_old" ] || continue
+        if ! grep -qxF "$_old" "$_toplevel_manifest_new"; then
+            rm -f "$TARGET_ABS/$_old"
+            echo "deploy_hooks: retired stale top-level file: $_old"
+        fi
+    done <"$TOPLEVEL_MANIFEST_TARGET"
+fi
+# Atomic in-target replace: mv/rename never follows an existing symlink
+# at the destination, and readers see either the old or new manifest.
+_manifest_staged="$(mktemp "$TARGET_ABS/.opc-managed-toplevel.tmp.XXXXXX")"
+cat "$_toplevel_manifest_new" >"$_manifest_staged"
+mv -f "$_manifest_staged" "$TOPLEVEL_MANIFEST_TARGET"
+
 if ! diff -rq "$HOOKS_SRC/src/" "$TARGET_ABS/src/" >/dev/null 2>&1; then
     echo "deploy_hooks: src/ mismatch after sync:" >&2
     diff -rq "$HOOKS_SRC/src/" "$TARGET_ABS/src/" >&2 || true
@@ -337,4 +428,18 @@ if ! diff -rq "$HOOKS_SRC/dist/" "$TARGET_ABS/dist/" >/dev/null 2>&1; then
     exit 3
 fi
 
-echo "deploy_hooks: mirrored src/ and dist/ from $HOOKS_SRC/ to $TARGET_ABS/"
+# Verify exactly the managed set (same manifest that drove the rsync, so
+# dotfile or unmanaged-extension drift is impossible by construction and
+# runtime-only state files in the target are never flagged as extras).
+_toplevel_mismatch=0
+while IFS= read -r _base; do
+    if ! cmp -s "$HOOKS_SRC/$_base" "$TARGET_ABS/$_base"; then
+        echo "deploy_hooks: top-level mismatch after sync: $_base" >&2
+        _toplevel_mismatch=1
+    fi
+done <"$_toplevel_manifest_new"
+if [ "$_toplevel_mismatch" != "0" ]; then
+    exit 6
+fi
+
+echo "deploy_hooks: mirrored src/, dist/, and top-level runtime files from $HOOKS_SRC/ to $TARGET_ABS/"

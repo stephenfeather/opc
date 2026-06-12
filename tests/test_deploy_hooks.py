@@ -91,7 +91,7 @@ class TestHappyPath:
         assert (target / "src" / "sample.ts").read_text() == "export const x = 1;\n"
         assert (target / "src" / "shared" / "util.ts").read_text() == "export const y = 2;\n"
         assert (target / "dist" / "sample.mjs").read_text() == "export const x = 1;\n"
-        assert "mirrored src/ and dist/" in result.stdout
+        assert "mirrored src/, dist/, and top-level runtime files" in result.stdout
 
     def test_idempotent_second_run(self, tmp_path: Path) -> None:
         _opc_root, script, target = _build_fixture(tmp_path)
@@ -201,7 +201,7 @@ class TestAutoModeWorktreeGuard:
 
         assert result.returncode == 0, result.stderr
         assert (target / "src" / "sample.ts").exists()
-        assert "mirrored src/ and dist/" in result.stdout
+        assert "mirrored src/, dist/, and top-level runtime files" in result.stdout
 
     def test_explicit_deploy_still_runs_from_worktree(self, tmp_path: Path) -> None:
         """Without --auto, the worktree check is bypassed — user opt-in."""
@@ -840,3 +840,192 @@ class TestDeployTargetOverride:
         assert result.returncode == 0, result.stderr
         assert (fake_home / ".claude" / "hooks" / "src" / "sample.ts").exists()
         assert (fake_home / ".claude" / "hooks" / "dist" / "sample.mjs").exists()
+
+
+class TestTopLevelRuntimeFileSync:
+    """Issue #157: top-level runtime files (hook entrypoints) must deploy too.
+
+    Managed set = top-level files matching *.sh, *.py, *.mjs. Dotfiles and
+    other extensions are never synced. Runtime-only state in the target
+    (scrub-watermark, scrub-*.log) must survive deploys. Managed files
+    removed from source are retired from the target on the next deploy via
+    the .opc-managed-toplevel manifest.
+    """
+
+    def test_syncs_managed_toplevel_scripts(self, tmp_path: Path) -> None:
+        opc_root, script, target = _build_fixture(tmp_path)
+        hooks = opc_root / "hooks"
+        (hooks / "guard.sh").write_text("#!/bin/sh\necho guard\n")
+        (hooks / "launcher.py").write_text("print(1)\n")
+        (hooks / "runner.mjs").write_text("console.log(1);\n")
+
+        result = _run(script, target)
+
+        assert result.returncode == 0, result.stderr
+        assert (target / "guard.sh").read_text() == "#!/bin/sh\necho guard\n"
+        assert (target / "launcher.py").read_text() == "print(1)\n"
+        assert (target / "runner.mjs").read_text() == "console.log(1);\n"
+
+    def test_does_not_sync_dotfiles_or_unmanaged_extensions(
+        self, tmp_path: Path
+    ) -> None:
+        """Ignored local state (.env, .DS_Store) and non-runtime files must
+        never leak into the runtime tree (Codex round-1 finding)."""
+        opc_root, script, target = _build_fixture(tmp_path)
+        hooks = opc_root / "hooks"
+        (hooks / ".env").write_text("SECRET=1\n")
+        (hooks / ".DS_Store").write_bytes(b"\\x00junk")
+        (hooks / "notes.txt").write_text("scratch\n")
+        (hooks / "guard.sh").write_text("#!/bin/sh\n")
+
+        result = _run(script, target)
+
+        assert result.returncode == 0, result.stderr
+        assert not (target / ".env").exists()
+        assert not (target / ".DS_Store").exists()
+        assert not (target / "notes.txt").exists()
+        assert (target / "guard.sh").exists()
+
+    def test_preserves_runtime_state_files(self, tmp_path: Path) -> None:
+        opc_root, script, target = _build_fixture(tmp_path)
+        (opc_root / "hooks" / "guard.sh").write_text("#!/bin/sh\n")
+        target.mkdir(parents=True)
+        (target / "scrub-watermark").write_text("wm-123\n")
+        (target / "scrub-audit.log").write_text("log-line\n")
+
+        result = _run(script, target)
+
+        assert result.returncode == 0, result.stderr
+        assert (target / "scrub-watermark").read_text() == "wm-123\n"
+        assert (target / "scrub-audit.log").read_text() == "log-line\n"
+
+    def test_retires_removed_managed_script(self, tmp_path: Path) -> None:
+        """A managed script deleted from source disappears from the target on
+        the next deploy (Codex round-1 finding: no indefinite stale hooks)."""
+        opc_root, script, target = _build_fixture(tmp_path)
+        hooks = opc_root / "hooks"
+        (hooks / "old-hook.sh").write_text("#!/bin/sh\n")
+        (hooks / "keeper.sh").write_text("#!/bin/sh\n")
+        target.mkdir(parents=True)
+        (target / "scrub-watermark").write_text("wm\n")
+
+        first = _run(script, target)
+        assert first.returncode == 0, first.stderr
+        assert (target / "old-hook.sh").exists()
+
+        (hooks / "old-hook.sh").unlink()
+        second = _run(script, target)
+
+        assert second.returncode == 0, second.stderr
+        assert not (target / "old-hook.sh").exists()
+        assert (target / "keeper.sh").exists()
+        assert (target / "scrub-watermark").exists()
+
+    def test_manifest_written_to_target(self, tmp_path: Path) -> None:
+        opc_root, script, target = _build_fixture(tmp_path)
+        (opc_root / "hooks" / "guard.sh").write_text("#!/bin/sh\n")
+
+        result = _run(script, target)
+
+        assert result.returncode == 0, result.stderr
+        manifest = target / ".opc-managed-toplevel"
+        assert manifest.exists()
+        assert "guard.sh" in manifest.read_text().splitlines()
+
+    def test_toplevel_sync_idempotent(self, tmp_path: Path) -> None:
+        opc_root, script, target = _build_fixture(tmp_path)
+        (opc_root / "hooks" / "guard.sh").write_text("#!/bin/sh\n")
+
+        first = _run(script, target)
+        second = _run(script, target)
+
+        assert first.returncode == 0, first.stderr
+        assert second.returncode == 0, second.stderr
+        assert (target / "guard.sh").exists()
+
+
+class TestRound2Hardening:
+    """Codex round-2 findings: signal-trap termination and manifest symlink."""
+
+    def test_manifest_symlink_refused(self, tmp_path: Path) -> None:
+        """A symlinked .opc-managed-toplevel must abort the deploy without
+        writing through the link (arbitrary file clobber otherwise)."""
+        opc_root, script, target = _build_fixture(tmp_path)
+        (opc_root / "hooks" / "guard.sh").write_text("#!/bin/sh\n")
+        target.mkdir(parents=True)
+        victim = tmp_path / "victim.txt"
+        victim.write_text("precious\n")
+        (target / ".opc-managed-toplevel").symlink_to(victim)
+
+        result = _run(script, target)
+
+        assert result.returncode == 4, (result.stdout, result.stderr)
+        assert victim.read_text() == "precious\n"
+
+    def test_term_signal_terminates_and_cleans_lock(self, tmp_path: Path) -> None:
+        """SIGTERM mid-deploy must stop the script (exit on signal), not let
+        it continue after releasing the lock. A slow rsync shim keeps the
+        script inside the critical section long enough to signal it."""
+        import os
+        import signal
+        import time
+
+        opc_root, script, target = _build_fixture(tmp_path)
+        (opc_root / "hooks" / "guard.sh").write_text("#!/bin/sh\n")
+
+        shim_dir = tmp_path / "shims"
+        shim_dir.mkdir()
+        shim = shim_dir / "rsync"
+        shim.write_text("#!/bin/sh\nsleep 30\nexec /usr/bin/rsync \"$@\"\n")
+        shim.chmod(0o755)
+
+        env = {
+            "DEPLOY_TARGET": str(target),
+            "HOME": "/tmp/nonexistent-home",
+            "PATH": f"{shim_dir}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
+            "TMPDIR": str(tmp_path / "tmp"),
+        }
+        (tmp_path / "tmp").mkdir()
+        proc = subprocess.Popen(
+            ["bash", str(script)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        time.sleep(1.5)  # inside the shimmed rsync sleep, lock held
+        # Signal the whole group: bash defers traps while a foreground
+        # child runs, so the child must die for the trap to fire (real
+        # TERM delivery - shutdown, kill of the npm pipeline - also
+        # targets the group).
+        os.killpg(proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            pytest.fail("script did not terminate after SIGTERM")
+
+        assert proc.returncode != 0, "TERM mid-deploy must not exit 0"
+        # the success line must never print: the deploy did not continue
+        stdout = proc.stdout.read() if proc.stdout else ""
+        assert "mirrored src/, dist/, and top-level runtime files" not in stdout
+        # lock must be cleaned up so future deploys are not wedged
+        assert not (tmp_path / "tmp" / "opc-deploy-hooks.lock.d").exists()
+
+    def test_poisoned_manifest_directory_entry_is_skipped(
+        self, tmp_path: Path
+    ) -> None:
+        """aegis M2: a manifest entry naming a directory (src/dist) must be
+        skipped, not abort the deploy via rm -f failing under set -e."""
+        opc_root, script, target = _build_fixture(tmp_path)
+        (opc_root / "hooks" / "guard.sh").write_text("#!/bin/sh\\n")
+        target.mkdir(parents=True)
+        (target / "src").mkdir()
+        (target / ".opc-managed-toplevel").write_text("src\\ndist\\nghost.sh\\n")
+
+        result = _run(script, target)
+
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        assert (target / "src").is_dir()
+        assert (target / "guard.sh").exists()

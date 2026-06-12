@@ -161,7 +161,11 @@ async def main():
             INSERT INTO sessions (id, project, working_on, claude_session_id, transcript_path, pid, started_at, last_heartbeat, exited_at)
             VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW(), NULL)
             ON CONFLICT (id) DO UPDATE SET
-                working_on = EXCLUDED.working_on,
+                -- Issue #65: SessionStart/resume re-registers with working_on=''.
+                -- COALESCE+NULLIF preserves an existing label when the new value
+                -- is blank, so the working-on-sync hook's value survives a resume;
+                -- a non-empty value still updates.
+                working_on = COALESCE(NULLIF(EXCLUDED.working_on, ''), sessions.working_on),
                 claude_session_id = EXCLUDED.claude_session_id,
                 transcript_path = EXCLUDED.transcript_path,
                 pid = EXCLUDED.pid,

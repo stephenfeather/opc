@@ -351,6 +351,13 @@ function isDaemonReachable(projectDir: string): boolean {
  * @returns true if start was attempted successfully
  */
 export function tryStartDaemon(projectDir: string): boolean {
+  // Test seam (issue #156): allow disabling the blocking spawnSync auto-start
+  // so missing-socket paths resolve 'unavailable' immediately instead of
+  // blocking on a 'uv run tldr daemon start' subprocess. Production default
+  // (env unset) is unchanged.
+  if (process.env.TLDR_NO_AUTOSTART === '1') {
+    return false;
+  }
   try {
     // FAST CHECK: Is daemon process running? (checks PID file + kill -0)
     // This is faster and more reliable than socket ping

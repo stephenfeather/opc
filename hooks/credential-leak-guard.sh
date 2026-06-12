@@ -96,7 +96,8 @@ def is_captured(match: re.Match, full_cmd: str) -> bool:
     # --- piped or redirected after the match, within same segment ---
     # Segment ends at unquoted ; && || or end-of-string. We walk char by char
     # tracking quote state, and look for a real pipe ('|' not part of '||')
-    # or a redirect ('>' not part of '>=' or '2>&1' style — any '>' counts).
+    # or a redirect that captures stdout ('>', '1>', '>>'); stderr-only
+    # redirects (2>, 2>>, 2>&1) leave stdout bound for the transcript.
     in_single = False
     in_double = False
     i = end
@@ -120,6 +121,12 @@ def is_captured(match: re.Match, full_cmd: str) -> bool:
             if ch == '|' and prv != '|':
                 return True
             if ch == '>':
+                # fd-2 redirect: skip the token, stdout is still leaking.
+                if prv == '2' and (i < 2 or not full_cmd[i - 2].isalnum()):
+                    i += 1
+                    while i < n and full_cmd[i] in '>&1':
+                        i += 1
+                    continue
                 return True
         i += 1
     return False

@@ -87,8 +87,15 @@ async function scrub(transcriptPath: string): Promise<void> {
         // swallow a JSON closing quote. Trim at the first JSON-boundary
         // character so the replacement never destroys structural quotes.
         let secret = f.secretValue;
-        const boundary = secret.search(/["\\]/);
-        if (boundary >= 0) secret = secret.slice(0, boundary);
+        if (f.ruleId === "private-key") {
+          // PEM blocks legitimately span \n escapes inside the JSON string;
+          // trim only at a structural quote so the key material is removed.
+          const q = secret.indexOf('"');
+          if (q >= 0) secret = secret.slice(0, q);
+        } else {
+          const boundary = secret.search(/["\\]/);
+          if (boundary >= 0) secret = secret.slice(0, boundary);
+        }
         if (secret.length < 8) continue; // too short to be a credential after trim
 
         const replacement = `[REDACTED:${f.ruleId}]`;

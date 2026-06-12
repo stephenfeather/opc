@@ -46,8 +46,10 @@ var SECRET_RULES = [
   {
     id: "private-key",
     description: "PEM Private Key",
-    // Covers RSA, EC, DSA, PGP, and OpenSSH private keys
-    regex: /-----BEGIN (RSA |EC |DSA |PGP |OPENSSH )?PRIVATE KEY/g,
+    // Covers RSA, EC, DSA, PGP, and OpenSSH private keys. Prefer the full
+    // BEGIN..END block (lazy) so scrubbing removes the key material, not
+    // just the header; fall back to the bare header when END is absent.
+    regex: /(?:-----BEGIN (?:RSA |EC |DSA |PGP |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |DSA |PGP |OPENSSH )?PRIVATE KEY-----)|(?:-----BEGIN (?:RSA |EC |DSA |PGP |OPENSSH )?PRIVATE KEY)/g,
     category: "secret"
   },
   // Source control

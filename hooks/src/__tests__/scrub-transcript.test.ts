@@ -51,6 +51,25 @@ describe("scrub-transcript CLI", () => {
     expect(fs.existsSync(`${p}.scrub.tmp`)).toBe(false);
   });
 
+  it("redacts the full PEM block, not just the BEGIN header", () => {
+    const pem = [
+      "-----BEGIN RSA PRIVATE KEY-----",
+      "MIIBOgIBAAJBAKfakebodyfakebodyfakebodyfakebodyfake",
+      "AgMBAAECQQCfakebodyfakebodyfakebodyfakebodyfakebody",
+      "-----END RSA PRIVATE KEY-----",
+    ].join("\n");
+    const p = makeTranscript([
+      JSON.stringify({ role: "user", content: `here is my key:\n${pem}` }),
+    ]);
+    const res = runScrub(p);
+    expect(res.status).toBe(0);
+    const after = fs.readFileSync(p, "utf-8");
+    expect(after).toContain("[REDACTED:private-key]");
+    expect(after).not.toContain("MIIBOgIBAA");
+    expect(after).not.toContain("END RSA PRIVATE KEY");
+    for (const line of after.trim().split("\n")) JSON.parse(line); // still valid JSONL
+  });
+
   it("preserves a restrictive file mode across the scrub rewrite", () => {
     const p = makeTranscript([
       JSON.stringify({ role: "user", content: `token is ${FAKE_DO_TOKEN}` }),

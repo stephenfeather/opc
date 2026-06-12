@@ -72,6 +72,10 @@ suite_bash() {
     run_case "$BASH_HOOK" ask  "aws configure get"         '{"tool_input":{"command":"aws configure get aws_secret_access_key"}}'
     run_case "$BASH_HOOK" ask  "logical-OR not pipe"       '{"tool_input":{"command":"gh auth token || true"}}'
     run_case "$BASH_HOOK" ask  "multi-segment 2nd bare"    '{"tool_input":{"command":"echo hi; gh auth token"}}'
+    run_case "$BASH_HOOK" ask  "stderr-only redirect"     '{"tool_input":{"command":"gh auth token 2>/dev/null"}}'
+    run_case "$BASH_HOOK" ask  "stderr append redirect"   '{"tool_input":{"command":"gh auth token 2>>err.log"}}'
+    run_case "$BASH_HOOK" ask  "2>&1 merges to stdout"    '{"tool_input":{"command":"gh auth token 2>&1"}}'
+    run_case "$BASH_HOOK" allow "stdout+stderr to file"   '{"tool_input":{"command":"gh auth token >/tmp/t 2>&1"}}'
 
     # ALLOW cases — captured / piped / redirected, or unrelated
     run_case "$BASH_HOOK" allow "captured \$( )"           '{"tool_input":{"command":"TOKEN=$(gh auth token)"}}'

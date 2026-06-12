@@ -48,8 +48,10 @@ var SECRET_RULES = [
   {
     id: "private-key",
     description: "PEM Private Key",
-    // Covers RSA, EC, DSA, PGP, and OpenSSH private keys
-    regex: /-----BEGIN (RSA |EC |DSA |PGP |OPENSSH )?PRIVATE KEY/g,
+    // Covers RSA, EC, DSA, PGP, and OpenSSH private keys. Prefer the full
+    // BEGIN..END block (lazy) so scrubbing removes the key material, not
+    // just the header; fall back to the bare header when END is absent.
+    regex: /(?:-----BEGIN (?:RSA |EC |DSA |PGP |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |DSA |PGP |OPENSSH )?PRIVATE KEY-----)|(?:-----BEGIN (?:RSA |EC |DSA |PGP |OPENSSH )?PRIVATE KEY)/g,
     category: "secret"
   },
   // Source control
@@ -427,8 +429,13 @@ async function scrub(transcriptPath) {
       for (const f of findings) {
         if (f.secretValue.startsWith("[REDACTED:")) continue;
         let secret = f.secretValue;
-        const boundary = secret.search(/["\\]/);
-        if (boundary >= 0) secret = secret.slice(0, boundary);
+        if (f.ruleId === "private-key") {
+          const q = secret.indexOf('"');
+          if (q >= 0) secret = secret.slice(0, q);
+        } else {
+          const boundary = secret.search(/["\\]/);
+          if (boundary >= 0) secret = secret.slice(0, boundary);
+        }
         if (secret.length < 8) continue;
         const replacement = `[REDACTED:${f.ruleId}]`;
         const before = scrubbed;

@@ -165,8 +165,15 @@ def handle_bash_tool(tool_info: dict) -> None:
     current_branch = get_current_branch(project_dir)
     safe_branch = current_branch.replace("/", "-")
 
-    # Initialize branch-keyed storage
-    branch_dir = project_dir / ".git" / "claude" / "branches" / safe_branch
+    # Initialize branch-keyed storage (resolve via git for worktree compatibility)
+    import subprocess
+    git_path = subprocess.run(
+        ["git", "-C", str(project_dir), "rev-parse", "--git-path", f"claude/branches/{safe_branch}"],
+        capture_output=True, text=True, check=False,
+    ).stdout.strip()
+    branch_dir = Path(git_path) if git_path else project_dir / ".git" / "claude" / "branches" / safe_branch
+    if not branch_dir.is_absolute():
+        branch_dir = project_dir / branch_dir
     branch_dir.mkdir(parents=True, exist_ok=True)
 
     # Extract exit code and output

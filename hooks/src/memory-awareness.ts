@@ -126,13 +126,34 @@ function checkMemoryRelevance(intent: string, projectDir: string): MemoryMatch |
 
   // Use text-only for fast checking (< 1s), user can run /recall for semantic
   const tagArgs = safeProjectTag ? ['--tags', safeProjectTag] : [];
+  // --project feeds the reranker's project_match signal (issue #130: the
+  // hook previously never passed it, so the 0.15 project weight was always
+  // zero on this path). Soft boost, not a filter.
+  // --project-first (issue #139) scopes fetch-time retrieval: own-project
+  // rows are fetched before the pool fills with big-project content — the
+  // only remediation that works for small projects. Still fills globally,
+  // and degrades to a plain global fetch on pre-migration DBs.
+  const projectArgs = safeProjectTag
+    ? ['--project', safeProjectTag, '--project-first']
+    : [];
+  // Hybrid search (issue #53, unblocked by #151): the corpus is single-space
+  // voyage-code-3 and recall filters the vector leg by embedding_model, so
+  // hybrid finally surfaces USER_PREFERENCE learnings that text-only FTS
+  // misses on short prompts. --provider voyage is an API embed (~150-300ms,
+  // no model cold-start); recall degrades to text-only within
+  // QUERY_EMBED_TIMEOUT=2s if the key is missing or the provider stalls, so
+  // worst case equals the old --text-only behavior. Hybrid also activates
+  // the reranker's type-affinity signal (dead on the text-only path).
+  // --source labels recall_log rows (issue #140 telemetry).
   const result = spawnSync('uv', [
     'run', 'python', 'scripts/core/recall_learnings.py',
-    '--query', searchTerm,  // Single keyword for text match
+    '--query', searchTerm,
     '--k', '3',
     '--json',
-    '--text-only',  // Fast text search for hints
-    ...tagArgs
+    '--provider', 'voyage',
+    '--source', 'hook',
+    ...tagArgs,
+    ...projectArgs
   ], {
     encoding: 'utf-8',
     cwd: opcDir,

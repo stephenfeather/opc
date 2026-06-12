@@ -227,19 +227,22 @@ function checkMemoryRelevance(intent, projectDir) {
   const projectTag = projectDir ? projectDir.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? "" : "";
   const safeProjectTag = projectTag && !projectTag.startsWith("-") ? projectTag : "";
   const tagArgs = safeProjectTag ? ["--tags", safeProjectTag] : [];
+  const projectArgs = safeProjectTag ? ["--project", safeProjectTag, "--project-first"] : [];
   const result = spawnSync("uv", [
     "run",
     "python",
     "scripts/core/recall_learnings.py",
     "--query",
     searchTerm,
-    // Single keyword for text match
     "--k",
     "3",
     "--json",
-    "--text-only",
-    // Fast text search for hints
-    ...tagArgs
+    "--provider",
+    "voyage",
+    "--source",
+    "hook",
+    ...tagArgs,
+    ...projectArgs
   ], {
     encoding: "utf-8",
     cwd: opcDir,

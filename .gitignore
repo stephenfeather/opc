@@ -17,6 +17,13 @@ backups/*.sql.gz
 .ruff_cache/
 .tldr/
 .tldrignore
+.codegraph/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
 
 # Claude Code
 .claude/

@@ -16,11 +16,15 @@ Examples:
 """
 
 import argparse
+import contextlib
 import faulthandler
-import hashlib
 import json
 import os
+import re
+import secrets
 import sqlite3
+import stat
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -67,6 +71,115 @@ def escape_fts5_query(query: str) -> str:
     words = query.split()
     quoted_words = [f'"{w.replace(chr(34), chr(34) + chr(34))}"' for w in words]
     return " OR ".join(quoted_words)
+
+
+_SESSION_NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def is_safe_artifact_path(candidate: str | Path, allowed_root: Path) -> bool:
+    """Return True if ``candidate`` resolves to a path within ``allowed_root``.
+
+    Resolution happens before the containment check so symlinks that point
+    outside the root are rejected. Non-existent paths are permitted (the
+    caller's own ``.exists()`` check decides whether to read them).
+    """
+    resolved = Path(candidate).resolve()
+    root = allowed_root.resolve()
+    return resolved.is_relative_to(root)
+
+
+def safe_artifact_read_path(
+    candidate: str | Path, allowed_root: Path, *, suffixes: tuple[str, ...]
+) -> Path | None:
+    """Return the validated resolved path, or ``None`` if it is not authorized.
+
+    Authorization policy: the resolved path must live inside
+    ``allowed_root`` (resolved) AND have a suffix in ``suffixes``. Resolution
+    happens before the containment check so symlinks escaping the root are
+    rejected. The returned Path is the exact object the caller must read, so the
+    checked target and the read target cannot diverge (no re-construction).
+    """
+    resolved = Path(candidate).resolve()
+    root = allowed_root.resolve()
+    if not resolved.is_relative_to(root):
+        return None
+    if resolved.suffix not in suffixes:
+        return None
+    return resolved
+
+
+def is_safe_dir_root(root: Path, repo_root: Path) -> bool:
+    """Return True if ``root`` is a trustworthy directory root under ``repo_root``.
+
+    Fails CLOSED: rejects the root if it resolves outside ``repo_root`` OR if any
+    path component from ``repo_root`` down to ``root`` (checked on the *unresolved*
+    on-disk path) is a symlink. This prevents a symlinked trust root (e.g. a swapped
+    ``thoughts/shared/handoffs``) from being blessed as the new authorization
+    boundary, since ``root.resolve()`` alone would silently follow it.
+    """
+    repo = repo_root.resolve()
+    if not root.resolve().is_relative_to(repo):
+        return False
+    # Derive the component chain from the *given* paths (not resolved), so we can
+    # walk each on-disk component and reject any that is itself a symlink. Anchor
+    # the walk at the resolved repo so macOS /var -> /private/var prefixes match.
+    try:
+        relative = root.absolute().relative_to(repo_root.absolute())
+    except ValueError:
+        return False
+    current = repo
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return False
+    return True
+
+
+def is_safe_session_name(name: str) -> bool:
+    """Return True if ``name`` is a safe session identifier.
+
+    Must consist solely of ``[A-Za-z0-9._-]``, be non-empty, and not be made
+    up entirely of dots (rejecting ".", "..", "..." and longer dot runs).
+    """
+    if not name or not _SESSION_NAME_RE.fullmatch(name):
+        return False
+    return name.strip(".") != ""
+
+
+def generate_uuid7(
+    timestamp_ms: int | None = None, random_bytes: bytes | bytearray | None = None
+) -> str:
+    """Return a canonical RFC 9562 UUIDv7 string.
+
+    Layout (128 bits): 48-bit big-endian unix-epoch milliseconds, 4-bit
+    version (0b0111), 12-bit ``rand_a``, 2-bit variant (0b10), 62-bit
+    ``rand_b``. ``timestamp_ms`` and ``random_bytes`` are injection seams for
+    tests; production callers leave them as ``None``.
+    """
+    if timestamp_ms is None:
+        timestamp_ms = int(datetime.now().timestamp() * 1000)
+    if random_bytes is None:
+        random_bytes = secrets.token_bytes(10)
+
+    # Enforce the contract with deliberate errors (bool is an int subclass — reject it).
+    if isinstance(timestamp_ms, bool) or not isinstance(timestamp_ms, int):
+        raise ValueError(f"timestamp_ms must be in [0, 2**48), got {timestamp_ms!r}")
+    if not 0 <= timestamp_ms < 2**48:
+        raise ValueError(f"timestamp_ms must be in [0, 2**48), got {timestamp_ms!r}")
+    if not isinstance(random_bytes, (bytes, bytearray)) or len(random_bytes) != 10:
+        raise ValueError("random_bytes must be exactly 10 bytes")
+
+    ts = timestamp_ms.to_bytes(6, "big")
+
+    rand_a = int.from_bytes(random_bytes[0:2], "big") & 0x0FFF
+    byte6 = 0x70 | (rand_a >> 8)
+    byte7 = rand_a & 0xFF
+
+    rand_b = bytearray(random_bytes[2:10])
+    rand_b[0] = (rand_b[0] & 0x3F) | 0x80
+
+    raw = ts + bytes([byte6, byte7]) + bytes(rand_b)
+    return str(uuid.UUID(bytes=raw))
 
 
 # ---------------------------------------------------------------------------
@@ -412,6 +525,34 @@ def search_dispatch(
 # ---------------------------------------------------------------------------
 
 
+def read_text_nofollow(path: Path) -> str | None:
+    """Read a regular file without following symlinks; return None on any failure.
+
+    Opens with ``O_NOFOLLOW`` so a symlinked final component is refused (ELOOP),
+    and ``fstat``s the open fd to require a regular file. The validation and the
+    read share the same fd, eliminating the TOCTOU window between an existence
+    check and the read. Never raises: returns None on OSError (missing file,
+    symlink, directory, device, permission, decode error, ...).
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    fd_owned = True
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        # fdopen takes ownership of the fd; its context manager closes it.
+        fd_owned = False
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            return handle.read()
+    except (OSError, UnicodeError):
+        return None
+    finally:
+        if fd_owned:
+            os.close(fd)
+
+
 def handle_span_id_lookup(
     conn: sqlite3.Connection, span_id: str, with_content: bool = False
 ) -> dict | None:
@@ -431,9 +572,18 @@ def handle_span_id_lookup(
         return None
 
     if with_content and handoff.get("file_path"):
-        file_path = Path(handoff["file_path"])
-        if file_path.exists():
-            handoff["content"] = file_path.read_text()
+        allowed_root = Path.cwd()
+        handoffs_root = allowed_root / "thoughts" / "shared" / "handoffs"
+
+        # Fail closed if the trusted handoffs root is itself reached via a symlink.
+        if is_safe_dir_root(handoffs_root, allowed_root):
+            safe_path = safe_artifact_read_path(
+                handoff["file_path"], handoffs_root, suffixes=(".md", ".yaml", ".yml")
+            )
+            if safe_path is not None:
+                content = read_text_nofollow(safe_path)
+                if content is not None:
+                    handoff["content"] = content
 
         session_name = handoff.get("session_name")
         if not session_name and handoff.get("file_path"):
@@ -443,15 +593,20 @@ def handle_span_id_lookup(
                 if idx + 1 < len(parts):
                     session_name = parts[idx + 1]
 
-        if session_name:
+        if session_name and is_safe_session_name(session_name):
             ledger_path = Path(f"CONTINUITY_CLAUDE-{session_name}.md")
-            if ledger_path.exists():
-                ledger = {
+            safe_ledger = safe_artifact_read_path(
+                ledger_path, allowed_root, suffixes=(".md",)
+            )
+            ledger_content = (
+                read_text_nofollow(safe_ledger) if safe_ledger is not None else None
+            )
+            if ledger_content is not None:
+                handoff["ledger"] = {
                     "session_name": session_name,
                     "file_path": str(ledger_path),
-                    "content": ledger_path.read_text(),
+                    "content": ledger_content,
                 }
-                handoff["ledger"] = ledger
             else:
                 ledger = get_ledger_for_session(conn, session_name)
                 if ledger:
@@ -482,9 +637,7 @@ def save_query(
         now: Timestamp override for testability (defaults to datetime.now())
     """
     timestamp = now or datetime.now()
-    query_id = hashlib.md5(
-        f"{question}{timestamp.isoformat()}".encode()
-    ).hexdigest()[:12]
+    query_id = generate_uuid7(timestamp_ms=int(timestamp.timestamp() * 1000))
 
     conn.execute(
         """
@@ -544,9 +697,8 @@ def _run_span_lookup(args: argparse.Namespace) -> None:
         print(f"Database not found: {db_path}")
         return
 
-    conn = _open_db(db_path)
-    handoff = handle_span_id_lookup(conn, args.by_span_id, with_content=args.with_content)
-    conn.close()
+    with contextlib.closing(_open_db(db_path)) as conn:
+        handoff = handle_span_id_lookup(conn, args.by_span_id, with_content=args.with_content)
 
     if args.json:
         print(json.dumps(handoff, indent=2, default=str))
@@ -568,20 +720,18 @@ def _run_search(args: argparse.Namespace, query: str) -> None:
         print("Run: uv run python scripts/artifact_index.py --all")
         return
 
-    conn = _open_db(db_path)
-    results = search_dispatch(conn, query, args.type, args.outcome, args.limit)
+    with contextlib.closing(_open_db(db_path)) as conn:
+        results = search_dispatch(conn, query, args.type, args.outcome, args.limit)
 
-    if args.json:
-        print(json.dumps(results, indent=2, default=str))
-    else:
-        formatted = format_results(results)
-        print(formatted)
+        if args.json:
+            print(json.dumps(results, indent=2, default=str))
+        else:
+            formatted = format_results(results)
+            print(formatted)
 
-        if args.save:
-            save_query(conn, query, formatted, results)
-            print("\n[Query saved for compound learning]")
-
-    conn.close()
+            if args.save:
+                save_query(conn, query, formatted, results)
+                print("\n[Query saved for compound learning]")
 
 
 # ---------------------------------------------------------------------------

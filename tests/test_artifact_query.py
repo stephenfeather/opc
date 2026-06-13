@@ -35,6 +35,7 @@ from scripts.core.artifact_query import (
     handle_span_id_lookup,
     is_safe_artifact_path,
     is_safe_session_name,
+    safe_artifact_read_path,
     save_query,
     search_continuity,
     search_dispatch,
@@ -593,16 +594,19 @@ class TestHandleSpanIdLookup:
         assert "content" not in result
 
     def test_with_content_reads_file(self, populated_db, tmp_path, monkeypatch):
-        # Create a fake handoff file under cwd (path-traversal guard requires
-        # the resolved file to live within Path.cwd()).
+        # Create a fake handoff file under the indexed handoffs dir (the guard
+        # requires the resolved file to live within thoughts/shared/handoffs/).
         monkeypatch.chdir(tmp_path)
-        handoff_file = tmp_path / "task-1.yaml"
+        handoffs_dir = tmp_path / "thoughts" / "shared" / "handoffs" / "auth-session"
+        handoffs_dir.mkdir(parents=True)
+        handoff_file = handoffs_dir / "task-1.yaml"
         handoff_file.write_text("handoff content here")
 
-        # Update the DB to point to our tmp file (relative to cwd)
+        # Update the DB to point to our handoff file (relative to cwd)
+        rel = "thoughts/shared/handoffs/auth-session/task-1.yaml"
         populated_db.execute(
             "UPDATE handoffs SET file_path = ? WHERE id = 'h1'",
-            ("task-1.yaml",),
+            (rel,),
         )
         populated_db.commit()
 
@@ -745,6 +749,53 @@ class TestIsSafeArtifactPath:
         assert is_safe_artifact_path(tmp_path / "does-not-exist.md", tmp_path) is True
 
 
+class TestSafeArtifactReadPath:
+    """Tests for safe_artifact_read_path — path-returning resolver."""
+
+    _SUFFIXES = (".md", ".yaml", ".yml")
+
+    def test_returns_resolved_path_for_valid(self, tmp_path):
+        target = tmp_path / "task-1.md"
+        target.write_text("x")
+        result = safe_artifact_read_path(target, tmp_path, suffixes=self._SUFFIXES)
+        assert result == target.resolve()
+
+    def test_relative_path_resolved_under_root(self, tmp_path, monkeypatch):
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / "task-1.yaml").write_text("x")
+        monkeypatch.chdir(tmp_path)
+        result = safe_artifact_read_path(
+            "sub/task-1.yaml", tmp_path / "sub", suffixes=self._SUFFIXES
+        )
+        assert result == (sub / "task-1.yaml").resolve()
+
+    def test_returns_none_for_outside_dir(self, tmp_path):
+        outside = tmp_path.parent / "outside.md"
+        outside.write_text("x")
+        assert (
+            safe_artifact_read_path(outside, tmp_path, suffixes=self._SUFFIXES) is None
+        )
+
+    def test_returns_none_for_wrong_suffix(self, tmp_path):
+        target = tmp_path / "task-1.txt"
+        target.write_text("x")
+        assert (
+            safe_artifact_read_path(target, tmp_path, suffixes=self._SUFFIXES) is None
+        )
+
+    def test_returns_none_for_escaping_symlink(self, tmp_path):
+        outside_dir = tmp_path.parent / "outside_secret_dir2"
+        outside_dir.mkdir()
+        secret = outside_dir / "secret.md"
+        secret.write_text("top secret")
+        root = tmp_path / "root"
+        root.mkdir()
+        link = root / "task-1.md"
+        link.symlink_to(secret)
+        assert safe_artifact_read_path(link, root, suffixes=self._SUFFIXES) is None
+
+
 class TestIsSafeSessionName:
     """Tests for is_safe_session_name — pure validation helper."""
 
@@ -768,6 +819,17 @@ class TestIsSafeSessionName:
 
     def test_single_dot_is_unsafe(self):
         assert is_safe_session_name(".") is False
+
+
+_HANDOFFS_REL = "thoughts/shared/handoffs/auth-session"
+
+
+def _make_handoff_file(tmp_path: Path, name: str, content: str) -> str:
+    """Create a handoff file under the indexed handoffs dir; return rel path."""
+    handoffs_dir = tmp_path / "thoughts" / "shared" / "handoffs" / "auth-session"
+    handoffs_dir.mkdir(parents=True, exist_ok=True)
+    (handoffs_dir / name).write_text(content)
+    return f"{_HANDOFFS_REL}/{name}"
 
 
 class TestHandleSpanIdLookupPathTraversal:
@@ -805,19 +867,83 @@ class TestHandleSpanIdLookupPathTraversal:
         assert result is not None
         assert "content" not in result
 
-    def test_symlink_inside_cwd_pointing_outside_not_read(
+    def test_symlink_inside_handoffs_pointing_outside_not_read(
         self, populated_db, tmp_path, monkeypatch
     ):
-        work = tmp_path / "work"
-        work.mkdir()
+        monkeypatch.chdir(tmp_path)
+        handoffs_dir = tmp_path / "thoughts" / "shared" / "handoffs" / "auth-session"
+        handoffs_dir.mkdir(parents=True)
         secret = tmp_path / "secret.txt"
         secret.write_text("SECRET")
-        link = work / "task-1.yaml"
+        link = handoffs_dir / "task-1.yaml"
         link.symlink_to(secret)
-        monkeypatch.chdir(work)
         populated_db.execute(
             "UPDATE handoffs SET file_path = ? WHERE id = 'h1'",
-            ("task-1.yaml",),
+            (f"{_HANDOFFS_REL}/task-1.yaml",),
+        )
+        populated_db.commit()
+
+        result = handle_span_id_lookup(populated_db, "span-abc123", with_content=True)
+        assert result is not None
+        assert "content" not in result
+
+    def test_dotenv_under_cwd_not_read(self, populated_db, tmp_path, monkeypatch):
+        """Poisoned row pointing at .env (under repo root) must not be read."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("SECRET_KEY=topsecret")
+        populated_db.execute(
+            "UPDATE handoffs SET file_path = ? WHERE id = 'h1'",
+            (".env",),
+        )
+        populated_db.commit()
+
+        result = handle_span_id_lookup(populated_db, "span-abc123", with_content=True)
+        assert result is not None
+        assert "content" not in result
+
+    def test_settings_local_under_cwd_not_read(
+        self, populated_db, tmp_path, monkeypatch
+    ):
+        """Poisoned row pointing at .claude/settings.local.json must not be read."""
+        monkeypatch.chdir(tmp_path)
+        settings = tmp_path / ".claude" / "settings.local.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text('{"secret": true}')
+        populated_db.execute(
+            "UPDATE handoffs SET file_path = ? WHERE id = 'h1'",
+            (".claude/settings.local.json",),
+        )
+        populated_db.commit()
+
+        result = handle_span_id_lookup(populated_db, "span-abc123", with_content=True)
+        assert result is not None
+        assert "content" not in result
+
+    def test_md_file_outside_handoffs_dir_not_read(
+        self, populated_db, tmp_path, monkeypatch
+    ):
+        """A .md file under cwd but outside handoffs dir proves the dir constraint."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "README.md").write_text("# secret readme")
+        populated_db.execute(
+            "UPDATE handoffs SET file_path = ? WHERE id = 'h1'",
+            ("README.md",),
+        )
+        populated_db.commit()
+
+        result = handle_span_id_lookup(populated_db, "span-abc123", with_content=True)
+        assert result is not None
+        assert "content" not in result
+
+    def test_disallowed_suffix_in_handoffs_dir_not_read(
+        self, populated_db, tmp_path, monkeypatch
+    ):
+        """A non-allowlisted suffix even inside handoffs dir is rejected."""
+        monkeypatch.chdir(tmp_path)
+        rel = _make_handoff_file(tmp_path, "task-1.txt", "secret txt")
+        populated_db.execute(
+            "UPDATE handoffs SET file_path = ? WHERE id = 'h1'",
+            (rel,),
         )
         populated_db.commit()
 
@@ -828,13 +954,12 @@ class TestHandleSpanIdLookupPathTraversal:
     def test_unsafe_session_name_skips_ledger(
         self, populated_db, tmp_path, monkeypatch
     ):
-        # Poison the session_name with traversal; legit handoff file under cwd.
+        # Poison the session_name with traversal; legit handoff file under handoffs dir.
         monkeypatch.chdir(tmp_path)
-        handoff_file = tmp_path / "task-1.yaml"
-        handoff_file.write_text("legit content")
+        rel = _make_handoff_file(tmp_path, "task-1.yaml", "legit content")
         populated_db.execute(
             "UPDATE handoffs SET file_path = ?, session_name = ? WHERE id = 'h1'",
-            ("task-1.yaml", "../../etc/passwd"),
+            (rel, "../../etc/passwd"),
         )
         populated_db.commit()
 
@@ -843,15 +968,14 @@ class TestHandleSpanIdLookupPathTraversal:
         assert result["content"] == "legit content"
         assert "ledger" not in result
 
-    def test_legit_file_under_cwd_returns_content(
+    def test_legit_md_under_handoffs_returns_content(
         self, populated_db, tmp_path, monkeypatch
     ):
         monkeypatch.chdir(tmp_path)
-        handoff_file = tmp_path / "task-1.yaml"
-        handoff_file.write_text("happy path content")
+        rel = _make_handoff_file(tmp_path, "task-01.md", "happy path content")
         populated_db.execute(
             "UPDATE handoffs SET file_path = ? WHERE id = 'h1'",
-            ("task-1.yaml",),
+            (rel,),
         )
         populated_db.commit()
 
@@ -859,17 +983,46 @@ class TestHandleSpanIdLookupPathTraversal:
         assert result is not None
         assert result["content"] == "happy path content"
 
+    def test_legit_yaml_under_handoffs_returns_content(
+        self, populated_db, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        rel = _make_handoff_file(tmp_path, "task-1.yaml", "yaml content")
+        populated_db.execute(
+            "UPDATE handoffs SET file_path = ? WHERE id = 'h1'",
+            (rel,),
+        )
+        populated_db.commit()
+
+        result = handle_span_id_lookup(populated_db, "span-abc123", with_content=True)
+        assert result is not None
+        assert result["content"] == "yaml content"
+
+    def test_legit_yml_under_handoffs_returns_content(
+        self, populated_db, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        rel = _make_handoff_file(tmp_path, "task-1.yml", "yml content")
+        populated_db.execute(
+            "UPDATE handoffs SET file_path = ? WHERE id = 'h1'",
+            (rel,),
+        )
+        populated_db.commit()
+
+        result = handle_span_id_lookup(populated_db, "span-abc123", with_content=True)
+        assert result is not None
+        assert result["content"] == "yml content"
+
     def test_legit_ledger_under_cwd_returned(
         self, populated_db, tmp_path, monkeypatch
     ):
         monkeypatch.chdir(tmp_path)
-        handoff_file = tmp_path / "task-1.yaml"
-        handoff_file.write_text("handoff content")
+        rel = _make_handoff_file(tmp_path, "task-1.yaml", "handoff content")
         ledger_file = tmp_path / "CONTINUITY_CLAUDE-auth-session.md"
         ledger_file.write_text("ledger content")
         populated_db.execute(
             "UPDATE handoffs SET file_path = ? WHERE id = 'h1'",
-            ("task-1.yaml",),
+            (rel,),
         )
         populated_db.commit()
 

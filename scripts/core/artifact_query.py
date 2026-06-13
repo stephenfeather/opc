@@ -87,6 +87,26 @@ def is_safe_artifact_path(candidate: str | Path, allowed_root: Path) -> bool:
     return resolved.is_relative_to(root)
 
 
+def safe_artifact_read_path(
+    candidate: str | Path, allowed_root: Path, *, suffixes: tuple[str, ...]
+) -> Path | None:
+    """Return the validated resolved path, or ``None`` if it is not authorized.
+
+    Authorization policy: the resolved path must live inside
+    ``allowed_root`` (resolved) AND have a suffix in ``suffixes``. Resolution
+    happens before the containment check so symlinks escaping the root are
+    rejected. The returned Path is the exact object the caller must read, so the
+    checked target and the read target cannot diverge (no re-construction).
+    """
+    resolved = Path(candidate).resolve()
+    root = allowed_root.resolve()
+    if not resolved.is_relative_to(root):
+        return None
+    if resolved.suffix not in suffixes:
+        return None
+    return resolved
+
+
 def is_safe_session_name(name: str) -> bool:
     """Return True if ``name`` is a safe session identifier.
 
@@ -487,9 +507,12 @@ def handle_span_id_lookup(
 
     if with_content and handoff.get("file_path"):
         allowed_root = Path.cwd()
-        file_path = Path(handoff["file_path"])
-        if file_path.exists() and is_safe_artifact_path(file_path, allowed_root):
-            handoff["content"] = file_path.read_text()
+        handoffs_root = allowed_root / "thoughts" / "shared" / "handoffs"
+        safe_path = safe_artifact_read_path(
+            handoff["file_path"], handoffs_root, suffixes=(".md", ".yaml", ".yml")
+        )
+        if safe_path is not None and safe_path.exists():
+            handoff["content"] = safe_path.read_text()
 
         session_name = handoff.get("session_name")
         if not session_name and handoff.get("file_path"):

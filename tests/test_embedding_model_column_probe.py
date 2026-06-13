@@ -97,6 +97,21 @@ class _FakeVectorDb:
                 db.executed.append(sql)
                 return []
 
+            async def execute(self, sql: str, *args: Any) -> str:
+                # SET LOCAL hnsw.iterative_scan (issue #153): no-op for the fake.
+                return "SET"
+
+            def transaction(self):
+                # RRF fetch runs inside a transaction now (issue #153 finding 1).
+                class _Tx:
+                    async def __aenter__(self):
+                        return None
+
+                    async def __aexit__(self, *exc: Any) -> bool:
+                        return False
+
+                return _Tx()
+
             async def fetchrow(self, sql: str, *args: Any) -> dict[str, Any]:
                 return {"cnt": 5}  # embeddings present -> vector branch
 

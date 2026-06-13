@@ -781,6 +781,22 @@ class _FakeRecallDb:
                 db.executed.append(sql)
                 return []
 
+            async def execute(self, sql: str, *args: Any) -> str:
+                # SET LOCAL hnsw.iterative_scan (issue #153): no-op for the fake.
+                return "SET"
+
+            def transaction(self):
+                # The RRF fetch now runs inside a transaction so SET LOCAL is
+                # scoped (issue #153 finding 1). Provide a no-op async CM.
+                class _Tx:
+                    async def __aenter__(self):
+                        return None
+
+                    async def __aexit__(self, *exc: Any) -> bool:
+                        return False
+
+                return _Tx()
+
             async def fetchrow(self, sql: str, *args: Any) -> dict[str, Any]:
                 # Embedding-count probe in search_learnings_postgres:
                 # report no embeddings so the text fallback branch runs.

@@ -161,3 +161,59 @@ class TestRrfVectorLegHnswServable:
             )
         finally:
             await conn.close()
+
+
+class TestRrfIterativeScanGucLive:
+    """Round-1 finding 1 (live): the SET LOCAL hnsw.iterative_scan GUC the
+    fetch path issues must be accepted by the installed pgvector, and the
+    bounded vector leg under it returns up to candidate_count rows."""
+
+    async def _setup(self):
+        if os.environ.get("OPC_SKIP_DB_TESTS"):
+            pytest.skip("OPC_SKIP_DB_TESTS set")
+        conn = await _try_connect()
+        if conn is None:
+            pytest.skip("database unreachable")
+        if not await _hnsw_index_present(conn):
+            await conn.close()
+            pytest.skip("HNSW index absent")
+        if await _embedded_row_count(conn) < 50:
+            await conn.close()
+            pytest.skip("too few embedded rows")
+        embedding = await _sample_embedding(conn)
+        if embedding is None:
+            await conn.close()
+            pytest.skip("no sample embedding")
+        return conn, embedding
+
+    async def test_set_local_strict_order_accepted_and_leg_fills(self):
+        conn, embedding = await self._setup()
+        try:
+            from scripts.core.recall_backends import (
+                _HNSW_ITERATIVE_SCAN_GUC,
+                build_rrf_cte,
+            )
+
+            candidate_count = 40
+            # Run the exact GUC the production fetch path issues, then the
+            # bounded vector leg, inside one transaction (SET LOCAL scope).
+            async with conn.transaction():
+                # Must not raise on pgvector >= 0.8 (strict_order is valid).
+                await conn.execute(_HNSW_ITERATIVE_SCAN_GUC)
+                cte = build_rrf_cte(chain_filter=True, candidate_param=3)
+                # Drive the bounded vector leg directly; $1 text, $2 embedding,
+                # $3 candidate LIMIT.
+                sql = (
+                    cte
+                    + "\n            SELECT id, vec_rank FROM vector_ranked"
+                )
+                rows = await conn.fetch(sql, "memory recall", embedding,
+                                        candidate_count)
+            # The chain filter (superseded_by IS NULL) is non-selective here,
+            # so the bounded leg should fill to the candidate cap.
+            assert len(rows) == candidate_count, (
+                f"bounded leg returned {len(rows)} rows, expected the "
+                f"candidate cap {candidate_count}"
+            )
+        finally:
+            await conn.close()

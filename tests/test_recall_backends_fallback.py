@@ -116,6 +116,21 @@ def _patch_pool(monkeypatch) -> None:
         async def fetch(self, _sql: str, *_args: Any) -> list[Any]:
             return []
 
+        async def execute(self, _sql: str, *_args: Any) -> str:
+            # SET LOCAL hnsw.iterative_scan (issue #153): no-op for the fake.
+            return "SET"
+
+        def transaction(self):
+            # RRF fetch runs inside a transaction now (issue #153 finding 1).
+            class _Tx:
+                async def __aenter__(self):
+                    return None
+
+                async def __aexit__(self, *_exc: Any) -> bool:
+                    return False
+
+            return _Tx()
+
     class FakeAcquire:
         async def __aenter__(self) -> FakeConn:
             return FakeConn()

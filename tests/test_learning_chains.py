@@ -39,6 +39,25 @@ class FakeAcquire:
         pass
 
 
+class _NoopTx:
+    """No-op async context manager for conn.transaction() (issue #153).
+
+    The hybrid RRF fetch scopes SET LOCAL hnsw.iterative_scan inside a
+    transaction; mock conns must return a real async CM.
+    """
+
+    async def __aenter__(self):
+        return None
+
+    async def __aexit__(self, *args):
+        return False
+
+
+def _attach_tx(conn) -> None:
+    """Give a mock conn a working transaction() CM (issue #153 finding 1)."""
+    conn.transaction = MagicMock(return_value=_NoopTx())
+
+
 @pytest.fixture
 def mock_pool():
     """Mock PostgreSQL connection pool."""
@@ -46,6 +65,7 @@ def mock_pool():
     conn.execute = AsyncMock(return_value="UPDATE 1")
     conn.fetch = AsyncMock(return_value=[])
     conn.fetchrow = AsyncMock(return_value={"cnt": 0})
+    _attach_tx(conn)
 
     pool = MagicMock()
     pool.acquire.return_value = FakeAcquire(conn)
@@ -144,6 +164,7 @@ class TestRecallChainFilter:
 
         conn = AsyncMock()
         conn.fetch = fake_fetch
+        _attach_tx(conn)
 
         pool = MagicMock()
         pool.acquire.return_value = FakeAcquire(conn)

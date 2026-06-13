@@ -641,6 +641,34 @@ def _is_project_capability_error(exc: BaseException) -> bool:
     return bool(_PROJECT_COLUMN_ERROR_RE.search(str(exc)))
 
 
+# Transaction-scoped GUC that makes pgvector's HNSW return true nearest-k under
+# WHERE filters (issue #153 round-1 finding 1). pgvector applies the leg's
+# project/model/type filters AFTER the ANN scan, so a bounded
+# `ORDER BY <=> $q LIMIT $N` can under-fill or miss true neighbours once the
+# planner actually uses HNSW (at scale). `strict_order` (not relaxed) preserves
+# exact distance ordering, which RRF rank fusion depends on. SET LOCAL keeps it
+# scoped to the current transaction so pooled connections never leak it.
+_HNSW_ITERATIVE_SCAN_GUC = "SET LOCAL hnsw.iterative_scan = 'strict_order'"
+
+
+async def _enable_hnsw_iterative_scan(conn: Any) -> None:
+    """Best-effort SET LOCAL of hnsw.iterative_scan within an open transaction.
+
+    Older pgvector (< 0.8) lacks the GUC and raises on the SET. That is a
+    no-op-safe degradation: the bounded leg still returns the post-filter ANN
+    candidates, just without iterative back-fill. Swallow the error (debug log)
+    rather than aborting recall (idempotent degradation).
+    """
+    try:
+        await conn.execute(_HNSW_ITERATIVE_SCAN_GUC)
+    except Exception:  # noqa: BLE001 - older pgvector lacks the GUC; degrade
+        logger.debug(
+            "hnsw.iterative_scan GUC unavailable; bounded leg may under-fill "
+            "under selective filters once HNSW engages",
+            exc_info=True,
+        )
+
+
 def reset_project_column_cache() -> None:
     """Clear the cached capability probe (test isolation)."""
     global _project_column_cache
@@ -1084,6 +1112,14 @@ async def search_learnings_hybrid_rrf(
         # the candidate count takes the final slot.
         boosted_candidate_idx = 6 + bool(boosted_pf) + bool(boosted_mf)
         plain_candidate_idx = 5 + bool(plain_pf) + bool(plain_mf)
+        # candidate_count is the recall-quality lever (issue #153 finding 2).
+        # RRF fuses RANKS, so truncating the vector leg to this pool drops the
+        # vector term for any true-neighbour whose vec_rank falls outside it: a
+        # row strong on FTS but ranked just past candidate_count can be pushed
+        # out of a final top-k that EXACT (unbounded) RRF would include.
+        # vector_candidate_multiplier (default 8 -> 40 candidates at k=5) trades
+        # recall fidelity for the bounded ANN walk; raise it to recover boundary
+        # rows, lower it only if EXPLAIN + recall quality both stay green.
         candidate_count = k * _recall_cfg.vector_candidate_multiplier
 
         def _cte(
@@ -1127,62 +1163,76 @@ async def search_learnings_hybrid_rrf(
             candidate_param=plain_candidate_idx,
         )
 
-        try:
-            rows = await conn.fetch(cte_boosted + boosted_tail, *boosted_args)
-        except Exception as exc:
-            if _is_project_capability_error(exc):
-                raise
-            logger.debug("RRF boosted+chain fallback", exc_info=True)
-            has_decay_columns = False
+        # Scope SET LOCAL hnsw.iterative_scan to this fetch (issue #153
+        # finding 1): asyncpg autocommits per statement, so a bare SET LOCAL
+        # would be dropped immediately. Run every RRF fetch attempt inside one
+        # transaction with the GUC applied first so the bounded vector leg
+        # returns true nearest-k under filters once HNSW engages.
+        async with conn.transaction():
+            await _enable_hnsw_iterative_scan(conn)
             try:
-                rows = await conn.fetch(cte_plain_args + plain_tail, *plain_args)
+                rows = await conn.fetch(cte_boosted + boosted_tail, *boosted_args)
             except Exception as exc:
                 if _is_project_capability_error(exc):
                     raise
-                logger.debug("RRF plain+chain fallback", exc_info=True)
-                rows = await conn.fetch(
-                    cte_plain_nochain + plain_tail, *plain_args,
-                )
-
-        if not rows and use_tsquery:
-            logger.debug("Expanded tsquery returned no results, falling back to plainto_tsquery")
-            fb_boosted = (
-                query, embedding_str, rrf_k, k * 2, boost,
-                *boosted_extra, candidate_count,
-            )
-            fb_plain = (
-                query, embedding_str, rrf_k, k * 2,
-                *plain_extra, candidate_count,
-            )
-            fb_cte_boosted = _cte(
-                chain=True, ts=False, pf=boosted_pf, mf=boosted_mf,
-                candidate_param=boosted_candidate_idx,
-            )
-            fb_cte_plain = _cte(
-                chain=True, ts=False, pf=plain_pf, mf=plain_mf,
-                candidate_param=plain_candidate_idx,
-            )
-            try:
-                if has_decay_columns:
-                    rows = await conn.fetch(fb_cte_boosted + boosted_tail, *fb_boosted)
-                else:
-                    rows = await conn.fetch(fb_cte_plain + plain_tail, *fb_plain)
-            except Exception as exc:
-                if _is_project_capability_error(exc):
-                    raise
-                logger.debug("plainto_tsquery chain fallback", exc_info=True)
+                logger.debug("RRF boosted+chain fallback", exc_info=True)
+                has_decay_columns = False
                 try:
-                    no_chain_cte = _cte(
-                        chain=False, ts=False, pf=plain_pf, mf=plain_mf,
-                        candidate_param=plain_candidate_idx,
-                    )
-                    rows = await conn.fetch(
-                        no_chain_cte + plain_tail, *fb_plain,
-                    )
+                    rows = await conn.fetch(cte_plain_args + plain_tail, *plain_args)
                 except Exception as exc:
                     if _is_project_capability_error(exc):
                         raise
-                    logger.debug("plainto_tsquery fallback also failed", exc_info=True)
+                    logger.debug("RRF plain+chain fallback", exc_info=True)
+                    rows = await conn.fetch(
+                        cte_plain_nochain + plain_tail, *plain_args,
+                    )
+
+            if not rows and use_tsquery:
+                logger.debug(
+                    "Expanded tsquery returned no results, "
+                    "falling back to plainto_tsquery"
+                )
+                fb_boosted = (
+                    query, embedding_str, rrf_k, k * 2, boost,
+                    *boosted_extra, candidate_count,
+                )
+                fb_plain = (
+                    query, embedding_str, rrf_k, k * 2,
+                    *plain_extra, candidate_count,
+                )
+                fb_cte_boosted = _cte(
+                    chain=True, ts=False, pf=boosted_pf, mf=boosted_mf,
+                    candidate_param=boosted_candidate_idx,
+                )
+                fb_cte_plain = _cte(
+                    chain=True, ts=False, pf=plain_pf, mf=plain_mf,
+                    candidate_param=plain_candidate_idx,
+                )
+                try:
+                    if has_decay_columns:
+                        rows = await conn.fetch(
+                            fb_cte_boosted + boosted_tail, *fb_boosted
+                        )
+                    else:
+                        rows = await conn.fetch(fb_cte_plain + plain_tail, *fb_plain)
+                except Exception as exc:
+                    if _is_project_capability_error(exc):
+                        raise
+                    logger.debug("plainto_tsquery chain fallback", exc_info=True)
+                    try:
+                        no_chain_cte = _cte(
+                            chain=False, ts=False, pf=plain_pf, mf=plain_mf,
+                            candidate_param=plain_candidate_idx,
+                        )
+                        rows = await conn.fetch(
+                            no_chain_cte + plain_tail, *fb_plain,
+                        )
+                    except Exception as exc:
+                        if _is_project_capability_error(exc):
+                            raise
+                        logger.debug(
+                            "plainto_tsquery fallback also failed", exc_info=True
+                        )
         return rows
 
     async with pool.acquire() as conn:

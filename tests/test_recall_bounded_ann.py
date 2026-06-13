@@ -107,18 +107,55 @@ class TestBuildRrfCteBoundedAnn:
 
 
 class _CapturingConn:
-    """Records (sql, args) for every fetch and returns canned rows."""
+    """Records (sql, args) for every fetch and returns canned rows.
 
-    def __init__(self, row_provider=None) -> None:
+    Also records ``execute`` statements and ``transaction()`` enter/exit so
+    tests can assert the bounded RRF fetch scopes ``SET LOCAL`` inside a
+    transaction (issue #153 round-1 finding 1). ``execute_error`` simulates an
+    older pgvector that rejects the ``hnsw.iterative_scan`` GUC.
+    """
+
+    def __init__(
+        self, row_provider=None, *, execute_error: Exception | None = None,
+    ) -> None:
         self.calls: list[tuple[str, tuple]] = []
+        self.executed: list[tuple[str, tuple]] = []
+        self.tx_depth = 0
+        self.max_tx_depth = 0
+        # Records (sql, tx_depth_at_call_time) for every fetch so tests can
+        # assert the RRF fetch happened inside an open transaction.
+        self.fetch_tx_depth: list[tuple[str, int]] = []
         self._row_provider = row_provider or (lambda sql, args: [])
+        self._execute_error = execute_error
 
     async def fetch(self, sql: str, *args: Any) -> list[Any]:
         self.calls.append((sql, args))
+        self.fetch_tx_depth.append((sql, self.tx_depth))
         return self._row_provider(sql, args)
+
+    async def execute(self, sql: str, *args: Any) -> str:
+        self.executed.append((sql, args))
+        if self._execute_error is not None and "iterative_scan" in sql:
+            raise self._execute_error
+        return "SET"
 
     async def fetchrow(self, sql: str, *args: Any) -> dict[str, Any]:
         return {"cnt": 0}
+
+    def transaction(self):
+        conn = self
+
+        class _Tx:
+            async def __aenter__(self):
+                conn.tx_depth += 1
+                conn.max_tx_depth = max(conn.max_tx_depth, conn.tx_depth)
+                return conn
+
+            async def __aexit__(self, *exc):
+                conn.tx_depth -= 1
+                return False
+
+        return _Tx()
 
 
 class _CapturingPool:
@@ -241,3 +278,224 @@ class TestRrfCandidateBinding:
         assert args[1] == str([0.1] * 8)  # $2 embedding str
         assert args[2] == rb._recall_cfg.rrf_k  # $3 rrf_k
         assert args[3] == k * 2  # $4 tail LIMIT
+
+
+# ============= Round-1 finding 1: filtered-HNSW under-fill GUC =============
+
+
+class TestRrfIterativeScanGuc:
+    """The bounded vector leg under-fills when pgvector applies WHERE filters
+    after the HNSW scan. Setting ``hnsw.iterative_scan = strict_order`` makes
+    the leg return true nearest-k under filters. It must be scoped with
+    ``SET LOCAL`` inside a transaction so pooled connections don't leak the
+    GUC, and must degrade gracefully on older pgvector that lacks the GUC.
+    """
+
+    async def test_set_local_iterative_scan_issued_before_fetch(
+        self, monkeypatch,
+    ):
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        conn = _CapturingConn()
+        _patch_rrf_env(monkeypatch, conn)
+
+        await rb.search_learnings_hybrid_rrf("query terms", k=3, expand=False)
+
+        # The GUC must be set via SET LOCAL (transaction-scoped), not plain SET.
+        guc_stmts = [
+            s for s, _ in conn.executed if "iterative_scan" in s
+        ]
+        assert guc_stmts, "expected a SET LOCAL hnsw.iterative_scan statement"
+        stmt = guc_stmts[0]
+        assert "SET LOCAL" in stmt.upper()
+        assert "strict_order" in stmt
+
+    async def test_rrf_fetch_runs_inside_transaction(self, monkeypatch):
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        conn = _CapturingConn()
+        _patch_rrf_env(monkeypatch, conn)
+
+        await rb.search_learnings_hybrid_rrf("query terms", k=3, expand=False)
+
+        # The RRF fetch (vector_ranked CTE) must execute while a transaction
+        # is open so SET LOCAL applies to it.
+        rrf_fetches = [
+            depth for sql, depth in conn.fetch_tx_depth
+            if "vector_ranked" in sql
+        ]
+        assert rrf_fetches, "expected an RRF fetch"
+        assert all(d >= 1 for d in rrf_fetches), (
+            "RRF fetch must run inside an open transaction (SET LOCAL scope)"
+        )
+
+    async def test_guc_set_before_rrf_fetch_in_order(self, monkeypatch):
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        # Single capturing conn records both execute and fetch; assert the GUC
+        # execute precedes the first RRF fetch.
+        events: list[str] = []
+
+        class _OrderConn(_CapturingConn):
+            async def execute(self, sql: str, *args: Any) -> str:
+                if "iterative_scan" in sql:
+                    events.append("guc")
+                return await super().execute(sql, *args)
+
+            async def fetch(self, sql: str, *args: Any) -> list[Any]:
+                if "vector_ranked" in sql:
+                    events.append("fetch")
+                return await super().fetch(sql, *args)
+
+        conn = _OrderConn()
+        _patch_rrf_env(monkeypatch, conn)
+
+        await rb.search_learnings_hybrid_rrf("query terms", k=3, expand=False)
+
+        assert "guc" in events and "fetch" in events
+        assert events.index("guc") < events.index("fetch")
+
+    async def test_unknown_guc_degrades_without_erroring(self, monkeypatch):
+        """Older pgvector lacks hnsw.iterative_scan; a SET LOCAL error must be
+        swallowed and recall must proceed (idempotent degradation)."""
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        boom = RuntimeError('unrecognized configuration parameter '
+                            '"hnsw.iterative_scan"')
+        conn = _CapturingConn(execute_error=boom)
+        _patch_rrf_env(monkeypatch, conn)
+
+        # Must not raise; the RRF fetch still runs.
+        results = await rb.search_learnings_hybrid_rrf(
+            "query terms", k=3, expand=False,
+        )
+        assert results == []
+        rrf_calls = [c for c in conn.calls if "vector_ranked" in c[0]]
+        assert rrf_calls, "RRF fetch must still run after GUC failure"
+
+
+# ====== Round-1 finding 2: bounded vs exact RRF fusion divergence ======
+
+
+def _rrf_score(rrf_k: int, fts_rank: int | None, vec_rank: int | None) -> float:
+    """RRF fusion mirroring the combined CTE: a missing rank contributes 0."""
+    score = 0.0
+    if fts_rank is not None:
+        score += 1.0 / (rrf_k + fts_rank)
+    if vec_rank is not None:
+        score += 1.0 / (rrf_k + vec_rank)
+    return score
+
+
+def _topk_ids(
+    rows: dict[str, tuple[int | None, int | None]],
+    *,
+    rrf_k: int,
+    candidate_count: int | None,
+    k: int,
+) -> list[str]:
+    """Rank ids by RRF score.
+
+    ``candidate_count`` truncates the vector leg: a row whose vec_rank exceeds
+    the candidate pool loses its vector term (matches the bounded inner
+    ``ORDER BY ... LIMIT``). ``None`` = exact (unbounded) RRF.
+    """
+    scored: list[tuple[float, str]] = []
+    for rid, (fts_rank, vec_rank) in rows.items():
+        eff_vec = vec_rank
+        if (
+            candidate_count is not None
+            and vec_rank is not None
+            and vec_rank > candidate_count
+        ):
+            eff_vec = None  # dropped from the truncated vector leg
+        if fts_rank is None and eff_vec is None:
+            continue  # row absent from both legs
+        scored.append((_rrf_score(rrf_k, fts_rank, eff_vec), rid))
+    # Deterministic tie-break by id so the test is repeatable.
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    return [rid for _score, rid in scored[:k]]
+
+
+class TestBoundedVsExactRrf:
+    """The candidate cap is the recall-quality lever: a row with a strong
+    fts_rank but vec_rank just outside the candidate pool loses its vector RRF
+    term and can drop from the final top-k that exact RRF would include.
+    These tests pin that tradeoff deterministically and show that raising the
+    multiplier recovers the boundary row.
+    """
+
+    def test_boundary_row_dropped_at_small_cap(self):
+        rrf_k = 60
+        k = 3
+        # 'boundary' is strong on FTS (rank 1) but its vec_rank (45) sits just
+        # outside a cap of 40. Three filler rows are solidly inside both legs.
+        # Fillers are vector-only (single RRF term). 'boundary' carries BOTH a
+        # moderate fts term and a vector term just outside a cap of 40: with
+        # both terms it outranks every filler (exact), but once the cap drops
+        # its vector term its lone fts term loses to all fillers (bounded).
+        rows = {
+            "a": (None, 1),
+            "b": (None, 2),
+            "c": (None, 3),
+            "boundary": (20, 45),
+        }
+        exact = _topk_ids(rows, rrf_k=rrf_k, candidate_count=None, k=k)
+        bounded = _topk_ids(rows, rrf_k=rrf_k, candidate_count=40, k=k)
+        # Exact RRF ranks 'boundary' into the top-k (fts term dominates).
+        assert "boundary" in exact
+        # Bounded (cap 40) drops its vector term and pushes it out of top-k.
+        assert "boundary" not in bounded
+
+    def test_raising_multiplier_recovers_boundary_row(self):
+        rrf_k = 60
+        k = 3
+        # Fillers are vector-only (single RRF term). 'boundary' carries BOTH a
+        # moderate fts term and a vector term just outside a cap of 40: with
+        # both terms it outranks every filler (exact), but once the cap drops
+        # its vector term its lone fts term loses to all fillers (bounded).
+        rows = {
+            "a": (None, 1),
+            "b": (None, 2),
+            "c": (None, 3),
+            "boundary": (20, 45),
+        }
+        # default multiplier 8 -> cap 40 drops it; multiplier 10 -> cap 50
+        # includes vec_rank 45, recovering exact behavior.
+        small = _topk_ids(rows, rrf_k=rrf_k, candidate_count=5 * 8, k=k)
+        large = _topk_ids(rows, rrf_k=rrf_k, candidate_count=5 * 10, k=k)
+        exact = _topk_ids(rows, rrf_k=rrf_k, candidate_count=None, k=k)
+        assert "boundary" not in small
+        assert "boundary" in large
+        assert large == exact
+
+    def test_divergence_bounded_when_all_vec_ranks_inside_cap(self):
+        """When every candidate's vec_rank is within the cap, bounded RRF
+        equals exact RRF exactly (zero divergence) — the documented
+        no-regression regime."""
+        rrf_k = 60
+        k = 5
+        rows = {
+            f"r{i}": (i + 1, i + 1) for i in range(20)
+        }  # all vec_ranks 1..20, well inside cap 40
+        exact = _topk_ids(rows, rrf_k=rrf_k, candidate_count=None, k=k)
+        bounded = _topk_ids(rows, rrf_k=rrf_k, candidate_count=40, k=k)
+        assert bounded == exact
+
+    def test_default_cap_overlap_within_documented_bound(self):
+        """At multiplier=8 (cap=40) with realistic rank spread, the bounded
+        top-k overlaps exact top-k by at least k-1 of k (documented bound:
+        at most one boundary displacement for these fixtures)."""
+        rrf_k = 60
+        k = 5
+        rows = {f"r{i}": (i + 1, i + 1) for i in range(60)}
+        # One adversarial boundary row: strong fts, vec just outside cap.
+        rows["edge"] = (1, 41)
+        exact = set(_topk_ids(rows, rrf_k=rrf_k, candidate_count=None, k=k))
+        bounded = set(_topk_ids(rows, rrf_k=rrf_k, candidate_count=40, k=k))
+        overlap = len(exact & bounded)
+        assert overlap >= k - 1, (overlap, exact, bounded)

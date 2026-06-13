@@ -34,7 +34,9 @@ from scripts.core.artifact_query import (
     get_ledger_for_session,
     handle_span_id_lookup,
     is_safe_artifact_path,
+    is_safe_dir_root,
     is_safe_session_name,
+    read_text_nofollow,
     safe_artifact_read_path,
     save_query,
     search_continuity,
@@ -796,6 +798,69 @@ class TestSafeArtifactReadPath:
         assert safe_artifact_read_path(link, root, suffixes=self._SUFFIXES) is None
 
 
+class TestReadTextNofollow:
+    """Tests for read_text_nofollow — no-follow, no-TOCTOU I/O helper."""
+
+    def test_reads_regular_file(self, tmp_path):
+        target = tmp_path / "file.md"
+        target.write_text("hello content")
+        assert read_text_nofollow(target) == "hello content"
+
+    def test_symlink_final_component_returns_none(self, tmp_path):
+        real = tmp_path / "real.md"
+        real.write_text("secret")
+        link = tmp_path / "link.md"
+        link.symlink_to(real)
+        # O_NOFOLLOW must refuse the symlinked final component.
+        assert read_text_nofollow(link) is None
+
+    def test_directory_returns_none(self, tmp_path):
+        d = tmp_path / "adir"
+        d.mkdir()
+        assert read_text_nofollow(d) is None
+
+    def test_missing_path_returns_none(self, tmp_path):
+        assert read_text_nofollow(tmp_path / "nope.md") is None
+
+
+class TestIsSafeDirRoot:
+    """Tests for is_safe_dir_root — fail-closed trust-root validation."""
+
+    def test_normal_dir_under_cwd_is_safe(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        root = tmp_path / "thoughts" / "shared" / "handoffs"
+        root.mkdir(parents=True)
+        assert is_safe_dir_root(root, tmp_path) is True
+
+    def test_symlinked_leaf_component_is_unsafe(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        real = tmp_path / "real_handoffs"
+        real.mkdir()
+        shared = tmp_path / "thoughts" / "shared"
+        shared.mkdir(parents=True)
+        link = shared / "handoffs"
+        link.symlink_to(real, target_is_directory=True)
+        assert is_safe_dir_root(link, tmp_path) is False
+
+    def test_symlinked_parent_component_is_unsafe(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        real_shared = tmp_path / "real_shared"
+        (real_shared / "handoffs").mkdir(parents=True)
+        thoughts = tmp_path / "thoughts"
+        thoughts.mkdir()
+        # thoughts/shared is a symlink to real_shared
+        (thoughts / "shared").symlink_to(real_shared, target_is_directory=True)
+        root = thoughts / "shared" / "handoffs"
+        assert is_safe_dir_root(root, tmp_path) is False
+
+    def test_root_outside_repo_is_unsafe(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        outside = tmp_path / "elsewhere"
+        outside.mkdir()
+        assert is_safe_dir_root(outside, repo) is False
+
+
 class TestIsSafeSessionName:
     """Tests for is_safe_session_name — pure validation helper."""
 
@@ -944,6 +1009,30 @@ class TestHandleSpanIdLookupPathTraversal:
         populated_db.execute(
             "UPDATE handoffs SET file_path = ? WHERE id = 'h1'",
             (rel,),
+        )
+        populated_db.commit()
+
+        result = handle_span_id_lookup(populated_db, "span-abc123", with_content=True)
+        assert result is not None
+        assert "content" not in result
+
+    def test_symlinked_handoffs_root_skips_content(
+        self, populated_db, tmp_path, monkeypatch
+    ):
+        """If thoughts/shared/handoffs is a symlink, content enrichment is skipped
+        even when file_path resolves under the symlink target."""
+        monkeypatch.chdir(tmp_path)
+        real = tmp_path / "real_handoffs" / "auth-session"
+        real.mkdir(parents=True)
+        (real / "task-1.yaml").write_text("symlink-target content")
+        shared = tmp_path / "thoughts" / "shared"
+        shared.mkdir(parents=True)
+        (shared / "handoffs").symlink_to(
+            tmp_path / "real_handoffs", target_is_directory=True
+        )
+        populated_db.execute(
+            "UPDATE handoffs SET file_path = ? WHERE id = 'h1'",
+            ("thoughts/shared/handoffs/auth-session/task-1.yaml",),
         )
         populated_db.commit()
 

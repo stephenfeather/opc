@@ -23,6 +23,7 @@ import os
 import re
 import secrets
 import sqlite3
+import stat
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -105,6 +106,33 @@ def safe_artifact_read_path(
     if resolved.suffix not in suffixes:
         return None
     return resolved
+
+
+def is_safe_dir_root(root: Path, repo_root: Path) -> bool:
+    """Return True if ``root`` is a trustworthy directory root under ``repo_root``.
+
+    Fails CLOSED: rejects the root if it resolves outside ``repo_root`` OR if any
+    path component from ``repo_root`` down to ``root`` (checked on the *unresolved*
+    on-disk path) is a symlink. This prevents a symlinked trust root (e.g. a swapped
+    ``thoughts/shared/handoffs``) from being blessed as the new authorization
+    boundary, since ``root.resolve()`` alone would silently follow it.
+    """
+    repo = repo_root.resolve()
+    if not root.resolve().is_relative_to(repo):
+        return False
+    # Derive the component chain from the *given* paths (not resolved), so we can
+    # walk each on-disk component and reject any that is itself a symlink. Anchor
+    # the walk at the resolved repo so macOS /var -> /private/var prefixes match.
+    try:
+        relative = root.absolute().relative_to(repo_root.absolute())
+    except ValueError:
+        return False
+    current = repo
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return False
+    return True
 
 
 def is_safe_session_name(name: str) -> bool:
@@ -487,6 +515,34 @@ def search_dispatch(
 # ---------------------------------------------------------------------------
 
 
+def read_text_nofollow(path: Path) -> str | None:
+    """Read a regular file without following symlinks; return None on any failure.
+
+    Opens with ``O_NOFOLLOW`` so a symlinked final component is refused (ELOOP),
+    and ``fstat``s the open fd to require a regular file. The validation and the
+    read share the same fd, eliminating the TOCTOU window between an existence
+    check and the read. Never raises: returns None on OSError (missing file,
+    symlink, directory, device, permission, decode error, ...).
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    fd_owned = True
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        # fdopen takes ownership of the fd; its context manager closes it.
+        fd_owned = False
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            return handle.read()
+    except (OSError, UnicodeError):
+        return None
+    finally:
+        if fd_owned:
+            os.close(fd)
+
+
 def handle_span_id_lookup(
     conn: sqlite3.Connection, span_id: str, with_content: bool = False
 ) -> dict | None:
@@ -508,11 +564,16 @@ def handle_span_id_lookup(
     if with_content and handoff.get("file_path"):
         allowed_root = Path.cwd()
         handoffs_root = allowed_root / "thoughts" / "shared" / "handoffs"
-        safe_path = safe_artifact_read_path(
-            handoff["file_path"], handoffs_root, suffixes=(".md", ".yaml", ".yml")
-        )
-        if safe_path is not None and safe_path.exists():
-            handoff["content"] = safe_path.read_text()
+
+        # Fail closed if the trusted handoffs root is itself reached via a symlink.
+        if is_safe_dir_root(handoffs_root, allowed_root):
+            safe_path = safe_artifact_read_path(
+                handoff["file_path"], handoffs_root, suffixes=(".md", ".yaml", ".yml")
+            )
+            if safe_path is not None:
+                content = read_text_nofollow(safe_path)
+                if content is not None:
+                    handoff["content"] = content
 
         session_name = handoff.get("session_name")
         if not session_name and handoff.get("file_path"):
@@ -524,13 +585,18 @@ def handle_span_id_lookup(
 
         if session_name and is_safe_session_name(session_name):
             ledger_path = Path(f"CONTINUITY_CLAUDE-{session_name}.md")
-            if ledger_path.exists() and is_safe_artifact_path(ledger_path, allowed_root):
-                ledger = {
+            safe_ledger = safe_artifact_read_path(
+                ledger_path, allowed_root, suffixes=(".md",)
+            )
+            ledger_content = (
+                read_text_nofollow(safe_ledger) if safe_ledger is not None else None
+            )
+            if ledger_content is not None:
+                handoff["ledger"] = {
                     "session_name": session_name,
                     "file_path": str(ledger_path),
-                    "content": ledger_path.read_text(),
+                    "content": ledger_content,
                 }
-                handoff["ledger"] = ledger
             else:
                 ledger = get_ledger_for_session(conn, session_name)
                 if ledger:

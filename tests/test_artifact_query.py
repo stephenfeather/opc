@@ -28,10 +28,13 @@ from scripts.core.artifact_query import (
     escape_fts5_query,
     format_result_section,
     format_results,
+    generate_uuid7,
     get_db_path,
     get_handoff_by_span_id,
     get_ledger_for_session,
     handle_span_id_lookup,
+    is_safe_artifact_path,
+    is_safe_session_name,
     save_query,
     search_continuity,
     search_dispatch,
@@ -39,7 +42,6 @@ from scripts.core.artifact_query import (
     search_past_queries,
     search_plans,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -590,15 +592,17 @@ class TestHandleSpanIdLookup:
         assert result["session_name"] == "auth-session"
         assert "content" not in result
 
-    def test_with_content_reads_file(self, populated_db, tmp_path):
-        # Create a fake handoff file
+    def test_with_content_reads_file(self, populated_db, tmp_path, monkeypatch):
+        # Create a fake handoff file under cwd (path-traversal guard requires
+        # the resolved file to live within Path.cwd()).
+        monkeypatch.chdir(tmp_path)
         handoff_file = tmp_path / "task-1.yaml"
         handoff_file.write_text("handoff content here")
 
-        # Update the DB to point to our tmp file
+        # Update the DB to point to our tmp file (relative to cwd)
         populated_db.execute(
             "UPDATE handoffs SET file_path = ? WHERE id = 'h1'",
-            (str(handoff_file),),
+            ("task-1.yaml",),
         )
         populated_db.commit()
 
@@ -701,3 +705,343 @@ class TestMain:
 
         captured = capsys.readouterr()
         assert "Database not found" in captured.out
+
+
+# ===========================================================================
+# Finding 1 — Path traversal guards (pure helpers)
+# ===========================================================================
+
+
+class TestIsSafeArtifactPath:
+    """Tests for is_safe_artifact_path — pure containment helper."""
+
+    def test_path_inside_root_is_safe(self, tmp_path):
+        target = tmp_path / "sub" / "file.md"
+        assert is_safe_artifact_path(target, tmp_path) is True
+
+    def test_relative_path_inside_root_is_safe(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        assert is_safe_artifact_path("file.md", tmp_path) is True
+
+    def test_absolute_path_outside_root_is_unsafe(self, tmp_path):
+        assert is_safe_artifact_path("/etc/hosts", tmp_path) is False
+
+    def test_relative_traversal_outside_root_is_unsafe(self, tmp_path):
+        assert is_safe_artifact_path(tmp_path / ".." / ".." / "x", tmp_path) is False
+
+    def test_symlink_escaping_root_is_unsafe(self, tmp_path):
+        outside_dir = tmp_path.parent / "outside_secret_dir"
+        outside_dir.mkdir()
+        secret = outside_dir / "secret.txt"
+        secret.write_text("top secret")
+        root = tmp_path / "root"
+        root.mkdir()
+        link = root / "link.txt"
+        link.symlink_to(secret)
+        # Resolution must happen BEFORE containment so the symlink is rejected.
+        assert is_safe_artifact_path(link, root) is False
+
+    def test_nonexistent_path_inside_root_is_safe(self, tmp_path):
+        assert is_safe_artifact_path(tmp_path / "does-not-exist.md", tmp_path) is True
+
+
+class TestIsSafeSessionName:
+    """Tests for is_safe_session_name — pure validation helper."""
+
+    def test_simple_name_is_safe(self):
+        assert is_safe_session_name("auth-session") is True
+
+    def test_name_with_allowed_punctuation_is_safe(self):
+        assert is_safe_session_name("auth.session_2-v3") is True
+
+    def test_empty_name_is_unsafe(self):
+        assert is_safe_session_name("") is False
+
+    def test_name_with_slash_is_unsafe(self):
+        assert is_safe_session_name("../etc/passwd") is False
+
+    def test_name_with_dotdot_is_unsafe(self):
+        assert is_safe_session_name("..") is False
+
+    def test_name_of_only_dots_is_unsafe(self):
+        assert is_safe_session_name("...") is False
+
+    def test_single_dot_is_unsafe(self):
+        assert is_safe_session_name(".") is False
+
+
+class TestHandleSpanIdLookupPathTraversal:
+    """Tests for handle_span_id_lookup path-traversal hardening."""
+
+    def test_absolute_path_outside_cwd_not_read(
+        self, populated_db, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        secret = tmp_path.parent / "secret_outside.txt"
+        secret.write_text("SECRET")
+        populated_db.execute(
+            "UPDATE handoffs SET file_path = ? WHERE id = 'h1'",
+            (str(secret),),
+        )
+        populated_db.commit()
+
+        result = handle_span_id_lookup(populated_db, "span-abc123", with_content=True)
+        assert result is not None
+        assert "content" not in result
+
+    def test_relative_traversal_not_read(self, populated_db, tmp_path, monkeypatch):
+        work = tmp_path / "work"
+        work.mkdir()
+        secret = tmp_path / "secret.txt"
+        secret.write_text("SECRET")
+        monkeypatch.chdir(work)
+        populated_db.execute(
+            "UPDATE handoffs SET file_path = ? WHERE id = 'h1'",
+            ("../secret.txt",),
+        )
+        populated_db.commit()
+
+        result = handle_span_id_lookup(populated_db, "span-abc123", with_content=True)
+        assert result is not None
+        assert "content" not in result
+
+    def test_symlink_inside_cwd_pointing_outside_not_read(
+        self, populated_db, tmp_path, monkeypatch
+    ):
+        work = tmp_path / "work"
+        work.mkdir()
+        secret = tmp_path / "secret.txt"
+        secret.write_text("SECRET")
+        link = work / "task-1.yaml"
+        link.symlink_to(secret)
+        monkeypatch.chdir(work)
+        populated_db.execute(
+            "UPDATE handoffs SET file_path = ? WHERE id = 'h1'",
+            ("task-1.yaml",),
+        )
+        populated_db.commit()
+
+        result = handle_span_id_lookup(populated_db, "span-abc123", with_content=True)
+        assert result is not None
+        assert "content" not in result
+
+    def test_unsafe_session_name_skips_ledger(
+        self, populated_db, tmp_path, monkeypatch
+    ):
+        # Poison the session_name with traversal; legit handoff file under cwd.
+        monkeypatch.chdir(tmp_path)
+        handoff_file = tmp_path / "task-1.yaml"
+        handoff_file.write_text("legit content")
+        populated_db.execute(
+            "UPDATE handoffs SET file_path = ?, session_name = ? WHERE id = 'h1'",
+            ("task-1.yaml", "../../etc/passwd"),
+        )
+        populated_db.commit()
+
+        result = handle_span_id_lookup(populated_db, "span-abc123", with_content=True)
+        assert result is not None
+        assert result["content"] == "legit content"
+        assert "ledger" not in result
+
+    def test_legit_file_under_cwd_returns_content(
+        self, populated_db, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        handoff_file = tmp_path / "task-1.yaml"
+        handoff_file.write_text("happy path content")
+        populated_db.execute(
+            "UPDATE handoffs SET file_path = ? WHERE id = 'h1'",
+            ("task-1.yaml",),
+        )
+        populated_db.commit()
+
+        result = handle_span_id_lookup(populated_db, "span-abc123", with_content=True)
+        assert result is not None
+        assert result["content"] == "happy path content"
+
+    def test_legit_ledger_under_cwd_returned(
+        self, populated_db, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        handoff_file = tmp_path / "task-1.yaml"
+        handoff_file.write_text("handoff content")
+        ledger_file = tmp_path / "CONTINUITY_CLAUDE-auth-session.md"
+        ledger_file.write_text("ledger content")
+        populated_db.execute(
+            "UPDATE handoffs SET file_path = ? WHERE id = 'h1'",
+            ("task-1.yaml",),
+        )
+        populated_db.commit()
+
+        result = handle_span_id_lookup(populated_db, "span-abc123", with_content=True)
+        assert result is not None
+        assert result["ledger"]["content"] == "ledger content"
+
+
+# ===========================================================================
+# Finding 2 — generate_uuid7 pure helper + save_query integration
+# ===========================================================================
+
+
+class TestGenerateUuid7:
+    """Tests for generate_uuid7 — pure RFC 9562 UUIDv7 helper."""
+
+    def test_returns_36_char_canonical_string(self):
+        result = generate_uuid7()
+        assert isinstance(result, str)
+        assert len(result) == 36
+        assert result.count("-") == 4
+
+    def test_version_nibble_is_7(self):
+        result = generate_uuid7(timestamp_ms=0, random_bytes=b"\x00" * 10)
+        # Version nibble is first char of 3rd group (index 14 overall).
+        assert result[14] == "7"
+
+    def test_variant_bits_are_10(self):
+        result = generate_uuid7(timestamp_ms=0, random_bytes=b"\xff" * 10)
+        # Variant nibble is first char of 4th group; high two bits must be 10.
+        variant_nibble = int(result[19], 16)
+        assert (variant_nibble >> 2) == 0b10
+
+    def test_deterministic_given_seeds(self):
+        a = generate_uuid7(timestamp_ms=123456789, random_bytes=b"\x01" * 10)
+        b = generate_uuid7(timestamp_ms=123456789, random_bytes=b"\x01" * 10)
+        assert a == b
+
+    def test_timestamp_ordering_sorts_lexicographically(self):
+        early = generate_uuid7(timestamp_ms=1000, random_bytes=b"\x00" * 10)
+        late = generate_uuid7(timestamp_ms=2000, random_bytes=b"\x00" * 10)
+        assert early < late
+
+    def test_lowercase_hex(self):
+        result = generate_uuid7(timestamp_ms=0xABCDEF, random_bytes=b"\xab" * 10)
+        assert result == result.lower()
+
+
+class TestSaveQueryUuid7:
+    """Tests for save_query using uuid7 ids."""
+
+    def test_stores_36_char_id(self, populated_db):
+        save_query(populated_db, "uuid question", "answer", {})
+        cursor = populated_db.execute(
+            "SELECT id FROM queries WHERE question = 'uuid question'"
+        )
+        row = cursor.fetchone()
+        assert row is not None
+        assert len(row[0]) == 36
+        assert row[0].count("-") == 4
+
+    def test_same_question_and_now_different_ids(self, populated_db):
+        from datetime import datetime
+
+        now = datetime(2026, 1, 1, 12, 0, 0)
+        save_query(populated_db, "dup question", "a", {}, now=now)
+        save_query(populated_db, "dup question", "a", {}, now=now)
+        cursor = populated_db.execute(
+            "SELECT id FROM queries WHERE question = 'dup question'"
+        )
+        ids = [r[0] for r in cursor.fetchall()]
+        assert len(ids) == 2
+        assert ids[0] != ids[1]
+
+
+# ===========================================================================
+# Finding 3 — connection lifetime in _run_span_lookup / _run_search
+# ===========================================================================
+
+
+class _CloseTrackingConn:
+    """Wrapper recording close() calls while delegating to a real connection."""
+
+    def __init__(self, real):
+        self._real = real
+        self.close_count = 0
+
+    def close(self):
+        self.close_count += 1
+        self._real.close()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class TestConnectionLifetime:
+    """_run_span_lookup / _run_search must close connections even on error."""
+
+    def _make_db(self, tmp_path):
+        db_file = tmp_path / "test.db"
+        conn = sqlite3.connect(str(db_file))
+        conn.executescript(_SCHEMA_PATH.read_text())
+        conn.commit()
+        conn.close()
+        return db_file
+
+    def test_span_lookup_closes_on_success(self, tmp_path, monkeypatch, capsys):
+        from scripts.core import artifact_query as aq
+
+        db_file = self._make_db(tmp_path)
+        tracker = {}
+
+        def fake_open(path):
+            tracker["conn"] = _CloseTrackingConn(sqlite3.connect(str(path)))
+            return tracker["conn"]
+
+        monkeypatch.setattr(aq, "_open_db", fake_open)
+        args = aq._build_parser().parse_args(["--by-span-id", "nope", "--db", str(db_file)])
+        aq._run_span_lookup(args)
+        assert tracker["conn"].close_count == 1
+
+    def test_span_lookup_closes_on_error(self, tmp_path, monkeypatch):
+        from scripts.core import artifact_query as aq
+
+        db_file = self._make_db(tmp_path)
+        tracker = {}
+
+        def fake_open(path):
+            tracker["conn"] = _CloseTrackingConn(sqlite3.connect(str(path)))
+            return tracker["conn"]
+
+        def boom(*a, **k):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(aq, "_open_db", fake_open)
+        monkeypatch.setattr(aq, "handle_span_id_lookup", boom)
+        args = aq._build_parser().parse_args(["--by-span-id", "x", "--db", str(db_file)])
+        with pytest.raises(RuntimeError):
+            aq._run_span_lookup(args)
+        assert tracker["conn"].close_count == 1
+
+    def test_search_closes_on_success(self, tmp_path, monkeypatch):
+        from scripts.core import artifact_query as aq
+
+        db_file = self._make_db(tmp_path)
+        tracker = {}
+
+        def fake_open(path):
+            tracker["conn"] = _CloseTrackingConn(sqlite3.connect(str(path)))
+            return tracker["conn"]
+
+        monkeypatch.setattr(aq, "_open_db", fake_open)
+        args = aq._build_parser().parse_args(["query", "--json", "--db", str(db_file)])
+        aq._run_search(args, "query")
+        assert tracker["conn"].close_count == 1
+
+    def test_search_closes_on_error(self, tmp_path, monkeypatch):
+        from scripts.core import artifact_query as aq
+
+        db_file = self._make_db(tmp_path)
+        tracker = {}
+
+        def fake_open(path):
+            tracker["conn"] = _CloseTrackingConn(sqlite3.connect(str(path)))
+            return tracker["conn"]
+
+        def boom(*a, **k):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(aq, "_open_db", fake_open)
+        monkeypatch.setattr(aq, "search_dispatch", boom)
+        args = aq._build_parser().parse_args(["query", "--json", "--db", str(db_file)])
+        with pytest.raises(RuntimeError):
+            aq._run_search(args, "query")
+        assert tracker["conn"].close_count == 1

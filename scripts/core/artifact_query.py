@@ -16,11 +16,14 @@ Examples:
 """
 
 import argparse
+import contextlib
 import faulthandler
-import hashlib
 import json
 import os
+import re
+import secrets
 import sqlite3
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -67,6 +70,58 @@ def escape_fts5_query(query: str) -> str:
     words = query.split()
     quoted_words = [f'"{w.replace(chr(34), chr(34) + chr(34))}"' for w in words]
     return " OR ".join(quoted_words)
+
+
+_SESSION_NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def is_safe_artifact_path(candidate: str | Path, allowed_root: Path) -> bool:
+    """Return True if ``candidate`` resolves to a path within ``allowed_root``.
+
+    Resolution happens before the containment check so symlinks that point
+    outside the root are rejected. Non-existent paths are permitted (the
+    caller's own ``.exists()`` check decides whether to read them).
+    """
+    resolved = Path(candidate).resolve()
+    root = allowed_root.resolve()
+    return resolved.is_relative_to(root)
+
+
+def is_safe_session_name(name: str) -> bool:
+    """Return True if ``name`` is a safe session identifier.
+
+    Must consist solely of ``[A-Za-z0-9._-]``, be non-empty, and not be made
+    up entirely of dots (rejecting ".", "..", "..." and longer dot runs).
+    """
+    if not name or not _SESSION_NAME_RE.fullmatch(name):
+        return False
+    return name.strip(".") != ""
+
+
+def generate_uuid7(timestamp_ms: int | None = None, random_bytes: bytes | None = None) -> str:
+    """Return a canonical RFC 9562 UUIDv7 string.
+
+    Layout (128 bits): 48-bit big-endian unix-epoch milliseconds, 4-bit
+    version (0b0111), 12-bit ``rand_a``, 2-bit variant (0b10), 62-bit
+    ``rand_b``. ``timestamp_ms`` and ``random_bytes`` are injection seams for
+    tests; production callers leave them as ``None``.
+    """
+    if timestamp_ms is None:
+        timestamp_ms = int(datetime.now().timestamp() * 1000)
+    if random_bytes is None:
+        random_bytes = secrets.token_bytes(10)
+
+    ts = timestamp_ms.to_bytes(6, "big")
+
+    rand_a = int.from_bytes(random_bytes[0:2], "big") & 0x0FFF
+    byte6 = 0x70 | (rand_a >> 8)
+    byte7 = rand_a & 0xFF
+
+    rand_b = bytearray(random_bytes[2:10])
+    rand_b[0] = (rand_b[0] & 0x3F) | 0x80
+
+    raw = ts + bytes([byte6, byte7]) + bytes(rand_b)
+    return str(uuid.UUID(bytes=raw))
 
 
 # ---------------------------------------------------------------------------
@@ -431,8 +486,9 @@ def handle_span_id_lookup(
         return None
 
     if with_content and handoff.get("file_path"):
+        allowed_root = Path.cwd()
         file_path = Path(handoff["file_path"])
-        if file_path.exists():
+        if file_path.exists() and is_safe_artifact_path(file_path, allowed_root):
             handoff["content"] = file_path.read_text()
 
         session_name = handoff.get("session_name")
@@ -443,9 +499,9 @@ def handle_span_id_lookup(
                 if idx + 1 < len(parts):
                     session_name = parts[idx + 1]
 
-        if session_name:
+        if session_name and is_safe_session_name(session_name):
             ledger_path = Path(f"CONTINUITY_CLAUDE-{session_name}.md")
-            if ledger_path.exists():
+            if ledger_path.exists() and is_safe_artifact_path(ledger_path, allowed_root):
                 ledger = {
                     "session_name": session_name,
                     "file_path": str(ledger_path),
@@ -482,9 +538,7 @@ def save_query(
         now: Timestamp override for testability (defaults to datetime.now())
     """
     timestamp = now or datetime.now()
-    query_id = hashlib.md5(
-        f"{question}{timestamp.isoformat()}".encode()
-    ).hexdigest()[:12]
+    query_id = generate_uuid7(timestamp_ms=int(timestamp.timestamp() * 1000))
 
     conn.execute(
         """
@@ -544,9 +598,8 @@ def _run_span_lookup(args: argparse.Namespace) -> None:
         print(f"Database not found: {db_path}")
         return
 
-    conn = _open_db(db_path)
-    handoff = handle_span_id_lookup(conn, args.by_span_id, with_content=args.with_content)
-    conn.close()
+    with contextlib.closing(_open_db(db_path)) as conn:
+        handoff = handle_span_id_lookup(conn, args.by_span_id, with_content=args.with_content)
 
     if args.json:
         print(json.dumps(handoff, indent=2, default=str))
@@ -568,20 +621,18 @@ def _run_search(args: argparse.Namespace, query: str) -> None:
         print("Run: uv run python scripts/artifact_index.py --all")
         return
 
-    conn = _open_db(db_path)
-    results = search_dispatch(conn, query, args.type, args.outcome, args.limit)
+    with contextlib.closing(_open_db(db_path)) as conn:
+        results = search_dispatch(conn, query, args.type, args.outcome, args.limit)
 
-    if args.json:
-        print(json.dumps(results, indent=2, default=str))
-    else:
-        formatted = format_results(results)
-        print(formatted)
+        if args.json:
+            print(json.dumps(results, indent=2, default=str))
+        else:
+            formatted = format_results(results)
+            print(formatted)
 
-        if args.save:
-            save_query(conn, query, formatted, results)
-            print("\n[Query saved for compound learning]")
-
-    conn.close()
+            if args.save:
+                save_query(conn, query, formatted, results)
+                print("\n[Query saved for compound learning]")
 
 
 # ---------------------------------------------------------------------------

@@ -146,7 +146,9 @@ def is_safe_session_name(name: str) -> bool:
     return name.strip(".") != ""
 
 
-def generate_uuid7(timestamp_ms: int | None = None, random_bytes: bytes | None = None) -> str:
+def generate_uuid7(
+    timestamp_ms: int | None = None, random_bytes: bytes | bytearray | None = None
+) -> str:
     """Return a canonical RFC 9562 UUIDv7 string.
 
     Layout (128 bits): 48-bit big-endian unix-epoch milliseconds, 4-bit
@@ -158,6 +160,14 @@ def generate_uuid7(timestamp_ms: int | None = None, random_bytes: bytes | None =
         timestamp_ms = int(datetime.now().timestamp() * 1000)
     if random_bytes is None:
         random_bytes = secrets.token_bytes(10)
+
+    # Enforce the contract with deliberate errors (bool is an int subclass — reject it).
+    if isinstance(timestamp_ms, bool) or not isinstance(timestamp_ms, int):
+        raise ValueError(f"timestamp_ms must be in [0, 2**48), got {timestamp_ms!r}")
+    if not 0 <= timestamp_ms < 2**48:
+        raise ValueError(f"timestamp_ms must be in [0, 2**48), got {timestamp_ms!r}")
+    if not isinstance(random_bytes, (bytes, bytearray)) or len(random_bytes) != 10:
+        raise ValueError("random_bytes must be exactly 10 bytes")
 
     ts = timestamp_ms.to_bytes(6, "big")
 

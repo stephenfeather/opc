@@ -1159,6 +1159,36 @@ class TestGenerateUuid7:
         result = generate_uuid7(timestamp_ms=0xABCDEF, random_bytes=b"\xab" * 10)
         assert result == result.lower()
 
+    def test_negative_timestamp_raises(self):
+        with pytest.raises(ValueError):
+            generate_uuid7(timestamp_ms=-1, random_bytes=b"\x00" * 10)
+
+    def test_timestamp_at_or_above_2pow48_raises(self):
+        with pytest.raises(ValueError):
+            generate_uuid7(timestamp_ms=2**48, random_bytes=b"\x00" * 10)
+
+    def test_max_in_range_timestamp_allowed(self):
+        result = generate_uuid7(timestamp_ms=2**48 - 1, random_bytes=b"\x00" * 10)
+        assert len(result) == 36
+        assert result[14] == "7"
+
+    def test_bool_timestamp_rejected(self):
+        with pytest.raises(ValueError):
+            generate_uuid7(timestamp_ms=True, random_bytes=b"\x00" * 10)
+
+    def test_short_random_bytes_raises(self):
+        with pytest.raises(ValueError):
+            generate_uuid7(timestamp_ms=0, random_bytes=b"short")
+
+    def test_long_random_bytes_raises(self):
+        with pytest.raises(ValueError):
+            generate_uuid7(timestamp_ms=0, random_bytes=b"\x00" * 11)
+
+    def test_bytearray_seed_accepted(self):
+        result = generate_uuid7(timestamp_ms=0, random_bytes=bytearray(10))
+        assert len(result) == 36
+        assert result[14] == "7"
+
 
 class TestSaveQueryUuid7:
     """Tests for save_query using uuid7 ids."""

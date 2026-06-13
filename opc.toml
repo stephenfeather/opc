@@ -153,6 +153,12 @@ recall_boost_multiplier = 0.002
 # BM25 normalization divisor for SQLite scores.
 bm25_normalization_divisor = 25.0
 
+# Vector-leg ANN candidate pool size = default_k * this multiplier (issue #153).
+# The bounded inner ORDER BY ... LIMIT lets the HNSW index accelerate recall.
+# RRF fuses RANKS, and truncating the candidate set shifts scores for rows
+# outside it, so keep this generous; lower only if EXPLAIN + recall quality hold.
+vector_candidate_multiplier = 8
+
 
 [embedding]
 # Default Ollama model for local embeddings.

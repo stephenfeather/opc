@@ -278,12 +278,50 @@ def model_filter_clause(model_label: str | None, *, param_index: int) -> str:
     return f"AND embedding_model = ${param_index}"
 
 
+def _build_vector_ranked_cte(
+    *, chain_clause: str, vector_extra: str, candidate_param: int | None,
+) -> str:
+    """Render the ``vector_ranked`` CTE body (issue #153).
+
+    With ``candidate_param`` it wraps a bounded ANN inner subquery
+    (``ORDER BY embedding <=> $2::vector LIMIT $N``) so the HNSW index can
+    accelerate the scan, then ranks the candidates with an outer
+    ``ROW_NUMBER()``. Without it, it reproduces the legacy unbounded leg
+    byte-identically (the window orders straight off the table).
+    """
+    if candidate_param is None:
+        return f"""vector_ranked AS (
+                SELECT
+                    id,
+                    ROW_NUMBER() OVER (ORDER BY embedding <=> $2::vector) as vec_rank
+                FROM archival_memory
+                WHERE metadata->>'type' = 'session_learning'{chain_clause}{vector_extra}
+                AND embedding IS NOT NULL
+            )"""
+    return f"""vector_ranked AS (
+                SELECT
+                    id,
+                    ROW_NUMBER() OVER (ORDER BY dist) as vec_rank
+                FROM (
+                    SELECT
+                        id,
+                        embedding <=> $2::vector AS dist
+                    FROM archival_memory
+                    WHERE metadata->>'type' = 'session_learning'{chain_clause}{vector_extra}
+                    AND embedding IS NOT NULL
+                    ORDER BY embedding <=> $2::vector
+                    LIMIT ${candidate_param}
+                ) cand
+            )"""
+
+
 def build_rrf_cte(
     *,
     chain_filter: bool,
     use_tsquery: bool = False,
     project_filter: str | None = None,
     model_filter: str | None = None,
+    candidate_param: int | None = None,
 ) -> str:
     """Build the SQL CTE for RRF (Reciprocal Rank Fusion) queries.
 
@@ -300,6 +338,15 @@ def build_rrf_cte(
     vector leg and the FULL OUTER JOIN degrades RRF to the text leg rather
     than erroring. ``None`` leaves the CTE byte-identical to the pre-#151
     path.
+
+    ``candidate_param`` is the positional index of the bounded ANN candidate
+    ``LIMIT`` (issue #153). When given, ``vector_ranked`` ranks a bounded
+    inner subquery shaped ``... ORDER BY embedding <=> $2::vector LIMIT $N`` —
+    the only shape pgvector's HNSW index accelerates — and an outer
+    ``ROW_NUMBER()`` ranks the (already small) candidate set for RRF fusion.
+    The filters live *inside* the inner subquery so the pool shrinks before
+    the LIMIT. ``None`` preserves the legacy unbounded leg byte-identically
+    for callers/tests that don't pass it.
     """
     chain_clause = (
         "\n                AND superseded_by IS NULL" if chain_filter else ""
@@ -314,6 +361,11 @@ def build_rrf_cte(
     # project predicate (issue #151: model filter is vector-only).
     vector_extra = f"{project_clause}{model_clause}"
     tsquery_fn = "to_tsquery" if use_tsquery else "plainto_tsquery"
+    vector_ranked = _build_vector_ranked_cte(
+        chain_clause=chain_clause,
+        vector_extra=vector_extra,
+        candidate_param=candidate_param,
+    )
     return f"""
             WITH fts_ranked AS (
                 SELECT
@@ -328,14 +380,7 @@ def build_rrf_cte(
                 WHERE metadata->>'type' = 'session_learning'{chain_clause}{project_clause}
                 AND to_tsvector('english', content) @@ {tsquery_fn}('english', $1)
             ),
-            vector_ranked AS (
-                SELECT
-                    id,
-                    ROW_NUMBER() OVER (ORDER BY embedding <=> $2::vector) as vec_rank
-                FROM archival_memory
-                WHERE metadata->>'type' = 'session_learning'{chain_clause}{vector_extra}
-                AND embedding IS NOT NULL
-            ),
+            {vector_ranked},
             combined AS (
                 SELECT
                     COALESCE(f.id, v.id) as id,
@@ -1033,13 +1078,25 @@ async def search_learnings_hybrid_rrf(
         boosted_mf = model_filter_clause(model_label, param_index=boosted_model_idx)
         plain_mf = model_filter_clause(model_label, param_index=plain_model_idx)
 
-        def _cte(*, chain: bool, ts: bool, pf: str, mf: str) -> str:
+        # Bounded ANN candidate LIMIT (issue #153) binds *last*, after project
+        # and model, mirroring #139/#151 so $1..$5 keep their numbers. Boosted
+        # base = $5, plain base = $4; project (when active) +1, model +1, then
+        # the candidate count takes the final slot.
+        boosted_candidate_idx = 6 + bool(boosted_pf) + bool(boosted_mf)
+        plain_candidate_idx = 5 + bool(plain_pf) + bool(plain_mf)
+        candidate_count = k * _recall_cfg.vector_candidate_multiplier
+
+        def _cte(
+            *, chain: bool, ts: bool, pf: str, mf: str, candidate_param: int,
+        ) -> str:
             return build_rrf_cte(
                 chain_filter=chain, use_tsquery=ts,
                 project_filter=pf, model_filter=mf,
+                candidate_param=candidate_param,
             )
 
-        # Append project then model values, matching the param ordering above.
+        # Append project then model values, matching the param ordering above,
+        # then the candidate count as the final positional arg.
         boosted_extra = (
             *((project,) if boosted_pf else ()),
             *((model_label,) if boosted_mf else ()),
@@ -1048,12 +1105,27 @@ async def search_learnings_hybrid_rrf(
             *((project,) if plain_pf else ()),
             *((model_label,) if plain_mf else ()),
         )
-        boosted_args = (text_query, embedding_str, rrf_k, k * 2, boost, *boosted_extra)
-        plain_args = (text_query, embedding_str, rrf_k, k * 2, *plain_extra)
+        boosted_args = (
+            text_query, embedding_str, rrf_k, k * 2, boost,
+            *boosted_extra, candidate_count,
+        )
+        plain_args = (
+            text_query, embedding_str, rrf_k, k * 2,
+            *plain_extra, candidate_count,
+        )
 
-        cte_boosted = _cte(chain=True, ts=use_tsquery, pf=boosted_pf, mf=boosted_mf)
-        cte_plain_args = _cte(chain=True, ts=use_tsquery, pf=plain_pf, mf=plain_mf)
-        cte_plain_nochain = _cte(chain=False, ts=use_tsquery, pf=plain_pf, mf=plain_mf)
+        cte_boosted = _cte(
+            chain=True, ts=use_tsquery, pf=boosted_pf, mf=boosted_mf,
+            candidate_param=boosted_candidate_idx,
+        )
+        cte_plain_args = _cte(
+            chain=True, ts=use_tsquery, pf=plain_pf, mf=plain_mf,
+            candidate_param=plain_candidate_idx,
+        )
+        cte_plain_nochain = _cte(
+            chain=False, ts=use_tsquery, pf=plain_pf, mf=plain_mf,
+            candidate_param=plain_candidate_idx,
+        )
 
         try:
             rows = await conn.fetch(cte_boosted + boosted_tail, *boosted_args)
@@ -1074,10 +1146,22 @@ async def search_learnings_hybrid_rrf(
 
         if not rows and use_tsquery:
             logger.debug("Expanded tsquery returned no results, falling back to plainto_tsquery")
-            fb_boosted = (query, embedding_str, rrf_k, k * 2, boost, *boosted_extra)
-            fb_plain = (query, embedding_str, rrf_k, k * 2, *plain_extra)
-            fb_cte_boosted = _cte(chain=True, ts=False, pf=boosted_pf, mf=boosted_mf)
-            fb_cte_plain = _cte(chain=True, ts=False, pf=plain_pf, mf=plain_mf)
+            fb_boosted = (
+                query, embedding_str, rrf_k, k * 2, boost,
+                *boosted_extra, candidate_count,
+            )
+            fb_plain = (
+                query, embedding_str, rrf_k, k * 2,
+                *plain_extra, candidate_count,
+            )
+            fb_cte_boosted = _cte(
+                chain=True, ts=False, pf=boosted_pf, mf=boosted_mf,
+                candidate_param=boosted_candidate_idx,
+            )
+            fb_cte_plain = _cte(
+                chain=True, ts=False, pf=plain_pf, mf=plain_mf,
+                candidate_param=plain_candidate_idx,
+            )
             try:
                 if has_decay_columns:
                     rows = await conn.fetch(fb_cte_boosted + boosted_tail, *fb_boosted)
@@ -1088,7 +1172,10 @@ async def search_learnings_hybrid_rrf(
                     raise
                 logger.debug("plainto_tsquery chain fallback", exc_info=True)
                 try:
-                    no_chain_cte = _cte(chain=False, ts=False, pf=plain_pf, mf=plain_mf)
+                    no_chain_cte = _cte(
+                        chain=False, ts=False, pf=plain_pf, mf=plain_mf,
+                        candidate_param=plain_candidate_idx,
+                    )
                     rows = await conn.fetch(
                         no_chain_cte + plain_tail, *fb_plain,
                     )

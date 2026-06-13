@@ -121,6 +121,15 @@ class TestRecallConfig:
         assert cfg.rrf_k == 60
         assert cfg.max_expansion_terms == 5
 
+    def test_vector_candidate_multiplier_default(self):
+        # Issue #153: bounded ANN candidate pool = default_k * this multiplier.
+        cfg = RecallConfig()
+        assert cfg.vector_candidate_multiplier == 8
+
+    def test_vector_candidate_multiplier_override(self):
+        cfg = RecallConfig(vector_candidate_multiplier=4)
+        assert cfg.vector_candidate_multiplier == 4
+
 
 class TestPatternsConfig:
     def test_defaults(self):

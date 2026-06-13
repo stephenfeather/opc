@@ -159,6 +159,11 @@ class RecallConfig:
     max_expansion_terms: int = 5
     recall_boost_multiplier: float = 0.002
     bm25_normalization_divisor: float = 25.0
+    # Issue #153: vector-leg ANN candidate pool size = default_k * this.
+    # The bounded inner ORDER BY ... LIMIT lets the HNSW index accelerate
+    # the hybrid RRF vector leg. Keep generous — RRF fuses ranks and
+    # truncating the candidate set shifts scores for rows outside it.
+    vector_candidate_multiplier: int = 8
 
 
 @dataclass(frozen=True)

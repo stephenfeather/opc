@@ -68,7 +68,9 @@ async def test_metadata_persisted_as_json(monkeypatch):
     ]
     await store_entities_and_edges(memory_id, entities, [])
 
-    # The 4th positional arg to the entity INSERT must be json.dumps(metadata).
+    # conn.fetchrow positional args are (sql, name, display_name, entity_type,
+    # metadata); index [4] is the metadata bind value ($4::jsonb), which must be
+    # json.dumps(metadata), not a hardcoded "{}".
     insert_call = conn.fetchrow.call_args
     metadata_arg = insert_call[0][4]
     assert metadata_arg == json.dumps({"is_directory": True})

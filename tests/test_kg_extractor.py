@@ -188,6 +188,14 @@ class TestCompiledDictionaryPatterns:
         tool_names = {e.name for e in entities if e.entity_type == "tool"}
         assert "postgresql" in tool_names
 
+    def test_non_word_boundary_at_end_matches(self):
+        """A dictionary term ending in a non-word character ('c++') must still
+        match — a plain `\\b...\\b` wrap would never match it (issue #122 PR
+        review)."""
+        entities = extract_entities("The c++ standard library is great")
+        language_names = {e.name for e in entities if e.entity_type == "language"}
+        assert "c++" in language_names
+
 
 class TestEntityBoundaryPattern:
     """Issue #122: entity membership matching must respect token boundaries even

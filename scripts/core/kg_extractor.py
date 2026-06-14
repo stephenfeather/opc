@@ -83,19 +83,33 @@ _FILE_EXTENSIONS: set[str] = {
 # ---------------------------------------------------------------------------
 
 
+def _bounded(term: str) -> str:
+    """Return ``re.escape(term)`` wrapped with token boundaries.
+
+    A plain ``\\b`` only works when the endpoint is a word character. Terms can
+    begin or end with non-word characters (e.g. ``c++`` in ``KNOWN_LANGUAGES``,
+    or canonical names like ``.env`` / ``../utils/helper.py``), where ``\\b``
+    would never match — ``\\bc\\+\\+\\b`` cannot match ``c++`` because ``+`` is
+    not a word char. Use a zero-width lookaround at any non-word endpoint
+    instead, which still rejects a fragment inside a larger word.
+    """
+    left = r"\b" if re.match(r"\w", term) else r"(?<!\w)"
+    right = r"\b" if re.search(r"\w$", term) else r"(?!\w)"
+    return left + re.escape(term) + right
+
+
 def _compile_alternation(terms: set[str]) -> re.Pattern[str]:
-    """Compile a word-boundary alternation over ``terms``.
+    """Compile a token-boundary alternation over ``terms``.
 
     Terms are ordered longest-first (ties broken alphabetically for
     determinism) so that, e.g., ``postgresql`` is preferred over ``postgres``
-    in the alternation. Compiled once at module load and reused across every
-    ``extract_entities`` call (issue #122 / #125).
+    in the alternation. Each term carries its own boundaries (via ``_bounded``)
+    so terms ending in non-word characters such as ``c++`` still match.
+    Compiled once at module load and reused across every ``extract_entities``
+    call (issue #122 / #125).
     """
     ordered = sorted(terms, key=lambda t: (-len(t), t))
-    return re.compile(
-        r"\b(?:" + "|".join(re.escape(t) for t in ordered) + r")\b",
-        re.IGNORECASE,
-    )
+    return re.compile("|".join(_bounded(t) for t in ordered), re.IGNORECASE)
 
 
 # Known-dictionary alternations, compiled once (hoisted out of extract_entities).
@@ -289,18 +303,10 @@ _MAX_FALLBACK_NAME_LEN = 256
 
 
 def _entity_boundary_pattern(name: str) -> re.Pattern[str]:
-    """Compile a whole-token matcher for an entity ``name``.
-
-    A plain ``\\b...\\b`` wrap only works when the name begins and ends with
-    word characters. Canonical names preserved by normalization can start or end
-    with non-word characters (e.g. ``.env`` or ``../utils/helper.py``), where
-    ``\\b`` would never match. Use a zero-width lookaround at any non-word
-    endpoint instead so a fragment inside a larger word is still rejected
-    (issue #122 review round 1).
-    """
-    left = r"\b" if re.match(r"\w", name) else r"(?<!\w)"
-    right = r"\b" if re.search(r"\w$", name) else r"(?!\w)"
-    return re.compile(left + re.escape(name) + right)
+    """Compile a whole-token matcher for an entity ``name`` (issue #122 review
+    round 1). Boundary handling is shared with the dictionary alternations via
+    ``_bounded`` so non-word endpoints (e.g. ``../utils/helper.py``) match."""
+    return re.compile(_bounded(name))
 
 
 def _iter_sentence_spans(text: str):

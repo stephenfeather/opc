@@ -450,19 +450,27 @@ async def store_entities_and_edges(
     """Persist entities and edges to PostgreSQL.
 
     Idempotent per memory_id: re-processing the same learning will not inflate
-    mention_count or edge weight. Each returned counter reflects genuinely new
-    rows only:
+    mention_count or edge weight. Returned counters:
 
-    - ``entities``: entity rows created on this call (``xmax = 0`` after the
-      upsert); ON CONFLICT updates are not counted.
+    - ``entities``: distinct entities resolved (created or already present) for
+      this memory — preserves the operator-facing "KG indexed" count even on a
+      mature graph where most entities already exist.
+    - ``created_entities``: entity rows genuinely inserted by this call
+      (``xmax = 0`` after the upsert); ON CONFLICT updates are not counted, so
+      this stays at 0 on idempotent re-runs.
     - ``mentions``: rows newly inserted into kg_entity_mentions (the per-memory
       dedup gate).
     - ``edges``: rows newly inserted into kg_edges.
+
+    Entity metadata is merged on conflict (``existing || incoming``) so a row
+    first stored with empty metadata can later be enriched (e.g. with
+    ``is_directory``) without clobbering unrelated keys.
     """
     from scripts.core.db.postgres_pool import get_pool
 
     pool = await get_pool()
     entity_count = 0
+    created_entity_count = 0
     edge_count = 0
     mention_count = 0
 
@@ -473,14 +481,18 @@ async def store_entities_and_edges(
 
             # Upsert entities — get or create. `xmax = 0` is true only for rows
             # genuinely inserted by this statement (not ON CONFLICT updates), so
-            # entity_count tracks new entities and stays idempotent on re-runs.
+            # created_entity_count stays idempotent on re-runs. Metadata is
+            # merged (existing || incoming) so a row first seen with {} can be
+            # enriched later; incoming {} is a no-op concat.
             for e in entities:
                 row = await conn.fetchrow(
                     """
                     INSERT INTO kg_entities (name, display_name, entity_type, metadata)
                     VALUES ($1, $2, $3, $4::jsonb)
                     ON CONFLICT (name, entity_type) DO UPDATE SET
-                        last_seen_at = NOW()
+                        last_seen_at = NOW(),
+                        metadata = COALESCE(kg_entities.metadata, '{}'::jsonb)
+                                   || EXCLUDED.metadata
                     RETURNING id, (xmax = 0) AS created
                     """,
                     e.name,
@@ -491,8 +503,9 @@ async def store_entities_and_edges(
                 if row:
                     eid = str(row["id"])
                     name_type_to_id[(e.name, e.entity_type)] = eid
+                    entity_count += 1
                     if row["created"]:
-                        entity_count += 1
+                        created_entity_count += 1
 
             # Insert entity mentions — the dedup gate.
             # Only increment mention_count when a new row is actually inserted.
@@ -553,6 +566,7 @@ async def store_entities_and_edges(
 
     return {
         "entities": entity_count,
+        "created_entities": created_entity_count,
         "edges": edge_count,
         "mentions": mention_count,
     }

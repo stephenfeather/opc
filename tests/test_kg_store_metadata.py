@@ -76,9 +76,47 @@ async def test_metadata_persisted_as_json(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_entity_count_only_genuinely_new(monkeypatch):
-    """entity_count counts only newly-created entities (created=True), so
-    re-processing the same content does not inflate the count."""
+async def test_metadata_merged_on_conflict(monkeypatch):
+    """The upsert merges metadata (existing || incoming) so an existing row with
+    empty metadata can be enriched later without clobbering unrelated keys."""
+    eid = str(uuid.uuid4())
+    conn = AsyncMock()
+    _mock_conn_transaction(conn)
+    conn.fetchrow.return_value = {"id": eid, "created": False}
+    conn.fetchval.return_value = None
+    conn.execute.return_value = None
+
+    pool = _mock_pool(conn)
+    monkeypatch.setattr(
+        "scripts.core.db.postgres_pool.get_pool",
+        AsyncMock(return_value=pool),
+    )
+
+    await store_entities_and_edges(
+        str(uuid.uuid4()),
+        [
+            ExtractedEntity(
+                name="scripts/core",
+                display_name="scripts/core",
+                entity_type="file",
+                metadata={"is_directory": True},
+            )
+        ],
+        [],
+    )
+
+    sql = conn.fetchrow.call_args[0][0]
+    # The conflict clause must merge rather than ignore metadata, guarding the
+    # existing side against NULL.
+    normalized = " ".join(sql.split())
+    assert "COALESCE(kg_entities.metadata, '{}'::jsonb) || EXCLUDED.metadata" in normalized
+
+
+@pytest.mark.asyncio
+async def test_entity_counts_resolved_and_created(monkeypatch):
+    """`entities` counts all resolved entities (observability is preserved on a
+    mature graph), while `created_entities` counts only genuinely-new rows
+    (idempotent on re-runs)."""
     new_eid = str(uuid.uuid4())
     existing_eid = str(uuid.uuid4())
     conn = AsyncMock()
@@ -105,5 +143,6 @@ async def test_entity_count_only_genuinely_new(monkeypatch):
     ]
     stats = await store_entities_and_edges(memory_id, entities, [])
 
-    # Only the genuinely-new entity is counted.
-    assert stats["entities"] == 1
+    # Both entities resolved; only one was genuinely created.
+    assert stats["entities"] == 2
+    assert stats["created_entities"] == 1

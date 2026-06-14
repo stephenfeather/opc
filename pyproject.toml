@@ -80,6 +80,7 @@ mcp-exec = "runtime.harness:main"
 mcp-generate = "runtime.generate_wrappers:main"
 mcp-generate-discovery = "runtime.generate_test_params:main"
 mcp-discover = "runtime.discover_schemas:main"
+opc = "runtime.opc_cli:main"
 
 [build-system]
 requires = ["hatchling"]

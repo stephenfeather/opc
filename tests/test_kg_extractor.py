@@ -327,6 +327,26 @@ class TestRelationExtraction:
         ]
         assert len(uses) > 0
 
+    def test_overlong_entity_name_skips_fallback_search(self):
+        """A pathologically long entity name is not compiled into a fallback
+        boundary regex (issue #122 review round 3 hot-path regression).
+
+        The over-long path is still placed in its own sentence by span, but it
+        does not trigger an expensive escaped-regex compile to chase a later
+        mention.
+        """
+        long_path = "a/" + ("x" * 300) + ".py"  # > _MAX_FALLBACK_NAME_LEN
+        content = f"{long_path} exists. Pytest uses {long_path} here."
+        entities = extract_entities(content)
+        assert any(e.name == long_path for e in entities)
+
+        relations = extract_relations(content, entities)
+        # No fallback-driven relation from the over-long name in the 2nd sentence.
+        uses = [
+            r for r in relations if r.relation == "uses" and long_path in {r.source, r.target}
+        ]
+        assert uses == []
+
     def test_relation_in_later_sentence_after_offsets(self):
         """Span-based sentence membership stays accurate after several
         multi-character delimiters (offset drift regression, issue #122)."""

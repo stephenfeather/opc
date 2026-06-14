@@ -281,6 +281,13 @@ _RE_CONFLICTS = re.compile(
 )
 
 
+# Entity names longer than this are not compiled into fallback boundary regexes.
+# Real names (paths, config vars, <=40-char backtick concepts) are far shorter;
+# a multi-KB "name" only arises from uncapped pathological content, where the
+# escaped-pattern compile would dominate the hot path (issue #122 review r3).
+_MAX_FALLBACK_NAME_LEN = 256
+
+
 def _entity_boundary_pattern(name: str) -> re.Pattern[str]:
     """Compile a whole-token matcher for an entity ``name``.
 
@@ -336,12 +343,23 @@ def extract_relations(
                 source_type=src_type, target_type=tgt_type,
             ))
 
-    # Pre-compile a whole-token pattern per entity once, so a name only matches
-    # as a whole token. The old `e.name in sent.lower()` substring test matched
-    # fragments (e.g. language "go" inside "going"), inventing cross-sentence
-    # relations (issue #122). Compiled outside the sentence loop to keep this
-    # O(entities), not O(sentences * entities) compilations.
-    entity_word_res = [(e, _entity_boundary_pattern(e.name)) for e in entities]
+    # Whole-token fallback matchers for entities mentioned outside their first
+    # span are compiled lazily and memoized. The old `e.name in sent.lower()`
+    # substring test matched fragments (e.g. "go" inside "going"), inventing
+    # cross-sentence relations (issue #122); a whole-token regex fixes that.
+    # Compiling lazily (only when the span check fails) and skipping over-long
+    # names avoids a hot-path regression from eagerly building huge escaped
+    # patterns for long file-path entities (issue #122 review r3).
+    boundary_cache: dict[str, re.Pattern[str]] = {}
+
+    def _fallback_search(name: str, text: str):
+        if len(name) > _MAX_FALLBACK_NAME_LEN:
+            return None
+        pat = boundary_cache.get(name)
+        if pat is None:
+            pat = _entity_boundary_pattern(name)
+            boundary_cache[name] = pat
+        return pat.search(text)
 
     # Split into sentences for co-occurrence (offsets are accurate per sentence)
     for sent_offset, sent in _iter_sentence_spans(content):
@@ -350,13 +368,13 @@ def extract_relations(
 
         # Find entities in this sentence, ordered by position in text.
         sent_entities = []
-        for e, word_re in entity_word_res:
+        for e in entities:
             if e.span and e.span[0] >= sent_offset and e.span[1] <= sent_end:
                 sent_entities.append((e.span[0], e))
             else:
                 # The span marks only the first mention; a later mention in
-                # another sentence is found via whole-word search.
-                m = word_re.search(sent_lower)
+                # another sentence is found via memoized whole-word search.
+                m = _fallback_search(e.name, sent_lower)
                 if m:
                     sent_entities.append((sent_offset + m.start(), e))
         # Sort by position, then entity_type for deterministic ordering of same-name entities

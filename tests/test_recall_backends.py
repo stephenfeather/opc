@@ -165,38 +165,6 @@ class TestCleanQueryText:
         assert result == "database error"
 
 
-# ==================== build_fallback_words ====================
-
-
-class TestBuildFallbackWords:
-    """Pure function: produce fallback word list when sanitization yields nothing."""
-
-    def test_extracts_first_word_alphanumeric(self):
-        from scripts.core.recall_backends import build_fallback_words
-
-        result = build_fallback_words("hello world")
-        assert result == ["hello"]
-
-    def test_strips_non_alnum_from_first_word(self):
-        from scripts.core.recall_backends import build_fallback_words
-
-        result = build_fallback_words("!test something")
-        assert result == ["test"]
-
-    def test_short_first_word_returns_as_is(self):
-        from scripts.core.recall_backends import build_fallback_words
-
-        # "a" is short but we still need something
-        result = build_fallback_words("a")
-        assert result == ["a"]
-
-    def test_empty_query_returns_fallback(self):
-        from scripts.core.recall_backends import build_fallback_words
-
-        result = build_fallback_words("")
-        assert result == ["a"]
-
-
 # ==================== build_or_query ====================
 
 
@@ -222,12 +190,30 @@ class TestBuildOrQueryFunction:
         assert "!" not in result
         assert "&" not in result
 
-    def test_fallback_when_all_filtered(self):
+    def test_empty_when_no_usable_terms(self):
         from scripts.core.recall_backends import build_or_query
 
-        # All words become too short after sanitization
-        result = build_or_query("!!", set())
-        assert len(result) > 0  # should produce a fallback
+        # All tokens sanitize away: return "" so the caller skips tsquery and
+        # uses ILIKE — never an injected stopword tsquery (issue #176).
+        result = build_or_query("!! @@", set())
+        assert result == ""
+
+    def test_empty_when_only_stopwords(self):
+        from scripts.core.recall_backends import build_or_query
+
+        # Query is entirely stopwords/short tokens that strip away.
+        result = build_or_query("of", {"of"})
+        assert result == ""
+
+    def test_empty_when_only_long_stopwords(self):
+        from scripts.core.recall_backends import build_or_query
+
+        # Stopwords longer than 2 chars survive sanitization but must still
+        # yield "" — clean_query_text falls back to the original query when
+        # everything is a stopword, so build_or_query re-filters stopwords to
+        # avoid injecting a stopword tsquery like "the"/"with" (issue #176).
+        result = build_or_query("with", {"with"})
+        assert result == ""
 
 
 # ==================== normalize_bm25_score ====================
@@ -785,6 +771,7 @@ class _FakeRecallDb:
     def __init__(self, missing_columns: set[str]) -> None:
         self.missing_columns = missing_columns
         self.executed: list[str] = []
+        self.executed_args: list[tuple[Any, ...]] = []
 
     def make_pool(self):
         db = self
@@ -799,6 +786,7 @@ class _FakeRecallDb:
                             f'column "{col}" does not exist'
                         )
                 db.executed.append(sql)
+                db.executed_args.append(args)
                 return []
 
             async def execute(self, sql: str, *args: Any) -> str:
@@ -919,6 +907,70 @@ class TestOldDatabaseDegradation:
             assert "superseded_by" not in sql, sql[:120]
             assert "project" in sql.split("FROM")[0], sql[:120]
         assert await rb.project_column_available(_ProbeFailConn()) is True
+
+
+class TestStopwordFallbackSkipsTsquery:
+    """Issue #176: when every token sanitizes away, the text-only path must
+    skip the tsquery entirely (no injected ``a`` stopword) and use ILIKE."""
+
+    def _patch_pool(self, monkeypatch, db: _FakeRecallDb) -> None:
+        async def fake_get_pool():
+            return db.make_pool()
+
+        import scripts.core.db.postgres_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "get_pool", fake_get_pool)
+
+    async def test_all_tokens_removed_skips_fts_uses_ilike(self, monkeypatch):
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        db = _FakeRecallDb(missing_columns=set())
+        self._patch_pool(monkeypatch, db)
+
+        # Query made entirely of punctuation: nothing survives sanitization.
+        results = await rb.search_learnings_text_only_postgres("!! @@", k=3)
+
+        assert results == []
+        assert db.executed, "expected the ILIKE fallback SQL to run"
+        # No tsquery was ever built — the all-removed path must not inject a
+        # stopword tsquery (acceptance criterion for #176).
+        for sql in db.executed:
+            assert "to_tsquery" not in sql, sql[:160]
+        assert any("ILIKE" in sql for sql in db.executed), "ILIKE fallback expected"
+
+    async def test_empty_query_returns_immediately_without_db_calls(self, monkeypatch):
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        db = _FakeRecallDb(missing_columns=set())
+        self._patch_pool(monkeypatch, db)
+
+        # Whitespace-only query: must short-circuit, not run ILIKE '%%' which
+        # would match every row (gemini/codex review on #176).
+        results = await rb.search_learnings_text_only_postgres("   ", k=3)
+
+        assert results == []
+        assert not db.executed, "empty/whitespace query must not touch the DB"
+
+    async def test_fts_still_runs_for_normal_query(self, monkeypatch):
+        """Guard: a query with real terms still uses tsquery (no regression)."""
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        db = _FakeRecallDb(missing_columns=set())
+        self._patch_pool(monkeypatch, db)
+
+        await rb.search_learnings_text_only_postgres("session affinity", k=3)
+
+        assert any("to_tsquery" in sql for sql in db.executed), "expected FTS"
+        # The tsquery argument is the OR-joined real terms, never a stopword.
+        fts_args = [
+            args[0]
+            for sql, args in zip(db.executed, db.executed_args)
+            if "to_tsquery" in sql
+        ]
+        assert fts_args and all(a == "session | affinity" for a in fts_args)
 
 
 class _ProbeFailConn:

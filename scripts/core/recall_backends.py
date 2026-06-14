@@ -93,28 +93,25 @@ def clean_query_text(query: str, stopwords: set[str]) -> str:
     return cleaned if cleaned.strip() else query
 
 
-def build_fallback_words(query: str) -> list[str]:
-    """Produce a fallback word list when sanitization yields nothing.
-
-    Extracts the first word, strips non-alphanumeric chars.
-    Returns ["a"] as last resort for empty queries.
-    """
-    if not query.strip():
-        return ["a"]
-    first_word = query.split()[0]
-    fallback = re.sub(r"[^a-zA-Z0-9]", "", first_word)
-    return [fallback] if fallback else ["a"]
-
-
 def build_or_query(query: str, stopwords: set[str]) -> str:
     """Build an OR-joined tsquery string from a raw query.
 
-    Pipeline: clean → split → sanitize → OR-join, with fallback.
+    Pipeline: clean → split → drop stopwords → sanitize → OR-join. Returns
+    ``""`` when every token sanitizes away (all stopwords/metacharacters).
+    Callers must treat an empty result as "no tsquery" and use the ILIKE
+    fallback rather than injecting a stopword like ``"a"`` — a stopword token
+    reduces to an empty tsquery that matches nothing yet still costs a
+    round-trip (issue #176).
+
+    Stopwords are dropped again here, after ``clean_query_text``: that helper
+    falls back to the *original* query when every word is a stopword, so a
+    lone long stopword (``"the"``, ``"with"``) would otherwise survive
+    sanitization (length > 2) and be injected as a stopword tsquery.
     """
     cleaned = clean_query_text(query, stopwords)
-    words = sanitize_tsquery_words(cleaned.split())
-    if not words:
-        words = build_fallback_words(query)
+    words = sanitize_tsquery_words(
+        [w for w in cleaned.split() if w not in stopwords]
+    )
     return " | ".join(words)
 
 
@@ -924,6 +921,12 @@ async def search_learnings_text_only_postgres(
     from scripts.core.db.postgres_pool import get_pool
     from scripts.core.query_expansion import STOPWORDS
 
+    # An empty/whitespace query would skip FTS and then run the ILIKE fallback
+    # with first_word="" → content ILIKE '%%', which matches every row. Short-
+    # circuit before touching the pool (issue #176 review).
+    if not query.strip():
+        return []
+
     or_query = build_or_query(query, STOPWORDS)
 
     async def _fetch_all(conn: Any, has_project: bool) -> list[Any]:
@@ -937,15 +940,22 @@ async def search_learnings_text_only_postgres(
                 template, include_project=has_project, project_filter=pf,
             )
 
-        try:
-            rows = await conn.fetch(_r(_TEXT_ONLY_FTS_SQL), or_query, k, *extra)
-        except Exception as exc:
-            if _is_project_capability_error(exc):
-                raise
-            logger.debug("Chain filter fallback in text_only_postgres FTS", exc_info=True)
-            rows = await conn.fetch(
-                _r(_TEXT_ONLY_FTS_NO_CHAIN_SQL), or_query, k, *extra,
-            )
+        # When every token sanitized away, or_query is "" (issue #176). Skip
+        # the FTS round-trip entirely and fall straight through to the ILIKE
+        # fallback below. Passing "" to to_tsquery is a Postgres syntax error,
+        # and a stopword token reduces to an empty tsquery that matches
+        # nothing — both are pointless, so we never build the query at all.
+        rows: list[Any] = []
+        if or_query:
+            try:
+                rows = await conn.fetch(_r(_TEXT_ONLY_FTS_SQL), or_query, k, *extra)
+            except Exception as exc:
+                if _is_project_capability_error(exc):
+                    raise
+                logger.debug("Chain filter fallback in text_only_postgres FTS", exc_info=True)
+                rows = await conn.fetch(
+                    _r(_TEXT_ONLY_FTS_NO_CHAIN_SQL), or_query, k, *extra,
+                )
 
         if not rows:
             first_word = query.split()[0] if query.split() else query

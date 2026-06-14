@@ -642,31 +642,134 @@ def _is_project_capability_error(exc: BaseException) -> bool:
 
 
 # Transaction-scoped GUC that makes pgvector's HNSW return true nearest-k under
-# WHERE filters (issue #153 round-1 finding 1). pgvector applies the leg's
-# project/model/type filters AFTER the ANN scan, so a bounded
-# `ORDER BY <=> $q LIMIT $N` can under-fill or miss true neighbours once the
-# planner actually uses HNSW (at scale). `strict_order` (not relaxed) preserves
-# exact distance ordering, which RRF rank fusion depends on. SET LOCAL keeps it
-# scoped to the current transaction so pooled connections never leak it.
+# WHERE filters (issue #153). pgvector applies the leg's project/model/type
+# filters AFTER the ANN scan, so a bounded `ORDER BY <=> $q LIMIT $N` can
+# under-fill or miss true neighbours once the planner actually uses HNSW (at
+# scale). `strict_order` (not relaxed) preserves exact distance ordering, which
+# RRF rank fusion depends on. SET LOCAL keeps it scoped to the current
+# transaction so pooled connections never leak it.
 _HNSW_ITERATIVE_SCAN_GUC = "SET LOCAL hnsw.iterative_scan = 'strict_order'"
 
+# Round-2 finding: the GUC must be PROBED once (own rolled-back transaction)
+# rather than SET inline. On older pgvector (< 0.8) the unknown-GUC error
+# aborts whatever transaction it runs in, so a "best-effort" inline SET would
+# poison the fetch transaction and turn version skew into a recall outage.
+# Mirror the project/embedding_model column probes: probe once, cache only the
+# definitive answer, expose a test reset helper.
+_hnsw_iterative_scan_cache: bool | None = None
 
-async def _enable_hnsw_iterative_scan(conn: Any) -> None:
-    """Best-effort SET LOCAL of hnsw.iterative_scan within an open transaction.
+# Latch the operator-facing "running without iterative scan" warning to once
+# per process so degraded recalls stay quiet after the first signal.
+_HNSW_NO_ITERATIVE_WARNED = False
 
-    Older pgvector (< 0.8) lacks the GUC and raises on the SET. That is a
-    no-op-safe degradation: the bounded leg still returns the post-filter ANN
-    candidates, just without iterative back-fill. Swallow the error (debug log)
-    rather than aborting recall (idempotent degradation).
+
+def reset_hnsw_iterative_scan_cache() -> None:
+    """Clear the cached hnsw.iterative_scan probe (test isolation)."""
+    global _hnsw_iterative_scan_cache, _HNSW_NO_ITERATIVE_WARNED
+    _hnsw_iterative_scan_cache = None
+    _HNSW_NO_ITERATIVE_WARNED = False
+
+
+def _set_hnsw_iterative_scan_cache_for_tests(value: bool | None) -> None:
+    """Force the hnsw.iterative_scan probe cache to a value (test-only)."""
+    global _hnsw_iterative_scan_cache
+    _hnsw_iterative_scan_cache = value
+
+
+class _ProbeRollback(Exception):  # noqa: N818 - control-flow sentinel, not an error
+    """Sentinel raised inside the probe transaction to force a rollback.
+
+    Not an error condition: it is raised on the SUCCESS path to make the
+    ``async with conn.transaction()`` issue ROLLBACK so the probe never commits
+    anything. Named without an ``Error`` suffix on purpose.
+    """
+
+
+_UNKNOWN_GUC_RE = re.compile(
+    r"unrecognized configuration parameter|"
+    r"invalid value for parameter|"
+    r"hnsw\.iterative_scan",
+    re.IGNORECASE,
+)
+
+
+def _is_unknown_guc_error(exc: BaseException) -> bool:
+    """True when exc looks like 'GUC not supported' rather than transient I/O.
+
+    asyncpg surfaces an unknown GUC as UndefinedObjectError; fall back to a
+    message regex for drivers/wrappers that raise a generic error so older
+    pgvector is classified as a definitive (cacheable) miss rather than a
+    transient hiccup.
     """
     try:
-        await conn.execute(_HNSW_ITERATIVE_SCAN_GUC)
-    except Exception:  # noqa: BLE001 - older pgvector lacks the GUC; degrade
-        logger.debug(
-            "hnsw.iterative_scan GUC unavailable; bounded leg may under-fill "
-            "under selective filters once HNSW engages",
+        from asyncpg.exceptions import (
+            InvalidParameterValueError,
+            UndefinedObjectError,
+        )
+
+        if isinstance(exc, (UndefinedObjectError, InvalidParameterValueError)):
+            return True
+    except ImportError:  # pragma: no cover - asyncpg absent
+        pass
+    return bool(_UNKNOWN_GUC_RE.search(str(exc)))
+
+
+async def hnsw_iterative_scan_available(conn: Any) -> bool:
+    """Check (once per process) whether SET hnsw.iterative_scan is accepted.
+
+    Runs the SET LOCAL inside its OWN transaction that is always rolled back,
+    so an unsupported GUC (older pgvector) can never poison a later fetch
+    transaction (round-2 finding 2). Only definitive answers are cached:
+    True when the GUC is accepted, False on an unsupported-GUC error. A
+    transient probe failure degrades THIS recall to no-iterative-scan but
+    leaves the cache unset so the next call retries.
+    """
+    global _hnsw_iterative_scan_cache
+    if _hnsw_iterative_scan_cache is not None:
+        return _hnsw_iterative_scan_cache
+    try:
+        async with conn.transaction():
+            await conn.execute(_HNSW_ITERATIVE_SCAN_GUC)
+            # Force rollback so nothing from the probe leaks into later work.
+            raise _ProbeRollback
+    except _ProbeRollback:
+        _hnsw_iterative_scan_cache = True
+        return True
+    except Exception as exc:  # noqa: BLE001 - classify supported vs transient
+        if _is_unknown_guc_error(exc):
+            logger.warning(
+                "pgvector hnsw.iterative_scan GUC unsupported (older pgvector) "
+                "— bounded ANN recall runs WITHOUT iterative scan and may "
+                "under-fill under selective filters once HNSW engages. Upgrade "
+                "pgvector >= 0.8 to enable (issue #153)."
+            )
+            _hnsw_iterative_scan_cache = False
+            return False
+        logger.warning(
+            "hnsw.iterative_scan probe failed transiently; this recall runs "
+            "without iterative scan and the probe retries next call",
             exc_info=True,
         )
+        return False
+
+
+async def _rrf_fetch(
+    conn: Any, sql: str, args: tuple, *, use_guc: bool,
+) -> list[Any]:
+    """Run one RRF fetch attempt inside its OWN transaction (round-2 finding 1).
+
+    Each attempt gets a fresh transaction so a failing fetch (e.g. a missing
+    recall_count/superseded_by column on a partially-migrated schema) rolls
+    back cleanly and the next fallback attempt starts unpoisoned — the prior
+    single-transaction-around-the-whole-cascade aborted every later fetch with
+    'current transaction is aborted'. ``use_guc`` issues the (already-probed,
+    supported) SET LOCAL so the bounded leg returns true nearest-k under
+    filters; it is never issued when the probe found the GUC unsupported.
+    """
+    async with conn.transaction():
+        if use_guc:
+            await conn.execute(_HNSW_ITERATIVE_SCAN_GUC)
+        return await conn.fetch(sql, *args)
 
 
 def reset_project_column_cache() -> None:
@@ -1163,76 +1266,95 @@ async def search_learnings_hybrid_rrf(
             candidate_param=plain_candidate_idx,
         )
 
-        # Scope SET LOCAL hnsw.iterative_scan to this fetch (issue #153
-        # finding 1): asyncpg autocommits per statement, so a bare SET LOCAL
-        # would be dropped immediately. Run every RRF fetch attempt inside one
-        # transaction with the GUC applied first so the bounded vector leg
-        # returns true nearest-k under filters once HNSW engages.
-        async with conn.transaction():
-            await _enable_hnsw_iterative_scan(conn)
+        # Probe the iterative-scan GUC ONCE (own rolled-back transaction) so an
+        # unsupported GUC on older pgvector can never poison a fetch
+        # transaction, then wrap EACH fetch attempt in its OWN transaction so a
+        # failing fallback rolls back cleanly and the next attempt starts fresh
+        # (round-2 findings 1 & 2). ``use_guc`` is the cached probe result.
+        use_guc = await hnsw_iterative_scan_available(conn)
+        global _HNSW_NO_ITERATIVE_WARNED
+        if not use_guc and not _HNSW_NO_ITERATIVE_WARNED:
+            _HNSW_NO_ITERATIVE_WARNED = True
+            logger.warning(
+                "bounded ANN RRF recall running WITHOUT hnsw.iterative_scan; "
+                "the vector leg may under-fill under selective project/model "
+                "filters once HNSW engages (issue #153)"
+            )
+
+        try:
+            rows = await _rrf_fetch(
+                conn, cte_boosted + boosted_tail, boosted_args, use_guc=use_guc,
+            )
+        except Exception as exc:
+            if _is_project_capability_error(exc):
+                raise
+            logger.debug("RRF boosted+chain fallback", exc_info=True)
+            has_decay_columns = False
             try:
-                rows = await conn.fetch(cte_boosted + boosted_tail, *boosted_args)
+                rows = await _rrf_fetch(
+                    conn, cte_plain_args + plain_tail, plain_args,
+                    use_guc=use_guc,
+                )
             except Exception as exc:
                 if _is_project_capability_error(exc):
                     raise
-                logger.debug("RRF boosted+chain fallback", exc_info=True)
-                has_decay_columns = False
-                try:
-                    rows = await conn.fetch(cte_plain_args + plain_tail, *plain_args)
-                except Exception as exc:
-                    if _is_project_capability_error(exc):
-                        raise
-                    logger.debug("RRF plain+chain fallback", exc_info=True)
-                    rows = await conn.fetch(
-                        cte_plain_nochain + plain_tail, *plain_args,
-                    )
+                logger.debug("RRF plain+chain fallback", exc_info=True)
+                rows = await _rrf_fetch(
+                    conn, cte_plain_nochain + plain_tail, plain_args,
+                    use_guc=use_guc,
+                )
 
-            if not rows and use_tsquery:
-                logger.debug(
-                    "Expanded tsquery returned no results, "
-                    "falling back to plainto_tsquery"
-                )
-                fb_boosted = (
-                    query, embedding_str, rrf_k, k * 2, boost,
-                    *boosted_extra, candidate_count,
-                )
-                fb_plain = (
-                    query, embedding_str, rrf_k, k * 2,
-                    *plain_extra, candidate_count,
-                )
-                fb_cte_boosted = _cte(
-                    chain=True, ts=False, pf=boosted_pf, mf=boosted_mf,
-                    candidate_param=boosted_candidate_idx,
-                )
-                fb_cte_plain = _cte(
-                    chain=True, ts=False, pf=plain_pf, mf=plain_mf,
-                    candidate_param=plain_candidate_idx,
-                )
+        if not rows and use_tsquery:
+            logger.debug(
+                "Expanded tsquery returned no results, "
+                "falling back to plainto_tsquery"
+            )
+            fb_boosted = (
+                query, embedding_str, rrf_k, k * 2, boost,
+                *boosted_extra, candidate_count,
+            )
+            fb_plain = (
+                query, embedding_str, rrf_k, k * 2,
+                *plain_extra, candidate_count,
+            )
+            fb_cte_boosted = _cte(
+                chain=True, ts=False, pf=boosted_pf, mf=boosted_mf,
+                candidate_param=boosted_candidate_idx,
+            )
+            fb_cte_plain = _cte(
+                chain=True, ts=False, pf=plain_pf, mf=plain_mf,
+                candidate_param=plain_candidate_idx,
+            )
+            try:
+                if has_decay_columns:
+                    rows = await _rrf_fetch(
+                        conn, fb_cte_boosted + boosted_tail, fb_boosted,
+                        use_guc=use_guc,
+                    )
+                else:
+                    rows = await _rrf_fetch(
+                        conn, fb_cte_plain + plain_tail, fb_plain,
+                        use_guc=use_guc,
+                    )
+            except Exception as exc:
+                if _is_project_capability_error(exc):
+                    raise
+                logger.debug("plainto_tsquery chain fallback", exc_info=True)
                 try:
-                    if has_decay_columns:
-                        rows = await conn.fetch(
-                            fb_cte_boosted + boosted_tail, *fb_boosted
-                        )
-                    else:
-                        rows = await conn.fetch(fb_cte_plain + plain_tail, *fb_plain)
+                    no_chain_cte = _cte(
+                        chain=False, ts=False, pf=plain_pf, mf=plain_mf,
+                        candidate_param=plain_candidate_idx,
+                    )
+                    rows = await _rrf_fetch(
+                        conn, no_chain_cte + plain_tail, fb_plain,
+                        use_guc=use_guc,
+                    )
                 except Exception as exc:
                     if _is_project_capability_error(exc):
                         raise
-                    logger.debug("plainto_tsquery chain fallback", exc_info=True)
-                    try:
-                        no_chain_cte = _cte(
-                            chain=False, ts=False, pf=plain_pf, mf=plain_mf,
-                            candidate_param=plain_candidate_idx,
-                        )
-                        rows = await conn.fetch(
-                            no_chain_cte + plain_tail, *fb_plain,
-                        )
-                    except Exception as exc:
-                        if _is_project_capability_error(exc):
-                            raise
-                        logger.debug(
-                            "plainto_tsquery fallback also failed", exc_info=True
-                        )
+                    logger.debug(
+                        "plainto_tsquery fallback also failed", exc_info=True
+                    )
         return rows
 
     async with pool.acquire() as conn:

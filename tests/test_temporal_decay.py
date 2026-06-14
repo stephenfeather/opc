@@ -26,6 +26,23 @@ from scripts.core.recall_learnings import record_recall  # noqa: E402
 # Fixtures
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _reset_recall_probe_caches():
+    """Reset module-level recall probe caches before each test (issue #153
+    round-2 test-isolation). project / embedding_model / hnsw.iterative_scan
+    are process-global; leaving them warm makes fetch-counting cascade tests
+    order-dependent."""
+    from scripts.core import recall_backends as rb
+
+    rb.reset_project_column_cache()
+    rb.reset_embedding_model_column_cache()
+    rb.reset_hnsw_iterative_scan_cache()
+    yield
+    rb.reset_project_column_cache()
+    rb.reset_embedding_model_column_cache()
+    rb.reset_hnsw_iterative_scan_cache()
+
+
 class FakeAcquire:
     """Fake async context manager for pool.acquire()."""
 
@@ -229,6 +246,14 @@ class TestRRFRecallBoost:
         mock_embedder.embed = AsyncMock(return_value=[0.1] * 1024)
         mock_embedder.aclose = AsyncMock()
 
+        # Pin caches so call 1 is the boosted RRF query, not a cold capability
+        # probe (issue #153 round-2 test-isolation): project/embedding_model
+        # pinned skip their probe fetches; hnsw pinned skips its probe execute.
+        from scripts.core import recall_backends as rb
+        rb._set_project_column_cache_for_tests(False)
+        rb._set_embedding_model_column_cache_for_tests(False)
+        rb._set_hnsw_iterative_scan_cache_for_tests(True)
+
         pgvector_patch = "scripts.core.db.postgres_pool.init_pgvector"
         embed_patch = "scripts.core.db.embedding_service.EmbeddingService"
         with patch("scripts.core.db.postgres_pool.get_pool", return_value=pool), \
@@ -241,6 +266,7 @@ class TestRRFRecallBoost:
         assert results[0]["similarity"] == 0.023
         assert "recall_count" not in results[0]
         assert "last_recalled" not in results[0]
+        # call 1 = boosted (fails, missing recall_count), call 2 = plain (ok).
         assert call_count == 2
 
     async def test_boost_is_zero_for_never_recalled(self):

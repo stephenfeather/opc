@@ -7,6 +7,26 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _reset_recall_probe_caches():
+    """Reset module-level recall probe caches before each test (issue #153
+    round-2 test-isolation). project / embedding_model / hnsw.iterative_scan
+    are process-global; leaving them warm makes fetch-counting cascade tests
+    order-dependent."""
+    from scripts.core import recall_backends as rb
+
+    rb.reset_project_column_cache()
+    rb.reset_embedding_model_column_cache()
+    rb.reset_hnsw_iterative_scan_cache()
+    yield
+    rb.reset_project_column_cache()
+    rb.reset_embedding_model_column_cache()
+    rb.reset_hnsw_iterative_scan_cache()
+
+
 # ==================== tsquery Sanitization ====================
 
 

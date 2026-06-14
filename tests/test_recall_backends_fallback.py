@@ -100,12 +100,21 @@ class _SlowEmbedder:
 
 @pytest.fixture(autouse=True)
 def _reset_degrade_latch():
-    """The once-per-process stderr warning latch must not leak across tests."""
+    """Reset the once-per-process stderr warning latch AND the module-level
+    recall probe caches so nothing leaks across tests (issue #153 round-2
+    test-isolation — process-global probe caches make fetch-counting cascades
+    order-dependent otherwise)."""
     from scripts.core import recall_backends as rb
 
     rb._EMBED_DEGRADE_WARNED = False
+    rb.reset_project_column_cache()
+    rb.reset_embedding_model_column_cache()
+    rb.reset_hnsw_iterative_scan_cache()
     yield
     rb._EMBED_DEGRADE_WARNED = False
+    rb.reset_project_column_cache()
+    rb.reset_embedding_model_column_cache()
+    rb.reset_hnsw_iterative_scan_cache()
 
 
 def _patch_pool(monkeypatch) -> None:
@@ -115,6 +124,24 @@ def _patch_pool(monkeypatch) -> None:
     class FakeConn:
         async def fetch(self, _sql: str, *_args: Any) -> list[Any]:
             return []
+
+        async def execute(self, _sql: str, *_args: Any) -> str:
+            # Session-level SET hnsw.iterative_scan issued once per connection
+            # on acquire (issue #153); no-op for the fake. The RRF cascade uses
+            # bare conn.fetch (no per-attempt transaction).
+            return "SET"
+
+        def transaction(self):
+            # Retained for callers that open a transaction; the round-3 RRF
+            # cascade does NOT (bare fetches, session SET on acquire).
+            class _Tx:
+                async def __aenter__(self):
+                    return None
+
+                async def __aexit__(self, *_exc: Any) -> bool:
+                    return False
+
+            return _Tx()
 
     class FakeAcquire:
         async def __aenter__(self) -> FakeConn:

@@ -7,6 +7,26 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _reset_recall_probe_caches():
+    """Reset module-level recall probe caches before each test (issue #153
+    round-2 test-isolation). project / embedding_model / hnsw.iterative_scan
+    are process-global; leaving them warm makes fetch-counting cascade tests
+    order-dependent."""
+    from scripts.core import recall_backends as rb
+
+    rb.reset_project_column_cache()
+    rb.reset_embedding_model_column_cache()
+    rb.reset_hnsw_iterative_scan_cache()
+    yield
+    rb.reset_project_column_cache()
+    rb.reset_embedding_model_column_cache()
+    rb.reset_hnsw_iterative_scan_cache()
+
+
 # ==================== tsquery Sanitization ====================
 
 
@@ -780,6 +800,24 @@ class _FakeRecallDb:
                         )
                 db.executed.append(sql)
                 return []
+
+            async def execute(self, sql: str, *args: Any) -> str:
+                # Session-level SET hnsw.iterative_scan is issued once per
+                # connection on acquire (issue #153); no-op for the fake. The
+                # RRF cascade itself uses bare conn.fetch (no transaction).
+                return "SET"
+
+            def transaction(self):
+                # Retained for any caller that opens a transaction; the round-3
+                # RRF cascade does NOT (bare fetches, session SET on acquire).
+                class _Tx:
+                    async def __aenter__(self):
+                        return None
+
+                    async def __aexit__(self, *exc: Any) -> bool:
+                        return False
+
+                return _Tx()
 
             async def fetchrow(self, sql: str, *args: Any) -> dict[str, Any]:
                 # Embedding-count probe in search_learnings_postgres:

@@ -97,6 +97,24 @@ class _FakeVectorDb:
                 db.executed.append(sql)
                 return []
 
+            async def execute(self, sql: str, *args: Any) -> str:
+                # Session-level SET hnsw.iterative_scan issued once per
+                # connection on acquire (issue #153); no-op for the fake. The
+                # RRF cascade uses bare conn.fetch (no per-attempt transaction).
+                return "SET"
+
+            def transaction(self):
+                # Retained for callers that open a transaction; the round-3 RRF
+                # cascade does NOT (bare fetches, session SET on acquire).
+                class _Tx:
+                    async def __aenter__(self):
+                        return None
+
+                    async def __aexit__(self, *exc: Any) -> bool:
+                        return False
+
+                return _Tx()
+
             async def fetchrow(self, sql: str, *args: Any) -> dict[str, Any]:
                 return {"cnt": 5}  # embeddings present -> vector branch
 

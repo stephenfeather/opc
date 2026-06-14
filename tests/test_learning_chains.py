@@ -26,6 +26,28 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # Fixtures
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _reset_recall_probe_caches():
+    """Reset all module-level recall probe caches before each test (issue #153
+    round-2 test-isolation fix).
+
+    project / embedding_model / hnsw.iterative_scan are process-global caches.
+    Left warm by an earlier test they silently skip their capability probes,
+    so fetch-counting cascade tests pass or fail by suite ORDER. Resetting to a
+    cold, known state before every test makes counts deterministic in isolation
+    (FIRST: independence).
+    """
+    from scripts.core import recall_backends as rb
+
+    rb.reset_project_column_cache()
+    rb.reset_embedding_model_column_cache()
+    rb.reset_hnsw_iterative_scan_cache()
+    yield
+    rb.reset_project_column_cache()
+    rb.reset_embedding_model_column_cache()
+    rb.reset_hnsw_iterative_scan_cache()
+
+
 class FakeAcquire:
     """Fake async context manager for pool.acquire()."""
 
@@ -39,6 +61,28 @@ class FakeAcquire:
         pass
 
 
+class _NoopTx:
+    """No-op async context manager for conn.transaction() (issue #153).
+
+    Round-3 production sets a SESSION-level ``SET hnsw.iterative_scan`` once per
+    connection on acquire and runs the RRF cascade as bare ``conn.fetch`` (no
+    per-attempt transaction). This no-op CM is retained only so mock conns whose
+    ``transaction`` attribute may be exercised by other paths return a real
+    async CM; the RRF cascade itself opens no transaction.
+    """
+
+    async def __aenter__(self):
+        return None
+
+    async def __aexit__(self, *args):
+        return False
+
+
+def _attach_tx(conn) -> None:
+    """Give a mock conn a working transaction() CM (issue #153 finding 1)."""
+    conn.transaction = MagicMock(return_value=_NoopTx())
+
+
 @pytest.fixture
 def mock_pool():
     """Mock PostgreSQL connection pool."""
@@ -46,6 +90,7 @@ def mock_pool():
     conn.execute = AsyncMock(return_value="UPDATE 1")
     conn.fetch = AsyncMock(return_value=[])
     conn.fetchrow = AsyncMock(return_value={"cnt": 0})
+    _attach_tx(conn)
 
     pool = MagicMock()
     pool.acquire.return_value = FakeAcquire(conn)
@@ -109,6 +154,11 @@ class TestRecallChainFilter:
 
         conn.fetch = fake_fetch
 
+        # Pin the project cache so call 1 is the real chain query, not a cold
+        # project capability probe (issue #153 round-2 test-isolation).
+        from scripts.core import recall_backends as rb
+        rb._set_project_column_cache_for_tests(False)
+
         with patch("scripts.core.recall_learnings.get_backend", return_value="postgres"), \
              patch("scripts.core.db.postgres_pool.get_pool", return_value=pool):
             from scripts.core.recall_learnings import search_learnings_text_only_postgres
@@ -144,6 +194,7 @@ class TestRecallChainFilter:
 
         conn = AsyncMock()
         conn.fetch = fake_fetch
+        _attach_tx(conn)
 
         pool = MagicMock()
         pool.acquire.return_value = FakeAcquire(conn)
@@ -151,6 +202,15 @@ class TestRecallChainFilter:
         mock_embedder = MagicMock()
         mock_embedder.embed = AsyncMock(return_value=[0.1] * 1024)
         mock_embedder.aclose = AsyncMock()
+
+        # Pin the capability caches so the counted conn.fetch calls are EXACTLY
+        # the cascade attempts (issue #153 round-2 test-isolation). Without
+        # pinning, cold project/embedding_model probes add probe fetches and the
+        # count becomes suite-order dependent.
+        from scripts.core import recall_backends as rb
+        rb._set_project_column_cache_for_tests(False)  # no project probe fetch
+        rb._set_embedding_model_column_cache_for_tests(False)  # no probe fetch
+        rb._set_hnsw_iterative_scan_cache_for_tests(True)  # no probe; SET via execute
 
         pgvector_patch = "scripts.core.db.postgres_pool.init_pgvector"
         embed_patch = "scripts.core.db.embedding_service.EmbeddingService"
@@ -161,7 +221,8 @@ class TestRecallChainFilter:
             results = await search_learnings_hybrid_rrf("test query", k=5, expand=False)
 
         assert len(results) == 1
-        # Should have tried: boosted+chain, plain+chain, plain (no chain)
+        # Exactly the cascade ran: boosted+chain, plain+chain, plain (no chain).
+        # Probe fetches are excluded because the caches are pinned above.
         assert call_count == 3
 
 

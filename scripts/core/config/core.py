@@ -64,6 +64,7 @@ _RANGE_RULES: dict[tuple[str, str], tuple[float | None, float | None]] = {
     ("recall", "default_k"): (1, None),
     ("recall", "rrf_k"): (1, None),
     ("recall", "max_expansion_terms"): (0, None),
+    ("recall", "vector_candidate_multiplier"): (1, None),
     ("database", "max_pool_size"): (1, None),
 }
 

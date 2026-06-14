@@ -139,3 +139,20 @@ class TestBuildConfig:
         assert cfg.dedup.threshold == 0.0
         cfg = build_config({"dedup": {"threshold": 1.0}})
         assert cfg.dedup.threshold == 1.0
+
+    def test_vector_candidate_multiplier_loads_from_toml(self):
+        # Issue #153: the new knob auto-wires from the [recall] section.
+        cfg = build_config({"recall": {"vector_candidate_multiplier": 12}})
+        assert cfg.recall.vector_candidate_multiplier == 12
+
+    def test_vector_candidate_multiplier_defaults_when_absent(self):
+        cfg = build_config({"recall": {"default_k": 5}})
+        assert cfg.recall.vector_candidate_multiplier == 8
+
+    def test_vector_candidate_multiplier_zero_rejected(self):
+        with pytest.raises(ConfigValidationError, match="below minimum"):
+            build_config({"recall": {"vector_candidate_multiplier": 0}})
+
+    def test_vector_candidate_multiplier_negative_rejected(self):
+        with pytest.raises(ConfigValidationError, match="below minimum"):
+            build_config({"recall": {"vector_candidate_multiplier": -3}})

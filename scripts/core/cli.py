@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_SCRIPTS_DIR = Path(__file__).resolve().parent
 
 
 @dataclass(frozen=True)
@@ -156,6 +156,7 @@ COMMANDS: dict[CommandKey, Command] = {
 # Keep this set explicit so new user-runnable scripts either join COMMANDS or
 # document why they remain path-only.
 EXCLUDED_CORE_SCRIPTS: set[str] = set()
+_MAX_COMMAND_LEN = max(len(k) for k in COMMANDS)
 
 
 def _format_command_name(key: CommandKey) -> str:
@@ -204,7 +205,7 @@ def format_help(prefix: CommandKey = ()) -> str:
 
 def resolve_command(argv: list[str]) -> tuple[CommandKey | None, Command | None, list[str]]:
     """Resolve the longest registered command prefix from argv."""
-    for length in range(min(len(argv), max(map(len, COMMANDS))), 0, -1):
+    for length in range(min(len(argv), _MAX_COMMAND_LEN), 0, -1):
         key = tuple(argv[:length])
         command = COMMANDS.get(key)
         if command is not None:
@@ -221,7 +222,7 @@ def _print_unknown(argv: list[str], stream: TextIO) -> None:
 
 def execute_command(command: Command, args: list[str]) -> int:
     """Run a registered command script under the current Python interpreter."""
-    script_path = _PROJECT_ROOT / "scripts" / "core" / command.script
+    script_path = _SCRIPTS_DIR / command.script
     if not script_path.exists():
         print(f"Registered script is missing: {script_path}", file=sys.stderr)
         return 127

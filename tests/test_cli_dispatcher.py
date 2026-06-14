@@ -8,6 +8,30 @@ from unittest.mock import patch
 from scripts.core import cli
 
 
+def test_packaged_entrypoint_loads_source_dispatcher() -> None:
+    from runtime.opc_cli import main
+
+    assert callable(main)
+    assert main.__name__ == "main"
+
+
+def _is_main_guard(node: ast.AST) -> bool:
+    """Return True only for `if __name__ == "__main__"` guards."""
+    if not isinstance(node, ast.If):
+        return False
+    test = node.test
+    return (
+        isinstance(test, ast.Compare)
+        and isinstance(test.left, ast.Name)
+        and test.left.id == "__name__"
+        and len(test.ops) == 1
+        and isinstance(test.ops[0], ast.Eq)
+        and len(test.comparators) == 1
+        and isinstance(test.comparators[0], ast.Constant)
+        and test.comparators[0].value == "__main__"
+    )
+
+
 def test_top_level_help_lists_grouped_commands() -> None:
     text = cli.format_help()
 
@@ -82,13 +106,7 @@ def test_cli_style_core_scripts_are_registered_or_explicitly_excluded() -> None:
             )
             for node in ast.walk(tree)
         )
-        has_main_guard = any(
-            isinstance(node, ast.If)
-            and isinstance(node.test, ast.Compare)
-            and isinstance(node.test.left, ast.Name)
-            and node.test.left.id == "__name__"
-            for node in ast.walk(tree)
-        )
+        has_main_guard = any(_is_main_guard(node) for node in ast.walk(tree))
         if imports_argparse and has_main_guard:
             cli_style_scripts.add(path.name)
 

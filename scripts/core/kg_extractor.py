@@ -7,8 +7,10 @@ results to PostgreSQL kg_entities, kg_edges, and kg_entity_mentions tables.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
+from collections import defaultdict
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -80,6 +82,41 @@ _FILE_EXTENSIONS: set[str] = {
 # Regex patterns
 # ---------------------------------------------------------------------------
 
+
+def _bounded(term: str) -> str:
+    """Return ``re.escape(term)`` wrapped with token boundaries.
+
+    A plain ``\\b`` only works when the endpoint is a word character. Terms can
+    begin or end with non-word characters (e.g. ``c++`` in ``KNOWN_LANGUAGES``,
+    or canonical names like ``.env`` / ``../utils/helper.py``), where ``\\b``
+    would never match — ``\\bc\\+\\+\\b`` cannot match ``c++`` because ``+`` is
+    not a word char. Use a zero-width lookaround at any non-word endpoint
+    instead, which still rejects a fragment inside a larger word.
+    """
+    left = r"\b" if re.match(r"\w", term) else r"(?<!\w)"
+    right = r"\b" if re.search(r"\w$", term) else r"(?!\w)"
+    return left + re.escape(term) + right
+
+
+def _compile_alternation(terms: set[str]) -> re.Pattern[str]:
+    """Compile a token-boundary alternation over ``terms``.
+
+    Terms are ordered longest-first (ties broken alphabetically for
+    determinism) so that, e.g., ``postgresql`` is preferred over ``postgres``
+    in the alternation. Each term carries its own boundaries (via ``_bounded``)
+    so terms ending in non-word characters such as ``c++`` still match.
+    Compiled once at module load and reused across every ``extract_entities``
+    call (issue #122 / #125).
+    """
+    ordered = sorted(terms, key=lambda t: (-len(t), t))
+    return re.compile("|".join(_bounded(t) for t in ordered), re.IGNORECASE)
+
+
+# Known-dictionary alternations, compiled once (hoisted out of extract_entities).
+_RE_KNOWN_TOOLS = _compile_alternation(KNOWN_TOOLS)
+_RE_KNOWN_LANGUAGES = _compile_alternation(KNOWN_LANGUAGES)
+_RE_KNOWN_LIBRARIES = _compile_alternation(KNOWN_LIBRARIES)
+
 # File paths: must contain / or end with a known extension
 _RE_FILE_PATH = re.compile(
     r'(?:^|[\s`"\',;()\[\]{}])('
@@ -125,8 +162,10 @@ def _normalize_name(name: str, entity_type: str) -> str:
     """Produce a canonical lowercase name."""
     n = name.strip().lower()
     if entity_type == "file":
-        # Remove leading ./ or /
-        n = n.lstrip("./")
+        # Remove a single leading "./" or "/" without corrupting other paths.
+        # lstrip("./") stripped any run of "." and "/" chars, turning ".env"
+        # into "env" and "../foo" into "foo" (issue #122).
+        n = re.sub(r"^(?:\./|/)", "", n)
     return n
 
 
@@ -198,27 +237,19 @@ def extract_entities(content: str) -> list[ExtractedEntity]:
         err = m.group(1)
         _add(err, "error", (m.start(1), m.end(1)))
 
-    # 5. Known tools (word-boundary match)
-    for tool in KNOWN_TOOLS:
-        # Use word boundary search
-        pattern = re.compile(r'\b' + re.escape(tool) + r'\b', re.IGNORECASE)
-        m = pattern.search(content)
-        if m:
-            _add(m.group(0), "tool", (m.start(), m.end()))
+    # 5. Known tools / languages / libraries (word-boundary alternation match).
+    # Patterns are pre-compiled at module load (issue #122 / #125). finditer
+    # walks matches in text order; _add dedupes by (canonical name, type), so
+    # each distinct term is recorded once with its first occurrence's span —
+    # identical output to the previous per-term search loops.
+    for m in _RE_KNOWN_TOOLS.finditer(content):
+        _add(m.group(0), "tool", (m.start(), m.end()))
 
-    # 6. Known languages
-    for lang in KNOWN_LANGUAGES:
-        pattern = re.compile(r'\b' + re.escape(lang) + r'\b', re.IGNORECASE)
-        m = pattern.search(content)
-        if m:
-            _add(m.group(0), "language", (m.start(), m.end()))
+    for m in _RE_KNOWN_LANGUAGES.finditer(content):
+        _add(m.group(0), "language", (m.start(), m.end()))
 
-    # 7. Known libraries
-    for lib in KNOWN_LIBRARIES:
-        pattern = re.compile(r'\b' + re.escape(lib) + r'\b', re.IGNORECASE)
-        m = pattern.search(content)
-        if m:
-            _add(m.group(0), "library", (m.start(), m.end()))
+    for m in _RE_KNOWN_LIBRARIES.finditer(content):
+        _add(m.group(0), "library", (m.start(), m.end()))
 
     # 8. Backtick-quoted terms (likely technical terms)
     for m in _RE_QUOTED.finditer(content):
@@ -264,6 +295,37 @@ _RE_CONFLICTS = re.compile(
 )
 
 
+# Entity names longer than this are not compiled into fallback boundary regexes.
+# Real names (paths, config vars, <=40-char backtick concepts) are far shorter;
+# a multi-KB "name" only arises from uncapped pathological content, where the
+# escaped-pattern compile would dominate the hot path (issue #122 review r3).
+_MAX_FALLBACK_NAME_LEN = 256
+
+
+def _entity_boundary_pattern(name: str) -> re.Pattern[str]:
+    """Compile a whole-token matcher for an entity ``name`` (issue #122 review
+    round 1). Boundary handling is shared with the dictionary alternations via
+    ``_bounded`` so non-word endpoints (e.g. ``../utils/helper.py``) match."""
+    return re.compile(_bounded(name))
+
+
+def _iter_sentence_spans(text: str):
+    """Yield ``(start_offset, sentence_text)`` for each sentence in ``text``.
+
+    Uses ``finditer`` on the delimiter pattern so the reported start offset is
+    the true index into ``text`` regardless of delimiter length. The previous
+    ``split`` + ``offset = end + 1`` approach assumed single-character
+    delimiters, so offsets drifted on every multi-character delimiter (e.g.
+    ``". "`` or ``"\n\n"``) and corrupted span-based sentence membership
+    (issue #122).
+    """
+    start = 0
+    for m in _RE_SENTENCE.finditer(text):
+        yield start, text[start:m.start()]
+        start = m.end()
+    yield start, text[start:]
+
+
 def extract_relations(
     content: str,
     entities: list[ExtractedEntity],
@@ -287,22 +349,40 @@ def extract_relations(
                 source_type=src_type, target_type=tgt_type,
             ))
 
-    # Split into sentences for co-occurrence
-    sentences = _RE_SENTENCE.split(content)
-    sent_offset = 0
+    # Whole-token fallback matchers for entities mentioned outside their first
+    # span are compiled lazily and memoized. The old `e.name in sent.lower()`
+    # substring test matched fragments (e.g. "go" inside "going"), inventing
+    # cross-sentence relations (issue #122); a whole-token regex fixes that.
+    # Compiling lazily (only when the span check fails) and skipping over-long
+    # names avoids a hot-path regression from eagerly building huge escaped
+    # patterns for long file-path entities (issue #122 review r3).
+    boundary_cache: dict[str, re.Pattern[str]] = {}
 
-    for sent in sentences:
+    def _fallback_search(name: str, text: str):
+        if len(name) > _MAX_FALLBACK_NAME_LEN:
+            return None
+        pat = boundary_cache.get(name)
+        if pat is None:
+            pat = _entity_boundary_pattern(name)
+            boundary_cache[name] = pat
+        return pat.search(text)
+
+    # Split into sentences for co-occurrence (offsets are accurate per sentence)
+    for sent_offset, sent in _iter_sentence_spans(content):
         sent_end = sent_offset + len(sent)
+        sent_lower = sent.lower()
 
-        # Find entities in this sentence, ordered by position in text
+        # Find entities in this sentence, ordered by position in text.
         sent_entities = []
         for e in entities:
             if e.span and e.span[0] >= sent_offset and e.span[1] <= sent_end:
                 sent_entities.append((e.span[0], e))
-            elif e.name in sent.lower():
-                # Use position of name in sentence for ordering
-                pos = sent.lower().find(e.name)
-                sent_entities.append((sent_offset + pos if pos >= 0 else sent_end, e))
+            else:
+                # The span marks only the first mention; a later mention in
+                # another sentence is found via memoized whole-word search.
+                m = _fallback_search(e.name, sent_lower)
+                if m:
+                    sent_entities.append((sent_offset + m.start(), e))
         # Sort by position, then entity_type for deterministic ordering of same-name entities
         sent_entities.sort(key=lambda x: (x[0], x[1].entity_type))
         sent_entities = [e for _, e in sent_entities]
@@ -334,20 +414,20 @@ def extract_relations(
                     _add_rel(e1.name, e2.name, "related_to", 0.5,
                              e1.entity_type, e2.entity_type)
 
-        sent_offset = sent_end + 1  # +1 for the split delimiter
-
-    # Directory containment: file entities sharing a prefix
-    # Collect directories that need materialization
+    # Directory containment: file entities sharing a parent directory.
+    # Group by parent dir in O(N) instead of the previous O(N^2) pairwise scan
+    # (issue #122). A directory is materialized only when 2+ files share it.
     dirs_seen: set[str] = set()
-    file_entities = [e for e in entities if e.entity_type == "file" and "/" in e.name]
-    for i, f1 in enumerate(file_entities):
-        for f2 in file_entities[i + 1:]:
-            dir1 = f1.name.rsplit("/", 1)[0]
-            dir2 = f2.name.rsplit("/", 1)[0]
-            if dir1 == dir2:
-                dirs_seen.add(dir1)
-                _add_rel(dir1, f1.name, "contains", 0.9, "file", "file")
-                _add_rel(dir1, f2.name, "contains", 0.9, "file", "file")
+    files_by_dir: dict[str, list[str]] = defaultdict(list)
+    for e in entities:
+        if e.entity_type == "file" and "/" in e.name:
+            files_by_dir[e.name.rsplit("/", 1)[0]].append(e.name)
+    for parent_dir, child_files in files_by_dir.items():
+        if len(child_files) < 2:
+            continue
+        dirs_seen.add(parent_dir)
+        for child in child_files:
+            _add_rel(parent_dir, child, "contains", 0.9, "file", "file")
 
     # Materialize directory entities so store_entities_and_edges can resolve IDs
     for d in dirs_seen:
@@ -394,13 +474,27 @@ async def store_entities_and_edges(
     """Persist entities and edges to PostgreSQL.
 
     Idempotent per memory_id: re-processing the same learning will not inflate
-    mention_count or edge weight. Uses kg_entity_mentions as the dedup gate —
-    entities and edges are only counted when a genuinely new mention is inserted.
+    mention_count or edge weight. Returned counters:
+
+    - ``entities``: distinct entities resolved (created or already present) for
+      this memory — preserves the operator-facing "KG indexed" count even on a
+      mature graph where most entities already exist.
+    - ``created_entities``: entity rows genuinely inserted by this call
+      (``xmax = 0`` after the upsert); ON CONFLICT updates are not counted, so
+      this stays at 0 on idempotent re-runs.
+    - ``mentions``: rows newly inserted into kg_entity_mentions (the per-memory
+      dedup gate).
+    - ``edges``: rows newly inserted into kg_edges.
+
+    Entity metadata is merged on conflict (``existing || incoming``) so a row
+    first stored with empty metadata can later be enriched (e.g. with
+    ``is_directory``) without clobbering unrelated keys.
     """
     from scripts.core.db.postgres_pool import get_pool
 
     pool = await get_pool()
     entity_count = 0
+    created_entity_count = 0
     edge_count = 0
     mention_count = 0
 
@@ -409,25 +503,33 @@ async def store_entities_and_edges(
             # Map (canonical_name, entity_type) -> entity UUID for edge insertion
             name_type_to_id: dict[tuple[str, str], str] = {}
 
-            # Upsert entities — get or create, but do NOT increment mention_count yet
+            # Upsert entities — get or create. `xmax = 0` is true only for rows
+            # genuinely inserted by this statement (not ON CONFLICT updates), so
+            # created_entity_count stays idempotent on re-runs. Metadata is
+            # merged (existing || incoming) so a row first seen with {} can be
+            # enriched later; incoming {} is a no-op concat.
             for e in entities:
                 row = await conn.fetchrow(
                     """
                     INSERT INTO kg_entities (name, display_name, entity_type, metadata)
                     VALUES ($1, $2, $3, $4::jsonb)
                     ON CONFLICT (name, entity_type) DO UPDATE SET
-                        last_seen_at = NOW()
-                    RETURNING id
+                        last_seen_at = NOW(),
+                        metadata = COALESCE(kg_entities.metadata, '{}'::jsonb)
+                                   || EXCLUDED.metadata
+                    RETURNING id, (xmax = 0) AS created
                     """,
                     e.name,
                     e.display_name,
                     e.entity_type,
-                    "{}",
+                    json.dumps(e.metadata),
                 )
                 if row:
                     eid = str(row["id"])
                     name_type_to_id[(e.name, e.entity_type)] = eid
                     entity_count += 1
+                    if row["created"]:
+                        created_entity_count += 1
 
             # Insert entity mentions — the dedup gate.
             # Only increment mention_count when a new row is actually inserted.
@@ -488,6 +590,7 @@ async def store_entities_and_edges(
 
     return {
         "entities": entity_count,
+        "created_entities": created_entity_count,
         "edges": edge_count,
         "mentions": mention_count,
     }

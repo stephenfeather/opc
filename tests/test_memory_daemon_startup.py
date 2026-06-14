@@ -1345,27 +1345,45 @@ class TestHardenDaemonEnvironment:
         # Should not raise.
         _harden_daemon_environment(os_umask_fn=MagicMock(), os_chdir_fn=fake_chdir)
 
-    def test_invoked_in_double_fork_after_setsid(self, monkeypatch):
-        """start_daemon's Unix path must call _harden_daemon_environment so the
-        umask/chdir hardening actually runs in the detached child.
+    def test_run_as_daemon_hardens_before_writing_pid_file(self, monkeypatch, tmp_path):
+        """_run_as_daemon must apply the umask/chdir hardening before it creates
+        the PID file, otherwise the PID file is written under the inherited
+        (world-readable) umask. This is the ordering that actually matters and
+        the reason the call lives at the top of _run_as_daemon rather than being
+        an unordered "is it called somewhere" check.
+
+        _run_as_daemon is the common entry point for the Unix double-fork, the
+        Windows detached subprocess, and --daemon-subprocess, so hardening here
+        covers every platform (Issue #103, gemini review of PR #183).
         """
         import scripts.core.memory_daemon as mod
 
-        if sys.platform == "win32":
-            pytest.skip("double-fork path is Unix-only")
+        order: list[str] = []
 
-        monkeypatch.setattr(mod, "is_running", lambda: (False, None))
-        # First fork: child (return 0) so we proceed past the parent early-return.
-        # Second fork: parent (return >0) so we sys.exit before _run_as_daemon.
-        fork_returns = iter([0, 12345])
-        monkeypatch.setattr(mod.os, "fork", lambda: next(fork_returns))
-        monkeypatch.setattr(mod.os, "setsid", MagicMock())
+        monkeypatch.setattr(
+            mod, "_harden_daemon_environment", lambda: order.append("harden")
+        )
+        # Redirect PID file into tmp and record when it is written.
+        pid_file = tmp_path / "memory-daemon.pid"
 
-        harden = MagicMock()
-        monkeypatch.setattr(mod, "_harden_daemon_environment", harden)
-        monkeypatch.setattr(mod, "_run_as_daemon", MagicMock())
+        real_write_text = type(pid_file).write_text
 
-        with pytest.raises(SystemExit):
-            mod.start_daemon()
+        def _tracking_write_text(self, *a, **k):
+            order.append("pid_write")
+            return real_write_text(self, *a, **k)
 
-        harden.assert_called_once_with()
+        monkeypatch.setattr(mod, "PID_FILE", pid_file)
+        monkeypatch.setattr(type(pid_file), "write_text", _tracking_write_text)
+
+        # Stub out the rest of the bootstrap and the loop.
+        monkeypatch.setattr(mod, "_reserve_low_fds", MagicMock())
+        monkeypatch.setattr(mod, "_setup_logging", MagicMock(return_value=MagicMock()))
+        monkeypatch.setattr(mod, "_setup_daemon_fds", MagicMock())
+        monkeypatch.setattr(mod, "daemon_loop", MagicMock())
+        monkeypatch.setattr(mod, "_logger", None)
+
+        mod._run_as_daemon()
+
+        assert order[:2] == ["harden", "pid_write"], (
+            f"hardening must precede PID file creation; got order {order}"
+        )

@@ -1065,7 +1065,10 @@ def _harden_daemon_environment(
         ``git worktree remove`` and preventing the filesystem from unmounting
         until the daemon stops.
 
-    Called after ``os.setsid()`` in the first fork, before the second fork.
+    Called from ``_run_as_daemon()`` — the common entry point for the Unix
+    double-fork, the Windows detached subprocess, and ``--daemon-subprocess`` —
+    before the PID file is written, so every platform is hardened and the PID
+    file itself is created under the owner-only umask.
 
     ``os.chdir`` is wrapped in graceful degradation mirroring
     ``_setup_daemon_fds``: this runs in the detached child before stdio is
@@ -1088,6 +1091,13 @@ def _harden_daemon_environment(
 
 def _run_as_daemon():
     """Run the daemon loop (called by subprocess on Windows, directly after fork on Unix)."""
+    # Standard daemon hardening (Issue #103): owner-only umask + detach from the
+    # invoking shell's cwd. Done here — the common entry point for the Unix
+    # double-fork, the Windows detached subprocess, and --daemon-subprocess — so
+    # all platforms are covered, and before the PID file write below so the PID
+    # file itself is created under the 0o077 umask.
+    _harden_daemon_environment()
+
     # Write PID file
     PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(str(os.getpid()))
@@ -1153,10 +1163,8 @@ def start_daemon():
         # Detach from terminal
         os.setsid()
 
-        # Standard daemon hardening: owner-only umask + detach from invoking
-        # cwd (Issue #103). Must run before the second fork so it applies to
-        # the surviving daemon process.
-        _harden_daemon_environment()
+        # umask/chdir hardening (Issue #103) runs in _run_as_daemon(), the
+        # common entry point for all platforms, so it is not repeated here.
 
         # Fork again to prevent zombie
         if os.fork() > 0:

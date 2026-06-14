@@ -1301,3 +1301,89 @@ class TestPatternDetectionSpawn:
             f"_run_pattern_detection_batch should not log errors on the happy path. "
             f"Got: {error_logs}"
         )
+
+
+class TestHardenDaemonEnvironment:
+    """_harden_daemon_environment applies standard daemon hardening (Issue #103).
+
+    Two missing daemonization steps in the Unix double-fork path:
+      - os.umask(0o077): any files the daemon creates (PID file, faulthandler
+        crash dumps, batch logs) are owner-only, not world-readable 0o644.
+      - os.chdir("/"): detach from the invoking shell's cwd so a git worktree
+        it was launched from can be removed and the filesystem unmounted.
+
+    The os.* functions are injected for testability, mirroring
+    _setup_daemon_fds — tests verify the syscall sequence without mutating the
+    test process's real umask or cwd.
+    """
+
+    def test_sets_owner_only_umask(self):
+        from scripts.core.memory_daemon import _harden_daemon_environment
+
+        fake_umask = MagicMock()
+        _harden_daemon_environment(os_umask_fn=fake_umask, os_chdir_fn=MagicMock())
+
+        fake_umask.assert_called_once_with(0o077)
+
+    def test_chdirs_to_root(self):
+        from scripts.core.memory_daemon import _harden_daemon_environment
+
+        fake_chdir = MagicMock()
+        _harden_daemon_environment(os_umask_fn=MagicMock(), os_chdir_fn=fake_chdir)
+
+        fake_chdir.assert_called_once_with("/")
+
+    def test_tolerant_of_chdir_oserror(self):
+        """A chdir failure (sandbox, missing root) must not crash the daemon
+        mid-detach where stdio is not yet wired and the traceback is lost.
+        Mirrors the graceful-degradation contract of _setup_daemon_fds.
+        """
+        from scripts.core.memory_daemon import _harden_daemon_environment
+
+        fake_chdir = MagicMock(side_effect=OSError("permission denied"))
+
+        # Should not raise.
+        _harden_daemon_environment(os_umask_fn=MagicMock(), os_chdir_fn=fake_chdir)
+
+    def test_run_as_daemon_hardens_before_writing_pid_file(self, monkeypatch, tmp_path):
+        """_run_as_daemon must apply the umask/chdir hardening before it creates
+        the PID file, otherwise the PID file is written under the inherited
+        (world-readable) umask. This is the ordering that actually matters and
+        the reason the call lives at the top of _run_as_daemon rather than being
+        an unordered "is it called somewhere" check.
+
+        _run_as_daemon is the common entry point for the Unix double-fork, the
+        Windows detached subprocess, and --daemon-subprocess, so hardening here
+        covers every platform (Issue #103, gemini review of PR #183).
+        """
+        import scripts.core.memory_daemon as mod
+
+        order: list[str] = []
+
+        monkeypatch.setattr(
+            mod, "_harden_daemon_environment", lambda: order.append("harden")
+        )
+        # Redirect PID file into tmp and record when it is written.
+        pid_file = tmp_path / "memory-daemon.pid"
+
+        real_write_text = type(pid_file).write_text
+
+        def _tracking_write_text(self, *a, **k):
+            order.append("pid_write")
+            return real_write_text(self, *a, **k)
+
+        monkeypatch.setattr(mod, "PID_FILE", pid_file)
+        monkeypatch.setattr(type(pid_file), "write_text", _tracking_write_text)
+
+        # Stub out the rest of the bootstrap and the loop.
+        monkeypatch.setattr(mod, "_reserve_low_fds", MagicMock())
+        monkeypatch.setattr(mod, "_setup_logging", MagicMock(return_value=MagicMock()))
+        monkeypatch.setattr(mod, "_setup_daemon_fds", MagicMock())
+        monkeypatch.setattr(mod, "daemon_loop", MagicMock())
+        monkeypatch.setattr(mod, "_logger", None)
+
+        mod._run_as_daemon()
+
+        assert order[:2] == ["harden", "pid_write"], (
+            f"hardening must precede PID file creation; got order {order}"
+        )

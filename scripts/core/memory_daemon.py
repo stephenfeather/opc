@@ -1046,8 +1046,58 @@ def _setup_daemon_fds(
         os_close_fn(devnull_fd)
 
 
+def _harden_daemon_environment(
+    *,
+    os_umask_fn=os.umask,
+    os_chdir_fn=os.chdir,
+) -> None:
+    """Apply standard daemon hardening missing from the double-fork path.
+
+    Two steps the classic Unix daemonization sequence requires (Issue #103):
+
+      - ``os.umask(0o077)``: any file the daemon subsequently creates (PID
+        file, faulthandler crash dumps, pattern-batch logs) gets owner-only
+        permissions instead of inheriting the shell's typically world-readable
+        0o644. Crash dumps and verbose logs can leak local-variable snippets,
+        session IDs, and project paths.
+      - ``os.chdir("/")``: detach from the invoking shell's cwd. Launched from
+        a git worktree, the daemon would otherwise pin that directory, blocking
+        ``git worktree remove`` and preventing the filesystem from unmounting
+        until the daemon stops.
+
+    Called from ``_run_as_daemon()`` — the common entry point for the Unix
+    double-fork, the Windows detached subprocess, and ``--daemon-subprocess`` —
+    before the PID file is written, so every platform is hardened and the PID
+    file itself is created under the owner-only umask.
+
+    ``os.chdir`` is wrapped in graceful degradation mirroring
+    ``_setup_daemon_fds``: this runs in the detached child before stdio is
+    redirected, so an uncaught ``OSError`` (sandbox, missing root) would kill
+    the daemon with a traceback nobody can read. ``os.umask`` never raises.
+
+    The os.* functions are injected for testability — production uses the real
+    syscalls; tests pass mocks to verify the sequence without mutating the test
+    process's real umask or cwd.
+    """
+    os_umask_fn(0o077)
+    try:
+        os_chdir_fn("/")
+    except OSError:
+        # Cannot reach root (sandbox/chroot). The daemon keeps running from the
+        # inherited cwd — degraded (worktree may stay pinned) but alive, which
+        # is strictly better than crashing mid-detach with no log.
+        pass
+
+
 def _run_as_daemon():
     """Run the daemon loop (called by subprocess on Windows, directly after fork on Unix)."""
+    # Standard daemon hardening (Issue #103): owner-only umask + detach from the
+    # invoking shell's cwd. Done here — the common entry point for the Unix
+    # double-fork, the Windows detached subprocess, and --daemon-subprocess — so
+    # all platforms are covered, and before the PID file write below so the PID
+    # file itself is created under the 0o077 umask.
+    _harden_daemon_environment()
+
     # Write PID file
     PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(str(os.getpid()))
@@ -1112,6 +1162,9 @@ def start_daemon():
 
         # Detach from terminal
         os.setsid()
+
+        # umask/chdir hardening (Issue #103) runs in _run_as_daemon(), the
+        # common entry point for all platforms, so it is not repeated here.
 
         # Fork again to prevent zombie
         if os.fork() > 0:

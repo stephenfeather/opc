@@ -281,6 +281,21 @@ _RE_CONFLICTS = re.compile(
 )
 
 
+def _entity_boundary_pattern(name: str) -> re.Pattern[str]:
+    """Compile a whole-token matcher for an entity ``name``.
+
+    A plain ``\\b...\\b`` wrap only works when the name begins and ends with
+    word characters. Canonical names preserved by normalization can start or end
+    with non-word characters (e.g. ``.env`` or ``../utils/helper.py``), where
+    ``\\b`` would never match. Use a zero-width lookaround at any non-word
+    endpoint instead so a fragment inside a larger word is still rejected
+    (issue #122 review round 1).
+    """
+    left = r"\b" if re.match(r"\w", name) else r"(?<!\w)"
+    right = r"\b" if re.search(r"\w$", name) else r"(?!\w)"
+    return re.compile(left + re.escape(name) + right)
+
+
 def _iter_sentence_spans(text: str):
     """Yield ``(start_offset, sentence_text)`` for each sentence in ``text``.
 
@@ -321,12 +336,12 @@ def extract_relations(
                 source_type=src_type, target_type=tgt_type,
             ))
 
-    # Pre-compile a word-boundary pattern per entity once, so a name only
-    # matches as a whole token. The old `e.name in sent.lower()` substring
-    # test matched fragments (e.g. language "go" inside "going"), inventing
-    # cross-sentence relations (issue #122). Compiled outside the sentence
-    # loop to keep this O(entities), not O(sentences * entities) compilations.
-    entity_word_res = [(e, re.compile(r"\b" + re.escape(e.name) + r"\b")) for e in entities]
+    # Pre-compile a whole-token pattern per entity once, so a name only matches
+    # as a whole token. The old `e.name in sent.lower()` substring test matched
+    # fragments (e.g. language "go" inside "going"), inventing cross-sentence
+    # relations (issue #122). Compiled outside the sentence loop to keep this
+    # O(entities), not O(sentences * entities) compilations.
+    entity_word_res = [(e, _entity_boundary_pattern(e.name)) for e in entities]
 
     # Split into sentences for co-occurrence (offsets are accurate per sentence)
     for sent_offset, sent in _iter_sentence_spans(content):

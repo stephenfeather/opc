@@ -189,6 +189,26 @@ class TestCompiledDictionaryPatterns:
         assert "postgresql" in tool_names
 
 
+class TestEntityBoundaryPattern:
+    """Issue #122: entity membership matching must respect token boundaries even
+    when the canonical name starts/ends with non-word characters."""
+
+    def test_plain_name_uses_word_boundaries(self):
+        pat = kg_extractor._entity_boundary_pattern("go")
+        assert pat.search("the go language") is not None
+        assert pat.search("we are going home") is None  # not a substring match
+
+    def test_leading_non_word_name_matches(self):
+        pat = kg_extractor._entity_boundary_pattern(".env")
+        assert pat.search("edit the .env file") is not None
+        # must not match a fragment inside a larger word
+        assert pat.search("preventive") is None
+
+    def test_relative_path_name_matches(self):
+        pat = kg_extractor._entity_boundary_pattern("../utils/helper.py")
+        assert pat.search("see ../utils/helper.py now") is not None
+
+
 class TestEdgeCases:
     def test_empty_content(self):
         assert extract_entities("") == []
@@ -286,6 +306,26 @@ class TestRelationExtraction:
         relations = extract_relations(content, entities)
         bogus = [r for r in relations if {r.source, r.target} == {"go", "pytest"}]
         assert bogus == [], f"unexpected cross-sentence relation: {bogus}"
+
+    def test_relative_path_relation_across_sentences(self):
+        """A relative path mentioned first in one sentence and again (with a
+        relation signal) in a later sentence must still produce the relation.
+
+        Regression for the word-boundary fix (issue #122 review round 1): names
+        with non-word endpoints like '../utils/helper.py' fail a naive
+        ``\\b...\\b`` wrap, silently dropping cross-sentence edges.
+        """
+        content = "../utils/helper.py exists. Pytest uses ../utils/helper.py in tests."
+        entities = extract_entities(content)
+        names = {e.name for e in entities}
+        assert "../utils/helper.py" in names
+        relations = extract_relations(content, entities)
+        uses = [
+            r
+            for r in relations
+            if r.relation == "uses" and "../utils/helper.py" in {r.source, r.target}
+        ]
+        assert len(uses) > 0
 
     def test_relation_in_later_sentence_after_offsets(self):
         """Span-based sentence membership stays accurate after several

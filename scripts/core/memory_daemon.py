@@ -164,62 +164,77 @@ except Exception:
 
 
 # Re-exports from memory_daemon_extractors (D12: shims per step)
-from scripts.core.memory_daemon_extractors import (  # noqa: E402
-    is_extraction_blocked as _is_extraction_blocked,
-    extract_memories_impl as _extract_memories_impl,
-    archive_session_jsonl as _archive_session_jsonl_impl,
-    calibrate_session_confidence as _calibrate_session_confidence_impl,
-    extract_and_store_workflows as _extract_and_store_workflows_impl,
-    generate_mini_handoff as _generate_mini_handoff_impl,
-    count_session_rejections as _count_session_rejections_impl,
-)
-
-# Re-exports from memory_daemon_core (D12: shims per step)
-from scripts.core.memory_daemon_core import (  # noqa: E402
-    StaleSession,
-    _ALLOWED_EXTRACTION_MODELS,
-    _normalize_project,
-    strip_yaml_frontmatter,
-)
+# Config from opc.toml [daemon] — read at call time, not import time (D3)
+from scripts.core.config import get_config as _get_config
 
 # Log-field sanitizer for DB-sourced / subprocess-sourced strings (#104).
 from scripts.core.log_safety import safe  # noqa: E402
 
-# Re-exports from memory_daemon_db (D12: shims per step)
-from scripts.core.memory_daemon_db import (  # noqa: E402
-    get_postgres_url,
-    use_postgres,
-    pg_connect,
-    get_sqlite_path,
-    pg_ensure_column,
-    sqlite_ensure_table,
-    ensure_schema,
-    pg_get_stale_sessions as _pg_get_stale_sessions_impl,
-    sqlite_get_stale_sessions as _sqlite_get_stale_sessions_impl,
-    get_stale_sessions as _get_stale_sessions_impl,
-    pg_mark_extracting,
-    pg_mark_extracted,
-    pg_mark_extraction_failed as _pg_mark_extraction_failed_impl,
-    pg_mark_archived,
-    mark_archived,
-    pg_mark_session_exited,
-    sqlite_mark_extracting,
-    sqlite_mark_extracted,
-    sqlite_mark_extraction_failed as _sqlite_mark_extraction_failed_impl,
-    sqlite_mark_session_exited,
-    pg_recover_stalled_extractions,
-    sqlite_recover_stalled_extractions,
-    recover_stalled_extractions,
-    mark_extracting,
-    mark_extracted,
-    mark_extraction_failed as _mark_extraction_failed_impl,
-    mark_session_exited,
+# Re-exports from memory_daemon_core (D12: shims per step)
+from scripts.core.memory_daemon_core import (  # noqa: E402
+    _ALLOWED_EXTRACTION_MODELS,
+    StaleSession,
+    _normalize_project,
+    strip_yaml_frontmatter,
+)
+from scripts.core.memory_daemon_db import (
     count_session_learnings as _count_session_learnings_db,
-    seed_last_pattern_run as _seed_last_pattern_run_db,
 )
 
-# Config from opc.toml [daemon] — read at call time, not import time (D3)
-from scripts.core.config import get_config as _get_config
+# Re-exports from memory_daemon_db (D12: shims per step)
+from scripts.core.memory_daemon_db import (  # noqa: E402
+    ensure_schema,
+    mark_archived,
+    mark_extracted,
+    mark_extracting,
+    mark_session_exited,
+    pg_connect,
+    recover_stalled_extractions,
+    use_postgres,
+)
+from scripts.core.memory_daemon_db import (
+    get_stale_sessions as _get_stale_sessions_impl,
+)
+from scripts.core.memory_daemon_db import (
+    mark_extraction_failed as _mark_extraction_failed_impl,
+)
+from scripts.core.memory_daemon_db import (
+    pg_get_stale_sessions as _pg_get_stale_sessions_impl,
+)
+from scripts.core.memory_daemon_db import (
+    pg_mark_extraction_failed as _pg_mark_extraction_failed_impl,
+)
+from scripts.core.memory_daemon_db import (
+    seed_last_pattern_run as _seed_last_pattern_run_db,
+)
+from scripts.core.memory_daemon_db import (
+    sqlite_get_stale_sessions as _sqlite_get_stale_sessions_impl,
+)
+from scripts.core.memory_daemon_db import (
+    sqlite_mark_extraction_failed as _sqlite_mark_extraction_failed_impl,
+)
+from scripts.core.memory_daemon_extractors import (
+    archive_session_jsonl as _archive_session_jsonl_impl,
+)
+from scripts.core.memory_daemon_extractors import (
+    calibrate_session_confidence as _calibrate_session_confidence_impl,
+)
+from scripts.core.memory_daemon_extractors import (
+    count_session_rejections as _count_session_rejections_impl,
+)
+from scripts.core.memory_daemon_extractors import (
+    extract_and_store_workflows as _extract_and_store_workflows_impl,
+)
+from scripts.core.memory_daemon_extractors import (
+    extract_memories_impl as _extract_memories_impl,
+)
+from scripts.core.memory_daemon_extractors import (
+    generate_mini_handoff as _generate_mini_handoff_impl,
+)
+from scripts.core.memory_daemon_extractors import (  # noqa: E402
+    is_extraction_blocked as _is_extraction_blocked,
+)
+
 _daemon_cfg = _get_config().daemon
 
 PID_FILE = Path.home() / ".claude" / "memory-daemon.pid"
@@ -583,7 +598,9 @@ def reap_completed_extractions():
             learnings_count = _count_session_learnings(session_id) if exit_code == 0 else None
             learnings_info = f", learnings={learnings_count}" if learnings_count is not None else ""
             rejections_count = _count_session_rejections(session_id) if exit_code == 0 else None
-            rejections_info = f", rejections={rejections_count}" if rejections_count is not None else ""
+            rejections_info = (
+                f", rejections={rejections_count}" if rejections_count is not None else ""
+            )
             log(f"Extraction completed for {safe(session_id)} "
                 f"(pid={pid}, project={safe(project)}, "
                 f"exit={exit_code}, elapsed={elapsed}s{learnings_info}{rejections_info})")
@@ -821,7 +838,7 @@ def _check_pattern_detection():
                 )
                 log(f"Pattern detection completed: {safe(total)} patterns "
                     f"from {safe(analyzed)} learnings ({type_summary})")
-            except (_json.JSONDecodeError, KeyError):
+            except (_json.JSONDecodeError, KeyError, AttributeError, TypeError):
                 log(f"Pattern detection completed: {safe(stdout[:200])}")
         else:
             # stderr can be None in two cases:
@@ -1072,12 +1089,12 @@ def start_daemon():
 
     if sys.platform == "win32":
         # Windows: spawn as detached subprocess
-        DETACHED_PROCESS = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        detached_process = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
         try:
             with open(os.devnull, "r+b") as devnull:
                 subprocess.Popen(
                     [sys.executable, __file__, "--daemon-subprocess"],
-                    creationflags=DETACHED_PROCESS,
+                    creationflags=detached_process,
                     stdin=devnull,
                     stdout=devnull,
                     stderr=devnull,
@@ -1170,7 +1187,7 @@ def status_daemon():
             conn.close()
             if row:
                 _, last_run, count = row
-                print(f"\nPattern Detection:")
+                print("\nPattern Detection:")
                 print(f"  Last run: {last_run}")
                 print(f"  Active patterns: {count}")
                 interval_h = int(_pattern_detection_interval()) // 3600

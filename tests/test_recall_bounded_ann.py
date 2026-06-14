@@ -126,6 +126,12 @@ class TestBuildRrfCteBoundedAnn:
 # ==================== _fetch_all param binding ====================
 
 
+_SUPPORTED_VECTOR_VERSION = "0.8.1"
+# Sentinel so a test can request "no extension row" (NULL) distinctly from the
+# default supported version.
+_NO_VECTOR_ROW = object()
+
+
 class _CapturingConn:
     """Capturing conn for the bare-fetch RRF cascade (issue #153 round-3).
 
@@ -133,24 +139,45 @@ class _CapturingConn:
     ``hnsw.iterative_scan`` GUC is SET once on connection acquire (autocommit),
     and the cascade is bare ``conn.fetch``. This conn records ``fetch`` and
     ``execute`` calls so tests can assert the SET is issued and the cascade
-    degrades. ``execute_error`` simulates an older pgvector rejecting the GUC —
-    the error is raised by ``execute`` WITHOUT any transaction to poison, so a
-    failed SET cannot abort later fetches.
+    degrades.
+
+    PR review fix: iterative-scan support is detected from the pgvector
+    extension VERSION (``SELECT extversion FROM pg_extension WHERE extname =
+    'vector'`` via ``fetchval``), NOT from SET success — PostgreSQL accepts any
+    two-part custom GUC as a placeholder, so a SET succeeding proves nothing.
+    ``vector_version`` controls what the extversion query returns (default
+    supported 0.8.1; pass an older string, ``None``, or ``_NO_VECTOR_ROW`` to
+    simulate unsupported / missing). ``execute_error`` still lets a test force a
+    transient SET failure.
     """
 
     def __init__(
-        self, row_provider=None, *, execute_error: Exception | None = None,
+        self,
+        row_provider=None,
+        *,
+        execute_error: Exception | None = None,
+        vector_version: Any = _SUPPORTED_VECTOR_VERSION,
     ) -> None:
         self.calls: list[tuple[str, tuple]] = []
         self.executed: list[tuple[str, tuple]] = []
+        self.fetchvals: list[tuple[str, tuple]] = []
         self.tx_depth = 0
         self.max_tx_depth = 0
         self._row_provider = row_provider or (lambda sql, args: [])
         self._execute_error = execute_error
+        self._vector_version = vector_version
 
     async def fetch(self, sql: str, *args: Any) -> list[Any]:
         self.calls.append((sql, args))
         return self._row_provider(sql, args)
+
+    async def fetchval(self, sql: str, *args: Any) -> Any:
+        self.fetchvals.append((sql, args))
+        if "extversion" in sql and "pg_extension" in sql:
+            if self._vector_version is _NO_VECTOR_ROW:
+                return None
+            return self._vector_version
+        return None
 
     async def execute(self, sql: str, *args: Any) -> str:
         self.executed.append((sql, args))
@@ -434,20 +461,18 @@ class TestRrfIterativeScanGuc:
         # No transaction was ever opened around the cascade.
         assert conn.max_tx_depth == 0
 
-    async def test_unsupported_guc_fetch_runs_and_warns_once(
+    async def test_unsupported_version_fetch_runs_and_warns_once(
         self, monkeypatch, caplog,
     ):
-        """Round-3 finding 2 setup: on older pgvector the session SET fails with
-        an unknown-GUC error; it is swallowed (no transaction to poison), recall
+        """PR review fix: on pgvector < 0.8 the version check detects no support,
+        the SET is NOT issued (placeholder GUC would silently 'succeed'), recall
         still runs, and a warning is logged."""
         import logging
 
         from scripts.core import recall_backends as rb
 
         rb.reset_project_column_cache()
-        boom = RuntimeError('unrecognized configuration parameter '
-                            '"hnsw.iterative_scan"')
-        conn = _CapturingConn(execute_error=boom)
+        conn = _CapturingConn(vector_version="0.7.4")
         _patch_rrf_env(monkeypatch, conn)
 
         with caplog.at_level(logging.WARNING):
@@ -456,82 +481,133 @@ class TestRrfIterativeScanGuc:
             )
         assert results == []
         rrf_calls = [c for c in conn.calls if "vector_ranked" in c[0]]
-        assert rrf_calls, "RRF fetch must still run when the GUC is unsupported"
+        assert rrf_calls, "RRF fetch must still run when iterative scan absent"
+        # The SET must NOT be issued on an unsupported version.
+        assert not any("iterative_scan" in s for s, _ in conn.executed), (
+            "must not issue the GUC SET on pgvector < 0.8"
+        )
         assert any(
             "iterative" in r.message.lower() and r.levelno >= logging.WARNING
             for r in caplog.records
         ), "expected a warning that bounded ANN runs without iterative scan"
 
-    async def test_ensure_caches_definitive_result(self, monkeypatch):
-        """ensure_hnsw_iterative_scan caches True on success and False on an
-        unsupported GUC (mirrors the column probes); a known-False skips the SET
-        entirely on later connections."""
+    # --- PR review fix: version-based capability detection ---
+
+    async def test_supported_version_caches_true_and_sets(self, monkeypatch):
+        """pgvector >= 0.8.0 -> cache True AND issue the session SET."""
         from scripts.core import recall_backends as rb
 
-        # Success -> cached True.
+        for ver in ("0.8.0", "0.8.1", "0.9.0", "1.0.0"):
+            rb.reset_hnsw_iterative_scan_cache()
+            conn = _CapturingConn(vector_version=ver)
+            assert await rb.ensure_hnsw_iterative_scan(conn) is True, ver
+            assert rb._hnsw_iterative_scan_cache is True
+            assert any("iterative_scan" in s for s, _ in conn.executed), ver
+
+    async def test_old_version_caches_false_no_set(self, monkeypatch):
+        """pgvector < 0.8.0 -> cache False and NEVER issue the SET (a placeholder
+        SET would silently succeed and mask the under-fill)."""
+        from scripts.core import recall_backends as rb
+
+        for ver in ("0.7.4", "0.5.1", "0.6.0"):
+            rb.reset_hnsw_iterative_scan_cache()
+            conn = _CapturingConn(vector_version=ver)
+            assert await rb.ensure_hnsw_iterative_scan(conn) is False, ver
+            assert rb._hnsw_iterative_scan_cache is False
+            assert not any("iterative_scan" in s for s, _ in conn.executed), ver
+
+    async def test_missing_extension_row_conservative_false(self, monkeypatch):
+        """No pg_extension row (NULL) -> conservatively unsupported, no SET."""
+        from scripts.core import recall_backends as rb
+
         rb.reset_hnsw_iterative_scan_cache()
-        ok_conn = _CapturingConn()
+        conn = _CapturingConn(vector_version=_NO_VECTOR_ROW)
+        assert await rb.ensure_hnsw_iterative_scan(conn) is False
+        assert rb._hnsw_iterative_scan_cache is False
+        assert not any("iterative_scan" in s for s, _ in conn.executed)
+
+    async def test_unparseable_version_conservative_false(self, monkeypatch):
+        """An unparseable extversion string -> conservatively unsupported."""
+        from scripts.core import recall_backends as rb
+
+        for ver in ("garbage", "", "v-unknown", "..."):
+            rb.reset_hnsw_iterative_scan_cache()
+            conn = _CapturingConn(vector_version=ver)
+            assert await rb.ensure_hnsw_iterative_scan(conn) is False, repr(ver)
+            assert rb._hnsw_iterative_scan_cache is False
+            assert not any("iterative_scan" in s for s, _ in conn.executed)
+
+    async def test_version_with_suffix_parsed(self, monkeypatch):
+        """Tolerant parse handles trailing non-numeric components."""
+        from scripts.core import recall_backends as rb
+
+        # Leading numeric components drive the comparison; 0.8.x-dev >= 0.8.0.
+        rb.reset_hnsw_iterative_scan_cache()
+        conn = _CapturingConn(vector_version="0.8.0-dev")
+        assert await rb.ensure_hnsw_iterative_scan(conn) is True
+
+    async def test_ensure_caches_definitive_result(self, monkeypatch):
+        """Supported -> cache True; unsupported -> cache False; known-False skips
+        the whole probe (no version query, no SET) on later connections."""
+        from scripts.core import recall_backends as rb
+
+        # Supported -> cached True, SET issued.
+        rb.reset_hnsw_iterative_scan_cache()
+        ok_conn = _CapturingConn(vector_version="0.8.1")
         assert await rb.ensure_hnsw_iterative_scan(ok_conn) is True
         assert rb._hnsw_iterative_scan_cache is True
 
         # Unsupported -> cached False (definitive miss).
         rb.reset_hnsw_iterative_scan_cache()
-        boom = RuntimeError('unrecognized configuration parameter '
-                            '"hnsw.iterative_scan"')
-        bad_conn = _CapturingConn(execute_error=boom)
+        bad_conn = _CapturingConn(vector_version="0.7.4")
         assert await rb.ensure_hnsw_iterative_scan(bad_conn) is False
         assert rb._hnsw_iterative_scan_cache is False
 
-        # Known-False: the SET is NOT attempted again on a new connection.
-        skip_conn = _CapturingConn()
+        # Known-False: neither the version query nor the SET runs again.
+        skip_conn = _CapturingConn(vector_version="0.8.1")
         assert await rb.ensure_hnsw_iterative_scan(skip_conn) is False
+        assert not skip_conn.fetchvals, "must skip version query when cached"
         assert not skip_conn.executed, "must skip SET when known unsupported"
 
     async def test_ensure_no_transaction_opened(self, monkeypatch):
-        """The session SET runs OUTSIDE any transaction (autocommit), so an
-        unsupported GUC cannot open or poison a transaction."""
+        """Version detection + the session SET run OUTSIDE any transaction."""
         from scripts.core import recall_backends as rb
 
         rb.reset_hnsw_iterative_scan_cache()
-        boom = RuntimeError('unrecognized configuration parameter '
-                            '"hnsw.iterative_scan"')
-        conn = _CapturingConn(execute_error=boom)
+        conn = _CapturingConn(vector_version="0.7.4")
 
         await rb.ensure_hnsw_iterative_scan(conn)
 
-        assert conn.max_tx_depth == 0, "session SET must not open a transaction"
+        assert conn.max_tx_depth == 0, "detection must not open a transaction"
 
-    async def test_transient_failure_not_cached_and_warns_once(
+    async def test_transient_version_query_failure_not_cached_warns_once(
         self, monkeypatch, caplog,
     ):
-        """Round-3 finding 2: a transient SET failure is NOT cached (retries on
-        the next connection), warns at most once per process, and never dumps a
-        stack trace (no exc_info) on the hot path."""
+        """A transient failure of the version query is NOT cached (retries next
+        connection), warns at most once per process, and never dumps a stack
+        trace (no exc_info) on the hot path."""
         import logging
 
         from scripts.core import recall_backends as rb
 
         rb.reset_hnsw_iterative_scan_cache()
-        # A timeout-like error that is NOT an unknown-GUC error -> transient.
         transient = TimeoutError("statement timeout")
 
         class _TransientConn(_CapturingConn):
-            async def execute(self, sql: str, *args: Any) -> str:
-                self.executed.append((sql, args))
-                if "iterative_scan" in sql:
+            async def fetchval(self, sql: str, *args: Any) -> Any:
+                self.fetchvals.append((sql, args))
+                if "extversion" in sql:
                     raise transient
-                return "SET"
+                return None
 
         conn1 = _TransientConn()
         with caplog.at_level(logging.WARNING):
             assert await rb.ensure_hnsw_iterative_scan(conn1) is False
-            # Not cached: the next connection retries the SET.
-            assert rb._hnsw_iterative_scan_cache is None
+            assert rb._hnsw_iterative_scan_cache is None  # not cached
             conn2 = _TransientConn()
             assert await rb.ensure_hnsw_iterative_scan(conn2) is False
             assert rb._hnsw_iterative_scan_cache is None
 
-        # Warned at most once across the two transient failures.
         transient_warnings = [
             r for r in caplog.records
             if "transient" in r.message.lower() and r.levelno >= logging.WARNING
@@ -540,7 +616,6 @@ class TestRrfIterativeScanGuc:
             f"expected one rate-limited transient warning, got "
             f"{len(transient_warnings)}"
         )
-        # No stack-trace spam on the hot path.
         assert all(r.exc_info is None for r in transient_warnings), (
             "transient warning must not include exc_info on the hot path"
         )

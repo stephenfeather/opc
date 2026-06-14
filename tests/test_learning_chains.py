@@ -64,8 +64,11 @@ class FakeAcquire:
 class _NoopTx:
     """No-op async context manager for conn.transaction() (issue #153).
 
-    The hybrid RRF fetch scopes SET LOCAL hnsw.iterative_scan inside a
-    transaction; mock conns must return a real async CM.
+    Round-3 production sets a SESSION-level ``SET hnsw.iterative_scan`` once per
+    connection on acquire and runs the RRF cascade as bare ``conn.fetch`` (no
+    per-attempt transaction). This no-op CM is retained only so mock conns whose
+    ``transaction`` attribute may be exercised by other paths return a real
+    async CM; the RRF cascade itself opens no transaction.
     """
 
     async def __aenter__(self):

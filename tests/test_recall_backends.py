@@ -802,12 +802,14 @@ class _FakeRecallDb:
                 return []
 
             async def execute(self, sql: str, *args: Any) -> str:
-                # SET LOCAL hnsw.iterative_scan (issue #153): no-op for the fake.
+                # Session-level SET hnsw.iterative_scan is issued once per
+                # connection on acquire (issue #153); no-op for the fake. The
+                # RRF cascade itself uses bare conn.fetch (no transaction).
                 return "SET"
 
             def transaction(self):
-                # The RRF fetch now runs inside a transaction so SET LOCAL is
-                # scoped (issue #153 finding 1). Provide a no-op async CM.
+                # Retained for any caller that opens a transaction; the round-3
+                # RRF cascade does NOT (bare fetches, session SET on acquire).
                 class _Tx:
                     async def __aenter__(self):
                         return None

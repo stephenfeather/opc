@@ -126,11 +126,14 @@ def _patch_pool(monkeypatch) -> None:
             return []
 
         async def execute(self, _sql: str, *_args: Any) -> str:
-            # SET LOCAL hnsw.iterative_scan (issue #153): no-op for the fake.
+            # Session-level SET hnsw.iterative_scan issued once per connection
+            # on acquire (issue #153); no-op for the fake. The RRF cascade uses
+            # bare conn.fetch (no per-attempt transaction).
             return "SET"
 
         def transaction(self):
-            # RRF fetch runs inside a transaction now (issue #153 finding 1).
+            # Retained for callers that open a transaction; the round-3 RRF
+            # cascade does NOT (bare fetches, session SET on acquire).
             class _Tx:
                 async def __aenter__(self):
                     return None

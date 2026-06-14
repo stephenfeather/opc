@@ -662,15 +662,26 @@ def _is_project_capability_error(exc: BaseException) -> bool:
 # scans, and every recall (and the bounded vector probes generally) wants it.
 _HNSW_ITERATIVE_SCAN_GUC = "SET hnsw.iterative_scan = 'strict_order'"
 
-# Cache the GUC-support detection (mirrors the project/embedding_model column
-# probes): True once the SET succeeded on a connection, False on a definitive
-# unknown-GUC error (older pgvector). Transient failures stay uncached and
-# retry, but are rate-limited (below) so a flapping DB never spams the hot path.
+# Cache the iterative-scan support detection (mirrors the project/
+# embedding_model column probes): True/False once a definitive answer is known,
+# None until probed. Transient failures stay uncached and retry, rate-limited
+# (below) so a flapping DB never spams the hot path.
 _hnsw_iterative_scan_cache: bool | None = None
 
-# Round-3 finding 2: rate-limit the transient-failure warning to once per
-# process (no exc_info stack-trace spam on every recall when the DB flaps).
+# Rate-limit the transient-failure warning to once per process (no exc_info
+# stack-trace spam on every recall when the DB flaps).
 _HNSW_TRANSIENT_WARNED = False
+
+# pgvector added the hnsw.iterative_scan GUC in 0.8.0. PR review fix: SET-success
+# is NOT a valid capability signal — PostgreSQL accepts ANY two-part custom GUC
+# (e.g. `SET hnsw.bogus = 'x'`) as a session placeholder when the prefix is
+# unreserved, so a SET on pgvector < 0.8 silently "succeeds" and would falsely
+# cache support True, leaving the bounded ANN leg to under-fill undetected.
+# pg_settings is also unreliable (the GUC isn't registered until pgvector loads).
+# The only sound signal is the installed extension version.
+_HNSW_ITERATIVE_SCAN_MIN_VERSION = (0, 8, 0)
+
+_VECTOR_VERSION_SQL = "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
 
 
 def reset_hnsw_iterative_scan_cache() -> None:
@@ -686,78 +697,94 @@ def _set_hnsw_iterative_scan_cache_for_tests(value: bool | None) -> None:
     _hnsw_iterative_scan_cache = value
 
 
-_UNKNOWN_GUC_RE = re.compile(
-    r"unrecognized configuration parameter|"
-    r"invalid value for parameter|"
-    r"hnsw\.iterative_scan",
-    re.IGNORECASE,
-)
+def _parse_pgvector_version(raw: str | None) -> tuple[int, ...] | None:
+    """Parse a pgvector extversion string into a leading-integer tuple.
 
-
-def _is_unknown_guc_error(exc: BaseException) -> bool:
-    """True when exc looks like 'GUC not supported' rather than transient I/O.
-
-    asyncpg surfaces an unknown GUC as UndefinedObjectError; fall back to a
-    message regex for drivers/wrappers that raise a generic error so older
-    pgvector is classified as a definitive (cacheable) miss rather than a
-    transient hiccup.
+    Tolerant: splits on '.', takes the leading run of integer components
+    (so '0.8.1' -> (0, 8, 1), '0.8.0-dev' -> (0, 8, 0)). Returns None when the
+    value is missing or has no leading integer component (caller treats None
+    conservatively as unsupported).
     """
-    try:
-        from asyncpg.exceptions import (
-            InvalidParameterValueError,
-            UndefinedObjectError,
-        )
-
-        if isinstance(exc, (UndefinedObjectError, InvalidParameterValueError)):
-            return True
-    except ImportError:  # pragma: no cover - asyncpg absent
-        pass
-    return bool(_UNKNOWN_GUC_RE.search(str(exc)))
+    if not raw:
+        return None
+    parts: list[int] = []
+    for component in str(raw).split("."):
+        # Take the leading integer prefix of each component ('0', '8', '1';
+        # '0' from '0-dev'); stop at the first component with no integer prefix.
+        digits = ""
+        for ch in component.strip():
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts) or None
 
 
 async def ensure_hnsw_iterative_scan(conn: Any) -> bool:
-    """Set the SESSION hnsw.iterative_scan GUC once per acquired connection.
+    """Enable session hnsw.iterative_scan when the installed pgvector supports it.
 
-    Issued OUTSIDE any transaction (asyncpg autocommits), so it persists for all
-    cascade fetches on this connection with ZERO per-attempt transaction
-    overhead and never opens a transaction that an unsupported GUC could poison
-    (round-3 redesign). Returns True when iterative scan is active on the
-    connection, False when the GUC is unsupported.
+    PR review fix: support is detected from the pgvector EXTENSION VERSION
+    (``SELECT extversion FROM pg_extension WHERE extname = 'vector'``), not from
+    SET success — Postgres accepts any custom-prefix GUC as a placeholder, so a
+    successful SET on pgvector < 0.8 would falsely signal support and let the
+    bounded ANN leg under-fill undetected.
 
-    Support is cached process-wide: once a definitive answer is known the SET is
-    skipped on a False (unsupported) result and re-issued cheaply (single
-    autocommit statement, no round-trip transaction) on True so each fresh
-    physical connection actually gets the session setting. Transient failures
-    are not cached and warn at most once per process (no exc_info spam).
+    Runs once per process (cached): the version query + (when supported) the
+    SESSION ``SET hnsw.iterative_scan = 'strict_order'`` both run OUTSIDE any
+    transaction (asyncpg autocommits), so there is zero per-attempt transaction
+    overhead and nothing to poison. When support is cached True the SET is
+    re-issued per acquire (a single cheap autocommit statement); a
+    per-connection skip via a marker attribute was tried and REVERTED because
+    asyncpg.Connection objects have no ``__dict__`` and reject custom attributes,
+    so the "skip" branch never fired in production and only added a caught
+    AttributeError on the hot path. Returns True when iterative scan is active.
+
+    Conservative default: a missing/NULL extension row or an unparseable version
+    is treated as UNSUPPORTED (cache False, no SET, warn once) — the bounded leg
+    still works, just without iterative scan. Transient failures of the version
+    query are NOT cached (retry next connection) and warn at most once per
+    process with no exc_info spam.
     """
     global _hnsw_iterative_scan_cache, _HNSW_TRANSIENT_WARNED
-    if _hnsw_iterative_scan_cache is False:
-        # Known unsupported: never attempt the SET again (older pgvector).
+    if _hnsw_iterative_scan_cache is not None:
+        # Definitive answer known: skip the version query. When supported,
+        # re-issue the cheap session SET so each fresh physical connection
+        # actually gets the setting; when unsupported, issue nothing.
+        if _hnsw_iterative_scan_cache:
+            await conn.execute(_HNSW_ITERATIVE_SCAN_GUC)
+            return True
         return False
+
     try:
-        await conn.execute(_HNSW_ITERATIVE_SCAN_GUC)
-    except Exception as exc:  # noqa: BLE001 - classify supported vs transient
-        if _is_unknown_guc_error(exc):
-            if _hnsw_iterative_scan_cache is not False:
-                logger.warning(
-                    "pgvector hnsw.iterative_scan GUC unsupported (older "
-                    "pgvector) — bounded ANN recall runs WITHOUT iterative "
-                    "scan and may under-fill under selective filters once HNSW "
-                    "engages. Upgrade pgvector >= 0.8 to enable (issue #153)."
-                )
-            _hnsw_iterative_scan_cache = False
-            return False
-        # Transient (timeout, reset): do not cache; rate-limit the warning to
-        # once per process and never dump a stack trace on the hot path.
+        raw_version = await conn.fetchval(_VECTOR_VERSION_SQL)
+    except Exception as exc:  # noqa: BLE001 - transient: do not cache, retry
         if not _HNSW_TRANSIENT_WARNED:
             _HNSW_TRANSIENT_WARNED = True
             logger.warning(
-                "setting hnsw.iterative_scan failed transiently (%s); this "
-                "recall runs without iterative scan and retries next "
-                "connection",
+                "pgvector version query failed transiently (%s); this recall "
+                "runs without iterative scan and retries next connection",
                 type(exc).__name__,
             )
         return False
+
+    version = _parse_pgvector_version(raw_version)
+    if version is None or version < _HNSW_ITERATIVE_SCAN_MIN_VERSION:
+        # Conservative: unknown/old pgvector -> iterative scan unsupported.
+        logger.warning(
+            "pgvector iterative scan unsupported (installed version %r < 0.8.0 "
+            "or undetectable) — bounded ANN recall runs WITHOUT iterative scan "
+            "and may under-fill under selective filters once HNSW engages. "
+            "Upgrade pgvector >= 0.8 to enable (issue #153).",
+            raw_version,
+        )
+        _hnsw_iterative_scan_cache = False
+        return False
+
+    # Supported: cache True and issue the session SET.
+    await conn.execute(_HNSW_ITERATIVE_SCAN_GUC)
     _hnsw_iterative_scan_cache = True
     return True
 

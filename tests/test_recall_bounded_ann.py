@@ -126,25 +126,16 @@ class TestBuildRrfCteBoundedAnn:
 # ==================== _fetch_all param binding ====================
 
 
-class _AbortedTransactionError(Exception):
-    """Models Postgres 'current transaction is aborted' (round-2 finding 1).
-
-    Once a statement fails inside a transaction, every subsequent statement in
-    that SAME transaction raises this until the transaction ends. A fresh
-    transaction() clears the aborted state.
-    """
-
-
 class _CapturingConn:
-    """Capturing conn modelling Postgres aborted-transaction semantics.
+    """Capturing conn for the bare-fetch RRF cascade (issue #153 round-3).
 
-    Records ``fetch``/``execute`` calls and ``transaction()`` enter/exit so
-    tests can assert the per-attempt-transaction design (issue #153 round-2).
-    After any statement raises inside a transaction, further statements in the
-    same transaction raise ``_AbortedTransactionError`` — proving the cascade
-    must open a fresh transaction per fallback attempt. ``execute_error``
-    simulates an older pgvector that rejects the ``hnsw.iterative_scan`` GUC
-    (the error aborts whatever transaction issues the SET).
+    Round-3 removed per-attempt transactions: the session-level
+    ``hnsw.iterative_scan`` GUC is SET once on connection acquire (autocommit),
+    and the cascade is bare ``conn.fetch``. This conn records ``fetch`` and
+    ``execute`` calls so tests can assert the SET is issued and the cascade
+    degrades. ``execute_error`` simulates an older pgvector rejecting the GUC —
+    the error is raised by ``execute`` WITHOUT any transaction to poison, so a
+    failed SET cannot abort later fetches.
     """
 
     def __init__(
@@ -154,40 +145,16 @@ class _CapturingConn:
         self.executed: list[tuple[str, tuple]] = []
         self.tx_depth = 0
         self.max_tx_depth = 0
-        # Records (sql, tx_depth_at_call_time) for every fetch so tests can
-        # assert the RRF fetch happened inside an open transaction.
-        self.fetch_tx_depth: list[tuple[str, int]] = []
         self._row_provider = row_provider or (lambda sql, args: [])
         self._execute_error = execute_error
-        # True while the current transaction is in the aborted state.
-        self._aborted = False
 
     async def fetch(self, sql: str, *args: Any) -> list[Any]:
-        if self.tx_depth > 0 and self._aborted:
-            raise _AbortedTransactionError(
-                "current transaction is aborted, commands ignored until "
-                "end of transaction block"
-            )
         self.calls.append((sql, args))
-        self.fetch_tx_depth.append((sql, self.tx_depth))
-        try:
-            return self._row_provider(sql, args)
-        except Exception:
-            # A failing statement poisons the rest of THIS transaction.
-            if self.tx_depth > 0:
-                self._aborted = True
-            raise
+        return self._row_provider(sql, args)
 
     async def execute(self, sql: str, *args: Any) -> str:
-        if self.tx_depth > 0 and self._aborted:
-            raise _AbortedTransactionError(
-                "current transaction is aborted, commands ignored until "
-                "end of transaction block"
-            )
         self.executed.append((sql, args))
         if self._execute_error is not None and "iterative_scan" in sql:
-            if self.tx_depth > 0:
-                self._aborted = True
             raise self._execute_error
         return "SET"
 
@@ -195,6 +162,8 @@ class _CapturingConn:
         return {"cnt": 0}
 
     def transaction(self):
+        # Retained for any caller that still opens a transaction; the round-3
+        # RRF cascade does NOT, so this should stay at depth 0 during recall.
         conn = self
 
         class _Tx:
@@ -205,10 +174,6 @@ class _CapturingConn:
 
             async def __aexit__(self, *exc):
                 conn.tx_depth -= 1
-                # Leaving the transaction (commit OR rollback) clears the
-                # aborted state — the next transaction starts clean.
-                if conn.tx_depth == 0:
-                    conn._aborted = False
                 return False
 
         return _Tx()
@@ -341,19 +306,19 @@ class TestRrfCandidateBinding:
         assert args[3] == k * 2  # $4 tail LIMIT
 
 
-# ====== Round-1/2 finding 1: filtered-HNSW under-fill GUC + cascade ======
+# === Round-3 finding 1: session-level GUC, no per-attempt transactions ===
 
 
 class TestRrfIterativeScanGuc:
-    """The bounded vector leg under-fills when pgvector applies WHERE filters
-    after the HNSW scan. ``hnsw.iterative_scan = strict_order`` makes the leg
-    return true nearest-k under filters. Round-2 redesign: the GUC is PROBED
-    once in its own rolled-back transaction (so version skew never poisons a
-    fetch), and EACH fetch attempt runs in its OWN transaction (so a failing
-    fallback rolls back cleanly instead of aborting the rest of the cascade).
+    """Round-3 redesign: the ``hnsw.iterative_scan = strict_order`` GUC is a
+    SESSION SET issued ONCE per acquired connection (autocommit, no SET LOCAL,
+    no per-attempt transaction), and the RRF cascade is bare ``conn.fetch``.
+    This removes the round-2 per-attempt BEGIN/SET LOCAL/COMMIT overhead while
+    still benefiting every cascade fetch, and a failed SET on older pgvector
+    poisons nothing because no transaction is ever opened.
     """
 
-    async def test_set_local_iterative_scan_issued_for_fetch(self, monkeypatch):
+    async def test_session_set_issued_once_per_acquire(self, monkeypatch):
         from scripts.core import recall_backends as rb
 
         rb.reset_project_column_cache()
@@ -362,15 +327,19 @@ class TestRrfIterativeScanGuc:
 
         await rb.search_learnings_hybrid_rrf("query terms", k=3, expand=False)
 
-        # SET LOCAL (transaction-scoped), strict_order, is issued (probe + the
-        # fetch attempt both run it).
+        # SESSION SET (not SET LOCAL), strict_order, issued exactly once for the
+        # acquired connection.
         guc_stmts = [s for s, _ in conn.executed if "iterative_scan" in s]
-        assert guc_stmts, "expected a SET LOCAL hnsw.iterative_scan statement"
+        assert len(guc_stmts) == 1, (
+            f"expected one session SET per acquire, got {guc_stmts}"
+        )
         stmt = guc_stmts[0]
-        assert "SET LOCAL" in stmt.upper()
+        assert "SET LOCAL" not in stmt.upper(), "must be a SESSION SET, not LOCAL"
         assert "strict_order" in stmt
 
-    async def test_rrf_fetch_runs_inside_transaction(self, monkeypatch):
+    async def test_no_transaction_wraps_the_cascade(self, monkeypatch):
+        """Round-3: the cascade must NOT open any transaction (no per-attempt
+        BEGIN/COMMIT). The capturing conn's transaction() depth must stay 0."""
         from scripts.core import recall_backends as rb
 
         rb.reset_project_column_cache()
@@ -379,16 +348,11 @@ class TestRrfIterativeScanGuc:
 
         await rb.search_learnings_hybrid_rrf("query terms", k=3, expand=False)
 
-        rrf_fetches = [
-            depth for sql, depth in conn.fetch_tx_depth
-            if "vector_ranked" in sql
-        ]
-        assert rrf_fetches, "expected an RRF fetch"
-        assert all(d >= 1 for d in rrf_fetches), (
-            "RRF fetch must run inside an open transaction (SET LOCAL scope)"
+        assert conn.max_tx_depth == 0, (
+            "RRF cascade must use bare fetches with no transaction wrapping"
         )
 
-    async def test_guc_set_before_rrf_fetch_in_order(self, monkeypatch):
+    async def test_session_set_before_rrf_fetch_in_order(self, monkeypatch):
         from scripts.core import recall_backends as rb
 
         rb.reset_project_column_cache()
@@ -413,13 +377,35 @@ class TestRrfIterativeScanGuc:
         assert "guc" in events and "fetch" in events
         assert events.index("guc") < events.index("fetch")
 
-    async def test_fallback_cascade_survives_aborted_transaction(
+    async def test_happy_path_one_set_plus_one_fetch(self, monkeypatch):
+        """Round-3 perf: the happy path (boosted succeeds) is exactly one
+        session SET + one RRF fetch — no extra round trips."""
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        # Pin column caches so no capability-probe fetches inflate the count.
+        rb._set_project_column_cache_for_tests(False)
+        rb._set_embedding_model_column_cache_for_tests(False)
+        # Boosted fetch "succeeds" (returns no rows) so no fallback runs; the
+        # point is to count round trips, not result shape.
+        conn = _CapturingConn(lambda sql, args: [])
+        _patch_rrf_env(monkeypatch, conn)
+
+        await rb.search_learnings_hybrid_rrf("query terms", k=3, expand=False)
+
+        guc_stmts = [s for s, _ in conn.executed if "iterative_scan" in s]
+        rrf_fetches = [c for c in conn.calls if "vector_ranked" in c[0]]
+        assert len(guc_stmts) == 1, "exactly one session SET per acquire"
+        assert len(rrf_fetches) == 1, (
+            "happy path must issue exactly one RRF fetch (no fallbacks)"
+        )
+
+    async def test_fallback_cascade_degrades_with_bare_fetches(
         self, monkeypatch,
     ):
-        """Round-2 finding 1: the boosted fetch fails (missing recall_count) and
-        aborts ITS transaction. With per-attempt transactions the plain fetch
-        opens a FRESH transaction and succeeds. The single-transaction design
-        would have died here with 'current transaction is aborted'."""
+        """Round-3: the boosted fetch fails (missing recall_count); with bare
+        fetches (no transaction) the plain fallback runs and succeeds. No
+        transaction means no 'aborted transaction' poisoning is possible."""
         from scripts.core import recall_backends as rb
 
         rb.reset_project_column_cache()
@@ -434,27 +420,26 @@ class TestRrfIterativeScanGuc:
         conn = _CapturingConn(provider)
         _patch_rrf_env(monkeypatch, conn)
 
-        # Must not raise _AbortedTransactionError; the plain fallback reaches a
-        # fresh transaction and returns.
         results = await rb.search_learnings_hybrid_rrf(
             "query terms", k=3, expand=False,
         )
         assert results == []
-        # Both the boosted (failing) and a plain (succeeding) RRF query ran.
         rrf_calls = [c for c in conn.calls if "vector_ranked" in c[0]]
         assert any("recall_count" in c[0] for c in rrf_calls), (
             "boosted attempt should have been tried"
         )
         assert any("recall_count" not in c[0] for c in rrf_calls), (
-            "plain fallback must reach a fresh transaction and run"
+            "plain fallback must run after the boosted attempt fails"
         )
+        # No transaction was ever opened around the cascade.
+        assert conn.max_tx_depth == 0
 
-    async def test_unsupported_guc_probe_false_fetch_runs_no_set_local(
+    async def test_unsupported_guc_fetch_runs_and_warns_once(
         self, monkeypatch, caplog,
     ):
-        """Round-2 finding 2: on older pgvector the probe returns False, no SET
-        LOCAL is issued on the fetch attempts (so nothing aborts the fetch
-        transaction), recall still runs, and a warning is logged."""
+        """Round-3 finding 2 setup: on older pgvector the session SET fails with
+        an unknown-GUC error; it is swallowed (no transaction to poison), recall
+        still runs, and a warning is logged."""
         import logging
 
         from scripts.core import recall_backends as rb
@@ -470,48 +455,41 @@ class TestRrfIterativeScanGuc:
                 "query terms", k=3, expand=False,
             )
         assert results == []
-
-        # The RRF fetch still ran.
         rrf_calls = [c for c in conn.calls if "vector_ranked" in c[0]]
         assert rrf_calls, "RRF fetch must still run when the GUC is unsupported"
-
-        # Exactly the probe issued the SET LOCAL (and failed); no SET LOCAL was
-        # issued on the fetch attempts (use_guc is False), so no fetch
-        # transaction was ever poisoned by the GUC.
-        guc_attempts = [s for s, _ in conn.executed if "iterative_scan" in s]
-        assert len(guc_attempts) == 1, (
-            "only the probe should attempt the GUC; fetches must skip it"
-        )
-
-        # Operators get a warning-level signal, not just a debug line.
         assert any(
             "iterative" in r.message.lower() and r.levelno >= logging.WARNING
             for r in caplog.records
         ), "expected a warning that bounded ANN runs without iterative scan"
 
-    async def test_probe_caches_definitive_result(self, monkeypatch):
-        """The probe caches True on success and False on unsupported, so the
-        own-transaction probe runs once per process (mirrors the column
-        probes)."""
+    async def test_ensure_caches_definitive_result(self, monkeypatch):
+        """ensure_hnsw_iterative_scan caches True on success and False on an
+        unsupported GUC (mirrors the column probes); a known-False skips the SET
+        entirely on later connections."""
         from scripts.core import recall_backends as rb
 
-        # Success path -> cached True.
+        # Success -> cached True.
         rb.reset_hnsw_iterative_scan_cache()
         ok_conn = _CapturingConn()
-        assert await rb.hnsw_iterative_scan_available(ok_conn) is True
+        assert await rb.ensure_hnsw_iterative_scan(ok_conn) is True
         assert rb._hnsw_iterative_scan_cache is True
 
-        # Unsupported path -> cached False (definitive miss).
+        # Unsupported -> cached False (definitive miss).
         rb.reset_hnsw_iterative_scan_cache()
         boom = RuntimeError('unrecognized configuration parameter '
                             '"hnsw.iterative_scan"')
         bad_conn = _CapturingConn(execute_error=boom)
-        assert await rb.hnsw_iterative_scan_available(bad_conn) is False
+        assert await rb.ensure_hnsw_iterative_scan(bad_conn) is False
         assert rb._hnsw_iterative_scan_cache is False
 
-    async def test_probe_rolls_back_its_own_transaction(self, monkeypatch):
-        """The probe must run inside a transaction it always exits (rollback),
-        so an unsupported GUC never leaves an aborted transaction behind."""
+        # Known-False: the SET is NOT attempted again on a new connection.
+        skip_conn = _CapturingConn()
+        assert await rb.ensure_hnsw_iterative_scan(skip_conn) is False
+        assert not skip_conn.executed, "must skip SET when known unsupported"
+
+    async def test_ensure_no_transaction_opened(self, monkeypatch):
+        """The session SET runs OUTSIDE any transaction (autocommit), so an
+        unsupported GUC cannot open or poison a transaction."""
         from scripts.core import recall_backends as rb
 
         rb.reset_hnsw_iterative_scan_cache()
@@ -519,13 +497,53 @@ class TestRrfIterativeScanGuc:
                             '"hnsw.iterative_scan"')
         conn = _CapturingConn(execute_error=boom)
 
-        await rb.hnsw_iterative_scan_available(conn)
+        await rb.ensure_hnsw_iterative_scan(conn)
 
-        # The probe opened and fully exited its transaction (depth back to 0)
-        # and the aborted state was cleared on exit.
-        assert conn.tx_depth == 0
-        assert conn._aborted is False
-        assert conn.max_tx_depth >= 1, "probe must use its own transaction"
+        assert conn.max_tx_depth == 0, "session SET must not open a transaction"
+
+    async def test_transient_failure_not_cached_and_warns_once(
+        self, monkeypatch, caplog,
+    ):
+        """Round-3 finding 2: a transient SET failure is NOT cached (retries on
+        the next connection), warns at most once per process, and never dumps a
+        stack trace (no exc_info) on the hot path."""
+        import logging
+
+        from scripts.core import recall_backends as rb
+
+        rb.reset_hnsw_iterative_scan_cache()
+        # A timeout-like error that is NOT an unknown-GUC error -> transient.
+        transient = TimeoutError("statement timeout")
+
+        class _TransientConn(_CapturingConn):
+            async def execute(self, sql: str, *args: Any) -> str:
+                self.executed.append((sql, args))
+                if "iterative_scan" in sql:
+                    raise transient
+                return "SET"
+
+        conn1 = _TransientConn()
+        with caplog.at_level(logging.WARNING):
+            assert await rb.ensure_hnsw_iterative_scan(conn1) is False
+            # Not cached: the next connection retries the SET.
+            assert rb._hnsw_iterative_scan_cache is None
+            conn2 = _TransientConn()
+            assert await rb.ensure_hnsw_iterative_scan(conn2) is False
+            assert rb._hnsw_iterative_scan_cache is None
+
+        # Warned at most once across the two transient failures.
+        transient_warnings = [
+            r for r in caplog.records
+            if "transient" in r.message.lower() and r.levelno >= logging.WARNING
+        ]
+        assert len(transient_warnings) == 1, (
+            f"expected one rate-limited transient warning, got "
+            f"{len(transient_warnings)}"
+        )
+        # No stack-trace spam on the hot path.
+        assert all(r.exc_info is None for r in transient_warnings), (
+            "transient warning must not include exc_info on the hot path"
+        )
 
 
 # ====== Round-1 finding 2: bounded vs exact RRF fusion divergence ======

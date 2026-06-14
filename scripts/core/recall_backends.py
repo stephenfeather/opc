@@ -641,48 +641,49 @@ def _is_project_capability_error(exc: BaseException) -> bool:
     return bool(_PROJECT_COLUMN_ERROR_RE.search(str(exc)))
 
 
-# Transaction-scoped GUC that makes pgvector's HNSW return true nearest-k under
-# WHERE filters (issue #153). pgvector applies the leg's project/model/type
-# filters AFTER the ANN scan, so a bounded `ORDER BY <=> $q LIMIT $N` can
-# under-fill or miss true neighbours once the planner actually uses HNSW (at
-# scale). `strict_order` (not relaxed) preserves exact distance ordering, which
-# RRF rank fusion depends on. SET LOCAL keeps it scoped to the current
-# transaction so pooled connections never leak it.
-_HNSW_ITERATIVE_SCAN_GUC = "SET LOCAL hnsw.iterative_scan = 'strict_order'"
+# SESSION-level GUC that makes pgvector's HNSW return true nearest-k under WHERE
+# filters (issue #153). pgvector applies the leg's project/model/type filters
+# AFTER the ANN scan, so a bounded `ORDER BY <=> $q LIMIT $N` can under-fill or
+# miss true neighbours once the planner actually uses HNSW (at scale).
+# `strict_order` (not relaxed) preserves exact distance ordering, which RRF rank
+# fusion depends on.
+#
+# Round-3 (perf/hot-path): this is a SESSION SET, not SET LOCAL, issued ONCE per
+# acquired connection — NOT per fetch attempt inside a transaction. Reasons:
+#   * The round-2 per-attempt BEGIN+SET LOCAL+fetch+COMMIT turned the happy path
+#     from 1 round trip into ~4 and the fallback cascade into ~12, on EVERY
+#     recall — pure overhead that buys nothing today (EXPLAIN proved the planner
+#     uses Seq Scan, not HNSW, at the current ~6k corpus).
+#   * Issued outside any explicit transaction, asyncpg autocommits it, so it
+#     persists for every cascade fetch on that connection, and a failed SET on
+#     older pgvector does NOT open or poison any transaction (kills the round-2
+#     transaction-poisoning concern without transactions at all).
+# Session-level "leak" is harmless: hnsw.iterative_scan only affects HNSW index
+# scans, and every recall (and the bounded vector probes generally) wants it.
+_HNSW_ITERATIVE_SCAN_GUC = "SET hnsw.iterative_scan = 'strict_order'"
 
-# Round-2 finding: the GUC must be PROBED once (own rolled-back transaction)
-# rather than SET inline. On older pgvector (< 0.8) the unknown-GUC error
-# aborts whatever transaction it runs in, so a "best-effort" inline SET would
-# poison the fetch transaction and turn version skew into a recall outage.
-# Mirror the project/embedding_model column probes: probe once, cache only the
-# definitive answer, expose a test reset helper.
+# Cache the GUC-support detection (mirrors the project/embedding_model column
+# probes): True once the SET succeeded on a connection, False on a definitive
+# unknown-GUC error (older pgvector). Transient failures stay uncached and
+# retry, but are rate-limited (below) so a flapping DB never spams the hot path.
 _hnsw_iterative_scan_cache: bool | None = None
 
-# Latch the operator-facing "running without iterative scan" warning to once
-# per process so degraded recalls stay quiet after the first signal.
-_HNSW_NO_ITERATIVE_WARNED = False
+# Round-3 finding 2: rate-limit the transient-failure warning to once per
+# process (no exc_info stack-trace spam on every recall when the DB flaps).
+_HNSW_TRANSIENT_WARNED = False
 
 
 def reset_hnsw_iterative_scan_cache() -> None:
-    """Clear the cached hnsw.iterative_scan probe (test isolation)."""
-    global _hnsw_iterative_scan_cache, _HNSW_NO_ITERATIVE_WARNED
+    """Clear the cached hnsw.iterative_scan support flag (test isolation)."""
+    global _hnsw_iterative_scan_cache, _HNSW_TRANSIENT_WARNED
     _hnsw_iterative_scan_cache = None
-    _HNSW_NO_ITERATIVE_WARNED = False
+    _HNSW_TRANSIENT_WARNED = False
 
 
 def _set_hnsw_iterative_scan_cache_for_tests(value: bool | None) -> None:
-    """Force the hnsw.iterative_scan probe cache to a value (test-only)."""
+    """Force the hnsw.iterative_scan support cache to a value (test-only)."""
     global _hnsw_iterative_scan_cache
     _hnsw_iterative_scan_cache = value
-
-
-class _ProbeRollback(Exception):  # noqa: N818 - control-flow sentinel, not an error
-    """Sentinel raised inside the probe transaction to force a rollback.
-
-    Not an error condition: it is raised on the SUCCESS path to make the
-    ``async with conn.transaction()`` issue ROLLBACK so the probe never commits
-    anything. Named without an ``Error`` suffix on purpose.
-    """
 
 
 _UNKNOWN_GUC_RE = re.compile(
@@ -714,62 +715,51 @@ def _is_unknown_guc_error(exc: BaseException) -> bool:
     return bool(_UNKNOWN_GUC_RE.search(str(exc)))
 
 
-async def hnsw_iterative_scan_available(conn: Any) -> bool:
-    """Check (once per process) whether SET hnsw.iterative_scan is accepted.
+async def ensure_hnsw_iterative_scan(conn: Any) -> bool:
+    """Set the SESSION hnsw.iterative_scan GUC once per acquired connection.
 
-    Runs the SET LOCAL inside its OWN transaction that is always rolled back,
-    so an unsupported GUC (older pgvector) can never poison a later fetch
-    transaction (round-2 finding 2). Only definitive answers are cached:
-    True when the GUC is accepted, False on an unsupported-GUC error. A
-    transient probe failure degrades THIS recall to no-iterative-scan but
-    leaves the cache unset so the next call retries.
+    Issued OUTSIDE any transaction (asyncpg autocommits), so it persists for all
+    cascade fetches on this connection with ZERO per-attempt transaction
+    overhead and never opens a transaction that an unsupported GUC could poison
+    (round-3 redesign). Returns True when iterative scan is active on the
+    connection, False when the GUC is unsupported.
+
+    Support is cached process-wide: once a definitive answer is known the SET is
+    skipped on a False (unsupported) result and re-issued cheaply (single
+    autocommit statement, no round-trip transaction) on True so each fresh
+    physical connection actually gets the session setting. Transient failures
+    are not cached and warn at most once per process (no exc_info spam).
     """
-    global _hnsw_iterative_scan_cache
-    if _hnsw_iterative_scan_cache is not None:
-        return _hnsw_iterative_scan_cache
+    global _hnsw_iterative_scan_cache, _HNSW_TRANSIENT_WARNED
+    if _hnsw_iterative_scan_cache is False:
+        # Known unsupported: never attempt the SET again (older pgvector).
+        return False
     try:
-        async with conn.transaction():
-            await conn.execute(_HNSW_ITERATIVE_SCAN_GUC)
-            # Force rollback so nothing from the probe leaks into later work.
-            raise _ProbeRollback
-    except _ProbeRollback:
-        _hnsw_iterative_scan_cache = True
-        return True
+        await conn.execute(_HNSW_ITERATIVE_SCAN_GUC)
     except Exception as exc:  # noqa: BLE001 - classify supported vs transient
         if _is_unknown_guc_error(exc):
-            logger.warning(
-                "pgvector hnsw.iterative_scan GUC unsupported (older pgvector) "
-                "— bounded ANN recall runs WITHOUT iterative scan and may "
-                "under-fill under selective filters once HNSW engages. Upgrade "
-                "pgvector >= 0.8 to enable (issue #153)."
-            )
+            if _hnsw_iterative_scan_cache is not False:
+                logger.warning(
+                    "pgvector hnsw.iterative_scan GUC unsupported (older "
+                    "pgvector) — bounded ANN recall runs WITHOUT iterative "
+                    "scan and may under-fill under selective filters once HNSW "
+                    "engages. Upgrade pgvector >= 0.8 to enable (issue #153)."
+                )
             _hnsw_iterative_scan_cache = False
             return False
-        logger.warning(
-            "hnsw.iterative_scan probe failed transiently; this recall runs "
-            "without iterative scan and the probe retries next call",
-            exc_info=True,
-        )
+        # Transient (timeout, reset): do not cache; rate-limit the warning to
+        # once per process and never dump a stack trace on the hot path.
+        if not _HNSW_TRANSIENT_WARNED:
+            _HNSW_TRANSIENT_WARNED = True
+            logger.warning(
+                "setting hnsw.iterative_scan failed transiently (%s); this "
+                "recall runs without iterative scan and retries next "
+                "connection",
+                type(exc).__name__,
+            )
         return False
-
-
-async def _rrf_fetch(
-    conn: Any, sql: str, args: tuple, *, use_guc: bool,
-) -> list[Any]:
-    """Run one RRF fetch attempt inside its OWN transaction (round-2 finding 1).
-
-    Each attempt gets a fresh transaction so a failing fetch (e.g. a missing
-    recall_count/superseded_by column on a partially-migrated schema) rolls
-    back cleanly and the next fallback attempt starts unpoisoned — the prior
-    single-transaction-around-the-whole-cascade aborted every later fetch with
-    'current transaction is aborted'. ``use_guc`` issues the (already-probed,
-    supported) SET LOCAL so the bounded leg returns true nearest-k under
-    filters; it is never issued when the probe found the GUC unsupported.
-    """
-    async with conn.transaction():
-        if use_guc:
-            await conn.execute(_HNSW_ITERATIVE_SCAN_GUC)
-        return await conn.fetch(sql, *args)
+    _hnsw_iterative_scan_cache = True
+    return True
 
 
 def reset_project_column_cache() -> None:
@@ -1266,42 +1256,27 @@ async def search_learnings_hybrid_rrf(
             candidate_param=plain_candidate_idx,
         )
 
-        # Probe the iterative-scan GUC ONCE (own rolled-back transaction) so an
-        # unsupported GUC on older pgvector can never poison a fetch
-        # transaction, then wrap EACH fetch attempt in its OWN transaction so a
-        # failing fallback rolls back cleanly and the next attempt starts fresh
-        # (round-2 findings 1 & 2). ``use_guc`` is the cached probe result.
-        use_guc = await hnsw_iterative_scan_available(conn)
-        global _HNSW_NO_ITERATIVE_WARNED
-        if not use_guc and not _HNSW_NO_ITERATIVE_WARNED:
-            _HNSW_NO_ITERATIVE_WARNED = True
-            logger.warning(
-                "bounded ANN RRF recall running WITHOUT hnsw.iterative_scan; "
-                "the vector leg may under-fill under selective project/model "
-                "filters once HNSW engages (issue #153)"
-            )
-
+        # Round-3: NO per-attempt transactions. The session-level
+        # hnsw.iterative_scan GUC was set once on connection acquire (see
+        # below), so every cascade fetch already benefits with zero per-attempt
+        # overhead. Bare conn.fetch (as on main, plus candidate_param plumbing):
+        # outside a transaction asyncpg autocommits each statement, so a failed
+        # fallback never poisons the next attempt.
         try:
-            rows = await _rrf_fetch(
-                conn, cte_boosted + boosted_tail, boosted_args, use_guc=use_guc,
-            )
+            rows = await conn.fetch(cte_boosted + boosted_tail, *boosted_args)
         except Exception as exc:
             if _is_project_capability_error(exc):
                 raise
             logger.debug("RRF boosted+chain fallback", exc_info=True)
             has_decay_columns = False
             try:
-                rows = await _rrf_fetch(
-                    conn, cte_plain_args + plain_tail, plain_args,
-                    use_guc=use_guc,
-                )
+                rows = await conn.fetch(cte_plain_args + plain_tail, *plain_args)
             except Exception as exc:
                 if _is_project_capability_error(exc):
                     raise
                 logger.debug("RRF plain+chain fallback", exc_info=True)
-                rows = await _rrf_fetch(
-                    conn, cte_plain_nochain + plain_tail, plain_args,
-                    use_guc=use_guc,
+                rows = await conn.fetch(
+                    cte_plain_nochain + plain_tail, *plain_args,
                 )
 
         if not rows and use_tsquery:
@@ -1327,15 +1302,11 @@ async def search_learnings_hybrid_rrf(
             )
             try:
                 if has_decay_columns:
-                    rows = await _rrf_fetch(
-                        conn, fb_cte_boosted + boosted_tail, fb_boosted,
-                        use_guc=use_guc,
+                    rows = await conn.fetch(
+                        fb_cte_boosted + boosted_tail, *fb_boosted
                     )
                 else:
-                    rows = await _rrf_fetch(
-                        conn, fb_cte_plain + plain_tail, fb_plain,
-                        use_guc=use_guc,
-                    )
+                    rows = await conn.fetch(fb_cte_plain + plain_tail, *fb_plain)
             except Exception as exc:
                 if _is_project_capability_error(exc):
                     raise
@@ -1345,9 +1316,8 @@ async def search_learnings_hybrid_rrf(
                         chain=False, ts=False, pf=plain_pf, mf=plain_mf,
                         candidate_param=plain_candidate_idx,
                     )
-                    rows = await _rrf_fetch(
-                        conn, no_chain_cte + plain_tail, fb_plain,
-                        use_guc=use_guc,
+                    rows = await conn.fetch(
+                        no_chain_cte + plain_tail, *fb_plain,
                     )
                 except Exception as exc:
                     if _is_project_capability_error(exc):
@@ -1359,6 +1329,11 @@ async def search_learnings_hybrid_rrf(
 
     async with pool.acquire() as conn:
         await init_pgvector(conn)
+        # Round-3: set the session-level hnsw.iterative_scan GUC ONCE per
+        # acquired connection (autocommit, single statement), so all cascade
+        # fetches below benefit with no per-attempt transaction overhead. Safe
+        # on older pgvector — a failed SET is swallowed and cached.
+        await ensure_hnsw_iterative_scan(conn)
         has_project = await project_column_available(conn)
         try:
             rows = await _fetch_all(conn, has_project)

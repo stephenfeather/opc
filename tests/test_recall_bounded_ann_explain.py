@@ -164,9 +164,10 @@ class TestRrfVectorLegHnswServable:
 
 
 class TestRrfIterativeScanGucLive:
-    """Round-1 finding 1 (live): the SET LOCAL hnsw.iterative_scan GUC the
-    fetch path issues must be accepted by the installed pgvector, and the
-    bounded vector leg under it returns up to candidate_count rows."""
+    """Round-3 (live): the SESSION hnsw.iterative_scan GUC the fetch path issues
+    once per acquire must be accepted by the installed pgvector, and the bounded
+    vector leg under it returns up to candidate_count rows. No transaction is
+    used — production issues a session SET on the bare (autocommit) connection."""
 
     async def _setup(self):
         if os.environ.get("OPC_SKIP_DB_TESTS"):
@@ -186,29 +187,31 @@ class TestRrfIterativeScanGucLive:
             pytest.skip("no sample embedding")
         return conn, embedding
 
-    async def test_set_local_strict_order_accepted_and_leg_fills(self):
+    async def test_session_set_strict_order_accepted_and_leg_fills(self):
         conn, embedding = await self._setup()
         try:
-            from scripts.core.recall_backends import (
-                _HNSW_ITERATIVE_SCAN_GUC,
-                build_rrf_cte,
-            )
+            from scripts.core import recall_backends as rb
+            from scripts.core.recall_backends import build_rrf_cte
 
             candidate_count = 40
-            # Run the exact GUC the production fetch path issues, then the
-            # bounded vector leg, inside one transaction (SET LOCAL scope).
-            async with conn.transaction():
-                # Must not raise on pgvector >= 0.8 (strict_order is valid).
-                await conn.execute(_HNSW_ITERATIVE_SCAN_GUC)
-                cte = build_rrf_cte(chain_filter=True, candidate_param=3)
-                # Drive the bounded vector leg directly; $1 text, $2 embedding,
-                # $3 candidate LIMIT.
-                sql = (
-                    cte
-                    + "\n            SELECT id, vec_rank FROM vector_ranked"
-                )
-                rows = await conn.fetch(sql, "memory recall", embedding,
-                                        candidate_count)
+            # Production path: SESSION SET once on the (autocommit) connection,
+            # NO transaction. Must succeed on pgvector >= 0.8.
+            rb.reset_hnsw_iterative_scan_cache()
+            assert await rb.ensure_hnsw_iterative_scan(conn) is True, (
+                "session SET hnsw.iterative_scan should be accepted by "
+                "pgvector >= 0.8"
+            )
+
+            cte = build_rrf_cte(chain_filter=True, candidate_param=3)
+            # Drive the bounded vector leg directly with a bare fetch (the
+            # session GUC persists on the connection); $1 text, $2 embedding,
+            # $3 candidate LIMIT.
+            sql = (
+                cte
+                + "\n            SELECT id, vec_rank FROM vector_ranked"
+            )
+            rows = await conn.fetch(sql, "memory recall", embedding,
+                                    candidate_count)
             # The chain filter (superseded_by IS NULL) is non-selective here,
             # so the bounded leg should fill to the candidate cap.
             assert len(rows) == candidate_count, (

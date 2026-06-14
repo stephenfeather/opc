@@ -96,14 +96,22 @@ def clean_query_text(query: str, stopwords: set[str]) -> str:
 def build_or_query(query: str, stopwords: set[str]) -> str:
     """Build an OR-joined tsquery string from a raw query.
 
-    Pipeline: clean → split → sanitize → OR-join. Returns ``""`` when every
-    token sanitizes away (all stopwords/metacharacters). Callers must treat
-    an empty result as "no tsquery" and use the ILIKE fallback rather than
-    injecting a literal stopword like ``"a"`` — ``to_tsquery('english', 'a')``
-    matches nothing yet still costs a round-trip (issue #176).
+    Pipeline: clean → split → drop stopwords → sanitize → OR-join. Returns
+    ``""`` when every token sanitizes away (all stopwords/metacharacters).
+    Callers must treat an empty result as "no tsquery" and use the ILIKE
+    fallback rather than injecting a stopword like ``"a"`` — a stopword token
+    reduces to an empty tsquery that matches nothing yet still costs a
+    round-trip (issue #176).
+
+    Stopwords are dropped again here, after ``clean_query_text``: that helper
+    falls back to the *original* query when every word is a stopword, so a
+    lone long stopword (``"the"``, ``"with"``) would otherwise survive
+    sanitization (length > 2) and be injected as a stopword tsquery.
     """
     cleaned = clean_query_text(query, stopwords)
-    words = sanitize_tsquery_words(cleaned.split())
+    words = sanitize_tsquery_words(
+        [w for w in cleaned.split() if w not in stopwords]
+    )
     return " | ".join(words)
 
 
@@ -913,6 +921,12 @@ async def search_learnings_text_only_postgres(
     from scripts.core.db.postgres_pool import get_pool
     from scripts.core.query_expansion import STOPWORDS
 
+    # An empty/whitespace query would skip FTS and then run the ILIKE fallback
+    # with first_word="" → content ILIKE '%%', which matches every row. Short-
+    # circuit before touching the pool (issue #176 review).
+    if not query.strip():
+        return []
+
     or_query = build_or_query(query, STOPWORDS)
 
     async def _fetch_all(conn: Any, has_project: bool) -> list[Any]:
@@ -927,9 +941,10 @@ async def search_learnings_text_only_postgres(
             )
 
         # When every token sanitized away, or_query is "" (issue #176). Skip
-        # the FTS round-trip entirely instead of injecting a stopword tsquery
-        # — to_tsquery('english', '') / a stopword matches nothing anyway —
-        # and fall straight through to the ILIKE fallback below.
+        # the FTS round-trip entirely and fall straight through to the ILIKE
+        # fallback below. Passing "" to to_tsquery is a Postgres syntax error,
+        # and a stopword token reduces to an empty tsquery that matches
+        # nothing — both are pointless, so we never build the query at all.
         rows: list[Any] = []
         if or_query:
             try:

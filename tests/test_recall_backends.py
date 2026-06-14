@@ -205,6 +205,16 @@ class TestBuildOrQueryFunction:
         result = build_or_query("of", {"of"})
         assert result == ""
 
+    def test_empty_when_only_long_stopwords(self):
+        from scripts.core.recall_backends import build_or_query
+
+        # Stopwords longer than 2 chars survive sanitization but must still
+        # yield "" — clean_query_text falls back to the original query when
+        # everything is a stopword, so build_or_query re-filters stopwords to
+        # avoid injecting a stopword tsquery like "the"/"with" (issue #176).
+        result = build_or_query("with", {"with"})
+        assert result == ""
+
 
 # ==================== normalize_bm25_score ====================
 
@@ -928,6 +938,20 @@ class TestStopwordFallbackSkipsTsquery:
         for sql in db.executed:
             assert "to_tsquery" not in sql, sql[:160]
         assert any("ILIKE" in sql for sql in db.executed), "ILIKE fallback expected"
+
+    async def test_empty_query_returns_immediately_without_db_calls(self, monkeypatch):
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        db = _FakeRecallDb(missing_columns=set())
+        self._patch_pool(monkeypatch, db)
+
+        # Whitespace-only query: must short-circuit, not run ILIKE '%%' which
+        # would match every row (gemini/codex review on #176).
+        results = await rb.search_learnings_text_only_postgres("   ", k=3)
+
+        assert results == []
+        assert not db.executed, "empty/whitespace query must not touch the DB"
 
     async def test_fts_still_runs_for_normal_query(self, monkeypatch):
         """Guard: a query with real terms still uses tsquery (no regression)."""

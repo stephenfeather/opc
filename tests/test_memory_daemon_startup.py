@@ -1029,6 +1029,87 @@ class TestPatternDetectionSpawn:
         assert closed == [True], "_check_pattern_detection must close _debug_stderr_handle"
         assert state.pattern_proc is None
 
+    @pytest.mark.parametrize(
+        "stdout",
+        [
+            b'["not", "an", "object"]',
+            b'{"patterns_detected": 1, "patterns_by_type": ["not", "a", "dict"]}',
+        ],
+    )
+    def test_check_pattern_detection_logs_malformed_json_shapes(
+        self, monkeypatch, stdout
+    ):
+        """Malformed pattern_batch JSON should fall back to the raw summary
+        log instead of propagating AttributeError or TypeError to daemon_loop.
+        """
+        import io
+
+        import scripts.core.memory_daemon as mod
+
+        monkeypatch.setattr(mod, "_daemon_state", self._fresh_state(mod))
+
+        log_calls: list[str] = []
+        monkeypatch.setattr(mod, "log", lambda m: log_calls.append(m))
+
+        stdout_bytes = stdout
+
+        class _FakeProc:
+            stdout = io.BytesIO(stdout_bytes)
+            stderr = None
+
+            def poll(self):
+                return 0
+
+        state = mod._ensure_daemon_state()
+        state.pattern_proc = _FakeProc()
+
+        mod._check_pattern_detection()
+
+        assert state.pattern_proc is None
+        assert len(log_calls) == 1
+        assert log_calls[0].startswith("Pattern detection completed:")
+
+    def test_check_pattern_detection_logs_type_error_from_summary_sort(
+        self, monkeypatch
+    ):
+        """The fallback should also cover unexpected TypeError while
+        summarizing parsed JSON-like data.
+        """
+        import io
+        import json
+
+        import scripts.core.memory_daemon as mod
+
+        monkeypatch.setattr(mod, "_daemon_state", self._fresh_state(mod))
+        monkeypatch.setattr(
+            json,
+            "loads",
+            lambda _stdout: {
+                "patterns_detected": 1,
+                "learnings_analyzed": 2,
+                "patterns_by_type": {"a": 1, 2: 3},
+            },
+        )
+
+        log_calls: list[str] = []
+        monkeypatch.setattr(mod, "log", lambda m: log_calls.append(m))
+
+        class _FakeProc:
+            stdout = io.BytesIO(b'{"syntactically": "valid"}')
+            stderr = None
+
+            def poll(self):
+                return 0
+
+        state = mod._ensure_daemon_state()
+        state.pattern_proc = _FakeProc()
+
+        mod._check_pattern_detection()
+
+        assert state.pattern_proc is None
+        assert len(log_calls) == 1
+        assert log_calls[0].startswith("Pattern detection completed:")
+
     def test_spawn_closes_debug_stderr_handle_on_popen_failure(self, monkeypatch, tmp_path):
         """Codex Round 3 Finding 2: if Popen raises after the verbose log is
         opened, the file handle must be closed. Otherwise repeated launch

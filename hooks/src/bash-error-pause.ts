@@ -99,11 +99,20 @@ function hasNonFalsePositiveMatch(text: string, patterns: RegExp[]): boolean {
   return false;
 }
 
+function isObjectInput(value: unknown): value is PostToolUseInput {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
 function main(): void {
   let input: PostToolUseInput;
   try {
     const stdinContent = readFileSync(0, 'utf-8');
-    input = JSON.parse(stdinContent);
+    const parsed = JSON.parse(stdinContent);
+    if (!isObjectInput(parsed)) {
+      console.log(JSON.stringify({ result: 'continue' }));
+      return;
+    }
+    input = parsed;
   } catch {
     console.log(JSON.stringify({ result: 'continue' }));
     return;

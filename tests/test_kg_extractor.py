@@ -1,5 +1,6 @@
 """Tests for knowledge graph entity and relationship extraction."""
 
+from scripts.core import kg_extractor
 from scripts.core.kg_extractor import (
     extract_entities,
     extract_relations,
@@ -31,6 +32,24 @@ class TestExtractFilePaths:
         file_names = {e.name for e in entities if e.entity_type == "file"}
         assert "3.12" not in file_names
 
+    def test_relative_parent_path_not_corrupted(self):
+        """'../' prefix must be preserved, not stripped to a bare path.
+
+        Regression for issue #122: lstrip('./') removed any combination of
+        leading '.' and '/' characters, turning '../utils/helper.py' into
+        'utils/helper.py'.
+        """
+        entities = extract_entities("See ../utils/helper.py for the fix")
+        names = {e.name for e in entities if e.entity_type == "file"}
+        assert "../utils/helper.py" in names
+        assert "utils/helper.py" not in names
+
+    def test_dot_slash_prefix_stripped(self):
+        """A leading './' is still normalized away."""
+        entities = extract_entities("Run ./scripts/core/x.py now")
+        names = {e.name for e in entities if e.entity_type == "file"}
+        assert "scripts/core/x.py" in names
+
 
 class TestExtractPythonImports:
     def test_from_import(self):
@@ -59,7 +78,9 @@ class TestExtractEnvVars:
         """Single-word ALL_CAPS without underscores should not match."""
         entities = extract_entities("The URL is important")
         config_names = {e.name for e in entities if e.entity_type == "config"}
-        assert "URL" not in config_names
+        # Names are canonicalized to lowercase, so the old "URL" check could
+        # never fail. A single all-caps word with no underscore must not match.
+        assert config_names == set()
 
 
 class TestExtractErrors:
@@ -140,6 +161,34 @@ class TestDeduplication:
         assert len(types) >= 2
 
 
+class TestCompiledDictionaryPatterns:
+    """Issue #122 / #125: tools/languages/libraries alternations are compiled
+    once at module load, not rebuilt per extract_entities call."""
+
+    def test_patterns_are_module_level_constants(self):
+        import re
+
+        for attr in ("_RE_KNOWN_TOOLS", "_RE_KNOWN_LANGUAGES", "_RE_KNOWN_LIBRARIES"):
+            pat = getattr(kg_extractor, attr)
+            assert isinstance(pat, re.Pattern), f"{attr} is not a compiled pattern"
+
+    def test_pattern_objects_reused_across_calls(self):
+        """The same compiled pattern object is reused across calls (no per-call
+        re.compile)."""
+        before = id(kg_extractor._RE_KNOWN_TOOLS)
+        extract_entities("Run pytest and docker")
+        extract_entities("Use uv and ruff")
+        after = id(kg_extractor._RE_KNOWN_TOOLS)
+        assert before == after
+
+    def test_longest_match_preferred(self):
+        """Longest-first ordering: 'postgresql' is matched as a whole, not as
+        'postgres' + leftover."""
+        entities = extract_entities("We use postgresql for storage")
+        tool_names = {e.name for e in entities if e.entity_type == "tool"}
+        assert "postgresql" in tool_names
+
+
 class TestEdgeCases:
     def test_empty_content(self):
         assert extract_entities("") == []
@@ -218,6 +267,42 @@ class TestRelationExtraction:
         relations = extract_relations(content, entities)
         conflicts = [r for r in relations if r.relation == "conflicts_with"]
         assert len(conflicts) > 0
+
+    def test_no_substring_cross_sentence_relation(self):
+        """An entity name must not match as a substring of a word in another
+        sentence.
+
+        Regression for issue #122: sentence membership used
+        `e.name in sent.lower()`, so language 'go' matched inside 'going',
+        creating a bogus go->pytest relation across sentence boundaries.
+        """
+        content = "Go compiles fast. We are going to adopt pytest here."
+        entities = extract_entities(content)
+        # Sanity: both entities are extracted.
+        names = {e.name for e in entities}
+        assert "go" in names
+        assert "pytest" in names
+
+        relations = extract_relations(content, entities)
+        bogus = [r for r in relations if {r.source, r.target} == {"go", "pytest"}]
+        assert bogus == [], f"unexpected cross-sentence relation: {bogus}"
+
+    def test_relation_in_later_sentence_after_offsets(self):
+        """Span-based sentence membership stays accurate after several
+        multi-character delimiters (offset drift regression, issue #122)."""
+        content = (
+            "First filler sentence here with words. "
+            "Second filler sentence to push the offset. "
+            "asyncpg replaced psycopg2 in the pool."
+        )
+        entities = extract_entities(content)
+        relations = extract_relations(content, entities)
+        supers = [
+            r
+            for r in relations
+            if r.relation == "supersedes" and {r.source, r.target} == {"asyncpg", "psycopg2"}
+        ]
+        assert len(supers) > 0
 
 
 # ---------------------------------------------------------------------------

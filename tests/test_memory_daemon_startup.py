@@ -1301,3 +1301,71 @@ class TestPatternDetectionSpawn:
             f"_run_pattern_detection_batch should not log errors on the happy path. "
             f"Got: {error_logs}"
         )
+
+
+class TestHardenDaemonEnvironment:
+    """_harden_daemon_environment applies standard daemon hardening (Issue #103).
+
+    Two missing daemonization steps in the Unix double-fork path:
+      - os.umask(0o077): any files the daemon creates (PID file, faulthandler
+        crash dumps, batch logs) are owner-only, not world-readable 0o644.
+      - os.chdir("/"): detach from the invoking shell's cwd so a git worktree
+        it was launched from can be removed and the filesystem unmounted.
+
+    The os.* functions are injected for testability, mirroring
+    _setup_daemon_fds — tests verify the syscall sequence without mutating the
+    test process's real umask or cwd.
+    """
+
+    def test_sets_owner_only_umask(self):
+        from scripts.core.memory_daemon import _harden_daemon_environment
+
+        fake_umask = MagicMock()
+        _harden_daemon_environment(os_umask_fn=fake_umask, os_chdir_fn=MagicMock())
+
+        fake_umask.assert_called_once_with(0o077)
+
+    def test_chdirs_to_root(self):
+        from scripts.core.memory_daemon import _harden_daemon_environment
+
+        fake_chdir = MagicMock()
+        _harden_daemon_environment(os_umask_fn=MagicMock(), os_chdir_fn=fake_chdir)
+
+        fake_chdir.assert_called_once_with("/")
+
+    def test_tolerant_of_chdir_oserror(self):
+        """A chdir failure (sandbox, missing root) must not crash the daemon
+        mid-detach where stdio is not yet wired and the traceback is lost.
+        Mirrors the graceful-degradation contract of _setup_daemon_fds.
+        """
+        from scripts.core.memory_daemon import _harden_daemon_environment
+
+        fake_chdir = MagicMock(side_effect=OSError("permission denied"))
+
+        # Should not raise.
+        _harden_daemon_environment(os_umask_fn=MagicMock(), os_chdir_fn=fake_chdir)
+
+    def test_invoked_in_double_fork_after_setsid(self, monkeypatch):
+        """start_daemon's Unix path must call _harden_daemon_environment so the
+        umask/chdir hardening actually runs in the detached child.
+        """
+        import scripts.core.memory_daemon as mod
+
+        if sys.platform == "win32":
+            pytest.skip("double-fork path is Unix-only")
+
+        monkeypatch.setattr(mod, "is_running", lambda: (False, None))
+        # First fork: child (return 0) so we proceed past the parent early-return.
+        # Second fork: parent (return >0) so we sys.exit before _run_as_daemon.
+        fork_returns = iter([0, 12345])
+        monkeypatch.setattr(mod.os, "fork", lambda: next(fork_returns))
+        monkeypatch.setattr(mod.os, "setsid", MagicMock())
+
+        harden = MagicMock()
+        monkeypatch.setattr(mod, "_harden_daemon_environment", harden)
+        monkeypatch.setattr(mod, "_run_as_daemon", MagicMock())
+
+        with pytest.raises(SystemExit):
+            mod.start_daemon()
+
+        harden.assert_called_once_with()

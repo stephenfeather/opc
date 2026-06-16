@@ -88,13 +88,47 @@ _ALLOW_ENV_EXACT: frozenset[str] = frozenset({
 
 _ALLOW_ENV_PREFIXES: tuple[str, ...] = ("LC_", "XDG_", "CLAUDE_")
 
+# Case-insensitive substring markers that flag an env name as secret-bearing.
+# Applied DENY-FIRST in _is_env_allowed: a key matching any marker is blocked
+# even when it also matches an allow prefix. This closes the broad-prefix
+# leak vector (Codex adversarial review #108 round 3, HIGH): without it the
+# ``CLAUDE_`` prefix would pass parent-controlled ``CLAUDE_API_KEY`` /
+# ``CLAUDE_TOKEN`` / ``CLAUDE_SECRET_*`` values into the Bash-capable
+# ``claude -p --dangerously-skip-permissions`` child. The extraction child
+# authenticates via the on-disk Claude credential store (under HOME), not an
+# env-carried token, so denying secret-named CLAUDE_* vars does not break it.
+# Canonical home for the markers: extract_session.redact_env reuses this same
+# tuple so the two trust boundaries cannot drift.
+_SENSITIVE_ENV_MARKERS: tuple[str, ...] = (
+    "KEY",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "DATABASE_URL",
+    "DSN",
+    "AUTH",
+    "CREDENTIAL",
+    "PRIVATE",
+    "CERT",
+)
+
+
+def _is_sensitive_env_name(key: str) -> bool:
+    """Return True if ``key`` looks secret-bearing (case-insensitive match)."""
+    upper = key.upper()
+    return any(marker in upper for marker in _SENSITIVE_ENV_MARKERS)
+
 
 def _is_env_allowed(key: str) -> bool:
     """Return True iff ``key`` is on the extraction env allowlist.
 
-    Prevents leaking DB credentials, API keys, or tokens to the
+    Deny-before-allow: a secret-named key is rejected even if it matches an
+    allow prefix. Prevents leaking DB credentials, API keys, or tokens to the
     ``claude -p`` extraction subprocess (Issue #108).
     """
+    if _is_sensitive_env_name(key):
+        return False
     if key in _ALLOW_ENV_EXACT:
         return True
     return any(key.startswith(prefix) for prefix in _ALLOW_ENV_PREFIXES)

@@ -38,6 +38,7 @@ from scripts.core.config.handlers import get_config
 from scripts.core.db.postgres_pool import get_pool
 from scripts.core.memory_daemon_core import (
     _ALLOWED_EXTRACTION_MODELS,
+    _SENSITIVE_ENV_MARKERS,
     build_extraction_command,
     build_extraction_env,
     strip_yaml_frontmatter,
@@ -52,20 +53,11 @@ from scripts.core.memory_daemon_extractors import (
 # ---------------------------------------------------------------------------
 
 # Substring redaction list (case-insensitive). Any env key containing one of
-# these tokens has its value masked in --verbose output.
-_SECRET_KEY_TOKENS: tuple[str, ...] = (
-    "KEY",
-    "TOKEN",
-    "SECRET",
-    "PASSWORD",
-    "PASSWD",
-    "DATABASE_URL",
-    "DSN",
-    "AUTH",
-    "CREDENTIAL",
-    "PRIVATE",
-    "CERT",
-)
+# these tokens has its value masked in --verbose output. Reuses the canonical
+# marker tuple from memory_daemon_core so the verbose-redaction boundary and
+# the extraction-env allowlist (#108) share one source of truth and cannot
+# drift apart.
+_SECRET_KEY_TOKENS: tuple[str, ...] = _SENSITIVE_ENV_MARKERS
 
 _REDACTED = "***REDACTED***"
 

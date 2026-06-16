@@ -221,6 +221,9 @@ class TestExtractionEnvAllowlist:
         "PATH", "HOME", "USER", "LANG", "TERM", "SHELL", "TMPDIR",
         "PYTHONPATH", "VIRTUAL_ENV",
         "LC_ALL", "XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR", "UV_CACHE_DIR",
+        # Non-secret CLAUDE_* vars the extractor child genuinely needs
+        # must still pass the broad-prefix allow.
+        "CLAUDE_OPC_DIR", "CLAUDE_SESSION_ARCHIVE_BUCKET",
     ])
     def test_allowed_keys_pass(self, key):
         assert _is_env_allowed(key) is True
@@ -233,6 +236,11 @@ class TestExtractionEnvAllowlist:
         # (UV_CACHE_DIR only), not a prefix, so registry credentials
         # under the old broad UV_ prefix must be filtered out.
         "UV_PUBLISH_TOKEN", "UV_INDEX_FOO_PASSWORD",
+        # Codex review #108 round 3 (HIGH): deny-before-allow blocks
+        # secret-named CLAUDE_* vars even though CLAUDE_ is an allow
+        # prefix — a hostile parent cannot smuggle them into the child.
+        "CLAUDE_API_KEY", "CLAUDE_TOKEN", "CLAUDE_SECRET_DB",
+        "CLAUDE_CODE_OAUTH_TOKEN",
     ])
     def test_secret_keys_filtered(self, key):
         assert _is_env_allowed(key) is False

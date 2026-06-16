@@ -23,12 +23,21 @@ SECRET_KEYS = [
     # broad UV_ prefix would leak these into the Bash-capable child.
     "UV_PUBLISH_TOKEN",
     "UV_INDEX_FOO_PASSWORD",
+    # Codex review #108 round 3 (HIGH): secret-named CLAUDE_* vars must not
+    # ride the broad CLAUDE_ allow prefix into the Bash-capable child.
+    "CLAUDE_API_KEY",
+    "CLAUDE_TOKEN",
+    "CLAUDE_SECRET_DB",
+    "CLAUDE_CODE_OAUTH_TOKEN",
 ]
 
 ALLOWED_KEYS = {
     "PATH": "/usr/bin:/bin",
     "HOME": "/home/u",
     "CLAUDE_CONFIG_DIR": "/home/u/.claude",
+    # A non-secret CLAUDE_* var the extractor child needs must survive
+    # deny-before-allow (proves the filter is not over-broad).
+    "CLAUDE_OPC_DIR": "/home/u/opc",
     "XDG_CONFIG_HOME": "/home/u/.config",
     "UV_CACHE_DIR": "/home/u/.cache/uv",
 }

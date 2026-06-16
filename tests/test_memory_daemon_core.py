@@ -8,6 +8,8 @@ injected as predicates.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from scripts.core.memory_daemon_core import (
@@ -250,6 +252,28 @@ class TestExtractionEnvAllowlist:
         assert env["CLAUDE_CONFIG_DIR"] == "/home/u/.claude"
         assert env["CLAUDE_MEMORY_EXTRACTION"] == "1"
         assert env["CLAUDE_PROJECT_DIR"] == "/tmp/proj"
+
+
+class TestExtractionEnvSourceTime:
+    def test_source_time_injected_when_provided(self):
+        src = datetime(2024, 1, 2, 3, 4, 5, tzinfo=UTC)
+        env = build_extraction_env({}, "/tmp/proj", source_time=src)
+        assert env["CLAUDE_SOURCE_TIME"] == src.isoformat()
+
+    def test_source_time_absent_when_not_provided(self):
+        env = build_extraction_env({}, "/tmp/proj")
+        assert "CLAUDE_SOURCE_TIME" not in env
+
+    def test_inherited_source_time_dropped_when_no_arg(self):
+        base = {"CLAUDE_SOURCE_TIME": "1999-01-01T00:00:00+00:00"}
+        env = build_extraction_env(base, "/tmp/proj")
+        assert "CLAUDE_SOURCE_TIME" not in env
+
+    def test_explicit_source_time_overrides_inherited(self):
+        base = {"CLAUDE_SOURCE_TIME": "1999-01-01T00:00:00+00:00"}
+        src = datetime(2024, 1, 2, 3, 4, 5, tzinfo=UTC)
+        env = build_extraction_env(base, "/tmp/proj", source_time=src)
+        assert env["CLAUDE_SOURCE_TIME"] == src.isoformat()
 
 
 # ── strip_yaml_frontmatter ────────────────────────────────────────

@@ -37,7 +37,8 @@ docstring for the full defense). Do NOT narrow this to OSError.
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
 
@@ -230,7 +231,11 @@ def build_extraction_command(
     return cmd
 
 
-def build_extraction_env(base_env: dict, project_dir: str | None) -> dict:
+def build_extraction_env(
+    base_env: Mapping[str, str],
+    project_dir: str | None,
+    source_time: datetime | None = None,
+) -> dict[str, str]:
     """Build environment dict for extraction subprocess.
 
     Returns a new dict — does not mutate base_env.
@@ -262,6 +267,8 @@ def build_extraction_env(base_env: dict, project_dir: str | None) -> dict:
     # unconditionally here. Only the deliberate backfill builder
     # (backfill_learnings.build_extraction_env) injects a source time.
     env.pop("CLAUDE_SOURCE_TIME", None)
+    if source_time is not None:
+        env["CLAUDE_SOURCE_TIME"] = source_time.isoformat()
     # Issue #96 + Codex Round 3: DEBUG-gated diagnostic log.
     # SECURITY-LOAD-BEARING — reveals daemon-owned information only.
     # The previous iteration dumped ``sorted(env.keys())`` which was

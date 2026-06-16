@@ -595,6 +595,17 @@ class TestRedactInput:
         assert "abc123secret" not in result["command"]
         assert "--token [REDACTED]" in result["command"]
 
+    def test_password_flag_quoted_space_delimited_redacted(self) -> None:
+        inp = {"command": 'psql --password "my secret password" -h localhost'}
+        result = redact_input(inp)
+        assert "my secret password" not in result["command"]
+        assert "--password [REDACTED]" in result["command"]
+
+    def test_token_flag_missing_value_does_not_consume_next_option(self) -> None:
+        inp = {"command": "deploy --token --environment prod"}
+        result = redact_input(inp)
+        assert result["command"] == "deploy --token --environment prod"
+
     def test_connection_string_password_redacted(self) -> None:
         inp = {"command": "psql postgresql://user:s3cretPass@localhost:5432/db"}
         result = redact_input(inp)

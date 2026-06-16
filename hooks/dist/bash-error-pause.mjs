@@ -66,7 +66,7 @@ function hasNonFalsePositiveMatch(text, patterns) {
   }
   return false;
 }
-function isObjectInput(value) {
+function isRecordInput(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 function main() {
@@ -74,7 +74,7 @@ function main() {
   try {
     const stdinContent = readFileSync(0, "utf-8");
     const parsed = JSON.parse(stdinContent);
-    if (!isObjectInput(parsed)) {
+    if (!isRecordInput(parsed)) {
       console.log(JSON.stringify({ result: "continue" }));
       return;
     }

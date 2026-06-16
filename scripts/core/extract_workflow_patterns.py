@@ -64,9 +64,21 @@ _REDACT_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"(Bearer\s+)\S+", re.IGNORECASE), rf"\1{_REDACT_MARKER}"),
     # Connection string passwords: ://user:PASSWORD@host
     (re.compile(r"(://[^:]+:)[^@]+(@)"), rf"\1{_REDACT_MARKER}\2"),
-    # --password=VALUE or --password VALUE, and token/secret/key variants
+    # --password=VALUE, --token=VALUE, --secret=VALUE, --key=VALUE
     (
-        re.compile(r"(--(?:password|token|secret|key)(?:=|\s+))\S+", re.IGNORECASE),
+        re.compile(
+            r"(--(?:password|token|secret|key)=)(?:\"[^\"]*\"|'[^']*'|\S+)",
+            re.IGNORECASE,
+        ),
+        rf"\1{_REDACT_MARKER}",
+    ),
+    # --password VALUE and token/secret/key variants. Do not consume the next
+    # option when the sensitive flag is missing a value.
+    (
+        re.compile(
+            r"(--(?:password|token|secret|key)\s+)(?:\"[^\"]*\"|'[^']*'|[^\s-]\S*)",
+            re.IGNORECASE,
+        ),
         rf"\1{_REDACT_MARKER}",
     ),
     # export VAR=VALUE or VAR=VALUE for sensitive env var names

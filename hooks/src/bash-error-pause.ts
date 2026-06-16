@@ -99,7 +99,7 @@ function hasNonFalsePositiveMatch(text: string, patterns: RegExp[]): boolean {
   return false;
 }
 
-function isObjectInput(value: unknown): value is PostToolUseInput {
+function isRecordInput(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
@@ -108,11 +108,11 @@ function main(): void {
   try {
     const stdinContent = readFileSync(0, 'utf-8');
     const parsed = JSON.parse(stdinContent);
-    if (!isObjectInput(parsed)) {
+    if (!isRecordInput(parsed)) {
       console.log(JSON.stringify({ result: 'continue' }));
       return;
     }
-    input = parsed;
+    input = parsed as unknown as PostToolUseInput;
   } catch {
     console.log(JSON.stringify({ result: 'continue' }));
     return;

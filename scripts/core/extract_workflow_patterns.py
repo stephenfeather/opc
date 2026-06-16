@@ -65,7 +65,22 @@ _REDACT_RULES: list[tuple[re.Pattern[str], str]] = [
     # Connection string passwords: ://user:PASSWORD@host
     (re.compile(r"(://[^:]+:)[^@]+(@)"), rf"\1{_REDACT_MARKER}\2"),
     # --password=VALUE, --token=VALUE, --secret=VALUE, --key=VALUE
-    (re.compile(r"(--(?:password|token|secret|key)=)\S+", re.IGNORECASE), rf"\1{_REDACT_MARKER}"),
+    (
+        re.compile(
+            r"(--(?:password|token|secret|key)=)(?:\"[^\"]*\"|'[^']*'|\S+)",
+            re.IGNORECASE,
+        ),
+        rf"\1{_REDACT_MARKER}",
+    ),
+    # --password VALUE and token/secret/key variants. Do not consume the next
+    # option when the sensitive flag is missing a value.
+    (
+        re.compile(
+            r"(--(?:password|token|secret|key)\s+)(?:\"[^\"]*\"|'[^']*'|[^\s-]\S*)",
+            re.IGNORECASE,
+        ),
+        rf"\1{_REDACT_MARKER}",
+    ),
     # export VAR=VALUE or VAR=VALUE for sensitive env var names
     (
         re.compile(
@@ -346,6 +361,9 @@ def extract_tool_uses(jsonl_path: Path, max_entries: int | None = None) -> list[
             tool_result responses for already-collected entries. Once all pending
             results are resolved, reading stops early.
     """
+    if max_entries is not None and max_entries <= 0:
+        return []
+
     tool_uses: list[dict] = []
     pending_ids: dict[str, int] = {}
     cap_reached = False

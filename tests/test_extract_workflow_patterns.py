@@ -536,6 +536,26 @@ class TestExtractToolUses:
         assert len(result) == 1
         assert result[0]["result_error"] is None
 
+    def test_zero_max_entries_returns_empty(self, tmp_path: Path) -> None:
+        """max_entries=0 should not collect any tool uses."""
+        jsonl_path = tmp_path / "session.jsonl"
+        _write_jsonl(
+            [_make_assistant_tool_use("Read", {"file_path": "/x.py"}, "t1")],
+            jsonl_path,
+        )
+        result = extract_tool_uses(jsonl_path, max_entries=0)
+        assert result == []
+
+    def test_negative_max_entries_returns_empty(self, tmp_path: Path) -> None:
+        """Negative max_entries should not collect any tool uses."""
+        jsonl_path = tmp_path / "session.jsonl"
+        _write_jsonl(
+            [_make_assistant_tool_use("Read", {"file_path": "/x.py"}, "t1")],
+            jsonl_path,
+        )
+        result = extract_tool_uses(jsonl_path, max_entries=-1)
+        assert result == []
+
 
 # ===========================================================================
 # redact_input
@@ -562,6 +582,29 @@ class TestRedactInput:
         result = redact_input(inp)
         assert "SuperSecret123" not in result["command"]
         assert "[REDACTED]" in result["command"]
+
+    def test_password_flag_space_delimited_redacted(self) -> None:
+        inp = {"command": "psql --password SuperSecret123 -h localhost"}
+        result = redact_input(inp)
+        assert "SuperSecret123" not in result["command"]
+        assert "--password [REDACTED]" in result["command"]
+
+    def test_token_flag_space_delimited_redacted(self) -> None:
+        inp = {"command": "deploy --token abc123secret --environment prod"}
+        result = redact_input(inp)
+        assert "abc123secret" not in result["command"]
+        assert "--token [REDACTED]" in result["command"]
+
+    def test_password_flag_quoted_space_delimited_redacted(self) -> None:
+        inp = {"command": 'psql --password "my secret password" -h localhost'}
+        result = redact_input(inp)
+        assert "my secret password" not in result["command"]
+        assert "--password [REDACTED]" in result["command"]
+
+    def test_token_flag_missing_value_does_not_consume_next_option(self) -> None:
+        inp = {"command": "deploy --token --environment prod"}
+        result = redact_input(inp)
+        assert result["command"] == "deploy --token --environment prod"
 
     def test_connection_string_password_redacted(self) -> None:
         inp = {"command": "psql postgresql://user:s3cretPass@localhost:5432/db"}

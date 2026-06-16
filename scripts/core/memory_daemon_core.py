@@ -78,9 +78,16 @@ _ALLOWED_EXTRACTION_MODELS: frozenset[str] = frozenset({"sonnet", "haiku", "opus
 # benefits from a shared cache, but a ``UV_`` prefix would also pass
 # ``UV_PUBLISH_TOKEN`` / ``UV_INDEX_*_PASSWORD`` registry credentials
 # into the child (Codex adversarial review #108 round 1, HIGH). The
-# ``CLAUDE_`` prefix is intentionally broad — the child authenticates
-# as Claude and needs whatever ``CLAUDE_*`` auth/config vars are set,
-# so a token-name denylist is NOT applied to it.
+# ``CLAUDE_`` prefix is intentionally broad so the child can read the
+# non-secret ``CLAUDE_*`` config it needs (``CLAUDE_OPC_DIR``,
+# ``CLAUDE_CONFIG_DIR``, ``CLAUDE_SESSION_ARCHIVE_BUCKET``), BUT the
+# deny-before-allow check in ``_is_env_allowed`` still rejects any
+# secret-named ``CLAUDE_*`` key (e.g. ``CLAUDE_API_KEY``) — see
+# ``_SENSITIVE_ENV_MARKERS`` below. DB/embedding credentials the
+# extractor's store step needs are loaded by ``store_learning.py`` from
+# ``.env`` (its own ``load_dotenv()``), NOT inherited from this env, so
+# stripping ``DATABASE_URL`` / ``*_URL`` here does not break storage in
+# the documented ``.env``-based deployment.
 _ALLOW_ENV_EXACT: frozenset[str] = frozenset({
     "PATH", "HOME", "USER", "LANG", "TERM", "SHELL", "TMPDIR",
     "PYTHONPATH", "VIRTUAL_ENV", "UV_CACHE_DIR",
@@ -119,6 +126,12 @@ _SENSITIVE_ENV_MARKERS: tuple[str, ...] = (
     "BEARER",
     "COOKIE",
     "PASSPHRASE",
+    # gemini #108 HIGH: connection-string names (CLAUDE_DB_URL,
+    # CLAUDE_POSTGRES_URL, REDIS_URL, ...) carry credentials but lack the
+    # markers above. "DB" is deliberately omitted (2-char, would over-match);
+    # "URL" already covers the cited CLAUDE_*_URL cases.
+    "URL",
+    "URI",
 )
 
 
@@ -139,7 +152,7 @@ def _is_env_allowed(key: str) -> bool:
         return False
     if key in _ALLOW_ENV_EXACT:
         return True
-    return any(key.startswith(prefix) for prefix in _ALLOW_ENV_PREFIXES)
+    return key.startswith(_ALLOW_ENV_PREFIXES)
 
 # Truthy tokens for MEMORY_DAEMON_DEBUG. Matched case-insensitively
 # after stripping whitespace. All other values (including "0", "false",

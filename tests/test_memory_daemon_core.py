@@ -244,6 +244,8 @@ class TestExtractionEnvAllowlist:
         # Aegis #108 LOW-2: marker-less credential names now covered.
         "CLAUDE_OAUTH", "CLAUDE_BEARER", "CLAUDE_COOKIE",
         "CLAUDE_PASSPHRASE",
+        # gemini #108 HIGH: connection-string names under CLAUDE_ prefix.
+        "CLAUDE_DB_URL", "CLAUDE_POSTGRES_URL", "REDIS_URL",
     ])
     def test_secret_keys_filtered(self, key):
         assert _is_env_allowed(key) is False

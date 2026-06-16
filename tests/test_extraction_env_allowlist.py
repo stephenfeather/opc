@@ -29,6 +29,10 @@ SECRET_KEYS = [
     "CLAUDE_TOKEN",
     "CLAUDE_SECRET_DB",
     "CLAUDE_CODE_OAUTH_TOKEN",
+    # gemini #108 HIGH: connection-string names carry credentials but lack
+    # the token/secret markers; "URL" closes this under the CLAUDE_ prefix.
+    "CLAUDE_DB_URL",
+    "CLAUDE_POSTGRES_URL",
 ]
 
 ALLOWED_KEYS = {

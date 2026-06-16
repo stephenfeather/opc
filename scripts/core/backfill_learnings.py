@@ -34,12 +34,15 @@ from scripts.core.log_safety import safe
 # The extraction env builder is unified in memory_daemon_core (#108/#109).
 # Backfill calls it with the unified signature
 # ``build_extraction_env(os.environ, project_dir, source_time=...)``.
-# It is imported (not re-exported): backfill historically owned a builder
-# with a DIFFERENT signature ``(project_dir, source_time=None)``, so we
-# deliberately do NOT advertise this symbol via ``__all__`` — that would
-# invite a same-name/different-signature trap for any caller written
-# against the old API. The canonical, importable definition is
-# ``scripts.core.memory_daemon_core.build_extraction_env``.
+# Importing it here does make ``backfill_learnings.build_extraction_env``
+# resolvable (a plain import binds the name in this module), but backfill
+# historically owned a builder with a DIFFERENT signature
+# ``(project_dir, source_time=None)``. We intentionally do NOT list it in
+# ``__all__`` so it is not advertised as a backfill export — a caller still
+# written against the old one-arg API would now hit a loud TypeError, not a
+# silent mis-bind. The canonical definition is
+# ``scripts.core.memory_daemon_core.build_extraction_env``; import it from
+# there, not from this module.
 from scripts.core.memory_daemon_core import build_extraction_env
 
 # ---------------------------------------------------------------------------

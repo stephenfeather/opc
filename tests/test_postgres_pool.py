@@ -45,6 +45,34 @@ class TestSanitizeLogMessage:
         assert "p@" not in result
         assert "p2@" not in result
 
+    def test_bearer_token_redacted(self):
+        msg = "httpx failed with Authorization: Bearer sk-proj-secret123456"
+        result = _sanitize_log_message(msg)
+        assert "sk-proj-secret123456" not in result
+        assert "Bearer ***" in result
+
+    def test_auth_header_values_redacted(self):
+        msg = "headers={'Authorization': 'Basic abc123SECRET', 'x-api-key': 'pa-secret123456'}"
+        result = _sanitize_log_message(msg)
+        assert "abc123SECRET" not in result
+        assert "pa-secret123456" not in result
+        assert "'Authorization': '***'" in result
+        assert "'x-api-key': '***'" in result
+
+    def test_sensitive_query_params_redacted(self):
+        msg = "GET https://api.example.test/embed?api_key=sk-secret123456&model=test"
+        result = _sanitize_log_message(msg)
+        assert "sk-secret123456" not in result
+        assert "api_key=***" in result
+        assert "model=test" in result
+
+    def test_provider_keys_in_free_text_redacted(self):
+        msg = "voyage rejected key pa-secret123456 and openai rejected sk-secret123456"
+        result = _sanitize_log_message(msg)
+        assert "pa-secret123456" not in result
+        assert "sk-secret123456" not in result
+        assert result.count("***") == 2
+
 
 # ---------------------------------------------------------------------------
 # Pure functions: _encode_vector
@@ -549,9 +577,7 @@ class TestInitPgvector:
     async def test_registers_vector_codec(self):
         mock_conn = AsyncMock()
         await init_pgvector(mock_conn)
-        mock_conn.execute.assert_called_once_with(
-            "CREATE EXTENSION IF NOT EXISTS vector"
-        )
+        mock_conn.execute.assert_called_once_with("CREATE EXTENSION IF NOT EXISTS vector")
         mock_conn.set_type_codec.assert_called_once()
         call_kwargs = mock_conn.set_type_codec.call_args
         assert call_kwargs[0][0] == "vector"  # first positional arg

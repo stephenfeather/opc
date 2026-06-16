@@ -72,6 +72,64 @@ _pool_lock = asyncio.Lock()
 
 _logger = logging.getLogger(__name__)
 
+_LOG_REDACTION_MARKER = "***"
+_SENSITIVE_QUERY_KEYS = (
+    "api[_-]?key",
+    "access[_-]?token",
+    "auth[_-]?token",
+    "client[_-]?secret",
+    "password",
+    "secret",
+    "token",
+)
+_LOG_REDACTION_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
+    # Connection-string userinfo: scheme://user:password@host or scheme://token@host.
+    (re.compile(r"://[^@\s]+@"), f"://{_LOG_REDACTION_MARKER}@"),
+    # Quoted header dumps from HTTP clients commonly use Python dict/repr syntax.
+    (
+        re.compile(
+            r"(\b(?:authorization|x-api-key|api-key)\b['\"]?\s*[:=]\s*)(['\"])[^'\"]+(['\"])",
+            re.IGNORECASE,
+        ),
+        rf"\1\2{_LOG_REDACTION_MARKER}\3",
+    ),
+    # Preserve the auth scheme for unquoted Authorization headers.
+    (
+        re.compile(
+            r"\b(Authorization\s*[:=]\s*[A-Za-z]+\s+)[A-Za-z0-9._~+/\-=]{8,}",
+            re.IGNORECASE,
+        ),
+        rf"\1{_LOG_REDACTION_MARKER}",
+    ),
+    (
+        re.compile(r"\b(Authorization\s*[:=]\s*)[A-Za-z0-9._~+/\-=]{8,}", re.IGNORECASE),
+        rf"\1{_LOG_REDACTION_MARKER}",
+    ),
+    # Authorization bearer values may also appear outside a structured headers dict.
+    (
+        re.compile(r"\b(Bearer\s+)[A-Za-z0-9._~+/\-=]{8,}", re.IGNORECASE),
+        rf"\1{_LOG_REDACTION_MARKER}",
+    ),
+    # Unquoted API-key header dumps using either ":" or "=" delimiters.
+    (
+        re.compile(
+            r"(\b(?:x-api-key|api-key)\b\s*[:=]\s*)[^'\"\s,;}]+",
+            re.IGNORECASE,
+        ),
+        rf"\1{_LOG_REDACTION_MARKER}",
+    ),
+    # URL query params with sensitive key names; preserve delimiters and unrelated params.
+    (
+        re.compile(
+            rf"([?&;](?:{'|'.join(_SENSITIVE_QUERY_KEYS)})=)[^&#\s]+",
+            re.IGNORECASE,
+        ),
+        rf"\1{_LOG_REDACTION_MARKER}",
+    ),
+    # Provider-style keys in free text.
+    (re.compile(r"\b(?:sk|pa)-[A-Za-z0-9_-]{8,}\b"), _LOG_REDACTION_MARKER),
+)
+
 
 # ---------------------------------------------------------------------------
 # Pure functions
@@ -79,8 +137,10 @@ _logger = logging.getLogger(__name__)
 
 
 def _sanitize_log_message(msg: str) -> str:
-    """Redact credentials from connection strings in log messages."""
-    return re.sub(r"://[^@]+@", "://***@", msg)
+    """Redact credentials and API secrets from log messages."""
+    for pattern, replacement in _LOG_REDACTION_RULES:
+        msg = pattern.sub(replacement, msg)
+    return msg
 
 
 # Public alias so other modules (e.g. recall_learnings degrade warnings, which
@@ -194,6 +254,7 @@ def resolve_connection_url(
 def _get_pool_config() -> dict[str, int]:
     """Read pool config from environment and delegate to build_pool_config."""
     from scripts.core.config import get_config
+
     return build_pool_config(
         max_size_str=os.environ.get(
             "AGENTICA_MAX_POOL_SIZE", str(get_config().database.max_pool_size)
@@ -267,7 +328,7 @@ def reset_pool() -> None:
 
 
 @asynccontextmanager
-async def get_connection() -> AsyncGenerator[Connection, None]:
+async def get_connection() -> AsyncGenerator[Connection]:
     """Acquire a connection from the pool."""
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -369,7 +430,7 @@ async def health_check(log_errors: bool = False) -> tuple[bool, str | None]:
 
 
 @asynccontextmanager
-async def get_transaction() -> AsyncGenerator[Connection, None]:
+async def get_transaction() -> AsyncGenerator[Connection]:
     """Acquire a connection from the pool with a transaction.
 
     Auto-commits on success, rolls back on exception.

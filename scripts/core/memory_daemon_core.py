@@ -66,6 +66,29 @@ class StaleSession(NamedTuple):
 # Allowlist of Claude models permitted for extraction subprocesses.
 _ALLOWED_EXTRACTION_MODELS: frozenset[str] = frozenset({"sonnet", "haiku", "opus"})
 
+# Issue #108 trust boundary: the extraction subprocess runs as
+# ``claude -p --dangerously-skip-permissions`` and only needs Claude
+# auth + a minimal session-scoped env. Everything else (DB URLs, cloud
+# creds, API tokens) must NOT be inherited. Allowlist ported from
+# backfill_learnings.py (#108/#109 unification).
+_ALLOW_ENV_EXACT: frozenset[str] = frozenset({
+    "PATH", "HOME", "USER", "LANG", "TERM", "SHELL", "TMPDIR",
+    "PYTHONPATH", "VIRTUAL_ENV",
+})
+
+_ALLOW_ENV_PREFIXES: tuple[str, ...] = ("LC_", "XDG_", "CLAUDE_", "UV_")
+
+
+def _is_env_allowed(key: str) -> bool:
+    """Return True iff ``key`` is on the extraction env allowlist.
+
+    Prevents leaking DB credentials, API keys, or tokens to the
+    ``claude -p`` extraction subprocess (Issue #108).
+    """
+    if key in _ALLOW_ENV_EXACT:
+        return True
+    return any(key.startswith(prefix) for prefix in _ALLOW_ENV_PREFIXES)
+
 # Truthy tokens for MEMORY_DAEMON_DEBUG. Matched case-insensitively
 # after stripping whitespace. All other values (including "0", "false",
 # "no", "off", "", and arbitrary garbage) disable DEBUG.
@@ -224,7 +247,7 @@ def build_extraction_env(base_env: dict, project_dir: str | None) -> dict:
     ``os.environ`` would leak through unchanged while the debug log
     claimed ``CLAUDE_PROJECT_DIR=unset``.
     """
-    env = dict(base_env)
+    env = {k: v for k, v in base_env.items() if _is_env_allowed(k)}
     env["CLAUDE_MEMORY_EXTRACTION"] = "1"
     # M1: drop any inherited value first, then set iff the caller
     # gave us one. This prevents silent inheritance AND keeps the

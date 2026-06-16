@@ -13,6 +13,7 @@ import pytest
 from scripts.core.memory_daemon_core import (
     StaleSession,
     _ALLOWED_EXTRACTION_MODELS,
+    _is_env_allowed,
     _normalize_project,
     build_extraction_command,
     build_extraction_env,
@@ -212,6 +213,43 @@ class TestBuildExtractionEnv:
         base = {"CLAUDE_SOURCE_TIME": "2020-01-01T00:00:00Z"}
         build_extraction_env(base, None)
         assert base["CLAUDE_SOURCE_TIME"] == "2020-01-01T00:00:00Z"
+
+
+class TestExtractionEnvAllowlist:
+    @pytest.mark.parametrize("key", [
+        "PATH", "HOME", "USER", "LANG", "TERM", "SHELL", "TMPDIR",
+        "PYTHONPATH", "VIRTUAL_ENV",
+        "LC_ALL", "XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR", "UV_CACHE_DIR",
+    ])
+    def test_allowed_keys_pass(self, key):
+        assert _is_env_allowed(key) is True
+
+    @pytest.mark.parametrize("key", [
+        "DATABASE_URL", "OPENAI_API_KEY", "VOYAGE_API_KEY",
+        "ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY", "GCP_SA_KEY",
+        "SECRET_TOKEN", "PASSWORD",
+    ])
+    def test_secret_keys_filtered(self, key):
+        assert _is_env_allowed(key) is False
+
+    def test_builder_drops_secrets(self):
+        base = {
+            "DATABASE_URL": "postgres://x",
+            "OPENAI_API_KEY": "sk-leak",
+            "VOYAGE_API_KEY": "vy-leak",
+            "AWS_SECRET_ACCESS_KEY": "aws-leak",
+            "PATH": "/usr/bin",
+            "CLAUDE_CONFIG_DIR": "/home/u/.claude",
+        }
+        env = build_extraction_env(base, "/tmp/proj")
+        assert "DATABASE_URL" not in env
+        assert "OPENAI_API_KEY" not in env
+        assert "VOYAGE_API_KEY" not in env
+        assert "AWS_SECRET_ACCESS_KEY" not in env
+        assert env["PATH"] == "/usr/bin"
+        assert env["CLAUDE_CONFIG_DIR"] == "/home/u/.claude"
+        assert env["CLAUDE_MEMORY_EXTRACTION"] == "1"
+        assert env["CLAUDE_PROJECT_DIR"] == "/tmp/proj"
 
 
 # ── strip_yaml_frontmatter ────────────────────────────────────────

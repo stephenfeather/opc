@@ -30,11 +30,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from scripts.core.log_safety import safe
-from scripts.core.memory_daemon_core import build_extraction_env
 
-# Re-exported for callers/tests that import this from this module.
-# Canonical definition now lives in memory_daemon_core (#108/#109).
-__all__ = [*globals().get("__all__", []), "build_extraction_env"]
+# The extraction env builder is unified in memory_daemon_core (#108/#109).
+# Backfill calls it with the unified signature
+# ``build_extraction_env(os.environ, project_dir, source_time=...)``.
+# It is imported (not re-exported): backfill historically owned a builder
+# with a DIFFERENT signature ``(project_dir, source_time=None)``, so we
+# deliberately do NOT advertise this symbol via ``__all__`` — that would
+# invite a same-name/different-signature trap for any caller written
+# against the old API. The canonical, importable definition is
+# ``scripts.core.memory_daemon_core.build_extraction_env``.
+from scripts.core.memory_daemon_core import build_extraction_env
 
 # ---------------------------------------------------------------------------
 # Pure functions

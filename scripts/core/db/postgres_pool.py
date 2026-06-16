@@ -96,18 +96,14 @@ _LOG_REDACTION_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     # Preserve the auth scheme for unquoted Authorization headers.
     (
         re.compile(
-            r"\b(Authorization\s*[:=]\s*[A-Za-z]+\s+)[A-Za-z0-9._~+/\-=]{8,}",
+            r"\b(Authorization\s*[:=]\s*(?:[A-Za-z]+\s+)?)[^'\"\s,;}]+",
             re.IGNORECASE,
         ),
         rf"\1{_LOG_REDACTION_MARKER}",
     ),
-    (
-        re.compile(r"\b(Authorization\s*[:=]\s*)[A-Za-z0-9._~+/\-=]{8,}", re.IGNORECASE),
-        rf"\1{_LOG_REDACTION_MARKER}",
-    ),
     # Authorization bearer values may also appear outside a structured headers dict.
     (
-        re.compile(r"\b(Bearer\s+)[A-Za-z0-9._~+/\-=]{8,}", re.IGNORECASE),
+        re.compile(r"\b(Bearer\s+)[^'\"\s,;}]{4,}", re.IGNORECASE),
         rf"\1{_LOG_REDACTION_MARKER}",
     ),
     # Unquoted API-key header dumps using either ":" or "=" delimiters.
@@ -121,7 +117,7 @@ _LOG_REDACTION_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     # URL query params with sensitive key names; preserve delimiters and unrelated params.
     (
         re.compile(
-            rf"([?&;](?:{'|'.join(_SENSITIVE_QUERY_KEYS)})=)[^&#\s]+",
+            rf"([?&;](?:{'|'.join(_SENSITIVE_QUERY_KEYS)})=)[^&#\s'\",;:)}}\]]+",
             re.IGNORECASE,
         ),
         rf"\1{_LOG_REDACTION_MARKER}",
@@ -147,7 +143,7 @@ def _sanitize_log_message(msg: str) -> str:
 # reach hook-captured stderr) can redact exception text without importing a
 # private name. Same behavior; do not diverge (aegis MEDIUM-2).
 def sanitize_log_message(msg: str) -> str:
-    """Public redactor: strip credentials from connection strings in a message."""
+    """Public redactor: strip credentials and API secrets from a message."""
     return _sanitize_log_message(msg)
 
 

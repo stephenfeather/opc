@@ -59,12 +59,36 @@ class TestSanitizeLogMessage:
         assert "'Authorization': '***'" in result
         assert "'x-api-key': '***'" in result
 
+    def test_unquoted_authorization_with_short_special_value_redacted(self):
+        msg = "httpx failed Authorization: Basic a$b@"
+        result = _sanitize_log_message(msg)
+        assert "a$b@" not in result
+        assert "Authorization: Basic ***" in result
+
+    def test_short_bearer_token_redacted(self):
+        msg = "request failed with Bearer tok$"
+        result = _sanitize_log_message(msg)
+        assert "tok$" not in result
+        assert "Bearer ***" in result
+
     def test_sensitive_query_params_redacted(self):
         msg = "GET https://api.example.test/embed?api_key=sk-secret123456&model=test"
         result = _sanitize_log_message(msg)
         assert "sk-secret123456" not in result
         assert "api_key=***" in result
         assert "model=test" in result
+
+    def test_sensitive_query_params_preserve_log_delimiters(self):
+        msg = "url='https://api.example.test/embed?api_key=abc123', headers={}"
+        result = _sanitize_log_message(msg)
+        assert "abc123" not in result
+        assert "url='https://api.example.test/embed?api_key=***', headers={}" == result
+
+    def test_sensitive_query_params_preserve_semicolon_params(self):
+        msg = "GET https://api.example.test/embed?api_key=abc123;model=test"
+        result = _sanitize_log_message(msg)
+        assert "abc123" not in result
+        assert "api_key=***;model=test" in result
 
     def test_provider_keys_in_free_text_redacted(self):
         msg = "voyage rejected key pa-secret123456 and openai rejected sk-secret123456"

@@ -183,65 +183,58 @@ class TestBuildExtractionCmd:
 
 class TestBuildExtractionEnv:
     def test_sets_extraction_flag(self):
-        env = build_extraction_env(project_dir="/some/project")
+        env = build_extraction_env({}, "/some/project")
         assert env["CLAUDE_MEMORY_EXTRACTION"] == "1"
 
     def test_sets_project_dir(self):
-        env = build_extraction_env(project_dir="/some/project")
+        env = build_extraction_env({}, "/some/project")
         assert env["CLAUDE_PROJECT_DIR"] == "/some/project"
 
     def test_none_project_dir_does_not_override(self):
-        with patch.dict("os.environ", {}, clear=True):
-            env = build_extraction_env(project_dir=None)
-            assert "CLAUDE_PROJECT_DIR" not in env
+        env = build_extraction_env({}, None)
+        assert "CLAUDE_PROJECT_DIR" not in env
 
     def test_excludes_sensitive_keys_via_allowlist(self):
-        with patch.dict(
-            "os.environ",
-            {
-                "AWS_SECRET_ACCESS_KEY": "secret",
-                "VOYAGE_API_KEY": "vk",
-                "OPENAI_API_KEY": "ok",
-                "DATABASE_URL": "pg://creds",
-                "POSTGRES_URL": "pg://creds2",
-                "GITHUB_TOKEN": "tok",
-                "PGPASSWORD": "pass",
-                "LANGSMITH_API_KEY": "ls",
-                "USER_TOKEN": "ut",
-                "PATH": "/usr/bin",
-                "HOME": "/home/test",
-                "CLAUDE_CONFIG_DIR": "/tmp/claude",
-            },
-            clear=True,
-        ):
-            env = build_extraction_env(project_dir=None)
-            # Sensitive keys excluded (not in allowlist)
-            assert "AWS_SECRET_ACCESS_KEY" not in env
-            assert "VOYAGE_API_KEY" not in env
-            assert "OPENAI_API_KEY" not in env
-            assert "DATABASE_URL" not in env
-            assert "POSTGRES_URL" not in env
-            assert "GITHUB_TOKEN" not in env
-            assert "PGPASSWORD" not in env
-            # Prefix-like names that aren't exact matches are excluded
-            assert "LANGSMITH_API_KEY" not in env
-            assert "USER_TOKEN" not in env
-            # Safe exact-match keys included
-            assert env["PATH"] == "/usr/bin"
-            assert env["HOME"] == "/home/test"
-            assert env["CLAUDE_CONFIG_DIR"] == "/tmp/claude"
+        base = {
+            "AWS_SECRET_ACCESS_KEY": "secret",
+            "VOYAGE_API_KEY": "vk",
+            "OPENAI_API_KEY": "ok",
+            "DATABASE_URL": "pg://creds",
+            "POSTGRES_URL": "pg://creds2",
+            "GITHUB_TOKEN": "tok",
+            "PGPASSWORD": "pass",
+            "LANGSMITH_API_KEY": "ls",
+            "USER_TOKEN": "ut",
+            "PATH": "/usr/bin",
+            "HOME": "/home/test",
+            "CLAUDE_CONFIG_DIR": "/tmp/claude",
+        }
+        env = build_extraction_env(base, None)
+        # Sensitive keys excluded (not in allowlist)
+        assert "AWS_SECRET_ACCESS_KEY" not in env
+        assert "VOYAGE_API_KEY" not in env
+        assert "OPENAI_API_KEY" not in env
+        assert "DATABASE_URL" not in env
+        assert "POSTGRES_URL" not in env
+        assert "GITHUB_TOKEN" not in env
+        assert "PGPASSWORD" not in env
+        # Prefix-like names that aren't exact matches are excluded
+        assert "LANGSMITH_API_KEY" not in env
+        assert "USER_TOKEN" not in env
+        # Safe exact-match keys included
+        assert env["PATH"] == "/usr/bin"
+        assert env["HOME"] == "/home/test"
+        assert env["CLAUDE_CONFIG_DIR"] == "/tmp/claude"
 
     def test_passes_allowlisted_vars(self):
-        with patch.dict("os.environ", {"PATH": "/usr/bin", "HOME": "/home/test"}, clear=True):
-            env = build_extraction_env(project_dir=None)
-            assert env["PATH"] == "/usr/bin"
-            assert env["HOME"] == "/home/test"
+        env = build_extraction_env({"PATH": "/usr/bin", "HOME": "/home/test"}, None)
+        assert env["PATH"] == "/usr/bin"
+        assert env["HOME"] == "/home/test"
 
     def test_blocks_non_allowlisted_vars(self):
-        with patch.dict("os.environ", {"MY_SECRET": "val", "PATH": "/usr/bin"}, clear=True):
-            env = build_extraction_env(project_dir=None)
-            assert "MY_SECRET" not in env
-            assert "PATH" in env
+        env = build_extraction_env({"MY_SECRET": "val", "PATH": "/usr/bin"}, None)
+        assert "MY_SECRET" not in env
+        assert "PATH" in env
 
 
 class TestParseExtractionOutput:

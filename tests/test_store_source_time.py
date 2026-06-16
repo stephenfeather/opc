@@ -322,21 +322,21 @@ class TestInvalidSourceTimeIgnored:
 
 class TestBackfillInjectsSourceTime:
     def test_build_extraction_env_sets_source_time(self) -> None:
-        from scripts.core.backfill_learnings import build_extraction_env
+        from scripts.core.memory_daemon_core import build_extraction_env
 
         src = datetime(2026, 1, 1, 8, 30, 0, tzinfo=UTC)
-        env = build_extraction_env("/proj", source_time=src)
+        env = build_extraction_env({}, "/proj", source_time=src)
         assert env["CLAUDE_SOURCE_TIME"] == src.isoformat()
 
     def test_build_extraction_env_omits_source_time_when_none(self) -> None:
-        from scripts.core.backfill_learnings import build_extraction_env
+        from scripts.core.memory_daemon_core import build_extraction_env
 
-        env = build_extraction_env("/proj")
+        env = build_extraction_env({}, "/proj")
         assert "CLAUDE_SOURCE_TIME" not in env
 
     def test_source_time_env_survives_allowlist(self) -> None:
         # CLAUDE_ prefix is allowlisted, so the injected value is not stripped.
-        from scripts.core.backfill_learnings import _is_env_allowed
+        from scripts.core.memory_daemon_core import _is_env_allowed
 
         assert _is_env_allowed("CLAUDE_SOURCE_TIME") is True
 
@@ -344,24 +344,18 @@ class TestBackfillInjectsSourceTime:
         # Fix 2: an ambient CLAUDE_SOURCE_TIME in the parent env must NOT pass
         # through. Injection is idempotent — only the computed value (or none)
         # reaches the child.
-        import os
-        from unittest.mock import patch as _patch
+        from scripts.core.memory_daemon_core import build_extraction_env
 
-        from scripts.core.backfill_learnings import build_extraction_env
-
-        with _patch.dict(os.environ, {"CLAUDE_SOURCE_TIME": "1999-01-01T00:00:00"}):
-            env = build_extraction_env("/proj")
+        base = {"CLAUDE_SOURCE_TIME": "1999-01-01T00:00:00"}
+        env = build_extraction_env(base, "/proj")
         assert "CLAUDE_SOURCE_TIME" not in env
 
     def test_build_extraction_env_inherited_replaced_by_computed(self) -> None:
-        import os
-        from unittest.mock import patch as _patch
-
-        from scripts.core.backfill_learnings import build_extraction_env
+        from scripts.core.memory_daemon_core import build_extraction_env
 
         src = datetime(2026, 1, 1, 8, 30, 0, tzinfo=UTC)
-        with _patch.dict(os.environ, {"CLAUDE_SOURCE_TIME": "1999-01-01T00:00:00"}):
-            env = build_extraction_env("/proj", source_time=src)
+        base = {"CLAUDE_SOURCE_TIME": "1999-01-01T00:00:00"}
+        env = build_extraction_env(base, "/proj", source_time=src)
         assert env["CLAUDE_SOURCE_TIME"] == src.isoformat()
 
 

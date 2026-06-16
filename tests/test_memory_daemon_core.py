@@ -8,11 +8,14 @@ injected as predicates.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from scripts.core.memory_daemon_core import (
-    StaleSession,
     _ALLOWED_EXTRACTION_MODELS,
+    StaleSession,
+    _is_env_allowed,
     _normalize_project,
     build_extraction_command,
     build_extraction_env,
@@ -22,7 +25,6 @@ from scripts.core.memory_daemon_core import (
     strip_yaml_frontmatter,
     validate_extraction_model,
 )
-
 
 # ── StaleSession NamedTuple ────────────────────────────────────────
 
@@ -212,6 +214,88 @@ class TestBuildExtractionEnv:
         base = {"CLAUDE_SOURCE_TIME": "2020-01-01T00:00:00Z"}
         build_extraction_env(base, None)
         assert base["CLAUDE_SOURCE_TIME"] == "2020-01-01T00:00:00Z"
+
+
+class TestExtractionEnvAllowlist:
+    @pytest.mark.parametrize("key", [
+        "PATH", "HOME", "USER", "LANG", "TERM", "SHELL", "TMPDIR",
+        "PYTHONPATH", "VIRTUAL_ENV",
+        "LC_ALL", "XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR", "UV_CACHE_DIR",
+        # Non-secret CLAUDE_* vars the extractor child genuinely needs
+        # must still pass the broad-prefix allow.
+        "CLAUDE_OPC_DIR", "CLAUDE_SESSION_ARCHIVE_BUCKET",
+    ])
+    def test_allowed_keys_pass(self, key):
+        assert _is_env_allowed(key) is True
+
+    @pytest.mark.parametrize("key", [
+        "DATABASE_URL", "OPENAI_API_KEY", "VOYAGE_API_KEY",
+        "ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY", "GCP_SA_KEY",
+        "SECRET_TOKEN", "PASSWORD",
+        # Codex review #108 round 1 (HIGH): UV_ is now an exact allow
+        # (UV_CACHE_DIR only), not a prefix, so registry credentials
+        # under the old broad UV_ prefix must be filtered out.
+        "UV_PUBLISH_TOKEN", "UV_INDEX_FOO_PASSWORD",
+        # Codex review #108 round 3 (HIGH): deny-before-allow blocks
+        # secret-named CLAUDE_* vars even though CLAUDE_ is an allow
+        # prefix — a hostile parent cannot smuggle them into the child.
+        "CLAUDE_API_KEY", "CLAUDE_TOKEN", "CLAUDE_SECRET_DB",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        # Aegis #108 LOW-2: marker-less credential names now covered.
+        "CLAUDE_OAUTH", "CLAUDE_BEARER", "CLAUDE_COOKIE",
+        "CLAUDE_PASSPHRASE",
+        # gemini #108 HIGH: connection-string names under CLAUDE_ prefix.
+        "CLAUDE_DB_URL", "CLAUDE_POSTGRES_URL", "REDIS_URL",
+    ])
+    def test_secret_keys_filtered(self, key):
+        assert _is_env_allowed(key) is False
+
+    def test_session_archive_bucket_not_denied_by_markers(self):
+        # Collision guard: CLAUDE_SESSION_ARCHIVE_BUCKET is a real var the
+        # extractor needs. Ensure no sensitive marker (e.g. a future
+        # "SESSION") silently denies it.
+        assert _is_env_allowed("CLAUDE_SESSION_ARCHIVE_BUCKET") is True
+
+    def test_builder_drops_secrets(self):
+        base = {
+            "DATABASE_URL": "postgres://x",
+            "OPENAI_API_KEY": "sk-leak",
+            "VOYAGE_API_KEY": "vy-leak",
+            "AWS_SECRET_ACCESS_KEY": "aws-leak",
+            "PATH": "/usr/bin",
+            "CLAUDE_CONFIG_DIR": "/home/u/.claude",
+        }
+        env = build_extraction_env(base, "/tmp/proj")
+        assert "DATABASE_URL" not in env
+        assert "OPENAI_API_KEY" not in env
+        assert "VOYAGE_API_KEY" not in env
+        assert "AWS_SECRET_ACCESS_KEY" not in env
+        assert env["PATH"] == "/usr/bin"
+        assert env["CLAUDE_CONFIG_DIR"] == "/home/u/.claude"
+        assert env["CLAUDE_MEMORY_EXTRACTION"] == "1"
+        assert env["CLAUDE_PROJECT_DIR"] == "/tmp/proj"
+
+
+class TestExtractionEnvSourceTime:
+    def test_source_time_injected_when_provided(self):
+        src = datetime(2024, 1, 2, 3, 4, 5, tzinfo=UTC)
+        env = build_extraction_env({}, "/tmp/proj", source_time=src)
+        assert env["CLAUDE_SOURCE_TIME"] == src.isoformat()
+
+    def test_source_time_absent_when_not_provided(self):
+        env = build_extraction_env({}, "/tmp/proj")
+        assert "CLAUDE_SOURCE_TIME" not in env
+
+    def test_inherited_source_time_dropped_when_no_arg(self):
+        base = {"CLAUDE_SOURCE_TIME": "1999-01-01T00:00:00+00:00"}
+        env = build_extraction_env(base, "/tmp/proj")
+        assert "CLAUDE_SOURCE_TIME" not in env
+
+    def test_explicit_source_time_overrides_inherited(self):
+        base = {"CLAUDE_SOURCE_TIME": "1999-01-01T00:00:00+00:00"}
+        src = datetime(2024, 1, 2, 3, 4, 5, tzinfo=UTC)
+        env = build_extraction_env(base, "/tmp/proj", source_time=src)
+        assert env["CLAUDE_SOURCE_TIME"] == src.isoformat()
 
 
 # ── strip_yaml_frontmatter ────────────────────────────────────────

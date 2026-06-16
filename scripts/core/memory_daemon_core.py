@@ -37,7 +37,8 @@ docstring for the full defense). Do NOT narrow this to OSError.
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
 
@@ -65,6 +66,93 @@ class StaleSession(NamedTuple):
 
 # Allowlist of Claude models permitted for extraction subprocesses.
 _ALLOWED_EXTRACTION_MODELS: frozenset[str] = frozenset({"sonnet", "haiku", "opus"})
+
+# Issue #108 trust boundary: the extraction subprocess runs as
+# ``claude -p --dangerously-skip-permissions`` and only needs Claude
+# auth + a minimal session-scoped env. Everything else (DB URLs, cloud
+# creds, API tokens) must NOT be inherited. Allowlist ported from
+# backfill_learnings.py (#108/#109 unification).
+#
+# ``UV_CACHE_DIR`` is allowed by EXACT name, not via a broad ``UV_``
+# prefix: the extractor's Bash child runs ``uv run python ...`` and
+# benefits from a shared cache, but a ``UV_`` prefix would also pass
+# ``UV_PUBLISH_TOKEN`` / ``UV_INDEX_*_PASSWORD`` registry credentials
+# into the child (Codex adversarial review #108 round 1, HIGH). The
+# ``CLAUDE_`` prefix is intentionally broad so the child can read the
+# non-secret ``CLAUDE_*`` config it needs (``CLAUDE_OPC_DIR``,
+# ``CLAUDE_CONFIG_DIR``, ``CLAUDE_SESSION_ARCHIVE_BUCKET``), BUT the
+# deny-before-allow check in ``_is_env_allowed`` still rejects any
+# secret-named ``CLAUDE_*`` key (e.g. ``CLAUDE_API_KEY``) — see
+# ``_SENSITIVE_ENV_MARKERS`` below. DB/embedding credentials the
+# extractor's store step needs are loaded by ``store_learning.py`` from
+# ``.env`` (its own ``load_dotenv()``), NOT inherited from this env, so
+# stripping ``DATABASE_URL`` / ``*_URL`` here does not break storage in
+# the documented ``.env``-based deployment.
+_ALLOW_ENV_EXACT: frozenset[str] = frozenset({
+    "PATH", "HOME", "USER", "LANG", "TERM", "SHELL", "TMPDIR",
+    "PYTHONPATH", "VIRTUAL_ENV", "UV_CACHE_DIR",
+})
+
+_ALLOW_ENV_PREFIXES: tuple[str, ...] = ("LC_", "XDG_", "CLAUDE_")
+
+# Case-insensitive substring markers that flag an env name as secret-bearing.
+# Applied DENY-FIRST in _is_env_allowed: a key matching any marker is blocked
+# even when it also matches an allow prefix. This closes the broad-prefix
+# leak vector (Codex adversarial review #108 round 3, HIGH): without it the
+# ``CLAUDE_`` prefix would pass parent-controlled ``CLAUDE_API_KEY`` /
+# ``CLAUDE_TOKEN`` / ``CLAUDE_SECRET_*`` values into the Bash-capable
+# ``claude -p --dangerously-skip-permissions`` child. The extraction child
+# authenticates via the on-disk Claude credential store (under HOME), not an
+# env-carried token, so denying secret-named CLAUDE_* vars does not break it.
+# Canonical home for the markers: extract_session.redact_env reuses this same
+# tuple so the two trust boundaries cannot drift.
+_SENSITIVE_ENV_MARKERS: tuple[str, ...] = (
+    "KEY",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "DATABASE_URL",
+    "DSN",
+    "AUTH",
+    "CREDENTIAL",
+    "PRIVATE",
+    "CERT",
+    # Aegis #108 LOW-2: marker-less credential names that would otherwise
+    # ride the broad CLAUDE_ allow prefix. NB: do NOT add "SESSION" —
+    # it would deny the legitimate CLAUDE_SESSION_ARCHIVE_BUCKET the
+    # extractor needs (guarded by a regression test).
+    "OAUTH",
+    "BEARER",
+    "COOKIE",
+    "PASSPHRASE",
+    # gemini #108 HIGH: connection-string names (CLAUDE_DB_URL,
+    # CLAUDE_POSTGRES_URL, REDIS_URL, ...) carry credentials but lack the
+    # markers above. "DB" is deliberately omitted (2-char, would over-match);
+    # "URL" already covers the cited CLAUDE_*_URL cases.
+    "URL",
+    "URI",
+)
+
+
+def _is_sensitive_env_name(key: str) -> bool:
+    """Return True if ``key`` looks secret-bearing (case-insensitive match)."""
+    upper = key.upper()
+    return any(marker in upper for marker in _SENSITIVE_ENV_MARKERS)
+
+
+def _is_env_allowed(key: str) -> bool:
+    """Return True iff ``key`` is on the extraction env allowlist.
+
+    Deny-before-allow: a secret-named key is rejected even if it matches an
+    allow prefix. Prevents leaking DB credentials, API keys, or tokens to the
+    ``claude -p`` extraction subprocess (Issue #108).
+    """
+    if _is_sensitive_env_name(key):
+        return False
+    if key in _ALLOW_ENV_EXACT:
+        return True
+    return key.startswith(_ALLOW_ENV_PREFIXES)
 
 # Truthy tokens for MEMORY_DAEMON_DEBUG. Matched case-insensitively
 # after stripping whitespace. All other values (including "0", "false",
@@ -207,7 +295,11 @@ def build_extraction_command(
     return cmd
 
 
-def build_extraction_env(base_env: dict, project_dir: str | None) -> dict:
+def build_extraction_env(
+    base_env: Mapping[str, str],
+    project_dir: str | None,
+    source_time: datetime | None = None,
+) -> dict[str, str]:
     """Build environment dict for extraction subprocess.
 
     Returns a new dict — does not mutate base_env.
@@ -224,7 +316,7 @@ def build_extraction_env(base_env: dict, project_dir: str | None) -> dict:
     ``os.environ`` would leak through unchanged while the debug log
     claimed ``CLAUDE_PROJECT_DIR=unset``.
     """
-    env = dict(base_env)
+    env = {k: v for k, v in base_env.items() if _is_env_allowed(k)}
     env["CLAUDE_MEMORY_EXTRACTION"] = "1"
     # M1: drop any inherited value first, then set iff the caller
     # gave us one. This prevents silent inheritance AND keeps the
@@ -239,6 +331,8 @@ def build_extraction_env(base_env: dict, project_dir: str | None) -> dict:
     # unconditionally here. Only the deliberate backfill builder
     # (backfill_learnings.build_extraction_env) injects a source time.
     env.pop("CLAUDE_SOURCE_TIME", None)
+    if source_time is not None:
+        env["CLAUDE_SOURCE_TIME"] = source_time.isoformat()
     # Issue #96 + Codex Round 3: DEBUG-gated diagnostic log.
     # SECURITY-LOAD-BEARING — reveals daemon-owned information only.
     # The previous iteration dumped ``sorted(env.keys())`` which was

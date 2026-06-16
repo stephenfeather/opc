@@ -31,6 +31,20 @@ from pathlib import Path
 
 from scripts.core.log_safety import safe
 
+# The extraction env builder is unified in memory_daemon_core (#108/#109).
+# Backfill calls it with the unified signature
+# ``build_extraction_env(os.environ, project_dir, source_time=...)``.
+# Importing it here does make ``backfill_learnings.build_extraction_env``
+# resolvable (a plain import binds the name in this module), but backfill
+# historically owned a builder with a DIFFERENT signature
+# ``(project_dir, source_time=None)``. We intentionally do NOT list it in
+# ``__all__`` so it is not advertised as a backfill export — a caller still
+# written against the old one-arg API would now hit a loud TypeError, not a
+# silent mis-bind. The canonical definition is
+# ``scripts.core.memory_daemon_core.build_extraction_env``; import it from
+# there, not from this module.
+from scripts.core.memory_daemon_core import build_extraction_env
+
 # ---------------------------------------------------------------------------
 # Pure functions
 # ---------------------------------------------------------------------------
@@ -117,55 +131,6 @@ def build_extraction_cmd(
         agent_prompt,
         f"Extract learnings from session {session_id}. JSONL path: {jsonl_path}",
     ]
-
-
-_ALLOW_ENV_EXACT = frozenset({
-    "PATH", "HOME", "USER", "LANG", "TERM", "SHELL", "TMPDIR",
-    "PYTHONPATH", "VIRTUAL_ENV",
-})
-
-_ALLOW_ENV_PREFIXES = (
-    "LC_",
-    "XDG_",
-    "CLAUDE_",
-    "UV_",
-)
-
-
-def _is_env_allowed(key: str) -> bool:
-    """Check if an env var key is on the extraction allowlist."""
-    if key in _ALLOW_ENV_EXACT:
-        return True
-    return any(key.startswith(prefix) for prefix in _ALLOW_ENV_PREFIXES)
-
-
-def build_extraction_env(
-    project_dir: str | None, source_time: datetime | None = None
-) -> dict[str, str]:
-    """Build allowlisted environment dict for extraction subprocess.
-
-    Only passes env vars matching known-safe exact names or prefixes.
-    This prevents leaking DB credentials, API keys, or tokens to the
-    LLM process.
-
-    Issue #52: when ``source_time`` is provided (the backfilled session's
-    JSONL mtime / end time), inject it as ``CLAUDE_SOURCE_TIME`` so the
-    extractor agent's ``store_learning.py`` calls stamp ``created_at`` from
-    the original session time instead of the NOW() default. The ``CLAUDE_``
-    prefix is already on the allowlist, so the value survives filtering.
-    """
-    env = {k: v for k, v in os.environ.items() if _is_env_allowed(k)}
-    env["CLAUDE_MEMORY_EXTRACTION"] = "1"
-    if project_dir:
-        env["CLAUDE_PROJECT_DIR"] = project_dir
-    # Fix 2 (trust boundary): never pass through an inherited/ambient
-    # CLAUDE_SOURCE_TIME. Drop it first, then inject ONLY the computed value
-    # (if any). Injection is idempotent -- the child sees the daemon-owned
-    # value or nothing, never a stale parent-shell value.
-    env.pop("CLAUDE_SOURCE_TIME", None)
-    if source_time is not None:
-        env["CLAUDE_SOURCE_TIME"] = source_time.isoformat()
-    return env
 
 
 def parse_extraction_output(stdout: str) -> dict[str, int]:
@@ -532,7 +497,7 @@ def run_extraction(
     is extraction time, which would recreate the recency bias this fix removes.
     """
     cmd = build_extraction_cmd(jsonl_path, session_id, agent_prompt, model, max_turns)
-    env = build_extraction_env(project_dir, source_time=source_time)
+    env = build_extraction_env(os.environ, project_dir, source_time=source_time)
 
     try:
         proc = subprocess.run(

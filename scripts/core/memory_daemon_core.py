@@ -72,12 +72,21 @@ _ALLOWED_EXTRACTION_MODELS: frozenset[str] = frozenset({"sonnet", "haiku", "opus
 # auth + a minimal session-scoped env. Everything else (DB URLs, cloud
 # creds, API tokens) must NOT be inherited. Allowlist ported from
 # backfill_learnings.py (#108/#109 unification).
+#
+# ``UV_CACHE_DIR`` is allowed by EXACT name, not via a broad ``UV_``
+# prefix: the extractor's Bash child runs ``uv run python ...`` and
+# benefits from a shared cache, but a ``UV_`` prefix would also pass
+# ``UV_PUBLISH_TOKEN`` / ``UV_INDEX_*_PASSWORD`` registry credentials
+# into the child (Codex adversarial review #108 round 1, HIGH). The
+# ``CLAUDE_`` prefix is intentionally broad — the child authenticates
+# as Claude and needs whatever ``CLAUDE_*`` auth/config vars are set,
+# so a token-name denylist is NOT applied to it.
 _ALLOW_ENV_EXACT: frozenset[str] = frozenset({
     "PATH", "HOME", "USER", "LANG", "TERM", "SHELL", "TMPDIR",
-    "PYTHONPATH", "VIRTUAL_ENV",
+    "PYTHONPATH", "VIRTUAL_ENV", "UV_CACHE_DIR",
 })
 
-_ALLOW_ENV_PREFIXES: tuple[str, ...] = ("LC_", "XDG_", "CLAUDE_", "UV_")
+_ALLOW_ENV_PREFIXES: tuple[str, ...] = ("LC_", "XDG_", "CLAUDE_")
 
 
 def _is_env_allowed(key: str) -> bool:

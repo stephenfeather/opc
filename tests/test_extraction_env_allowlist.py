@@ -18,6 +18,11 @@ SECRET_KEYS = [
     "GCP_SA_KEY",
     "GITHUB_TOKEN",
     "GH_TOKEN",
+    # Codex review #108 round 1 (HIGH): secret-bearing UV_ registry vars
+    # must NOT survive. Only UV_CACHE_DIR is allowed by exact name; a
+    # broad UV_ prefix would leak these into the Bash-capable child.
+    "UV_PUBLISH_TOKEN",
+    "UV_INDEX_FOO_PASSWORD",
 ]
 
 ALLOWED_KEYS = {

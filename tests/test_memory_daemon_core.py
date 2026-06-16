@@ -229,6 +229,10 @@ class TestExtractionEnvAllowlist:
         "DATABASE_URL", "OPENAI_API_KEY", "VOYAGE_API_KEY",
         "ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY", "GCP_SA_KEY",
         "SECRET_TOKEN", "PASSWORD",
+        # Codex review #108 round 1 (HIGH): UV_ is now an exact allow
+        # (UV_CACHE_DIR only), not a prefix, so registry credentials
+        # under the old broad UV_ prefix must be filtered out.
+        "UV_PUBLISH_TOKEN", "UV_INDEX_FOO_PASSWORD",
     ])
     def test_secret_keys_filtered(self, key):
         assert _is_env_allowed(key) is False

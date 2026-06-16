@@ -241,9 +241,18 @@ class TestExtractionEnvAllowlist:
         # prefix — a hostile parent cannot smuggle them into the child.
         "CLAUDE_API_KEY", "CLAUDE_TOKEN", "CLAUDE_SECRET_DB",
         "CLAUDE_CODE_OAUTH_TOKEN",
+        # Aegis #108 LOW-2: marker-less credential names now covered.
+        "CLAUDE_OAUTH", "CLAUDE_BEARER", "CLAUDE_COOKIE",
+        "CLAUDE_PASSPHRASE",
     ])
     def test_secret_keys_filtered(self, key):
         assert _is_env_allowed(key) is False
+
+    def test_session_archive_bucket_not_denied_by_markers(self):
+        # Collision guard: CLAUDE_SESSION_ARCHIVE_BUCKET is a real var the
+        # extractor needs. Ensure no sensitive marker (e.g. a future
+        # "SESSION") silently denies it.
+        assert _is_env_allowed("CLAUDE_SESSION_ARCHIVE_BUCKET") is True
 
     def test_builder_drops_secrets(self):
         base = {

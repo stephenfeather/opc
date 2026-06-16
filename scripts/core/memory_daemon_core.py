@@ -111,6 +111,14 @@ _SENSITIVE_ENV_MARKERS: tuple[str, ...] = (
     "CREDENTIAL",
     "PRIVATE",
     "CERT",
+    # Aegis #108 LOW-2: marker-less credential names that would otherwise
+    # ride the broad CLAUDE_ allow prefix. NB: do NOT add "SESSION" —
+    # it would deny the legitimate CLAUDE_SESSION_ARCHIVE_BUCKET the
+    # extractor needs (guarded by a regression test).
+    "OAUTH",
+    "BEARER",
+    "COOKIE",
+    "PASSPHRASE",
 )
 
 

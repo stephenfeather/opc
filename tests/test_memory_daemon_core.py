@@ -13,8 +13,8 @@ from datetime import UTC, datetime
 import pytest
 
 from scripts.core.memory_daemon_core import (
-    StaleSession,
     _ALLOWED_EXTRACTION_MODELS,
+    StaleSession,
     _is_env_allowed,
     _normalize_project,
     build_extraction_command,
@@ -25,7 +25,6 @@ from scripts.core.memory_daemon_core import (
     strip_yaml_frontmatter,
     validate_extraction_model,
 )
-
 
 # ── StaleSession NamedTuple ────────────────────────────────────────
 

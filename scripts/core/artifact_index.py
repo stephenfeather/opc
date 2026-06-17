@@ -319,9 +319,11 @@ def db_execute(
         if return_id:
             sql = _append_returning_id(sql)
         cur = conn.cursor()
-        cur.execute(sql, params)
-        row = cur.fetchone() if return_id else None
-        cur.close()
+        try:
+            cur.execute(sql, params)
+            row = cur.fetchone() if return_id else None
+        finally:
+            cur.close()
         return str(row[0]) if (return_id and row) else None
 
     # SQLite: use directly

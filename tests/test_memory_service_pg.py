@@ -6,7 +6,9 @@ and verifying they correctly delegate to the pure query functions.
 
 from __future__ import annotations
 
+import importlib
 import json
+import sys
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
@@ -711,73 +713,288 @@ class TestTagOperations:
 
 
 class TestConfigWiring:
-    """Tests that search defaults come from opc.toml config."""
+    """Tests that search defaults are read from current config at call time."""
 
-    def test_search_text_uses_config_default_limit(self):
-        """search_text default limit should come from recall config."""
-        import inspect
+    @staticmethod
+    def config(*, limit: int = 37, rrf_k: int = 91, max_archival: int = 23):
+        from scripts.core.config.models import DatabaseConfig, OPCConfig, RecallConfig
 
+        return OPCConfig(
+            recall=RecallConfig(default_search_limit=limit, rrf_k=rrf_k),
+            database=DatabaseConfig(max_archival_context=max_archival),
+        )
+
+    async def test_search_text_uses_current_config_default_limit_after_import(self):
         from scripts.core.db.memory_service_pg import MemoryServicePG
 
-        sig = inspect.signature(MemoryServicePG.search_text)
-        # Should not be hardcoded 10 — should come from config
-        from scripts.core.config import get_config
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[])
+        svc = MemoryServicePG(session_id="s1")
 
-        expected = get_config().recall.default_search_limit
-        assert sig.parameters["limit"].default == expected
+        with (
+            patch(
+                "scripts.core.db.memory_service_pg._get_config",
+                return_value=self.config(limit=37),
+            ),
+            patch.object(
+                MemoryServicePG,
+                "_check_superseded_column",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "scripts.core.db.memory_service_pg.get_connection",
+                return_value=FakeConnection(conn),
+            ),
+            patch(
+                "scripts.core.db.memory_service_pg.build_text_search_sql",
+                return_value=("SELECT 1", []),
+            ) as build_sql,
+        ):
+            await svc.search_text("needle")
 
-    def test_search_vector_uses_config_default_limit(self):
-        import inspect
+        assert build_sql.call_args.args[3] == 37
 
+    def test_module_import_does_not_load_config(self):
+        sys.modules.pop("scripts.core.db.memory_service_pg", None)
+
+        with patch("scripts.core.config.get_config") as get_config:
+            module = importlib.import_module("scripts.core.db.memory_service_pg")
+
+        get_config.assert_not_called()
+        assert module.MemoryServicePG is not None
+
+    async def test_search_text_explicit_limit_overrides_config_default(self):
         from scripts.core.db.memory_service_pg import MemoryServicePG
 
-        sig = inspect.signature(MemoryServicePG.search_vector)
-        from scripts.core.config import get_config
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[])
+        svc = MemoryServicePG(session_id="s1")
 
-        expected = get_config().recall.default_search_limit
-        assert sig.parameters["limit"].default == expected
+        with (
+            patch(
+                "scripts.core.db.memory_service_pg._get_config",
+                return_value=self.config(limit=37),
+            ),
+            patch.object(
+                MemoryServicePG,
+                "_check_superseded_column",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "scripts.core.db.memory_service_pg.get_connection",
+                return_value=FakeConnection(conn),
+            ),
+            patch(
+                "scripts.core.db.memory_service_pg.build_text_search_sql",
+                return_value=("SELECT 1", []),
+            ) as build_sql,
+        ):
+            await svc.search_text("needle", limit=4)
 
-    def test_search_uses_config_default_limit(self):
-        import inspect
+        assert build_sql.call_args.args[3] == 4
 
+    async def test_search_vector_uses_current_config_default_limit_after_import(self):
         from scripts.core.db.memory_service_pg import MemoryServicePG
 
-        sig = inspect.signature(MemoryServicePG.search)
-        from scripts.core.config import get_config
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[])
+        svc = MemoryServicePG(session_id="s1")
 
-        expected = get_config().recall.default_search_limit
-        assert sig.parameters["limit"].default == expected
+        with (
+            patch(
+                "scripts.core.db.memory_service_pg._get_config",
+                return_value=self.config(limit=37),
+            ),
+            patch.object(
+                MemoryServicePG,
+                "_check_superseded_column",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "scripts.core.db.memory_service_pg.get_connection",
+                return_value=FakeConnection(conn),
+            ),
+            patch("scripts.core.db.memory_service_pg.init_pgvector", new=AsyncMock()),
+            patch(
+                "scripts.core.db.memory_service_pg.build_vector_search_sql",
+                return_value=("SELECT 1", []),
+            ) as build_sql,
+        ):
+            await svc.search_vector([0.1])
 
-    def test_search_hybrid_rrf_uses_config_defaults(self):
-        import inspect
+        assert build_sql.call_args.args[3] == 37
 
+    async def test_search_alias_delegates_none_limit_to_search_text(self):
         from scripts.core.db.memory_service_pg import MemoryServicePG
 
-        sig = inspect.signature(MemoryServicePG.search_hybrid_rrf)
-        from scripts.core.config import get_config
+        svc = MemoryServicePG(session_id="s1")
 
-        recall_cfg = get_config().recall
-        assert sig.parameters["limit"].default == recall_cfg.default_search_limit
-        assert sig.parameters["k"].default == recall_cfg.rrf_k
+        with patch.object(svc, "search_text", new=AsyncMock(return_value=[])) as search_text:
+            await svc.search("needle")
 
-    def test_search_with_tags_uses_config_default_limit(self):
-        import inspect
+        search_text.assert_awaited_once_with("needle", None)
 
+    async def test_search_vector_threshold_uses_current_config_default_limit(self):
         from scripts.core.db.memory_service_pg import MemoryServicePG
 
-        sig = inspect.signature(MemoryServicePG.search_with_tags)
-        from scripts.core.config import get_config
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[])
+        svc = MemoryServicePG(session_id="s1")
 
-        expected = get_config().recall.default_search_limit
-        assert sig.parameters["limit"].default == expected
+        with (
+            patch(
+                "scripts.core.db.memory_service_pg._get_config",
+                return_value=self.config(limit=37),
+            ),
+            patch.object(
+                MemoryServicePG,
+                "_check_superseded_column",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "scripts.core.db.memory_service_pg.get_connection",
+                return_value=FakeConnection(conn),
+            ),
+            patch("scripts.core.db.memory_service_pg.init_pgvector", new=AsyncMock()),
+        ):
+            await svc.search_vector_with_threshold([0.1])
 
-    def test_to_context_uses_config_max_archival(self):
-        import inspect
+        assert conn.fetch.call_args.args[-1] == 37
 
+    async def test_search_vector_filter_uses_current_config_default_limit(self):
         from scripts.core.db.memory_service_pg import MemoryServicePG
 
-        sig = inspect.signature(MemoryServicePG.to_context)
-        from scripts.core.config import get_config
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[])
+        svc = MemoryServicePG(session_id="s1")
 
-        expected = get_config().database.max_archival_context
-        assert sig.parameters["max_archival"].default == expected
+        with (
+            patch(
+                "scripts.core.db.memory_service_pg._get_config",
+                return_value=self.config(limit=37),
+            ),
+            patch.object(
+                MemoryServicePG,
+                "_check_superseded_column",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "scripts.core.db.memory_service_pg.get_connection",
+                return_value=FakeConnection(conn),
+            ),
+            patch("scripts.core.db.memory_service_pg.init_pgvector", new=AsyncMock()),
+        ):
+            await svc.search_vector_with_filter([0.1], {"type": "session_learning"})
+
+        assert conn.fetch.call_args.args[-1] == 37
+
+    async def test_search_hybrid_uses_current_config_default_limit(self):
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[])
+        svc = MemoryServicePG(session_id="s1")
+
+        with (
+            patch(
+                "scripts.core.db.memory_service_pg._get_config",
+                return_value=self.config(limit=37),
+            ),
+            patch.object(
+                MemoryServicePG,
+                "_check_superseded_column",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "scripts.core.db.memory_service_pg.get_connection",
+                return_value=FakeConnection(conn),
+            ),
+            patch("scripts.core.db.memory_service_pg.init_pgvector", new=AsyncMock()),
+            patch(
+                "scripts.core.db.memory_service_pg.build_hybrid_search_sql",
+                return_value=("SELECT 1", []),
+            ) as build_sql,
+        ):
+            await svc.search_hybrid("needle", [0.1])
+
+        assert build_sql.call_args.args[4] == 37
+
+    async def test_search_hybrid_rrf_uses_current_config_defaults(self):
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[])
+        svc = MemoryServicePG(session_id="s1")
+
+        with (
+            patch(
+                "scripts.core.db.memory_service_pg._get_config",
+                return_value=self.config(limit=37, rrf_k=91),
+            ),
+            patch.object(
+                MemoryServicePG,
+                "_check_superseded_column",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "scripts.core.db.memory_service_pg.get_connection",
+                return_value=FakeConnection(conn),
+            ),
+            patch("scripts.core.db.memory_service_pg.init_pgvector", new=AsyncMock()),
+        ):
+            await svc.search_hybrid_rrf("needle", [0.1])
+
+        assert conn.fetch.call_args.args[-2:] == (91, 37)
+
+    async def test_search_with_tags_uses_current_config_default_limit(self):
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[])
+        svc = MemoryServicePG(session_id="s1")
+
+        with (
+            patch(
+                "scripts.core.db.memory_service_pg._get_config",
+                return_value=self.config(limit=37),
+            ),
+            patch.object(
+                MemoryServicePG,
+                "_check_superseded_column",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "scripts.core.db.memory_service_pg.get_connection",
+                return_value=FakeConnection(conn),
+            ),
+        ):
+            await svc.search_with_tags("needle")
+
+        assert conn.fetch.call_args.args[-1] == 37
+
+    async def test_to_context_uses_current_config_max_archival_after_import(self):
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[])
+        svc = MemoryServicePG(session_id="s1")
+
+        with (
+            patch(
+                "scripts.core.db.memory_service_pg._get_config",
+                return_value=self.config(max_archival=23),
+            ),
+            patch.object(svc, "get_all_core", new=AsyncMock(return_value={})),
+            patch.object(
+                MemoryServicePG,
+                "_check_superseded_column",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "scripts.core.db.memory_service_pg.get_connection",
+                return_value=FakeConnection(conn),
+            ),
+        ):
+            await svc.to_context()
+
+        assert conn.fetch.call_args.args[-1] == 23

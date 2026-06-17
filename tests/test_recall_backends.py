@@ -675,6 +675,50 @@ class TestRecallSqlSelectsProject:
             )
             assert "{" not in sql and "}" not in sql
 
+    def test_plain_rrf_fallback_placeholder_count_matches_args(self):
+        """Issue #173: plain-tail fallbacks must not rely on extra binds.
+
+        The plain tail itself ends at ``LIMIT $4``; bounded ANN, project-first,
+        and embedding-model filters can add later placeholders inside the CTE.
+        This verifies the final rendered SQL's highest positional bind matches
+        the exact fallback args tuple for both chained and no-chain fallbacks.
+        """
+        from scripts.core import recall_backends as rb
+
+        project = "opc"
+        model_label = "voyage-code-3"
+        plain_pf = rb.project_filter_clause(project, has_project=True, param_index=5)
+        plain_mf = rb.model_filter_clause(model_label, param_index=6)
+        candidate_param = 7
+        plain_tail = rb.render_recall_sql(
+            rb._RRF_PLAIN_TAIL_SQL,
+            include_project=True,
+            project_expr=", a.project",
+        )
+        args = (
+            "query text",
+            "[0.1, 0.2]",
+            60,
+            10,
+            project,
+            model_label,
+            40,
+        )
+
+        for chain in (True, False):
+            sql = (
+                rb.build_rrf_cte(
+                    chain_filter=chain,
+                    use_tsquery=False,
+                    project_filter=plain_pf,
+                    model_filter=plain_mf,
+                    candidate_param=candidate_param,
+                )
+                + plain_tail
+            )
+            placeholders = [int(match) for match in re.findall(r"\$(\d+)", sql)]
+            assert max(placeholders) == len(args)
+
 
 def _undefined_column_error() -> Exception:
     from asyncpg.exceptions import UndefinedColumnError

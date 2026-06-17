@@ -19,6 +19,7 @@ Examples:
 """
 
 import argparse
+import json
 import os
 import re
 import sqlite3
@@ -278,24 +279,58 @@ def init_db(db_path: Path) -> sqlite3.Connection:
     return init_sqlite(db_path)
 
 
-def db_execute(conn, sql: str, params: tuple = (), table_hint: str = ""):
+def _append_returning_id(sql: str) -> str:
+    """Append a ``RETURNING id`` clause to an INSERT statement.
+
+    Works for both backends: PostgreSQL and SQLite (>= 3.35) support
+    ``RETURNING`` on INSERT / INSERT ... ON CONFLICT DO UPDATE / INSERT OR
+    REPLACE, returning the affected row regardless of whether it was inserted
+    or updated.
+    """
+    return sql.rstrip().rstrip(";").rstrip() + " RETURNING id"
+
+
+def db_execute(
+    conn,
+    sql: str,
+    params: tuple = (),
+    table_hint: str = "",
+    return_id: bool = False,
+):
     """Execute SQL on either SQLite or PostgreSQL connection.
 
     Handles the difference between SQLite (conn.execute) and
     PostgreSQL (conn.cursor().execute) interfaces.
+
+    When ``return_id`` is True the statement is treated as an INSERT, a
+    ``RETURNING id`` clause is appended, and the stored primary-key id is
+    fetched and returned as a string (None if no row was returned). The id is
+    the value the database actually persisted — a DB-generated UUID on
+    PostgreSQL, the deterministic file id on SQLite — so callers never have to
+    re-query for it. When False the original fire-and-forget behavior and
+    ``None`` return are preserved.
     """
     # Check if this is a PostgreSQL connection
-    is_pg = hasattr(conn, 'cursor') and not isinstance(conn, sqlite3.Connection)
+    is_pg = hasattr(conn, "cursor") and not isinstance(conn, sqlite3.Connection)
 
     if is_pg:
         # PostgreSQL: use adapted queries for existing schema
         sql, params = _adapt_for_postgres(sql, params, table_hint)
+        if return_id:
+            sql = _append_returning_id(sql)
         cur = conn.cursor()
         cur.execute(sql, params)
+        row = cur.fetchone() if return_id else None
         cur.close()
-    else:
-        # SQLite: use directly
-        conn.execute(sql, params)
+        return str(row[0]) if (return_id and row) else None
+
+    # SQLite: use directly
+    if return_id:
+        cur = conn.execute(_append_returning_id(sql), params)
+        row = cur.fetchone()
+        return str(row[0]) if row else None
+    conn.execute(sql, params)
+    return None
 
 
 
@@ -437,9 +472,9 @@ def index_continuity(conn, base_path: Path = Path(".")):
     return count
 
 
-def _index_handoff(conn, data: dict) -> None:
-    """Write handoff data to database."""
-    db_execute(
+def _index_handoff(conn, data: dict) -> str | None:
+    """Write handoff data to database. Returns the stored row id."""
+    return db_execute(
         conn,
         """
         INSERT OR REPLACE INTO handoffs
@@ -466,12 +501,13 @@ def _index_handoff(conn, data: dict) -> None:
             data["braintrust_session_id"],
             data["created_at"],
         ),
+        return_id=True,
     )
 
 
-def _index_plan(conn, data: dict) -> None:
-    """Write plan data to database."""
-    db_execute(
+def _index_plan(conn, data: dict) -> str | None:
+    """Write plan data to database. Returns the stored row id."""
+    return db_execute(
         conn,
         """
         INSERT OR REPLACE INTO plans
@@ -487,12 +523,13 @@ def _index_plan(conn, data: dict) -> None:
             data["phases"],
             data["constraints"],
         ),
+        return_id=True,
     )
 
 
-def _index_continuity(conn, data: dict) -> None:
-    """Write continuity data to database."""
-    db_execute(
+def _index_continuity(conn, data: dict) -> str | None:
+    """Write continuity data to database. Returns the stored row id."""
+    return db_execute(
         conn,
         """
         INSERT OR REPLACE INTO continuity
@@ -511,6 +548,7 @@ def _index_continuity(conn, data: dict) -> None:
             data["key_decisions"],
             data["snapshot_reason"],
         ),
+        return_id=True,
     )
 
 
@@ -523,28 +561,41 @@ _INDEX_DISPATCH = {
 }
 
 
-def index_single_file(conn, file_path: Path) -> bool:
+def index_single_file(conn, file_path: Path) -> dict | None:
     """Index a single file based on its location/type.
 
-    Returns True if indexed successfully, False otherwise.
+    Returns a dict ``{"id", "type", "file"}`` on success, where ``id`` is the
+    primary-key id the database actually persisted (a DB-generated UUID on
+    PostgreSQL, the deterministic file id on SQLite). Returns ``None`` if the
+    file type is unknown or indexing fails. Callers handle their own
+    stdout/exit-code formatting.
     """
     file_path = Path(file_path).resolve()
     file_type = classify_file(file_path)
 
     if file_type is None:
         print(f"Unknown file type, skipping: {file_path}")
-        return False
+        return None
 
     parser, writer, label = _INDEX_DISPATCH[file_type]
     try:
         data = parser(file_path)
-        writer(conn, data)
+        row_id = writer(conn, data)
         conn.commit()
-        print(f"Indexed {label}: {file_path.name}")
-        return True
+        return {"id": row_id, "type": label, "file": file_path.name}
     except Exception as e:
         print(f"Error indexing {label} {file_path}: {e}")
-        return False
+        return None
+
+
+def build_index_payload(result: dict | None) -> dict:
+    """Shape the ``--json`` CLI response for a single-file index operation.
+
+    ``result`` is the return value of :func:`index_single_file`.
+    """
+    if result is None:
+        return {"success": False}
+    return {"success": True, **result}
 
 
 def main() -> int:
@@ -558,6 +609,11 @@ def main() -> int:
     parser.add_argument("--all", action="store_true", help="Index everything")
     parser.add_argument("--file", type=str, help="Index a single file (fast, for hooks)")
     parser.add_argument("--db", type=str, help="Custom database path (SQLite only)")
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit JSON (incl. the stored row id) for --file; for machine callers",
+    )
 
     args = parser.parse_args()
 
@@ -577,9 +633,13 @@ def main() -> int:
         else:
             conn = init_sqlite(get_db_path(args.db))
 
-        success = index_single_file(conn, file_path)
+        result = index_single_file(conn, file_path)
         conn.close()
-        return 0 if success else 1
+        if args.json:
+            print(json.dumps(build_index_payload(result)))
+        elif result is not None:
+            print(f"Indexed {result['type']}: {result['file']}")
+        return 0 if result is not None else 1
 
     if not any([args.handoffs, args.plans, args.continuity, args.all]):
         parser.print_help()

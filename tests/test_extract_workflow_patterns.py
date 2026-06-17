@@ -595,6 +595,12 @@ class TestRedactInput:
         assert "abc123secret" not in result["command"]
         assert "--token [REDACTED]" in result["command"]
 
+    def test_secret_flag_space_delimited_redacted(self) -> None:
+        inp = {"command": "deploy --secret abc123secret --environment prod"}
+        result = redact_input(inp)
+        assert "abc123secret" not in result["command"]
+        assert "--secret [REDACTED]" in result["command"]
+
     def test_password_flag_quoted_space_delimited_redacted(self) -> None:
         inp = {"command": 'psql --password "my secret password" -h localhost'}
         result = redact_input(inp)

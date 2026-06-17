@@ -54,7 +54,7 @@ from .postgres_pool import get_connection, get_pool, get_transaction, init_pgvec
 
 logger = logging.getLogger(__name__)
 
-# Load config defaults for search methods.
+# Load config defaults lazily for search methods.
 from scripts.core.config import get_config as _get_config
 
 # Capability probe for the embedding_model column (issue #151, round 1 FIX 1).
@@ -62,8 +62,31 @@ from scripts.core.config import get_config as _get_config
 # recall_backends does not import this module.
 from scripts.core.recall_backends import embedding_model_column_available
 
-_recall_cfg = _get_config().recall
-_db_cfg = _get_config().database
+
+def _recall_cfg() -> Any:
+    """Return current recall config.
+
+    Keep this at call time so tests and long-lived processes can reset or
+    override config after this module has already been imported.
+    """
+    return _get_config().recall
+
+
+def _db_cfg() -> Any:
+    """Return current database config at call time."""
+    return _get_config().database
+
+
+def _search_limit(limit: int | None) -> int:
+    return _recall_cfg().default_search_limit if limit is None else limit
+
+
+def _rrf_k(k: int | None) -> int:
+    return _recall_cfg().rrf_k if k is None else k
+
+
+def _max_archival(max_archival: int | None) -> int:
+    return _db_cfg().max_archival_context if max_archival is None else max_archival
 
 
 class EmbeddingProvider(Protocol):
@@ -504,14 +527,15 @@ class MemoryServicePG:
     async def search_text(
         self,
         query: str,
-        limit: int = _recall_cfg.default_search_limit,
+        limit: int | None = None,
         start_date: datetime | None = None,
         end_date: datetime | None = None,
     ) -> list[dict[str, Any]]:
         """Search archival memory with full-text search."""
+        resolved_limit = _search_limit(limit)
         has_col = await self._check_superseded_column()
         sql, params = build_text_search_sql(
-            self.session_id, self.agent_id, query, limit,
+            self.session_id, self.agent_id, query, resolved_limit,
             start_date=start_date, end_date=end_date,
             include_active_filter=has_col,
         )
@@ -522,7 +546,7 @@ class MemoryServicePG:
     async def search_vector(
         self,
         query_embedding: list[float],
-        limit: int = _recall_cfg.default_search_limit,
+        limit: int | None = None,
         start_date: datetime | None = None,
         end_date: datetime | None = None,
         embedding_model: str | None = None,
@@ -533,6 +557,7 @@ class MemoryServicePG:
         dedup fallback pins to one space, mirroring search_vector_global. The
         capability probe drops the filter on a pre-migration DB.
         """
+        resolved_limit = _search_limit(limit)
         has_col = await self._check_superseded_column()
         padded_query = pad_embedding(query_embedding)
         async with get_connection() as conn:
@@ -541,7 +566,7 @@ class MemoryServicePG:
             if model_label and not await embedding_model_column_available(conn):
                 model_label = None
             sql, params = build_vector_search_sql(
-                self.session_id, self.agent_id, padded_query, limit,
+                self.session_id, self.agent_id, padded_query, resolved_limit,
                 start_date=start_date, end_date=end_date,
                 include_active_filter=has_col,
                 embedding_model=model_label,
@@ -549,7 +574,7 @@ class MemoryServicePG:
             rows = await conn.fetch(sql, *params)
             return format_rows(rows, extra_fields=["similarity"])
 
-    async def search(self, query: str, limit: int = _recall_cfg.default_search_limit) -> list[dict[str, Any]]:
+    async def search(self, query: str, limit: int | None = None) -> list[dict[str, Any]]:
         """Search archival memory with FTS (backward compatible alias)."""
         return await self.search_text(query, limit)
 
@@ -557,9 +582,10 @@ class MemoryServicePG:
         self,
         query_embedding: list[float],
         threshold: float = 0.0,
-        limit: int = 10,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         """Search archival memory with vector similarity and threshold filter."""
+        resolved_limit = _search_limit(limit)
         has_col = await self._check_superseded_column()
         active_filter = f"AND {ACTIVE_ROW_FILTER}" if has_col else ""
         padded_query = pad_embedding(query_embedding)
@@ -578,7 +604,7 @@ class MemoryServicePG:
                 ORDER BY embedding <=> $3::vector
                 LIMIT $5
                 """,
-                self.session_id, self.agent_id, padded_query, threshold, limit,
+                self.session_id, self.agent_id, padded_query, threshold, resolved_limit,
             )
             return format_rows(rows, extra_fields=["similarity"])
 
@@ -586,9 +612,10 @@ class MemoryServicePG:
         self,
         query_embedding: list[float],
         metadata_filter: dict[str, Any],
-        limit: int = 10,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         """Search archival memory with vector similarity and metadata filter."""
+        resolved_limit = _search_limit(limit)
         has_col = await self._check_superseded_column()
         active_filter = f"AND {ACTIVE_ROW_FILTER}" if has_col else ""
         padded_query = pad_embedding(query_embedding)
@@ -608,7 +635,7 @@ class MemoryServicePG:
                 LIMIT $5
                 """,
                 self.session_id, self.agent_id, padded_query,
-                json.dumps(metadata_filter), limit,
+                json.dumps(metadata_filter), resolved_limit,
             )
             return format_rows(rows, extra_fields=["similarity"])
 
@@ -661,17 +688,18 @@ class MemoryServicePG:
         self,
         text_query: str,
         query_embedding: list[float],
-        limit: int = 10,
+        limit: int | None = None,
         text_weight: float = 0.3,
         vector_weight: float = 0.7,
         start_date: datetime | None = None,
         end_date: datetime | None = None,
     ) -> list[dict[str, Any]]:
         """Hybrid search combining full-text search and vector similarity."""
+        resolved_limit = _search_limit(limit)
         has_col = await self._check_superseded_column()
         padded_query = pad_embedding(query_embedding)
         sql, params = build_hybrid_search_sql(
-            self.session_id, self.agent_id, text_query, padded_query, limit,
+            self.session_id, self.agent_id, text_query, padded_query, resolved_limit,
             text_weight=text_weight, vector_weight=vector_weight,
             start_date=start_date, end_date=end_date,
             include_active_filter=has_col,
@@ -688,10 +716,12 @@ class MemoryServicePG:
         self,
         text_query: str,
         query_embedding: list[float],
-        limit: int = _recall_cfg.default_search_limit,
-        k: int = _recall_cfg.rrf_k,
+        limit: int | None = None,
+        k: int | None = None,
     ) -> list[dict[str, Any]]:
         """Hybrid search using Reciprocal Rank Fusion."""
+        resolved_limit = _search_limit(limit)
+        resolved_k = _rrf_k(k)
         has_col = await self._check_superseded_column()
         active_filter = f"AND {ACTIVE_ROW_FILTER}" if has_col else ""
         padded_query = pad_embedding(query_embedding)
@@ -737,7 +767,7 @@ class MemoryServicePG:
                 LIMIT $6
                 """,
                 self.session_id, self.agent_id, text_query,
-                padded_query, k, limit,
+                padded_query, resolved_k, resolved_limit,
             )
             return format_rows(
                 rows, extra_fields=["rrf_score"], float_fields=["rrf_score"]
@@ -822,9 +852,10 @@ class MemoryServicePG:
         query: str,
         tags: list[str] | None = None,
         tag_match_mode: str = "any",
-        limit: int = _recall_cfg.default_search_limit,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         """Search archival memory with optional tag filtering."""
+        resolved_limit = _search_limit(limit)
         has_col = await self._check_superseded_column()
         active_filter = f"AND a.{ACTIVE_ROW_FILTER}" if has_col else ""
         async with get_connection() as conn:
@@ -845,7 +876,7 @@ class MemoryServicePG:
                     ORDER BY score DESC
                     LIMIT $4
                     """,
-                    self.session_id, self.agent_id, query, limit,
+                    self.session_id, self.agent_id, query, resolved_limit,
                 )
             elif tag_match_mode == "all":
                 rows = await conn.fetch(
@@ -871,7 +902,7 @@ class MemoryServicePG:
                     LIMIT $6
                     """,
                     self.session_id, self.agent_id, query,
-                    tags, len(tags), limit,
+                    tags, len(tags), resolved_limit,
                 )
             else:
                 rows = await conn.fetch(
@@ -894,7 +925,7 @@ class MemoryServicePG:
                     ORDER BY score DESC
                     LIMIT $5
                     """,
-                    self.session_id, self.agent_id, query, tags, limit,
+                    self.session_id, self.agent_id, query, tags, resolved_limit,
                 )
 
             return format_rows(rows, extra_fields=["score"], float_fields=["score"])
@@ -920,8 +951,9 @@ class MemoryServicePG:
         )
         return format_recall_text(core_matches, archival_results)
 
-    async def to_context(self, max_archival: int = _db_cfg.max_archival_context) -> str:
+    async def to_context(self, max_archival: int | None = None) -> str:
         """Generate context string for prompt injection."""
+        resolved_max_archival = _max_archival(max_archival)
         core = await self.get_all_core()
         has_col = await self._check_superseded_column()
         active_filter = f"AND {ACTIVE_ROW_FILTER}" if has_col else ""
@@ -935,7 +967,7 @@ class MemoryServicePG:
                 ORDER BY created_at DESC
                 LIMIT $3
                 """,
-                self.session_id, self.agent_id, max_archival,
+                self.session_id, self.agent_id, resolved_max_archival,
             )
 
         archival_contents = [row["content"] for row in rows]

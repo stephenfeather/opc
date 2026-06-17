@@ -19,7 +19,6 @@ from pathlib import Path
 import pytest
 
 from scripts.core.artifact_index import (
-    build_index_payload,
     db_execute,
     index_single_file,
     init_sqlite,
@@ -64,7 +63,7 @@ class TestIndexSingleFileReturnsId:
     def test_returns_structured_result(self, conn, tmp_path):
         f = _write_handoff(tmp_path)
         result = index_single_file(conn, f)
-        assert result is not None
+        assert result["success"] is True
         assert result["type"] == "handoff"
         assert result["file"] == f.name
         assert result["id"]
@@ -94,26 +93,21 @@ class TestIndexSingleFileReturnsId:
         ).fetchone()[0]
         assert count == 1
 
-    def test_unknown_type_returns_none(self, conn, tmp_path):
+    def test_unknown_type_returns_failure_with_error(self, conn, tmp_path):
         f = tmp_path / "notes.txt"
         f.write_text("not an artifact")
-        assert index_single_file(conn, f) is None
+        result = index_single_file(conn, f)
+        assert result["success"] is False
+        assert "error" in result
+        assert "id" not in result
 
-
-class TestBuildIndexPayload:
-    def test_success_payload_includes_fields(self):
-        result = {"id": "abc123", "type": "handoff", "file": "x.md"}
-        payload = build_index_payload(result)
-        assert payload == {
-            "success": True,
-            "id": "abc123",
-            "type": "handoff",
-            "file": "x.md",
-        }
-
-    def test_failure_payload(self):
-        payload = build_index_payload(None)
-        assert payload == {"success": False}
+    def test_db_failure_returns_error(self, tmp_path):
+        # A connection whose write fails must surface a machine-readable error,
+        # not just success: False.
+        f = _write_handoff(tmp_path)
+        result = index_single_file(_RaisingPgConn(), f)
+        assert result["success"] is False
+        assert "boom db" in result["error"]
 
 
 class TestCliJson:
@@ -163,7 +157,8 @@ class TestCliJson:
         assert proc.returncode == 1
         # stdout must be parseable JSON only — diagnostics belong on stderr.
         payload = json.loads(proc.stdout)
-        assert payload == {"success": False}
+        assert payload["success"] is False
+        assert "error" in payload
         assert "Unknown file type" in proc.stderr
 
     def test_json_file_not_found_emits_json_failure(self, tmp_path):
@@ -203,6 +198,24 @@ class _FakePgConn:
 
     def cursor(self):
         return self.cursor_obj
+
+
+class _RaisingPgCursor:
+    def execute(self, sql, params=()):
+        raise RuntimeError("boom db")
+
+    def close(self):
+        pass
+
+
+class _RaisingPgConn:
+    """Fake non-sqlite connection whose writes fail, to exercise error paths."""
+
+    def cursor(self):
+        return _RaisingPgCursor()
+
+    def commit(self):
+        pass
 
 
 class TestDbExecutePostgresReturningId:

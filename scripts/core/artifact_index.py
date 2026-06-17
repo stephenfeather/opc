@@ -472,8 +472,13 @@ def index_continuity(conn, base_path: Path = Path(".")):
     return count
 
 
-def _index_handoff(conn, data: dict) -> str | None:
-    """Write handoff data to database. Returns the stored row id."""
+def _index_handoff(conn, data: dict, return_id: bool = False) -> str | None:
+    """Write handoff data to database.
+
+    Returns the stored row id when ``return_id`` is True (single-file path),
+    else ``None``. Bulk callers leave it False to keep the fire-and-forget
+    write path, matching the plan/continuity bulk writers.
+    """
     return db_execute(
         conn,
         """
@@ -501,12 +506,12 @@ def _index_handoff(conn, data: dict) -> str | None:
             data["braintrust_session_id"],
             data["created_at"],
         ),
-        return_id=True,
+        return_id=return_id,
     )
 
 
-def _index_plan(conn, data: dict) -> str | None:
-    """Write plan data to database. Returns the stored row id."""
+def _index_plan(conn, data: dict, return_id: bool = False) -> str | None:
+    """Write plan data to database. Returns the stored row id when requested."""
     return db_execute(
         conn,
         """
@@ -523,12 +528,12 @@ def _index_plan(conn, data: dict) -> str | None:
             data["phases"],
             data["constraints"],
         ),
-        return_id=True,
+        return_id=return_id,
     )
 
 
-def _index_continuity(conn, data: dict) -> str | None:
-    """Write continuity data to database. Returns the stored row id."""
+def _index_continuity(conn, data: dict, return_id: bool = False) -> str | None:
+    """Write continuity data to database. Returns the stored row id when requested."""
     return db_execute(
         conn,
         """
@@ -548,7 +553,7 @@ def _index_continuity(conn, data: dict) -> str | None:
             data["key_decisions"],
             data["snapshot_reason"],
         ),
-        return_id=True,
+        return_id=return_id,
     )
 
 
@@ -561,46 +566,40 @@ _INDEX_DISPATCH = {
 }
 
 
-def index_single_file(conn, file_path: Path) -> dict | None:
+def index_single_file(conn, file_path: Path) -> dict:
     """Index a single file based on its location/type.
 
-    Returns a dict ``{"id", "type", "file"}`` on success, where ``id`` is the
-    primary-key id the database actually persisted (a DB-generated UUID on
-    PostgreSQL, the deterministic file id on SQLite). Returns ``None`` if the
-    file type is unknown or indexing fails. Diagnostics go to stderr so callers
-    can keep stdout machine-readable; callers own stdout/exit-code formatting.
+    Returns a result dict that doubles as the machine-readable ``--json``
+    payload:
+
+    - success: ``{"success": True, "id", "type", "file"}`` where ``id`` is the
+      primary-key id the database actually persisted (a DB-generated UUID on
+      PostgreSQL, the deterministic file id on SQLite).
+    - failure: ``{"success": False, "error": <reason>}`` for an unknown file
+      type or any parser/writer/commit error.
+
+    Diagnostics are also echoed to stderr so the human (non-JSON) path keeps
+    stdout clean; the ``error`` is carried in the result so machine callers can
+    distinguish *why* indexing failed (bad path vs DB rejection vs commit).
     """
     file_path = Path(file_path).resolve()
     file_type = classify_file(file_path)
 
     if file_type is None:
-        print(f"Unknown file type, skipping: {file_path}", file=sys.stderr)
-        return None
+        msg = f"Unknown file type, skipping: {file_path}"
+        print(msg, file=sys.stderr)
+        return {"success": False, "error": msg}
 
     parser, writer, label = _INDEX_DISPATCH[file_type]
     try:
         data = parser(file_path)
-        row_id = writer(conn, data)
+        row_id = writer(conn, data, return_id=True)
         conn.commit()
-        return {"id": row_id, "type": label, "file": file_path.name}
+        return {"success": True, "id": row_id, "type": label, "file": file_path.name}
     except Exception as e:
-        print(f"Error indexing {label} {file_path}: {e}", file=sys.stderr)
-        return None
-
-
-def build_index_payload(result: dict | None, error: str | None = None) -> dict:
-    """Shape the ``--json`` CLI response for a single-file index operation.
-
-    ``result`` is the return value of :func:`index_single_file`. On failure
-    (``result is None``) an optional ``error`` string is included so machine
-    callers get a reason alongside ``success: false``.
-    """
-    if result is None:
-        payload: dict = {"success": False}
-        if error:
-            payload["error"] = error
-        return payload
-    return {"success": True, **result}
+        msg = f"Error indexing {label} {file_path}: {e}"
+        print(msg, file=sys.stderr)
+        return {"success": False, "error": msg}
 
 
 def main() -> int:
@@ -634,22 +633,20 @@ def main() -> int:
         if not file_path.exists():
             msg = f"File not found: {file_path}"
             print(msg, file=sys.stderr)
-            if args.json:
-                print(json.dumps(build_index_payload(None, error=msg)))
-            return 1
-
-        if using_pg:
-            conn = init_postgres()
+            result = {"success": False, "error": msg}
         else:
-            conn = init_sqlite(get_db_path(args.db))
+            if using_pg:
+                conn = init_postgres()
+            else:
+                conn = init_sqlite(get_db_path(args.db))
+            result = index_single_file(conn, file_path)
+            conn.close()
 
-        result = index_single_file(conn, file_path)
-        conn.close()
         if args.json:
-            print(json.dumps(build_index_payload(result)))
-        elif result is not None:
+            print(json.dumps(result))
+        elif result["success"]:
             print(f"Indexed {result['type']}: {result['file']}")
-        return 0 if result is not None else 1
+        return 0 if result["success"] else 1
 
     if not any([args.handoffs, args.plans, args.continuity, args.all]):
         parser.print_help()

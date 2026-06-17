@@ -58,11 +58,6 @@ logger = logging.getLogger(__name__)
 from scripts.core.config import get_config as _get_config
 from scripts.core.config.models import DatabaseConfig, RecallConfig
 
-# Capability probe for the embedding_model column (issue #151, round 1 FIX 1).
-# Deferred import (matches the config import above) and circular-safe:
-# recall_backends does not import this module.
-from scripts.core.recall_backends import embedding_model_column_available
-
 
 def _recall_cfg() -> RecallConfig:
     """Return current recall config.
@@ -88,6 +83,19 @@ def _rrf_k(k: int | None) -> int:
 
 def _max_archival(max_archival: int | None) -> int:
     return _db_cfg().max_archival_context if max_archival is None else max_archival
+
+
+async def _embedding_model_column_available(conn: Any) -> bool:
+    """Probe lazily so importing this module does not warm config caches.
+
+    ``recall_backends`` still keeps its own import-time config defaults. Import
+    it only on paths that actually need the embedding-model capability probe,
+    otherwise ``memory_service_pg`` import would indirectly freeze config before
+    callers can set test/runtime overrides.
+    """
+    from scripts.core.recall_backends import embedding_model_column_available
+
+    return await embedding_model_column_available(conn)
 
 
 class EmbeddingProvider(Protocol):
@@ -564,7 +572,7 @@ class MemoryServicePG:
         async with get_connection() as conn:
             await init_pgvector(conn)
             model_label = embedding_model
-            if model_label and not await embedding_model_column_available(conn):
+            if model_label and not await _embedding_model_column_available(conn):
                 model_label = None
             sql, params = build_vector_search_sql(
                 self.session_id, self.agent_id, padded_query, resolved_limit,
@@ -664,7 +672,7 @@ class MemoryServicePG:
         async with get_connection() as conn:
             await init_pgvector(conn)
             model_filter = ""
-            if embedding_model and await embedding_model_column_available(conn):
+            if embedding_model and await _embedding_model_column_available(conn):
                 model_filter = f"AND embedding_model = ${len(params) + 1}"
                 params.append(embedding_model)
             rows = await conn.fetch(

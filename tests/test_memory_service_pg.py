@@ -6,7 +6,9 @@ and verifying they correctly delegate to the pure query functions.
 
 from __future__ import annotations
 
+import importlib
 import json
+import sys
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
@@ -751,6 +753,15 @@ class TestConfigWiring:
             await svc.search_text("needle")
 
         assert build_sql.call_args.args[3] == 37
+
+    def test_module_import_does_not_load_config(self):
+        sys.modules.pop("scripts.core.db.memory_service_pg", None)
+
+        with patch("scripts.core.config.get_config") as get_config:
+            module = importlib.import_module("scripts.core.db.memory_service_pg")
+
+        get_config.assert_not_called()
+        assert module.MemoryServicePG is not None
 
     async def test_search_text_explicit_limit_overrides_config_default(self):
         from scripts.core.db.memory_service_pg import MemoryServicePG

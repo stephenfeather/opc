@@ -56,6 +56,7 @@ logger = logging.getLogger(__name__)
 
 # Load config defaults lazily for search methods.
 from scripts.core.config import get_config as _get_config
+from scripts.core.config.models import DatabaseConfig, RecallConfig
 
 # Capability probe for the embedding_model column (issue #151, round 1 FIX 1).
 # Deferred import (matches the config import above) and circular-safe:
@@ -63,7 +64,7 @@ from scripts.core.config import get_config as _get_config
 from scripts.core.recall_backends import embedding_model_column_available
 
 
-def _recall_cfg() -> Any:
+def _recall_cfg() -> RecallConfig:
     """Return current recall config.
 
     Keep this at call time so tests and long-lived processes can reset or
@@ -72,7 +73,7 @@ def _recall_cfg() -> Any:
     return _get_config().recall
 
 
-def _db_cfg() -> Any:
+def _db_cfg() -> DatabaseConfig:
     """Return current database config at call time."""
     return _get_config().database
 

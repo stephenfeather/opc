@@ -567,14 +567,14 @@ def index_single_file(conn, file_path: Path) -> dict | None:
     Returns a dict ``{"id", "type", "file"}`` on success, where ``id`` is the
     primary-key id the database actually persisted (a DB-generated UUID on
     PostgreSQL, the deterministic file id on SQLite). Returns ``None`` if the
-    file type is unknown or indexing fails. Callers handle their own
-    stdout/exit-code formatting.
+    file type is unknown or indexing fails. Diagnostics go to stderr so callers
+    can keep stdout machine-readable; callers own stdout/exit-code formatting.
     """
     file_path = Path(file_path).resolve()
     file_type = classify_file(file_path)
 
     if file_type is None:
-        print(f"Unknown file type, skipping: {file_path}")
+        print(f"Unknown file type, skipping: {file_path}", file=sys.stderr)
         return None
 
     parser, writer, label = _INDEX_DISPATCH[file_type]
@@ -584,17 +584,22 @@ def index_single_file(conn, file_path: Path) -> dict | None:
         conn.commit()
         return {"id": row_id, "type": label, "file": file_path.name}
     except Exception as e:
-        print(f"Error indexing {label} {file_path}: {e}")
+        print(f"Error indexing {label} {file_path}: {e}", file=sys.stderr)
         return None
 
 
-def build_index_payload(result: dict | None) -> dict:
+def build_index_payload(result: dict | None, error: str | None = None) -> dict:
     """Shape the ``--json`` CLI response for a single-file index operation.
 
-    ``result`` is the return value of :func:`index_single_file`.
+    ``result`` is the return value of :func:`index_single_file`. On failure
+    (``result is None``) an optional ``error`` string is included so machine
+    callers get a reason alongside ``success: false``.
     """
     if result is None:
-        return {"success": False}
+        payload: dict = {"success": False}
+        if error:
+            payload["error"] = error
+        return payload
     return {"success": True, **result}
 
 
@@ -621,11 +626,16 @@ def main() -> int:
     using_pg = use_postgres() and not args.db  # Custom db path forces SQLite
     db_type = "PostgreSQL" if using_pg else "SQLite"
 
-    # Handle single file indexing (fast path for hooks)
+    # Handle single file indexing (fast path for hooks).
+    # With --json, stdout is kept strictly machine-readable: exactly one JSON
+    # object is printed on every path and all diagnostics go to stderr.
     if args.file:
         file_path = Path(args.file)
         if not file_path.exists():
-            print(f"File not found: {file_path}")
+            msg = f"File not found: {file_path}"
+            print(msg, file=sys.stderr)
+            if args.json:
+                print(json.dumps(build_index_payload(None, error=msg)))
             return 1
 
         if using_pg:

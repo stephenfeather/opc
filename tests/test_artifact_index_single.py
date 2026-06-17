@@ -20,6 +20,7 @@ import pytest
 
 from scripts.core.artifact_index import (
     build_index_payload,
+    db_execute,
     index_single_file,
     init_sqlite,
 )
@@ -151,3 +152,81 @@ class TestCliJson:
         proc = self._run(["--file", str(f), "--db", str(db)])
         assert proc.returncode == 0, proc.stderr
         assert proc.stdout.strip() == "Indexed handoff: task-10.md"
+
+    def test_json_unknown_type_stdout_is_pure_json(self, tmp_path):
+        # Not under a handoffs/plans path and not a continuity ledger.
+        f = tmp_path / "notes.txt"
+        f.write_text("not an artifact")
+        db = tmp_path / "ctx.db"
+
+        proc = self._run(["--file", str(f), "--db", str(db), "--json"])
+        assert proc.returncode == 1
+        # stdout must be parseable JSON only — diagnostics belong on stderr.
+        payload = json.loads(proc.stdout)
+        assert payload == {"success": False}
+        assert "Unknown file type" in proc.stderr
+
+    def test_json_file_not_found_emits_json_failure(self, tmp_path):
+        missing = tmp_path / "handoffs" / "nope.md"
+        db = tmp_path / "ctx.db"
+
+        proc = self._run(["--file", str(missing), "--db", str(db), "--json"])
+        assert proc.returncode == 1
+        payload = json.loads(proc.stdout)
+        assert payload["success"] is False
+        assert "error" in payload
+        assert "File not found" in proc.stderr
+
+
+class _FakePgCursor:
+    """Minimal psycopg2-like cursor recording the executed SQL."""
+
+    def __init__(self, returned_id):
+        self._returned_id = returned_id
+        self.executed_sql = None
+
+    def execute(self, sql, params=()):
+        self.executed_sql = sql
+
+    def fetchone(self):
+        return (self._returned_id,)
+
+    def close(self):
+        pass
+
+
+class _FakePgConn:
+    """Fake non-sqlite connection so db_execute takes the PostgreSQL path."""
+
+    def __init__(self, returned_id):
+        self.cursor_obj = _FakePgCursor(returned_id)
+
+    def cursor(self):
+        return self.cursor_obj
+
+
+class TestDbExecutePostgresReturningId:
+    """db_execute must append RETURNING id and return the DB-stored id on PG."""
+
+    def test_returns_db_generated_id_and_appends_returning(self):
+        uuid_value = "48d985fb-e318-4f07-ab16-2727b6a66dec"
+        conn = _FakePgConn(uuid_value)
+        result = db_execute(
+            conn,
+            "INSERT OR REPLACE INTO plans (id, title) VALUES (?, ?)",
+            ("hex123", "A plan"),
+            return_id=True,
+        )
+        assert result == uuid_value
+        assert "RETURNING id" in conn.cursor_obj.executed_sql
+
+    def test_no_returning_clause_when_return_id_false(self):
+        conn = _FakePgConn("ignored")
+        result = db_execute(
+            conn,
+            "INSERT OR REPLACE INTO plans (id, title) VALUES (?, ?)",
+            ("hex123", "A plan"),
+            return_id=False,
+        )
+        assert result is None
+        assert "RETURNING id" not in conn.cursor_obj.executed_sql

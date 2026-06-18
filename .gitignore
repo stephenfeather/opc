@@ -8,6 +8,7 @@ __pycache__/
 # Environment
 .env
 .env.backup.*
+.envrc
 
 # Database backups (contain sensitive data)
 backups/*.dump
@@ -28,6 +29,7 @@ coverage.xml
 # Claude Code
 .claude/
 CLAUDE.md
+AGENT.md
 
 # Worktrees
 .worktrees/

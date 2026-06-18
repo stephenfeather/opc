@@ -98,6 +98,26 @@ class _SlowEmbedder:
         self.closed = True
 
 
+class _SlowConstructEmbedder:
+    """__init__ blocks far past the recall deadline (simulating a cold LOCAL
+    sentence-transformers model load, ~14s). embed() would succeed instantly if
+    construction ever finished. Issue #152: construction must run inside the
+    QUERY_EMBED_TIMEOUT budget so a budgeted caller degrades instead of hanging
+    through the synchronous load."""
+
+    CONSTRUCT_SLEEP = 5.0
+
+    def __init__(self, *a: Any, **kw: Any) -> None:
+        import time as _time
+
+        _time.sleep(self.CONSTRUCT_SLEEP)
+
+    async def embed(self, *_a: Any, **_kw: Any) -> list[float]:
+        return [0.1] * 8
+
+    async def aclose(self) -> None: ...
+
+
 @pytest.fixture(autouse=True)
 def _reset_degrade_latch():
     """Reset the once-per-process stderr warning latch AND the module-level
@@ -110,11 +130,13 @@ def _reset_degrade_latch():
     rb.reset_project_column_cache()
     rb.reset_embedding_model_column_cache()
     rb.reset_hnsw_iterative_scan_cache()
+    rb.reset_construct_inflight()
     yield
     rb._EMBED_DEGRADE_WARNED = False
     rb.reset_project_column_cache()
     rb.reset_embedding_model_column_cache()
     rb.reset_hnsw_iterative_scan_cache()
+    rb.reset_construct_inflight()
 
 
 def _patch_pool(monkeypatch) -> None:
@@ -484,3 +506,255 @@ class TestHybridEmbedFallback:
         # Redaction + no query text still hold.
         assert "first query" not in err
         assert "second query" not in err
+
+    async def test_slow_construction_degrades_within_deadline(self, monkeypatch):
+        """Issue #152: EmbeddingService construction (the LOCAL model load) now
+        runs INSIDE the QUERY_EMBED_TIMEOUT budget. A construction that blocks
+        far past the deadline must degrade to text-only quickly — not hang the
+        caller through the synchronous load (the pre-#152 bug)."""
+        from scripts.core import recall_backends as rb
+
+        monkeypatch.setattr(rb, "QUERY_EMBED_TIMEOUT", 0.05)
+        _patch_embedder(monkeypatch, _SlowConstructEmbedder)
+        _patch_pool(monkeypatch)
+
+        async def fake_text_only(query, k=10, *, project=None):
+            return [dict(_TEXT_RESULT)]
+
+        monkeypatch.setattr(rb, "search_learnings_text_only_postgres", fake_text_only)
+
+        start = time.monotonic()
+        results = await rb.search_learnings_hybrid_rrf(
+            "query terms",
+            k=3,
+            provider="local",
+        )
+        elapsed = time.monotonic() - start
+
+        assert results == [dict(_TEXT_RESULT)]
+        # Well under the 5s construct sleep (and the hook's 5s budget). With the
+        # pre-#152 synchronous construction this blocked the loop for ~5s.
+        assert elapsed < 3.0, f"degrade took {elapsed:.2f}s; construction not bounded"
+
+    async def test_slow_construction_emits_timeout_warning(self, monkeypatch, capsys):
+        """A construction that exceeds the deadline flows into the same latched,
+        redacted, provider-named 'timed out' warning as a stalled embed."""
+        from scripts.core import recall_backends as rb
+
+        monkeypatch.setattr(rb, "QUERY_EMBED_TIMEOUT", 0.05)
+        _patch_embedder(monkeypatch, _SlowConstructEmbedder)
+        _patch_pool(monkeypatch)
+
+        async def fake_text_only(query, k=10, *, project=None):
+            return [dict(_TEXT_RESULT)]
+
+        monkeypatch.setattr(rb, "search_learnings_text_only_postgres", fake_text_only)
+
+        await rb.search_learnings_hybrid_rrf("secret query", k=3, provider="local")
+
+        err = capsys.readouterr().err
+        assert "warning" in err.lower()
+        assert "timed out" in err.lower()
+        assert "local" in err.lower()
+        assert "secret query" not in err
+
+    async def test_construct_off_thread_uses_daemon_thread(self, monkeypatch):
+        """Issue #152: the construction worker MUST be a daemon thread so a
+        short-lived caller (the memory-awareness hook subprocess) exits promptly
+        after degrading instead of joining an uncancellable ~14s model load at
+        interpreter shutdown."""
+        import threading as _threading
+
+        from scripts.core import recall_backends as rb
+        from scripts.core.db import embedding_providers as ep
+
+        # Force the cold local path (the only path that uses a worker thread).
+        monkeypatch.setattr(ep, "local_model_cached", lambda *a, **k: False)
+
+        captured: dict[str, Any] = {}
+        real_thread_cls = _threading.Thread
+
+        def _spy_thread(*a: Any, **kw: Any):
+            captured["daemon"] = kw.get("daemon")
+            return real_thread_cls(*a, **kw)
+
+        monkeypatch.setattr(rb.threading, "Thread", _spy_thread)
+        _patch_embedder(monkeypatch, _OkEmbedder)
+
+        embedder = await rb._construct_embedder_off_thread("local")
+
+        assert isinstance(embedder, _OkEmbedder)
+        assert captured.get("daemon") is True
+
+    async def test_construct_off_thread_marshals_construct_error(self, monkeypatch):
+        """A constructor that raises in the worker thread propagates to the
+        awaiting caller (so the degrade guard catches it), not silently."""
+        from scripts.core import recall_backends as rb
+        from scripts.core.db import embedding_providers as ep
+
+        # Cold local path so the error is marshalled back from the worker thread.
+        monkeypatch.setattr(ep, "local_model_cached", lambda *a, **k: False)
+        _patch_embedder(monkeypatch, _ConstructRaisingEmbedder)
+
+        with pytest.raises(ValueError):
+            await rb._construct_embedder_off_thread("local")
+
+    async def test_settle_future_result_is_noop_when_done(self):
+        """A late worker-thread settle on an already-cancelled future (caller
+        degraded on timeout) must be a no-op, never InvalidStateError."""
+        from scripts.core import recall_backends as rb
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        fut.cancel()
+
+        # Must not raise.
+        rb._settle_future_result(fut, object())
+        rb._settle_future_exc(fut, RuntimeError("late"))
+
+    async def test_construct_off_thread_bounds_inflight(self, monkeypatch):
+        """Issue #152 round 1 (finding 2): once the in-flight construction cap
+        is reached, further constructions raise immediately (caller degrades)
+        instead of spawning more daemon threads — bounding the thread leak when
+        a cold model load is stuck."""
+        import threading as _threading
+
+        from scripts.core import recall_backends as rb
+        from scripts.core.db import embedding_providers as ep
+
+        # Cold local path (warm would bypass the cap), cap fully saturated.
+        monkeypatch.setattr(ep, "local_model_cached", lambda *a, **k: False)
+        monkeypatch.setattr(rb, "_MAX_CONSTRUCT_INFLIGHT", 0)
+
+        spawned = {"n": 0}
+        real_thread_cls = _threading.Thread
+
+        def _spy_thread(*a: Any, **kw: Any):
+            spawned["n"] += 1
+            return real_thread_cls(*a, **kw)
+
+        monkeypatch.setattr(rb.threading, "Thread", _spy_thread)
+        _patch_embedder(monkeypatch, _OkEmbedder)
+
+        with pytest.raises(RuntimeError):
+            await rb._construct_embedder_off_thread("local")
+
+        # The cap is checked before any worker thread is started.
+        assert spawned["n"] == 0
+
+    async def test_construct_off_thread_cap_does_not_block_fast_providers(
+        self, monkeypatch
+    ):
+        """Issue #152 round 2 (finding 3): the in-flight cap is scoped to the
+        slow LOCAL load. A saturated cap must NOT make fast providers
+        (voyage/openai/ollama) degrade — they have no model load to bound."""
+        from scripts.core import recall_backends as rb
+
+        # Cap fully saturated for local...
+        monkeypatch.setattr(rb, "_MAX_CONSTRUCT_INFLIGHT", 0)
+        _patch_embedder(monkeypatch, _OkEmbedder)
+
+        # ...yet a voyage construction still succeeds (not capped).
+        embedder = await rb._construct_embedder_off_thread("voyage")
+        assert isinstance(embedder, _OkEmbedder)
+
+    async def test_warm_local_constructs_inline(self, monkeypatch):
+        """Issue #152 round 3 (finding 1): a warm local cache hit must construct
+        inline — no worker thread, and not subject to the cold-load cap — so the
+        common steady-state recall does not pay the thread/Future cost."""
+        import threading as _threading
+
+        from scripts.core import recall_backends as rb
+        from scripts.core.db import embedding_providers as ep
+
+        # Model already cached → warm.
+        monkeypatch.setattr(ep, "local_model_cached", lambda *a, **k: True)
+        # Cap saturated: if warm went through the cap it would wrongly raise.
+        monkeypatch.setattr(rb, "_MAX_CONSTRUCT_INFLIGHT", 0)
+
+        spawned = {"n": 0}
+        real_thread_cls = _threading.Thread
+
+        def _spy_thread(*a: Any, **kw: Any):
+            spawned["n"] += 1
+            return real_thread_cls(*a, **kw)
+
+        monkeypatch.setattr(rb.threading, "Thread", _spy_thread)
+        _patch_embedder(monkeypatch, _OkEmbedder)
+
+        embedder = await rb._construct_embedder_off_thread("local")
+
+        assert isinstance(embedder, _OkEmbedder)
+        assert spawned["n"] == 0  # inline, no worker thread
+
+    async def test_construct_inflight_rolled_back_on_thread_start_failure(
+        self, monkeypatch
+    ):
+        """Issue #152 round 3 (finding 2): if Thread.start() raises (OS thread
+        exhaustion), the in-flight counter must roll back — otherwise the cap
+        leaks and eventually wedges all local recalls until process restart."""
+        from scripts.core import recall_backends as rb
+        from scripts.core.db import embedding_providers as ep
+
+        monkeypatch.setattr(ep, "local_model_cached", lambda *a, **k: False)
+        _patch_embedder(monkeypatch, _OkEmbedder)
+
+        class _BadThread:
+            def __init__(self, *a: Any, **kw: Any) -> None: ...
+
+            def start(self) -> None:
+                raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(rb.threading, "Thread", _BadThread)
+
+        before = rb._construct_inflight
+        with pytest.raises(RuntimeError):
+            await rb._construct_embedder_off_thread("local")
+
+        # Counter restored: the failed start did not leak a permanent +1.
+        assert rb._construct_inflight == before
+
+
+class TestLocalLoadOutputSafety:
+    """Issue #152 round 1 (finding 1): the local model load must not redirect
+    process-global stdout/stderr, because it can run on a daemon thread that
+    outlives the recall caller and would otherwise swallow the degraded-recall
+    warning + CLI output."""
+
+    def test_load_does_not_redirect_process_fds(self, monkeypatch):
+        import os as _os
+
+        import sentence_transformers
+
+        from scripts.core.db import embedding_providers as ep
+
+        class _FakeST:
+            def __init__(self, model, device=None):
+                # If the loader redirected fds 1/2, this stdout write would be
+                # swallowed; the assertion below is on dup2 calls, which is the
+                # precise mechanism the fix removes.
+                self._m = model
+
+            def get_sentence_embedding_dimension(self):
+                return 1024
+
+        monkeypatch.setattr(sentence_transformers, "SentenceTransformer", _FakeST)
+        ep.reset_local_model_cache()
+
+        dup2_targets: list[int] = []
+        real_dup2 = _os.dup2
+
+        def _spy_dup2(src, dst, *a):
+            dup2_targets.append(dst)
+            return real_dup2(src, dst, *a)
+
+        monkeypatch.setattr(ep.os, "dup2", _spy_dup2)
+
+        try:
+            ep._load_sentence_transformer("BAAI/bge-large-en-v1.5", None)
+        finally:
+            ep.reset_local_model_cache()
+
+        # stdout(1)/stderr(2) must never be redirected by the load path.
+        assert 1 not in dup2_targets
+        assert 2 not in dup2_targets

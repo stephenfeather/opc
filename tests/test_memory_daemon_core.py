@@ -257,6 +257,7 @@ class TestExtractionEnvAllowlist:
             "CLAUDE_ＴＯＫＥＮ",
             "CLAUDE_TOKEN-NAME",
             "claude_token",
+            "",
         ],
     )
     def test_unsupported_env_names_filtered_before_allow_prefix(self, key):

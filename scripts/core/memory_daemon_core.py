@@ -98,7 +98,7 @@ _ALLOW_ENV_PREFIXES: tuple[str, ...] = ("LC_", "XDG_", "CLAUDE_")
 
 def _is_supported_env_name(key: str) -> bool:
     """Return True if ``key`` uses the conservative env-name alphabet."""
-    return key.isascii() and all(c == "_" or c.isdigit() or "A" <= c <= "Z" for c in key)
+    return bool(key) and all(c == "_" or "0" <= c <= "9" or "A" <= c <= "Z" for c in key)
 
 
 # Case-insensitive substring markers that flag an env name as secret-bearing.

@@ -130,11 +130,13 @@ def _reset_degrade_latch():
     rb.reset_project_column_cache()
     rb.reset_embedding_model_column_cache()
     rb.reset_hnsw_iterative_scan_cache()
+    rb.reset_construct_inflight()
     yield
     rb._EMBED_DEGRADE_WARNED = False
     rb.reset_project_column_cache()
     rb.reset_embedding_model_column_cache()
     rb.reset_hnsw_iterative_scan_cache()
+    rb.reset_construct_inflight()
 
 
 def _patch_pool(monkeypatch) -> None:
@@ -602,3 +604,75 @@ class TestHybridEmbedFallback:
         # Must not raise.
         rb._settle_future_result(fut, object())
         rb._settle_future_exc(fut, RuntimeError("late"))
+
+    async def test_construct_off_thread_bounds_inflight(self, monkeypatch):
+        """Issue #152 round 1 (finding 2): once the in-flight construction cap
+        is reached, further constructions raise immediately (caller degrades)
+        instead of spawning more daemon threads — bounding the thread leak when
+        a cold model load is stuck."""
+        import threading as _threading
+
+        from scripts.core import recall_backends as rb
+
+        monkeypatch.setattr(rb, "_MAX_CONSTRUCT_INFLIGHT", 0)
+
+        spawned = {"n": 0}
+        real_thread_cls = _threading.Thread
+
+        def _spy_thread(*a: Any, **kw: Any):
+            spawned["n"] += 1
+            return real_thread_cls(*a, **kw)
+
+        monkeypatch.setattr(rb.threading, "Thread", _spy_thread)
+        _patch_embedder(monkeypatch, _OkEmbedder)
+
+        with pytest.raises(RuntimeError):
+            await rb._construct_embedder_off_thread("local")
+
+        # The cap is checked before any worker thread is started.
+        assert spawned["n"] == 0
+
+
+class TestLocalLoadOutputSafety:
+    """Issue #152 round 1 (finding 1): the local model load must not redirect
+    process-global stdout/stderr, because it can run on a daemon thread that
+    outlives the recall caller and would otherwise swallow the degraded-recall
+    warning + CLI output."""
+
+    def test_load_does_not_redirect_process_fds(self, monkeypatch):
+        import os as _os
+
+        import sentence_transformers
+
+        from scripts.core.db import embedding_providers as ep
+
+        class _FakeST:
+            def __init__(self, model, device=None):
+                # If the loader redirected fds 1/2, this stdout write would be
+                # swallowed; the assertion below is on dup2 calls, which is the
+                # precise mechanism the fix removes.
+                self._m = model
+
+            def get_sentence_embedding_dimension(self):
+                return 1024
+
+        monkeypatch.setattr(sentence_transformers, "SentenceTransformer", _FakeST)
+        ep.reset_local_model_cache()
+
+        dup2_targets: list[int] = []
+        real_dup2 = _os.dup2
+
+        def _spy_dup2(src, dst, *a):
+            dup2_targets.append(dst)
+            return real_dup2(src, dst, *a)
+
+        monkeypatch.setattr(ep.os, "dup2", _spy_dup2)
+
+        try:
+            ep._load_sentence_transformer("BAAI/bge-large-en-v1.5", None)
+        finally:
+            ep.reset_local_model_cache()
+
+        # stdout(1)/stderr(2) must never be redirected by the load path.
+        assert 1 not in dup2_targets
+        assert 2 not in dup2_targets

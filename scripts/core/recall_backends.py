@@ -84,6 +84,28 @@ def _settle_future_exc(fut: asyncio.Future, exc: BaseException) -> None:
         fut.set_exception(exc)
 
 
+# Bound on concurrent construction worker threads (issue #152 round 1,
+# finding 2). wait_for cancellation cannot stop the uncancellable model load,
+# so each timed-out recall would otherwise leave its worker thread alive. Under
+# a stuck cold load (e.g. a wedged model download) with steady recall traffic
+# in one long-lived process, that is an unbounded daemon-thread leak. The cap
+# makes construction degrade to text-only (raise -> the caller's degrade guard)
+# once too many loads are already in flight, instead of piling up threads.
+# NOTE: we cap rather than coalesce onto one shared EmbeddingService — sharing
+# a single instance across concurrent recalls would let each caller's finally
+# aclose() it, causing a double-close / use-after-close for the next caller.
+_MAX_CONSTRUCT_INFLIGHT = 4
+_construct_inflight = 0
+_construct_inflight_lock = threading.Lock()
+
+
+def reset_construct_inflight() -> None:
+    """Reset the in-flight construction counter (test isolation; issue #152)."""
+    global _construct_inflight
+    with _construct_inflight_lock:
+        _construct_inflight = 0
+
+
 async def _construct_embedder_off_thread(provider: str) -> Any:
     """Construct an ``EmbeddingService`` on a daemon thread (issue #152).
 
@@ -96,9 +118,22 @@ async def _construct_embedder_off_thread(provider: str) -> Any:
     interpreter shutdown, so a short-lived caller (the memory-awareness hook
     subprocess) exits promptly after degrading instead of joining the load.
 
+    Raises ``RuntimeError`` (which the caller's degrade guard catches) when
+    ``_MAX_CONSTRUCT_INFLIGHT`` loads are already running, so a stuck cold load
+    cannot accumulate unbounded worker threads (finding 2).
+
     Imported lazily so test monkeypatches of ``EmbeddingService`` take effect.
     """
     from scripts.core.db.embedding_service import EmbeddingService
+
+    global _construct_inflight
+    with _construct_inflight_lock:
+        if _construct_inflight >= _MAX_CONSTRUCT_INFLIGHT:
+            raise RuntimeError(
+                f"embedder construction backlog ({_construct_inflight} loads "
+                "in flight); degrading to text-only"
+            )
+        _construct_inflight += 1
 
     loop = asyncio.get_running_loop()
     fut: asyncio.Future = loop.create_future()
@@ -114,12 +149,19 @@ async def _construct_embedder_off_thread(provider: str) -> Any:
             pass
 
     def _build() -> None:
+        global _construct_inflight
         try:
             embedder = EmbeddingService(provider=provider)
         except BaseException as exc:  # noqa: BLE001 - marshalled to the loop
             _settle(_settle_future_exc, exc)
         else:
             _settle(_settle_future_result, embedder)
+        finally:
+            # Decrement only when the load actually finishes (not when the
+            # caller times out) — that is what keeps the count an accurate
+            # ceiling on live worker threads.
+            with _construct_inflight_lock:
+                _construct_inflight -= 1
 
     threading.Thread(target=_build, name="recall-embedder-build", daemon=True).start()
     return await fut

@@ -412,6 +412,15 @@ def _load_sentence_transformer(model: str, device: str | None) -> Any:
         if cached is not None:
             return cached
 
+        # IMPORTANT (#152 round 1): do NOT redirect file descriptors 1/2 here.
+        # This load now runs on a daemon worker thread that can outlive the
+        # recall caller (deadline-bounded construction in recall_backends).
+        # ``os.dup2`` on fds 1/2 is process-global, so suppressing native
+        # loader output that way would also swallow the MAIN thread's degraded
+        # recall warning and the CLI's result print for the entire ~14s cold
+        # load — failing the fix in exactly the degraded case it exists to
+        # serve. Quiet only at the Python logging / tqdm level, which filters
+        # by logger and cannot hijack the parent process's stdout/stderr.
         loggers_to_quiet = [
             "sentence_transformers",
             "transformers",
@@ -423,28 +432,9 @@ def _load_sentence_transformer(model: str, device: str | None) -> Any:
             _logging.getLogger(name).setLevel(_logging.ERROR)
         prev_env = os.environ.get("TQDM_DISABLE")
         os.environ["TQDM_DISABLE"] = "1"
-        # fd-level redirection of stdout/stderr is process-global and not
-        # thread-safe; the lock above guarantees only one thread does it at a
-        # time.
-        devnull_fd = -1
-        old_stdout_fd = -1
-        old_stderr_fd = -1
         try:
-            devnull_fd = os.open(os.devnull, os.O_WRONLY)
-            old_stdout_fd = os.dup(1)
-            old_stderr_fd = os.dup(2)
-            os.dup2(devnull_fd, 1)
-            os.dup2(devnull_fd, 2)
             loaded = SentenceTransformer(model, device=device)
         finally:
-            if old_stderr_fd >= 0:
-                os.dup2(old_stderr_fd, 2)
-                os.close(old_stderr_fd)
-            if old_stdout_fd >= 0:
-                os.dup2(old_stdout_fd, 1)
-                os.close(old_stdout_fd)
-            if devnull_fd >= 0:
-                os.close(devnull_fd)
             if prev_env is None:
                 os.environ.pop("TQDM_DISABLE", None)
             else:

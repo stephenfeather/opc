@@ -51,6 +51,51 @@ def test_detail_composite_key_value_redacted():
     assert redact_db_values(text) == "Key (a, b)=(<redacted>) already exists."
 
 
+def test_detail_value_with_embedded_paren_does_not_leak_suffix():
+    # The value contains a right paren; nothing after )=( may survive on the
+    # value side. Over-redaction to the final paren is the safe direction;
+    # leaking any value char is the bug (Finding 1).
+    text = "DETAIL: Key (path)=(foo)bar) already exists."
+    out = redact_db_values(text)
+    assert "foo" not in out
+    assert "bar" not in out
+    assert ")=(<redacted>)" in out
+    assert out.endswith(" already exists.")
+
+
+def test_detail_value_is_parenthetical_secret_fully_redacted():
+    text = "DETAIL: Key (k)=((secret)) already exists."
+    out = redact_db_values(text)
+    assert "secret" not in out
+    assert ")=(<redacted>)" in out
+
+
+def test_detail_filesystem_path_value_with_parens_redacted():
+    text = "DETAIL: Key (file)=(/var/data (old)/backup.db) already exists."
+    out = redact_db_values(text)
+    assert "/var/data" not in out
+    assert "backup.db" not in out
+    assert ")=(<redacted>)" in out
+
+
+def test_detail_composite_value_with_embedded_paren_keeps_column_group():
+    text = "Key (a, b)=(1, 2)x) already exists."
+    out = redact_db_values(text)
+    assert "Key (a, b)=(<redacted>)" in out
+    assert out.startswith("Key (a, b)=(<redacted>)")
+    assert "1, 2" not in out
+
+
+def test_detail_redaction_does_not_cross_newline():
+    # The value match is newline-bounded so a multiline traceback is not
+    # over-collapsed across lines.
+    text = "DETAIL: Key (k)=(v) already exists.\nLINE 2: keep (this) paren\n"
+    out = redact_db_values(text)
+    assert "(this)" in out
+    assert ")=(<redacted>)" in out
+    assert "\n" in out
+
+
 # ---------------------------------------------------------------------------
 # redact_db_values — identifiers preserved
 # ---------------------------------------------------------------------------
@@ -151,6 +196,20 @@ def test_safe_exception_none_pgcode_has_no_bracket():
     e = _FakePgError("msg", None)  # type: ignore[arg-type]
     out = safe_exception(e)
     assert out == "_FakePgError: msg"
+
+
+def test_safe_exception_hostile_pgcode_property_does_not_raise():
+    # A hostile exception whose .pgcode property raises must not propagate
+    # out of the logging helper; it falls back to no [code] bracket (Finding 2).
+    class HostilePgcodeError(Exception):
+        @property
+        def pgcode(self):
+            raise RuntimeError("pgcode boom")
+
+    out = safe_exception(HostilePgcodeError("msg"))
+    assert isinstance(out, str)
+    assert "[" not in out
+    assert out == "HostilePgcodeError: msg"
 
 
 # ---------------------------------------------------------------------------

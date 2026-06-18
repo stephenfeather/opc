@@ -27,9 +27,14 @@ _DEFAULT_MAX_LEN = 500
 _SINGLE_QUOTED_LITERAL = re.compile(r"'[^']*'")
 
 # Unique-violation DETAIL echo: ``DETAIL: Key (col)=(value) already exists.``
-# Redact only the value group — the second paren-pair after ``=`` — leaving
-# the column-name group intact.
-_DETAIL_KEY_VALUE = re.compile(r"\)=\([^)]*\)")
+# Redact only the value group — the paren-pair after ``=`` — leaving the
+# column-name group intact. The value is matched GREEDILY through the LAST
+# ``)`` on the same line (``[^\n]*``): a value containing its own right paren
+# (e.g. ``(foo)bar)``) must not leak its suffix. ``[^\n]`` keeps the match on
+# one line so multiline tracebacks are not over-collapsed. Over-redacting a
+# trailing same-line parenthetical is the accepted safe direction; leaking any
+# value char is the bug this guards against (#117 review, Finding 1).
+_DETAIL_KEY_VALUE = re.compile(r"\)=\([^\n]*\)")
 _NONE_MARKER = "<none>"
 _UNREPRESENTABLE = "<unrepresentable>"
 
@@ -197,8 +202,9 @@ def redact_db_values(text: object) -> str:
        for diagnosis.
     2. **Unique-violation DETAIL echo** — psycopg emits
        ``DETAIL: Key (col)=(value) already exists.``; the value group
-       ``)=(...)`` (regex ``\\)=\\([^)]*\\)``) is replaced with
-       ``)=(<redacted>)``, leaving the column-name group intact.
+       ``)=(...)`` (regex ``\\)=\\([^\\n]*\\)``, greedy to the LAST ``)`` on
+       the line so a value containing its own paren cannot leak) is replaced
+       with ``)=(<redacted>)``, leaving the column-name group intact.
 
     Both substitutions are global (all occurrences) and operate uniformly on
     the whole string, so the same call works for a single exception message
@@ -229,7 +235,8 @@ def safe_exception(e: object, *, max_len: int = _DEFAULT_MAX_LEN) -> str:
 
     - ``name = type(e).__name__``
     - ``code = getattr(e, "pgcode", None)`` — psycopg2 exposes SQLSTATE as
-      ``.pgcode``; non-DB exceptions yield ``None``.
+      ``.pgcode``; non-DB exceptions yield ``None``. Read defensively (a
+      hostile ``pgcode`` property that raises falls back to ``None``).
     - ``prefix = f"{name}[{code}]"`` when a code is present, else ``name``.
     - With a (redacted, non-empty) message: ``f"{prefix}: {msg}"``.
     - With an empty message: ``prefix`` alone.
@@ -238,7 +245,15 @@ def safe_exception(e: object, *, max_len: int = _DEFAULT_MAX_LEN) -> str:
     via ``redact_db_values``/``safe``).
     """
     name = type(e).__name__
-    code = getattr(e, "pgcode", None)
+    try:
+        code = getattr(e, "pgcode", None)
+    except Exception:  # noqa: BLE001
+        # A hostile exception may expose ``pgcode`` as a property that raises.
+        # Narrow to Exception (NOT BaseException) so KeyboardInterrupt and
+        # SystemExit still propagate, mirroring ``_coerce``. Falling back to
+        # ``None`` drops the ``[code]`` bracket rather than letting the error
+        # escape this logging helper (#117 review, Finding 2).
+        code = None
     msg = redact_db_values(_coerce(e))
     prefix = f"{name}[{code}]" if code else name
     if msg:

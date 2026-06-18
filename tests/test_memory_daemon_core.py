@@ -250,11 +250,34 @@ class TestExtractionEnvAllowlist:
     def test_secret_keys_filtered(self, key):
         assert _is_env_allowed(key) is False
 
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "CLAUDE_TÖKEN",
+            "CLAUDE_ＴＯＫＥＮ",
+            "CLAUDE_TOKEN-NAME",
+            "claude_token",
+            "",
+        ],
+    )
+    def test_unsupported_env_names_filtered_before_allow_prefix(self, key):
+        assert _is_env_allowed(key) is False
+
     def test_session_archive_bucket_not_denied_by_markers(self):
         # Collision guard: CLAUDE_SESSION_ARCHIVE_BUCKET is a real var the
         # extractor needs. Ensure no sensitive marker (e.g. a future
         # "SESSION") silently denies it.
         assert _is_env_allowed("CLAUDE_SESSION_ARCHIVE_BUCKET") is True
+
+    def test_builder_drops_homoglyph_secret_name(self):
+        base = {
+            "CLAUDE_TÖKEN": "homoglyph-secret",
+            "CLAUDE_CONFIG_DIR": "/home/u/.claude",
+        }
+        env = build_extraction_env(base, "/tmp/proj")
+        assert "CLAUDE_TÖKEN" not in env
+        assert "homoglyph-secret" not in env.values()
+        assert env["CLAUDE_CONFIG_DIR"] == "/home/u/.claude"
 
     def test_builder_drops_secrets(self):
         base = {

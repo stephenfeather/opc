@@ -438,10 +438,6 @@ def _load_sentence_transformer(model: str, device: str | None) -> Any:
             "Install with: pip install sentence-transformers torch"
         )
 
-    import faulthandler
-
-    _enable_faulthandler(faulthandler)
-
     with _LOCAL_MODEL_CACHE_LOCK:
         # Re-check under the lock: another thread may have loaded it while we
         # waited (double-checked locking).
@@ -449,6 +445,14 @@ def _load_sentence_transformer(model: str, device: str | None) -> Any:
         if cached is not None:
             return cached
 
+        # Enable native crash dumps under the lock, on the actual cold-load
+        # path only. _enable_faulthandler does an unguarded check-then-open on
+        # the module-global crash-log fd; cold loads can now run on concurrent
+        # daemon threads, so calling it outside the lock would race and leak an
+        # fd / double-init faulthandler (Copilot + gemini, PR #201).
+        import faulthandler
+
+        _enable_faulthandler(faulthandler)
         loaded = SentenceTransformer(model, device=device)
         _LOCAL_MODEL_CACHE[key] = loaded
         return loaded

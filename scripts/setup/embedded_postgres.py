@@ -36,7 +36,7 @@ def start_embedded_postgres(pgdata: Path) -> dict[str, Any]:
             - server: PostgresServer instance (for cleanup)
     """
     try:
-        import pgserver
+        import pgserver  # pyright: ignore[reportMissingImports]
     except ImportError:
         return {
             "success": False,
@@ -75,8 +75,8 @@ def stop_embedded_postgres(pgdata: Path) -> dict[str, Any]:
             - error: str (if failed)
     """
     try:
-        import pgserver
-        from pgserver._commands import pg_ctl
+        import pgserver  # pyright: ignore[reportMissingImports]
+        from pgserver._commands import pg_ctl  # pyright: ignore[reportMissingImports]
     except ImportError:
         return {
             "success": False,

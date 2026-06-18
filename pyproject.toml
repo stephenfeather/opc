@@ -112,6 +112,60 @@ no_implicit_reexport = true
 module = "anthropic.*"
 ignore_missing_imports = true
 
+[tool.pyright]
+# Pyright runs as an editor-assist type checker; the project's stricter checker is
+# `mypy --strict` (see [tool.mypy] above). The goal here is for Pyright's
+# diagnostics to be signal, not noise (issue #200): resolve against the project
+# virtualenv and the same import roots pytest uses, and downgrade the high-volume
+# false-positive rules that fire on intentional dynamic patterns.
+pythonVersion = "3.13"
+# Resolve imports against the project venv so installed deps (httpx, asyncpg,
+# sentence_transformers, pytest, ...) are found in editors, not just under `uv run`.
+venvPath = "."
+venv = ".venv"
+# Mirror the pytest `pythonpath` exactly so first-party imports (scripts.*,
+# src/runtime) resolve. Note: `scripts` is deliberately NOT added as a root —
+# doing so puts the local `scripts/mcp` package ahead of the installed `mcp`
+# dependency in resolution, shadowing it and producing false diagnostics.
+extraPaths = ["src", "."]
+typeCheckingMode = "basic"
+include = ["scripts", "src", "tests"]
+exclude = [
+    "**/__pycache__",
+    "**/.venv",
+    ".worktrees",
+    "**/node_modules",
+]
+
+# Unused locals are already reported by ruff (F841); silence the duplicate.
+reportUnusedVariable = "none"
+
+# High-volume false positives in this dynamically-typed codebase. Downgraded to
+# "warning" so they remain visible in editors without burying the genuinely-fatal
+# diagnostics.
+#
+# reportMissingImports and reportUndefinedVariable are deliberately kept at error
+# (their default): both catch real import-time failures — this repo has several
+# first-party imports that reference modules which no longer exist (e.g.
+# `scripts.math_base`, `scripts.agentica_patterns.*`), which should stay red until
+# fixed (tracked in #204). Genuinely-optional imports (anthropic, z3, pgserver,
+# tldr.api) are guarded with try/except or lazy-imported and are silenced at the
+# import site with `# pyright: ignore[reportMissingImports]`, rather than globally,
+# so that real broken imports are not masked.
+reportArgumentType = "warning"
+reportAttributeAccessIssue = "warning"
+reportPossiblyUnboundVariable = "warning"
+reportOptionalSubscript = "warning"
+reportOptionalMemberAccess = "warning"
+reportCallIssue = "warning"
+reportAssignmentType = "warning"
+reportOperatorIssue = "warning"
+reportIndexIssue = "warning"
+reportReturnType = "warning"
+reportGeneralTypeIssues = "warning"
+reportFunctionMemberAccess = "warning"
+reportUnsupportedDunderAll = "warning"
+
 [tool.ruff]
 line-length = 100
 target-version = "py313"

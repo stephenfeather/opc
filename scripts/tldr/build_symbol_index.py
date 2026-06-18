@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "packages" / "tldr-code"))
 
 # Try to import TLDR API, but gracefully handle missing deps
 try:
-    from tldr.api import (
+    from tldr.api import (  # pyright: ignore[reportMissingImports]
         build_function_index,
         extract_file,
         scan_project_files,

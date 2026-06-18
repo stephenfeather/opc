@@ -21,8 +21,8 @@ from typing import Any
 faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
 
 try:
-    import anthropic
-    from anthropic.types import TextBlock
+    import anthropic  # pyright: ignore[reportMissingImports]
+    from anthropic.types import TextBlock  # pyright: ignore[reportMissingImports]
 except ImportError:
     anthropic = None  # type: ignore[assignment]
     TextBlock = None  # type: ignore[assignment, misc]

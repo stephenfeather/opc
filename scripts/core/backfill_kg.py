@@ -48,6 +48,7 @@ import asyncpg
 
 from scripts.core.db.postgres_pool import close_pool, get_pool
 from scripts.core.kg_extractor import (
+    MAX_KG_CONTENT_CHARS,
     extract_entities,
     extract_relations,
     store_entities_and_edges,
@@ -55,10 +56,9 @@ from scripts.core.kg_extractor import (
 from scripts.core.log_safety import safe
 from scripts.core.store_learning import detect_backend
 
-# Per-row cap before regex extraction: a single oversized adversarial
-# transcript row must not stall the whole backfill. Extraction is heuristic;
-# the leading portion of a learning carries the salient entities.
-MAX_CONTENT_CHARS = 100_000
+# Backward-compatible name for tests and callers that imported the local
+# constant before the shared cap moved to kg_extractor (issue #186).
+MAX_CONTENT_CHARS = MAX_KG_CONTENT_CHARS
 
 # Issue #131: systemic failures must abort the run promptly instead of being
 # logged once per row across the whole backlog. Explicit allowlist of

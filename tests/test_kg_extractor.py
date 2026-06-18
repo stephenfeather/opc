@@ -1,7 +1,10 @@
 """Tests for knowledge graph entity and relationship extraction."""
 
+import logging
+
 from scripts.core import kg_extractor
 from scripts.core.kg_extractor import (
+    MAX_EXTRACTED_RELATIONS,
     extract_entities,
     extract_relations,
 )
@@ -371,6 +374,24 @@ class TestRelationExtraction:
             if r.relation == "supersedes" and {r.source, r.target} == {"asyncpg", "psycopg2"}
         ]
         assert len(supers) > 0
+
+    def test_entity_dense_sentence_relation_extraction_is_bounded(self, caplog):
+        """Entity-dense content must truncate instead of doing unbounded pairwise work.
+
+        Regression for issue #186: a single sentence with hundreds of quoted
+        concepts previously drove O(E^2) relation emission with per-pair signal
+        regex searches.
+        """
+        content = "Using " + " ".join(f"`concept-{i:03d}`" for i in range(250))
+        entities = extract_entities(content)
+
+        caplog.set_level(logging.WARNING, logger="scripts.core.kg_extractor")
+        relations = extract_relations(content, entities)
+
+        assert len(relations) <= MAX_EXTRACTED_RELATIONS
+        assert "KG relation extraction truncated" in caplog.text
+        assert "entity_count" in caplog.text
+        assert "sentence_entity_count" in caplog.text
 
 
 # ---------------------------------------------------------------------------

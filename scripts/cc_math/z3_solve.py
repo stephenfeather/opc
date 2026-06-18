@@ -32,7 +32,7 @@ faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log")
 
 def get_z3():
     """Lazy import Z3."""
-    import z3
+    import z3  # pyright: ignore[reportMissingImports]
 
     return z3
 

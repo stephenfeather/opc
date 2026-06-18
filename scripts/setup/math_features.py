@@ -81,7 +81,7 @@ def verify_imports() -> dict[str, str]:
 
     # Z3 - test SAT solving
     try:
-        import z3
+        import z3  # pyright: ignore[reportMissingImports]
 
         x = z3.Int("x")
         s = z3.Solver()

@@ -113,11 +113,11 @@ module = "anthropic.*"
 ignore_missing_imports = true
 
 [tool.pyright]
-# Pyright runs as the editor-assist type checker; the authoritative type gate is
-# `mypy --strict` (see [tool.mypy] above) which runs in CI. The goal here is for
-# Pyright's diagnostics to be signal, not noise (issue #200): resolve against the
-# project virtualenv and the same import roots pytest uses, and downgrade the
-# high-volume false-positive rules that fire on intentional dynamic patterns.
+# Pyright runs as an editor-assist type checker; the project's stricter checker is
+# `mypy --strict` (see [tool.mypy] above). The goal here is for Pyright's
+# diagnostics to be signal, not noise (issue #200): resolve against the project
+# virtualenv and the same import roots pytest uses, and downgrade the high-volume
+# false-positive rules that fire on intentional dynamic patterns.
 pythonVersion = "3.13"
 # Resolve imports against the project venv so installed deps (httpx, asyncpg,
 # sentence_transformers, pytest, ...) are found in editors, not just under `uv run`.
@@ -138,19 +138,18 @@ exclude = [
 # Unused locals are already reported by ruff (F841); silence the duplicate.
 reportUnusedVariable = "none"
 
-# High-volume false positives in this dynamically-typed, mypy-gated codebase.
-# Downgraded to "warning" so they remain visible in editors without burying the
-# genuinely-fatal diagnostics. reportUndefinedVariable is deliberately left at
-# error (its default) — it catches real NameError-at-import bugs.
+# High-volume false positives in this dynamically-typed codebase. Downgraded to
+# "warning" so they remain visible in editors without burying the genuinely-fatal
+# diagnostics.
 #
-# reportMissingImports is a warning, not an error, because several import sites
-# are intentionally optional: extras-gated deps (anthropic in a try/except,
-# z3/pgserver/tldr.api lazy-imported) are absent under a default `uv sync`, and
-# some first-party modules resolve only via runtime sys.path manipulation that
-# Pyright can't follow statically. Keeping it at error made a clean checkout red
-# for imports the code is designed to tolerate. Genuine typos still surface as
-# warnings; truly-fatal undefined names are caught by reportUndefinedVariable.
-reportMissingImports = "warning"
+# reportMissingImports and reportUndefinedVariable are deliberately kept at error
+# (their default): both catch real import-time failures — this repo has several
+# first-party imports that reference modules which no longer exist (e.g.
+# `scripts.math_base`, `scripts.agentica_patterns.*`), which should stay red until
+# fixed (tracked in #204). Genuinely-optional imports (anthropic, z3, pgserver,
+# tldr.api) are guarded with try/except or lazy-imported and are silenced at the
+# import site with `# pyright: ignore[reportMissingImports]`, rather than globally,
+# so that real broken imports are not masked.
 reportArgumentType = "warning"
 reportAttributeAccessIssue = "warning"
 reportPossiblyUnboundVariable = "warning"

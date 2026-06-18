@@ -928,3 +928,42 @@ class TestVectorEmbedFallback:
             "query terms", k=3, provider="local", text_fallback=True,
         )
         assert calls == ["local"]
+
+    async def test_nonlocal_provider_embed_not_cancelled_by_deadline(self, monkeypatch):
+        """Codex PR #203 (P2): a non-local provider (voyage) governs its own
+        network embed via httpx timeout + retries. The vector-path deadline is
+        scoped to LOCAL only, so a slow-but-healthy voyage embed must run to
+        completion — NOT be cancelled by VECTOR_EMBED_TIMEOUT and degraded to
+        text (which would silently drop the provider's retry path)."""
+        from scripts.core import recall_backends as rb
+
+        class _SlowCompletingVoyageEmbedder:
+            completions: list[bool] = []
+
+            def __init__(self, *a: Any, **kw: Any) -> None: ...
+
+            @property
+            def model_label(self) -> str:
+                return "voyage-code-3"
+
+            async def embed(self, *_a: Any, **_kw: Any) -> list[float]:
+                # Longer than the (tiny) deadline below. If the deadline were
+                # (wrongly) applied to voyage, this sleep would be cancelled and
+                # completions would stay empty.
+                await asyncio.sleep(0.2)
+                type(self).completions.append(True)
+                return [0.1] * 8
+
+            async def aclose(self) -> None: ...
+
+        _SlowCompletingVoyageEmbedder.completions = []
+        # A deadline that WOULD trip if it were applied to the 0.2s embed.
+        monkeypatch.setattr(rb, "VECTOR_EMBED_TIMEOUT", 0.05)
+        _patch_embedder(monkeypatch, _SlowCompletingVoyageEmbedder)
+        _patch_vector_pool(monkeypatch)
+
+        await rb.search_learnings_postgres(
+            "query terms", k=3, provider="voyage", text_fallback=True,
+        )
+        # The embed ran to completion — voyage was not bounded by the deadline.
+        assert _SlowCompletingVoyageEmbedder.completions == [True]

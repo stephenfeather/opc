@@ -168,7 +168,7 @@ except Exception:
 from scripts.core.config import get_config as _get_config
 
 # Log-field sanitizer for DB-sourced / subprocess-sourced strings (#104).
-from scripts.core.log_safety import safe  # noqa: E402
+from scripts.core.log_safety import redact_db_values, safe, safe_exception  # noqa: E402
 
 # Re-exports from memory_daemon_core (D12: shims per step)
 from scripts.core.memory_daemon_core import (  # noqa: E402
@@ -999,17 +999,19 @@ def daemon_loop():
         try:
             daemon_tick()
         except Exception as e:
-            log(f"Error in daemon loop: {safe(e)}")
+            log(f"Error in daemon loop: {safe_exception(e)}")
             if DEBUG:
                 import traceback
 
                 # Traceback may include exception messages that transit
                 # DB content (psycopg errors embed query parameters).
-                # Wrap to neutralize control chars — the resulting log
-                # line collapses the traceback to a single line with
-                # \x0a markers, which is noisier for humans but keeps
-                # the injection boundary closed (cycle-1 CodeRabbit).
-                log(f"[DEBUG] traceback: {safe(traceback.format_exc())}")
+                # redact_db_values() strips the bound parameter VALUES
+                # (single-quoted literals + unique-violation DETAIL echo);
+                # safe() then collapses the traceback to a single line with
+                # \x0a markers, which is noisier for humans but keeps both
+                # the DB-value leak (#117) and the injection boundary
+                # (#104) closed.
+                log(f"[DEBUG] traceback: {safe(redact_db_values(traceback.format_exc()))}")
         time.sleep(_poll_interval())
 
 

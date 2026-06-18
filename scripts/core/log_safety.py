@@ -14,9 +14,22 @@ See ``thoughts/shared/plans/issue-104-log-injection-sanitization.md``.
 
 from __future__ import annotations
 
-__all__ = ["safe"]
+import re
+
+__all__ = ["safe", "redact_db_values", "safe_exception"]
 
 _DEFAULT_MAX_LEN = 500
+
+# Single-quoted literals delimit bound-parameter VALUES in Postgres error
+# text (the SQL statement and ``LINE ...`` context echo them). Double-quoted
+# identifiers (column/table names) are intentionally NOT matched — they carry
+# no user data and are valuable for diagnosis.
+_SINGLE_QUOTED_LITERAL = re.compile(r"'[^']*'")
+
+# Unique-violation DETAIL echo: ``DETAIL: Key (col)=(value) already exists.``
+# Redact only the value group — the second paren-pair after ``=`` — leaving
+# the column-name group intact.
+_DETAIL_KEY_VALUE = re.compile(r"\)=\([^)]*\)")
 _NONE_MARKER = "<none>"
 _UNREPRESENTABLE = "<unrepresentable>"
 
@@ -165,3 +178,69 @@ def safe(value: object, *, max_len: int = _DEFAULT_MAX_LEN) -> str:
         dropped = raw_len - max_len
         return _escape_controls(head) + f"...[truncated {dropped} characters]"
     return _escape_controls(coerced)
+
+
+def redact_db_values(text: object) -> str:
+    """Strip DB-sourced VALUES from Postgres/psycopg error text.
+
+    Addresses GitHub issue #117: psycopg2/asyncpg exception messages embed
+    the failing SQL statement plus its bound parameter values (in the
+    message, the ``LINE ...`` context, and the unique-violation ``DETAIL:``
+    echo). Logging that text raw leaks DB content. This helper removes the
+    two real leak vectors while preserving the error class and identifiers
+    needed to diagnose the failure:
+
+    1. **Single-quoted literals** — every ``'...'`` (regex ``'[^']*'``) is
+       replaced with ``'<redacted>'``. Single quotes delimit VALUES in
+       Postgres. Double-quoted identifiers (``"column"``/``"table"``) are
+       deliberately LEFT INTACT — they carry no user data and are useful
+       for diagnosis.
+    2. **Unique-violation DETAIL echo** — psycopg emits
+       ``DETAIL: Key (col)=(value) already exists.``; the value group
+       ``)=(...)`` (regex ``\\)=\\([^)]*\\)``) is replaced with
+       ``)=(<redacted>)``, leaving the column-name group intact.
+
+    Both substitutions are global (all occurrences) and operate uniformly on
+    the whole string, so the same call works for a single exception message
+    or a full ``traceback.format_exc()``.
+
+    Control characters are **not** escaped here — that is ``safe()``'s job.
+    Callers that log the result should wrap it with ``safe()`` (or use
+    ``safe_exception()``, which composes the two).
+
+    Never raises a non-system Exception: non-``str`` input is coerced via the
+    same never-raises path ``safe()`` uses (``_coerce``).
+    """
+    coerced = _coerce(text)
+    coerced = _SINGLE_QUOTED_LITERAL.sub("'<redacted>'", coerced)
+    coerced = _DETAIL_KEY_VALUE.sub(")=(<redacted>)", coerced)
+    return coerced
+
+
+def safe_exception(e: object, *, max_len: int = _DEFAULT_MAX_LEN) -> str:
+    """Render an exception for logging with DB values scrubbed and escaped.
+
+    Composes :func:`redact_db_values` (remove DB-sourced VALUES) with
+    :func:`safe` (printable-ASCII-only + truncation) so the full output
+    contract of ``safe()`` still holds — the return value contains only
+    ``\\t`` or printable ASCII and is bounded by ``max_len``.
+
+    Output shape:
+
+    - ``name = type(e).__name__``
+    - ``code = getattr(e, "pgcode", None)`` — psycopg2 exposes SQLSTATE as
+      ``.pgcode``; non-DB exceptions yield ``None``.
+    - ``prefix = f"{name}[{code}]"`` when a code is present, else ``name``.
+    - With a (redacted, non-empty) message: ``f"{prefix}: {msg}"``.
+    - With an empty message: ``prefix`` alone.
+
+    Never raises a non-system Exception (delegates coercion to ``_coerce``
+    via ``redact_db_values``/``safe``).
+    """
+    name = type(e).__name__
+    code = getattr(e, "pgcode", None)
+    msg = redact_db_values(_coerce(e))
+    prefix = f"{name}[{code}]" if code else name
+    if msg:
+        return safe(f"{prefix}: {msg}", max_len=max_len)
+    return safe(prefix, max_len=max_len)

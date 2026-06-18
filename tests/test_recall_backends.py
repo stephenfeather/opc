@@ -798,6 +798,29 @@ class TestProjectColumnProbe:
         assert await rb.project_column_available(conn) is True
         assert conn.calls == 2
 
+    async def test_transient_failure_warning_omits_exc_info_and_names_type(self, caplog):
+        """Issue #117: the transient-probe warning must not dump a full
+        traceback (asyncpg/psycopg messages embed params); instead it names
+        the exception type, matching the sibling pgvector-probe convention."""
+        import logging
+
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        conn = self._make_conn(RuntimeError("WHERE id = 'sk-secret-value'"))
+        with caplog.at_level(logging.WARNING):
+            assert await rb.project_column_available(conn) is False
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings, "expected a WARNING record for the transient probe failure"
+        rec = warnings[0]
+        # No traceback attached (exc_info dropped).
+        assert rec.exc_info is None
+        msg = rec.getMessage()
+        assert "RuntimeError" in msg
+        # The exception's embedded value must not leak via the message.
+        assert "sk-secret-value" not in msg
+
     async def test_mark_project_column_missing_downgrades_cache(self):
         from scripts.core import recall_backends as rb
 

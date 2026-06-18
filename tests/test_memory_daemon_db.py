@@ -776,7 +776,26 @@ class TestCountSessionLearningsDb:
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert warnings, "expected a WARNING record for swallowed DB error"
-        assert "count_session_learnings failed" in warnings[0].getMessage()
+        msg = warnings[0].getMessage()
+        assert "count_session_learnings failed" in msg
+        # Exception rendered via safe_exception(): "ClassName: message".
+        assert "Exception: db down" in msg
+
+    @patch("scripts.core.memory_daemon_db.use_postgres", return_value=True)
+    @patch(
+        "scripts.core.memory_daemon_db.pg_connect",
+        side_effect=Exception("INSERT failed for id = 'sk-secret-value'"),
+    )
+    def test_warning_redacts_db_values_in_exception(self, mock_pg, mock_use, caplog):
+        # Issue #117: a single-quoted VALUE in the exception text must not leak.
+        from scripts.core.memory_daemon_db import count_session_learnings
+
+        with caplog.at_level(logging.WARNING, logger="memory-daemon"):
+            assert count_session_learnings("sess-1") is None
+
+        msg = caplog.records[0].getMessage()
+        assert "sk-secret-value" not in msg
+        assert "'<redacted>'" in msg
 
 
 class TestSeedLastPatternRunDb:
@@ -820,4 +839,7 @@ class TestSeedLastPatternRunDb:
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert warnings, "expected a WARNING record for swallowed DB error"
-        assert "seed_last_pattern_run failed" in warnings[0].getMessage()
+        msg = warnings[0].getMessage()
+        assert "seed_last_pattern_run failed" in msg
+        # Exception rendered via safe_exception(): "ClassName: message".
+        assert "Exception: db down" in msg

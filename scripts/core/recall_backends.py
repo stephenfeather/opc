@@ -972,11 +972,11 @@ async def project_column_available(conn: Any) -> bool:
         )
         _project_column_cache = False
         return False
-    except Exception:
+    except Exception as exc:
         logger.warning(
             "project column probe failed transiently; degrading this recall "
-            "to no-project SQL and retrying the probe on the next call",
-            exc_info=True,
+            "to no-project SQL and retrying the probe on the next call (%s)",
+            type(exc).__name__,
         )
         return False
     _project_column_cache = True

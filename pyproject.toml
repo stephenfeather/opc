@@ -140,7 +140,17 @@ reportUnusedVariable = "none"
 
 # High-volume false positives in this dynamically-typed, mypy-gated codebase.
 # Downgraded to "warning" so they remain visible in editors without burying the
-# genuine errors that survive (e.g. reportMissingImports, reportUndefinedVariable).
+# genuinely-fatal diagnostics. reportUndefinedVariable is deliberately left at
+# error (its default) — it catches real NameError-at-import bugs.
+#
+# reportMissingImports is a warning, not an error, because several import sites
+# are intentionally optional: extras-gated deps (anthropic in a try/except,
+# z3/pgserver/tldr.api lazy-imported) are absent under a default `uv sync`, and
+# some first-party modules resolve only via runtime sys.path manipulation that
+# Pyright can't follow statically. Keeping it at error made a clean checkout red
+# for imports the code is designed to tolerate. Genuine typos still surface as
+# warnings; truly-fatal undefined names are caught by reportUndefinedVariable.
+reportMissingImports = "warning"
 reportArgumentType = "warning"
 reportAttributeAccessIssue = "warning"
 reportPossiblyUnboundVariable = "warning"

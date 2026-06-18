@@ -400,5 +400,8 @@ def count_session_rejections(session_id: str) -> int | None:
         if get_rejection_count is None:
             return None
         return get_rejection_count(session_id)
-    except Exception:
+    except Exception as e:
+        logger.warning(
+            "Rejection count failed for %s: %s", safe(session_id), safe(e)
+        )
         return None

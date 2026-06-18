@@ -586,6 +586,23 @@ def _count_session_rejections(session_id: str) -> int | None:
     return _count_session_rejections_impl(session_id)
 
 
+def _timed_stage(name, fn):
+    """Run a post-extraction pipeline stage, returning its result.
+
+    Under DEBUG, emit a single timing line ``stage <name>: <ms> ms`` using a
+    monotonic clock. No-op timing overhead when DEBUG is off — the stage runs
+    unwrapped. Only the stage name and duration are logged; never content.
+    """
+    if not DEBUG:
+        return fn()
+    start = time.monotonic()
+    try:
+        return fn()
+    finally:
+        elapsed_ms = (time.monotonic() - start) * 1000
+        debug(f"stage {name}: {elapsed_ms:.1f} ms")
+
+
 def reap_completed_extractions():
     """Check for completed extraction processes and remove from active set."""
     ae = get_active_extractions()
@@ -619,10 +636,22 @@ def reap_completed_extractions():
 
             if exit_code == 0:
                 mark_extracted(session_id)
-                _calibrate_session_confidence(session_id)
-                _extract_and_store_workflows(session_id, jsonl_path, project)
-                _generate_mini_handoff(session_id, jsonl_path, project)
-                archive_session_jsonl(session_id, jsonl_path)
+                _timed_stage(
+                    "calibrate",
+                    lambda: _calibrate_session_confidence(session_id),
+                )
+                _timed_stage(
+                    "workflows",
+                    lambda: _extract_and_store_workflows(session_id, jsonl_path, project),
+                )
+                _timed_stage(
+                    "handoff",
+                    lambda: _generate_mini_handoff(session_id, jsonl_path, project),
+                )
+                _timed_stage(
+                    "archive",
+                    lambda: archive_session_jsonl(session_id, jsonl_path),
+                )
             else:
                 mark_extraction_failed(
                     session_id, last_error=stderr_text or None

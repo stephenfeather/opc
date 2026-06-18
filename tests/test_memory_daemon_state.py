@@ -338,6 +338,54 @@ class TestReapCompletedExtractions:
 
 
 # ---------------------------------------------------------------------------
+# Issue #98 — per-stage pipeline timing helper (_timed_stage)
+# ---------------------------------------------------------------------------
+
+
+class TestTimedStage:
+    """_timed_stage wraps a pipeline stage, returns its result, and emits a
+    DEBUG-gated timing line (stage name + elapsed ms). Lines only surface
+    under --debug so normal operation stays quiet.
+    """
+
+    def test_returns_wrapped_result(self, monkeypatch):
+        from scripts.core import memory_daemon
+
+        monkeypatch.setattr(memory_daemon, "DEBUG", False, raising=False)
+        result = memory_daemon._timed_stage("calibrate", lambda: "ok")
+        assert result == "ok"
+
+    def test_emits_debug_line_when_debug_on(self, monkeypatch):
+        from scripts.core import memory_daemon
+
+        messages: list[str] = []
+        monkeypatch.setattr(memory_daemon, "log", lambda m: messages.append(str(m)))
+        monkeypatch.setattr(memory_daemon, "DEBUG", True, raising=False)
+
+        memory_daemon._timed_stage("calibrate", lambda: None)
+
+        assert any("calibrate" in m for m in messages), (
+            f"Expected a debug line naming the stage, got {messages}"
+        )
+        assert any("ms" in m for m in messages), (
+            f"Expected an elapsed-ms duration in the debug line, got {messages}"
+        )
+
+    def test_no_line_when_debug_off(self, monkeypatch):
+        from scripts.core import memory_daemon
+
+        messages: list[str] = []
+        monkeypatch.setattr(memory_daemon, "log", lambda m: messages.append(str(m)))
+        monkeypatch.setattr(memory_daemon, "DEBUG", False, raising=False)
+
+        memory_daemon._timed_stage("calibrate", lambda: None)
+
+        assert messages == [], (
+            f"Expected zero log output with DEBUG off, got {messages}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Step 5.1 — Daemon lifecycle tests
 # ---------------------------------------------------------------------------
 

@@ -371,6 +371,38 @@ class TestCountSessionRejections:
 
         assert count_session_rejections("s1") is None
 
+    @patch("scripts.core.memory_daemon_extractors.get_rejection_count",
+           side_effect=Exception("db error"))
+    def test_logs_on_error(self, mock_get, caplog):
+        """Issue #98 — the previously-silent except path must log the
+        failure via the module logger so the swallowed error is visible.
+        """
+        import logging
+
+        from scripts.core.memory_daemon_extractors import count_session_rejections
+
+        with caplog.at_level(logging.WARNING, logger="memory-daemon"):
+            assert count_session_rejections("s1") is None
+
+        assert any(
+            "rejection" in r.getMessage().lower() for r in caplog.records
+        ), f"Expected a logged rejection-count failure, got {caplog.records}"
+
+    @patch("scripts.core.memory_daemon_extractors.get_rejection_count",
+           side_effect=Exception("db error"))
+    def test_log_redacts_exception(self, mock_get, caplog):
+        """The logged failure must route the exception through safe()."""
+        import logging
+
+        from scripts.core.memory_daemon_extractors import count_session_rejections
+
+        with caplog.at_level(logging.WARNING, logger="memory-daemon"):
+            count_session_rejections("s1")
+
+        # safe() is the module redaction helper used throughout; the
+        # exception text should appear (proving we logged the cause).
+        assert any("db error" in r.getMessage() for r in caplog.records)
+
 
 # ---------------------------------------------------------------------------
 # Issue #96 Round 1 fix — debug-wiring regression guard

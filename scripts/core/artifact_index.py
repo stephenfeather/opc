@@ -328,9 +328,15 @@ def db_execute(
 
     # SQLite: use directly
     if return_id:
-        cur = conn.execute(_append_returning_id(sql), params)
-        row = cur.fetchone()
-        return str(row[0]) if row else None
+        # RETURNING requires SQLite >= 3.35. On older libraries fall back to a
+        # plain write: the id column is the first bound param (the deterministic
+        # file id we just inserted), so we can return it without re-querying.
+        if sqlite3.sqlite_version_info >= (3, 35, 0):
+            cur = conn.execute(_append_returning_id(sql), params)
+            row = cur.fetchone()
+            return str(row[0]) if row else None
+        conn.execute(sql, params)
+        return str(params[0]) if params else None
     conn.execute(sql, params)
     return None
 
@@ -597,8 +603,20 @@ def index_single_file(conn, file_path: Path) -> dict:
         data = parser(file_path)
         row_id = writer(conn, data, return_id=True)
         conn.commit()
+        if row_id is None:
+            # The whole point is to surface the persisted PK; if the write
+            # returned no id, fail loudly rather than report a hollow success.
+            msg = f"Indexed {label} but no row id was returned: {file_path}"
+            print(msg, file=sys.stderr)
+            return {"success": False, "error": msg}
         return {"success": True, "id": row_id, "type": label, "file": file_path.name}
     except Exception as e:
+        # Roll back the pending transaction so a reused connection isn't left
+        # in an aborted state. Guard for connections that lack rollback().
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         msg = f"Error indexing {label} {file_path}: {e}"
         print(msg, file=sys.stderr)
         return {"success": False, "error": msg}
@@ -637,12 +655,21 @@ def main() -> int:
             print(msg, file=sys.stderr)
             result = {"success": False, "error": msg}
         else:
-            if using_pg:
-                conn = init_postgres()
-            else:
-                conn = init_sqlite(get_db_path(args.db))
-            result = index_single_file(conn, file_path)
-            conn.close()
+            # Guard connection setup too: a failed init must still yield a JSON
+            # failure on stdout under --json, not an uncaught traceback.
+            try:
+                if using_pg:
+                    conn = init_postgres()
+                else:
+                    conn = init_sqlite(get_db_path(args.db))
+                try:
+                    result = index_single_file(conn, file_path)
+                finally:
+                    conn.close()
+            except Exception as e:
+                msg = f"Database connection or initialization failed: {e}"
+                print(msg, file=sys.stderr)
+                result = {"success": False, "error": msg}
 
         if args.json:
             print(json.dumps(result))

@@ -5,10 +5,12 @@ MCP `index_artifacts` tool can echo it back to callers (e.g. for an
 immediate `mark_handoff`) without a separate DB round-trip.
 
 Covers:
-- index_single_file returns {id, type, file} matching the row written
+- index_single_file returns {success, id, type, file} matching the row written
 - the returned id equals the value persisted in the DB
-- unknown file types return None
-- build_index_payload shapes the --json CLI response
+- unknown file types / write failures return {success: False, error}
+- a write that yields no id is reported as a failure, not a hollow success
+- the --file --json CLI emits exactly one JSON object on every path
+- db_execute(return_id=True) appends RETURNING id and returns the stored id (PG)
 """
 
 import json
@@ -108,6 +110,15 @@ class TestIndexSingleFileReturnsId:
         result = index_single_file(_RaisingPgConn(), f)
         assert result["success"] is False
         assert "boom db" in result["error"]
+
+    def test_write_without_id_is_failure_not_hollow_success(self, tmp_path):
+        # If the write returns no row id, the surfacing contract is violated;
+        # report failure rather than success with a missing id.
+        f = _write_handoff(tmp_path)
+        result = index_single_file(_NoRowPgConn(), f)
+        assert result["success"] is False
+        assert "no row id" in result["error"]
+        assert "id" not in result
 
 
 class TestCliJson:
@@ -215,6 +226,33 @@ class _RaisingPgConn:
         return _RaisingPgCursor()
 
     def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+
+class _NoRowPgCursor:
+    """Cursor whose RETURNING fetch yields no row (id cannot be surfaced)."""
+
+    def execute(self, sql, params=()):
+        pass
+
+    def fetchone(self):
+        return None
+
+    def close(self):
+        pass
+
+
+class _NoRowPgConn:
+    def cursor(self):
+        return _NoRowPgCursor()
+
+    def commit(self):
+        pass
+
+    def rollback(self):
         pass
 
 

@@ -138,6 +138,7 @@ def extract_memories_impl(
 
         proc = subprocess_popen(
             cmd,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             env=env,
@@ -188,6 +189,7 @@ def archive_session_jsonl(
     try:
         result = subprocess.run(
             ["zstd", "-q", "--rm", str(jsonl_path)],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             timeout=300,
         )
@@ -198,6 +200,7 @@ def archive_session_jsonl(
 
         result = subprocess.run(
             ["aws", "s3", "cp", str(zst_path), s3_key, "--quiet"],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             timeout=120,
         )
@@ -206,6 +209,7 @@ def archive_session_jsonl(
             log_fn(f"S3 upload failed for {safe(session_id)}: {err}")
             subprocess.run(
                 ["zstd", "-d", "-q", "--rm", str(zst_path)],
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 timeout=300,
             )
@@ -229,6 +233,7 @@ def archive_session_jsonl(
             try:
                 subprocess.run(
                     ["zstd", "-d", "-q", "--rm", str(zst_path)],
+                    stdin=subprocess.DEVNULL,
                     capture_output=True,
                     timeout=300,
                 )

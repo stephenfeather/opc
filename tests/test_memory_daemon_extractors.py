@@ -155,6 +155,41 @@ class TestExtractMemoriesImpl:
         assert 999 in ae
         mock_popen.assert_called_once()
 
+    def test_successful_extraction_spawns_with_stdin_devnull(self, tmp_path):
+        # Issue #98 hardening: the extraction Popen must close stdin
+        # (stdin=subprocess.DEVNULL) so the child cannot block on or read
+        # from the daemon's stdin.
+        import subprocess
+
+        from scripts.core.memory_daemon_extractors import extract_memories_impl
+
+        jsonl = tmp_path / "session.jsonl"
+        jsonl.write_text('{"type":"msg"}\n')
+        mock_proc = MagicMock()
+        mock_proc.pid = 999
+        mock_popen = MagicMock(return_value=mock_proc)
+        cfg = MagicMock()
+        cfg.extraction_model = "sonnet"
+        cfg.extraction_max_turns = 10
+
+        result = extract_memories_impl(
+            session_id="s1",
+            project_dir=str(tmp_path),
+            transcript_path=str(jsonl),
+            active_extractions={},
+            subprocess_popen=mock_popen,
+            is_blocked_fn=lambda _: False,
+            mark_extracted_fn=MagicMock(),
+            mark_failed_fn=MagicMock(),
+            log_fn=MagicMock(),
+            daemon_cfg=cfg,
+            allowed_models=frozenset({"sonnet", "haiku", "opus"}),
+            strip_frontmatter_fn=lambda c: c,
+        )
+
+        assert result is True
+        assert mock_popen.call_args.kwargs["stdin"] == subprocess.DEVNULL
+
     def test_live_extraction_env_lacks_inherited_source_time(self, tmp_path):
         # Issue #52 Round 3: a daemon launched with a stale CLAUDE_SOURCE_TIME
         # in its environment must NOT pass it to live extraction (which sets the
@@ -218,6 +253,101 @@ class TestArchiveSessionJsonl:
         mock_log = MagicMock()
         archive_session_jsonl("s1", None, log_fn=mock_log,
                               mark_archived_fn=MagicMock())
+
+    def test_success_path_spawns_with_stdin_devnull(self, monkeypatch, tmp_path):
+        # Issue #98 hardening: zstd compress + aws s3 cp must both pass
+        # stdin=subprocess.DEVNULL so child processes never read the
+        # daemon's stdin.
+        import subprocess
+
+        from scripts.core.memory_daemon_extractors import archive_session_jsonl
+
+        monkeypatch.setenv("CLAUDE_SESSION_ARCHIVE_BUCKET", "test-bucket")
+        jsonl = tmp_path / "session.jsonl"
+        jsonl.write_text("{}\n")
+
+        ok = MagicMock()
+        ok.returncode = 0
+        mock_run = MagicMock(return_value=ok)
+        monkeypatch.setattr(
+            "scripts.core.memory_daemon_extractors.subprocess.run", mock_run
+        )
+
+        archive_session_jsonl("s1", jsonl, log_fn=MagicMock(),
+                              mark_archived_fn=MagicMock())
+
+        # First call: zstd compress. Second call: aws s3 cp.
+        assert mock_run.call_count == 2
+        for call in mock_run.call_args_list:
+            assert call.kwargs["stdin"] == subprocess.DEVNULL
+
+    def test_s3_fail_rollback_spawns_with_stdin_devnull(self, monkeypatch, tmp_path):
+        # Issue #98 hardening: the zstd -d rollback after an S3 upload
+        # failure must also pass stdin=subprocess.DEVNULL.
+        import subprocess
+
+        from scripts.core.memory_daemon_extractors import archive_session_jsonl
+
+        monkeypatch.setenv("CLAUDE_SESSION_ARCHIVE_BUCKET", "test-bucket")
+        jsonl = tmp_path / "session.jsonl"
+        jsonl.write_text("{}\n")
+
+        compress_ok = MagicMock()
+        compress_ok.returncode = 0
+        s3_fail = MagicMock()
+        s3_fail.returncode = 1
+        s3_fail.stderr = b"boom"
+        rollback = MagicMock()
+        rollback.returncode = 0
+        mock_run = MagicMock(side_effect=[compress_ok, s3_fail, rollback])
+        monkeypatch.setattr(
+            "scripts.core.memory_daemon_extractors.subprocess.run", mock_run
+        )
+
+        archive_session_jsonl("s1", jsonl, log_fn=MagicMock(),
+                              mark_archived_fn=MagicMock())
+
+        # compress, s3 cp, then rollback decompress.
+        assert mock_run.call_count == 3
+        for call in mock_run.call_args_list:
+            assert call.kwargs["stdin"] == subprocess.DEVNULL
+
+    def test_timeout_rollback_spawns_with_stdin_devnull(self, monkeypatch, tmp_path):
+        # Issue #98 hardening: the zstd -d rollback in the TimeoutExpired
+        # branch must also pass stdin=subprocess.DEVNULL.
+        import subprocess
+
+        from scripts.core.memory_daemon_extractors import archive_session_jsonl
+
+        monkeypatch.setenv("CLAUDE_SESSION_ARCHIVE_BUCKET", "test-bucket")
+        jsonl = tmp_path / "session.jsonl"
+        jsonl.write_text("{}\n")
+        zst = jsonl.with_suffix(".jsonl.zst")
+
+        def _run(cmd, *args, **kwargs):
+            # First call (zstd compress): simulate the rename effect so the
+            # timeout rollback branch's guard (zst exists, jsonl gone) passes,
+            # then raise TimeoutExpired.
+            if mock_run.call_count == 1:
+                jsonl.unlink()
+                zst.write_text("compressed")
+                raise subprocess.TimeoutExpired(cmd=cmd, timeout=300)
+            rollback = MagicMock()
+            rollback.returncode = 0
+            return rollback
+
+        mock_run = MagicMock(side_effect=_run)
+        monkeypatch.setattr(
+            "scripts.core.memory_daemon_extractors.subprocess.run", mock_run
+        )
+
+        archive_session_jsonl("s1", jsonl, log_fn=MagicMock(),
+                              mark_archived_fn=MagicMock())
+
+        # compress (timeout) then rollback decompress.
+        assert mock_run.call_count == 2
+        for call in mock_run.call_args_list:
+            assert call.kwargs["stdin"] == subprocess.DEVNULL
 
 
 # ---------------------------------------------------------------------------

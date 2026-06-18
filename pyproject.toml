@@ -112,6 +112,49 @@ no_implicit_reexport = true
 module = "anthropic.*"
 ignore_missing_imports = true
 
+[tool.pyright]
+# Pyright runs as the editor-assist type checker; the authoritative type gate is
+# `mypy --strict` (see [tool.mypy] above) which runs in CI. The goal here is for
+# Pyright's diagnostics to be signal, not noise (issue #200): resolve against the
+# project virtualenv and the same import roots pytest uses, and downgrade the
+# high-volume false-positive rules that fire on intentional dynamic patterns.
+pythonVersion = "3.13"
+# Resolve imports against the project venv so installed deps (httpx, asyncpg,
+# sentence_transformers, pytest, ...) are found in editors, not just under `uv run`.
+venvPath = "."
+venv = ".venv"
+# Mirror the pytest `pythonpath` so first-party imports (scripts.*, src/runtime,
+# sibling modules like artifact_query) resolve.
+extraPaths = ["src", ".", "scripts"]
+typeCheckingMode = "basic"
+include = ["scripts", "src", "tests"]
+exclude = [
+    "**/__pycache__",
+    "**/.venv",
+    ".worktrees",
+    "**/node_modules",
+]
+
+# Unused locals are already reported by ruff (F841); silence the duplicate.
+reportUnusedVariable = "none"
+
+# High-volume false positives in this dynamically-typed, mypy-gated codebase.
+# Downgraded to "warning" so they remain visible in editors without burying the
+# genuine errors that survive (e.g. reportMissingImports, reportUndefinedVariable).
+reportArgumentType = "warning"
+reportAttributeAccessIssue = "warning"
+reportPossiblyUnbound = "warning"
+reportOptionalSubscript = "warning"
+reportOptionalMemberAccess = "warning"
+reportCallIssue = "warning"
+reportAssignmentType = "warning"
+reportOperatorIssue = "warning"
+reportIndexIssue = "warning"
+reportReturnType = "warning"
+reportGeneralTypeIssues = "warning"
+reportFunctionMemberAccess = "warning"
+reportUnsupportedDunderAll = "warning"
+
 [tool.ruff]
 line-length = 100
 target-version = "py313"

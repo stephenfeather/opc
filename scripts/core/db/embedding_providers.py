@@ -13,6 +13,7 @@ Providers:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import threading
 from typing import Any
@@ -20,6 +21,17 @@ from typing import Any
 import httpx
 
 from scripts.core.db.embedding_service import EmbeddingError, EmbeddingProvider
+
+# Quiet the noisy local-loader libraries ONCE at import (issue #152 round 2).
+# The sentence-transformers load can run on a daemon thread that outlives the
+# recall caller, so a per-load save/restore of these PROCESS-GLOBAL logger
+# levels would race with — and clobber — concurrent main-thread logging. Setting
+# them once (no restore) removes the race; ERROR-only is the desired steady
+# state for these verbose libraries in a backend module. TQDM_DISABLE is set
+# with setdefault so an explicit caller preference still wins.
+for _noisy_logger in ("sentence_transformers", "transformers", "safetensors", "torch"):
+    logging.getLogger(_noisy_logger).setLevel(logging.ERROR)
+os.environ.setdefault("TQDM_DISABLE", "1")
 
 # ---------------------------------------------------------------------------
 # Host validation
@@ -380,10 +392,17 @@ def reset_local_model_cache() -> None:
 def _load_sentence_transformer(model: str, device: str | None) -> Any:
     """Load (or return a process-cached) SentenceTransformer (issue #152).
 
-    The heavy load runs at most once per (model, device). Native stdout/stderr
-    from the loader is redirected to /dev/null and noisy library loggers are
-    quieted for the duration of the load only. Raises ImportError with install
-    guidance when sentence-transformers is absent.
+    The heavy load runs at most once per (model, device). Noisy loader output
+    is quieted once at module import (see top of file) rather than around this
+    call, because the load can run on a daemon thread that outlives the caller
+    and per-load mutation of process-global logging/env state would race with
+    the main thread (round 2). Raises ImportError with install guidance when
+    sentence-transformers is absent.
+
+    The cache lock serialises cold loads: this is deliberate — without it,
+    concurrent cold loads would each materialise a multi-GB model (OOM risk).
+    The fast-path read above is lock-free, so a warm hit never blocks behind an
+    in-progress load.
     """
     key = (model, device)
     # Lock-free fast path: an already-loaded model is returned without taking
@@ -401,7 +420,6 @@ def _load_sentence_transformer(model: str, device: str | None) -> Any:
         )
 
     import faulthandler
-    import logging as _logging
 
     _enable_faulthandler(faulthandler)
 
@@ -412,36 +430,7 @@ def _load_sentence_transformer(model: str, device: str | None) -> Any:
         if cached is not None:
             return cached
 
-        # IMPORTANT (#152 round 1): do NOT redirect file descriptors 1/2 here.
-        # This load now runs on a daemon worker thread that can outlive the
-        # recall caller (deadline-bounded construction in recall_backends).
-        # ``os.dup2`` on fds 1/2 is process-global, so suppressing native
-        # loader output that way would also swallow the MAIN thread's degraded
-        # recall warning and the CLI's result print for the entire ~14s cold
-        # load — failing the fix in exactly the degraded case it exists to
-        # serve. Quiet only at the Python logging / tqdm level, which filters
-        # by logger and cannot hijack the parent process's stdout/stderr.
-        loggers_to_quiet = [
-            "sentence_transformers",
-            "transformers",
-            "safetensors",
-            "torch",
-        ]
-        prev_levels = {name: _logging.getLogger(name).level for name in loggers_to_quiet}
-        for name in loggers_to_quiet:
-            _logging.getLogger(name).setLevel(_logging.ERROR)
-        prev_env = os.environ.get("TQDM_DISABLE")
-        os.environ["TQDM_DISABLE"] = "1"
-        try:
-            loaded = SentenceTransformer(model, device=device)
-        finally:
-            if prev_env is None:
-                os.environ.pop("TQDM_DISABLE", None)
-            else:
-                os.environ["TQDM_DISABLE"] = prev_env
-            for name in loggers_to_quiet:
-                _logging.getLogger(name).setLevel(prev_levels[name])
-
+        loaded = SentenceTransformer(model, device=device)
         _LOCAL_MODEL_CACHE[key] = loaded
         return loaded
 

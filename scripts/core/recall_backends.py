@@ -118,22 +118,28 @@ async def _construct_embedder_off_thread(provider: str) -> Any:
     interpreter shutdown, so a short-lived caller (the memory-awareness hook
     subprocess) exits promptly after degrading instead of joining the load.
 
-    Raises ``RuntimeError`` (which the caller's degrade guard catches) when
-    ``_MAX_CONSTRUCT_INFLIGHT`` loads are already running, so a stuck cold load
-    cannot accumulate unbounded worker threads (finding 2).
+    For the LOCAL provider only, raises ``RuntimeError`` (which the caller's
+    degrade guard catches) when ``_MAX_CONSTRUCT_INFLIGHT`` loads are already
+    running, so a stuck cold load cannot accumulate unbounded worker threads
+    (round 1, finding 2). The cap is scoped to local because only local has a
+    slow/uncancellable model load — fast providers (voyage/openai/ollama) read
+    env in their __init__ and must not be rejected because local loads are
+    occupying the budget (round 2, finding 3).
 
     Imported lazily so test monkeypatches of ``EmbeddingService`` take effect.
     """
     from scripts.core.db.embedding_service import EmbeddingService
 
     global _construct_inflight
-    with _construct_inflight_lock:
-        if _construct_inflight >= _MAX_CONSTRUCT_INFLIGHT:
-            raise RuntimeError(
-                f"embedder construction backlog ({_construct_inflight} loads "
-                "in flight); degrading to text-only"
-            )
-        _construct_inflight += 1
+    capped = provider == "local"
+    if capped:
+        with _construct_inflight_lock:
+            if _construct_inflight >= _MAX_CONSTRUCT_INFLIGHT:
+                raise RuntimeError(
+                    f"local embedder construction backlog ({_construct_inflight} "
+                    "loads in flight); degrading to text-only"
+                )
+            _construct_inflight += 1
 
     loop = asyncio.get_running_loop()
     fut: asyncio.Future = loop.create_future()
@@ -159,9 +165,10 @@ async def _construct_embedder_off_thread(provider: str) -> Any:
         finally:
             # Decrement only when the load actually finishes (not when the
             # caller times out) — that is what keeps the count an accurate
-            # ceiling on live worker threads.
-            with _construct_inflight_lock:
-                _construct_inflight -= 1
+            # ceiling on live worker threads. Mirrors the increment: local only.
+            if capped:
+                with _construct_inflight_lock:
+                    _construct_inflight -= 1
 
     threading.Thread(target=_build, name="recall-embedder-build", daemon=True).start()
     return await fut

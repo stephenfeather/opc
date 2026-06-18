@@ -632,6 +632,22 @@ class TestHybridEmbedFallback:
         # The cap is checked before any worker thread is started.
         assert spawned["n"] == 0
 
+    async def test_construct_off_thread_cap_does_not_block_fast_providers(
+        self, monkeypatch
+    ):
+        """Issue #152 round 2 (finding 3): the in-flight cap is scoped to the
+        slow LOCAL load. A saturated cap must NOT make fast providers
+        (voyage/openai/ollama) degrade — they have no model load to bound."""
+        from scripts.core import recall_backends as rb
+
+        # Cap fully saturated for local...
+        monkeypatch.setattr(rb, "_MAX_CONSTRUCT_INFLIGHT", 0)
+        _patch_embedder(monkeypatch, _OkEmbedder)
+
+        # ...yet a voyage construction still succeeds (not capped).
+        embedder = await rb._construct_embedder_off_thread("voyage")
+        assert isinstance(embedder, _OkEmbedder)
+
 
 class TestLocalLoadOutputSafety:
     """Issue #152 round 1 (finding 1): the local model load must not redirect

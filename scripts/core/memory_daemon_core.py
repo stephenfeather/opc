@@ -95,6 +95,12 @@ _ALLOW_ENV_EXACT: frozenset[str] = frozenset({
 
 _ALLOW_ENV_PREFIXES: tuple[str, ...] = ("LC_", "XDG_", "CLAUDE_")
 
+
+def _is_supported_env_name(key: str) -> bool:
+    """Return True if ``key`` uses the conservative env-name alphabet."""
+    return key.isascii() and all(c == "_" or c.isdigit() or "A" <= c <= "Z" for c in key)
+
+
 # Case-insensitive substring markers that flag an env name as secret-bearing.
 # Applied DENY-FIRST in _is_env_allowed: a key matching any marker is blocked
 # even when it also matches an allow prefix. This closes the broad-prefix
@@ -148,11 +154,14 @@ def _is_env_allowed(key: str) -> bool:
     allow prefix. Prevents leaking DB credentials, API keys, or tokens to the
     ``claude -p`` extraction subprocess (Issue #108).
     """
+    if not _is_supported_env_name(key):
+        return False
     if _is_sensitive_env_name(key):
         return False
     if key in _ALLOW_ENV_EXACT:
         return True
     return key.startswith(_ALLOW_ENV_PREFIXES)
+
 
 # Truthy tokens for MEMORY_DAEMON_DEBUG. Matched case-insensitively
 # after stripping whitespace. All other values (including "0", "false",

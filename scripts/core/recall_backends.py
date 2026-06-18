@@ -64,6 +64,17 @@ _EMBED_DEGRADE_WARNED = False
 # embed on timeout (cancelling an httpx request is safe).
 QUERY_EMBED_TIMEOUT = 2.0
 
+# Issue #199: a deadline for the vector / --vector-only backend's
+# construction+embed. Unlike hybrid, --vector-only is an explicit, non-hook,
+# non-budgeted request, so this deadline is deliberately generous rather than
+# the hook's 2.0s: a legitimate cold LOCAL BGE load (~14.6s) should complete
+# and return real vector results — honoring the explicit request — and only a
+# genuinely wedged load (e.g. a hung HF download) trips it and degrades to text.
+# Construction routes through _construct_embedder_off_thread (same as hybrid,
+# #152) so the cold load runs off the event-loop thread; the deadline bounds
+# the wedge case so a single stuck load can no longer hang the recall forever.
+VECTOR_EMBED_TIMEOUT = 30.0
+
 
 def _settle_future_result(fut: asyncio.Future, value: Any) -> None:
     """Resolve ``fut`` with ``value`` unless it is already done (issue #152).
@@ -1588,10 +1599,34 @@ async def search_learnings_postgres(
     # embedding space (issue #151). None for the text-fallback branch.
     model_label: str | None = None
     if has_embeddings:
-        embedder = EmbeddingService(provider=provider)
+        # Issue #199: construction AND embed share a single VECTOR_EMBED_TIMEOUT
+        # budget and route through the same off-thread helper as hybrid (#152),
+        # so a cold/wedged LOCAL model load no longer blocks the event-loop
+        # thread synchronously (pre-#199 the construction sat OUTSIDE this try,
+        # so a constructor failure also bypassed the degrade guard and crashed
+        # recall). The deadline is generous (not the hook's 2.0s) because
+        # --vector-only is an explicit, non-budgeted request — see
+        # VECTOR_EMBED_TIMEOUT. The holder keeps at most one entry, appended
+        # only after construction succeeds, so a construction that times out or
+        # raises leaves the finally with nothing to aclose (mirrors #152).
+        embedder_holder: list[EmbeddingService] = []
+
+        async def _acquire() -> tuple[str | None, list[float]]:
+            embedder = await _construct_embedder_off_thread(provider)
+            embedder_holder.append(embedder)
+            # Capture the embedding-space label before the finally closes the
+            # embedder; bound into the vector leg so the query never
+            # cross-compares spaces (issue #151). getattr guards custom
+            # embedders that predate model_label.
+            label = getattr(embedder, "model_label", None)
+            emb = await embedder.embed(query, input_type="query")
+            return label, emb
+
         try:
-            model_label = getattr(embedder, "model_label", None)
-            query_embedding = await embedder.embed(query, input_type="query")
+            model_label, query_embedding = await asyncio.wait_for(
+                _acquire(),
+                timeout=VECTOR_EMBED_TIMEOUT,
+            )
         except Exception:
             logger.warning(
                 "Embedding generation failed, falling back to text search",
@@ -1602,7 +1637,15 @@ async def search_learnings_postgres(
             else:
                 return []
         finally:
-            await embedder.aclose()
+            # Only close a successfully-constructed embedder; a construction
+            # that timed out or raised leaves the holder empty. A raise here
+            # must never override the pending fallback return, so swallow
+            # cleanup failures to the debug log (mirrors #152 hybrid).
+            if embedder_holder:
+                try:
+                    await embedder_holder[0].aclose()
+                except Exception:  # noqa: BLE001 - cleanup is best-effort
+                    logger.debug("embedder close failed", exc_info=True)
 
     async def _fetch_with_chain_fallback(
         conn: Any,

@@ -602,7 +602,7 @@ def count_session_learnings(session_id: str) -> int | None:
         conn.close()
         return count
     except Exception as e:
-        logger.debug("count_session_learnings failed for %s: %s", session_id, e)
+        logger.warning("count_session_learnings failed for %s: %s", session_id, e)
         return None
 
 
@@ -623,5 +623,5 @@ def seed_last_pattern_run() -> float:
         if row and row[0]:
             return row[0].timestamp()
     except Exception as e:
-        logger.debug("seed_last_pattern_run failed: %s", e)
+        logger.warning("seed_last_pattern_run failed: %s", e)
     return 0

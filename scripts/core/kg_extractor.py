@@ -294,6 +294,18 @@ _RE_CONFLICTS = re.compile(
     re.IGNORECASE,
 )
 
+# Shared content cap for KG extraction callers. The backfill path already
+# applied this bound locally; live store paths use the same value so one large
+# learning cannot pin indexing.
+MAX_KG_CONTENT_CHARS = 100_000
+
+# Defensive relation extraction bounds (issue #186). These keep the heuristic
+# graph side effect from doing unbounded sentence-membership and pairwise work
+# on entity-dense content.
+MAX_RELATION_ENTITIES = 200
+MAX_SENTENCE_ENTITIES = 50
+MAX_EXTRACTED_RELATIONS = 1_000
+
 
 # Entity names longer than this are not compiled into fallback boundary regexes.
 # Real names (paths, config vars, <=40-char backtick concepts) are far shorter;
@@ -334,20 +346,40 @@ def extract_relations(
     if len(entities) < 2:
         return []
 
+    truncated_reasons: set[str] = set()
+    if len(entities) > MAX_RELATION_ENTITIES:
+        truncated_reasons.add("entity_count")
+        entities_for_relations = entities[:MAX_RELATION_ENTITIES]
+    else:
+        entities_for_relations = entities
+
     relations: list[ExtractedRelation] = []
     seen_rels: set[tuple[str, str | None, str, str | None, str]] = set()
 
     def _add_rel(
-        src: str, tgt: str, rel: str, conf: float = 1.0,
-        src_type: str | None = None, tgt_type: str | None = None,
+        src: str,
+        tgt: str,
+        rel: str,
+        conf: float = 1.0,
+        src_type: str | None = None,
+        tgt_type: str | None = None,
     ):
+        if len(relations) >= MAX_EXTRACTED_RELATIONS:
+            truncated_reasons.add("relation_count")
+            return
         key = (src, src_type, tgt, tgt_type, rel)
         if key not in seen_rels and src != tgt:
             seen_rels.add(key)
-            relations.append(ExtractedRelation(
-                src, tgt, rel, conf,
-                source_type=src_type, target_type=tgt_type,
-            ))
+            relations.append(
+                ExtractedRelation(
+                    src,
+                    tgt,
+                    rel,
+                    conf,
+                    source_type=src_type,
+                    target_type=tgt_type,
+                )
+            )
 
     # Whole-token fallback matchers for entities mentioned outside their first
     # span are compiled lazily and memoized. The old `e.name in sent.lower()`
@@ -374,7 +406,7 @@ def extract_relations(
 
         # Find entities in this sentence, ordered by position in text.
         sent_entities = []
-        for e in entities:
+        for e in entities_for_relations:
             if e.span and e.span[0] >= sent_offset and e.span[1] <= sent_end:
                 sent_entities.append((e.span[0], e))
             else:
@@ -385,41 +417,54 @@ def extract_relations(
                     sent_entities.append((sent_offset + m.start(), e))
         # Sort by position, then entity_type for deterministic ordering of same-name entities
         sent_entities.sort(key=lambda x: (x[0], x[1].entity_type))
+        if len(sent_entities) > MAX_SENTENCE_ENTITIES:
+            truncated_reasons.add("sentence_entity_count")
+            sent_entities = sent_entities[:MAX_SENTENCE_ENTITIES]
         sent_entities = [e for _, e in sent_entities]
+
+        if _RE_SUPERSEDES.search(sent):
+            relation_signal = "supersedes"
+        elif _RE_SOLVES.search(sent):
+            relation_signal = "solves"
+        elif _RE_CONFLICTS.search(sent):
+            relation_signal = "conflicts_with"
+        elif _RE_USES.search(sent):
+            relation_signal = "uses"
+        else:
+            relation_signal = "related_to"
 
         # Pairwise relation inference within sentence
         for i, e1 in enumerate(sent_entities):
-            for e2 in sent_entities[i + 1:]:
-                # Check for specific relation signals
-                if _RE_SUPERSEDES.search(sent):
-                    _add_rel(e1.name, e2.name, "supersedes", 0.8,
-                             e1.entity_type, e2.entity_type)
-                elif _RE_SOLVES.search(sent):
+            if len(relations) >= MAX_EXTRACTED_RELATIONS:
+                truncated_reasons.add("relation_count")
+                break
+            for e2 in sent_entities[i + 1 :]:
+                if relation_signal == "supersedes":
+                    _add_rel(e1.name, e2.name, "supersedes", 0.8, e1.entity_type, e2.entity_type)
+                elif relation_signal == "solves":
                     if e2.entity_type == "error":
-                        _add_rel(e1.name, e2.name, "solves", 0.9,
-                                 e1.entity_type, e2.entity_type)
+                        _add_rel(e1.name, e2.name, "solves", 0.9, e1.entity_type, e2.entity_type)
                     elif e1.entity_type == "error":
-                        _add_rel(e2.name, e1.name, "solves", 0.9,
-                                 e2.entity_type, e1.entity_type)
+                        _add_rel(e2.name, e1.name, "solves", 0.9, e2.entity_type, e1.entity_type)
                     else:
-                        _add_rel(e1.name, e2.name, "solves", 0.7,
-                                 e1.entity_type, e2.entity_type)
-                elif _RE_CONFLICTS.search(sent):
-                    _add_rel(e1.name, e2.name, "conflicts_with", 0.8,
-                             e1.entity_type, e2.entity_type)
-                elif _RE_USES.search(sent):
-                    _add_rel(e1.name, e2.name, "uses", 0.7,
-                             e1.entity_type, e2.entity_type)
+                        _add_rel(e1.name, e2.name, "solves", 0.7, e1.entity_type, e2.entity_type)
+                elif relation_signal == "conflicts_with":
+                    _add_rel(
+                        e1.name, e2.name, "conflicts_with", 0.8, e1.entity_type, e2.entity_type
+                    )
+                elif relation_signal == "uses":
+                    _add_rel(e1.name, e2.name, "uses", 0.7, e1.entity_type, e2.entity_type)
                 else:
-                    _add_rel(e1.name, e2.name, "related_to", 0.5,
-                             e1.entity_type, e2.entity_type)
+                    _add_rel(e1.name, e2.name, "related_to", 0.5, e1.entity_type, e2.entity_type)
+            if len(relations) >= MAX_EXTRACTED_RELATIONS:
+                break
 
     # Directory containment: file entities sharing a parent directory.
     # Group by parent dir in O(N) instead of the previous O(N^2) pairwise scan
     # (issue #122). A directory is materialized only when 2+ files share it.
     dirs_seen: set[str] = set()
     files_by_dir: dict[str, list[str]] = defaultdict(list)
-    for e in entities:
+    for e in entities_for_relations:
         if e.entity_type == "file" and "/" in e.name:
             files_by_dir[e.name.rsplit("/", 1)[0]].append(e.name)
     for parent_dir, child_files in files_by_dir.items():
@@ -427,19 +472,38 @@ def extract_relations(
             continue
         dirs_seen.add(parent_dir)
         for child in child_files:
+            if len(relations) >= MAX_EXTRACTED_RELATIONS:
+                truncated_reasons.add("relation_count")
+                break
             _add_rel(parent_dir, child, "contains", 0.9, "file", "file")
+        if len(relations) >= MAX_EXTRACTED_RELATIONS:
+            break
 
     # Materialize directory entities so store_entities_and_edges can resolve IDs
+    existing_entity_keys = {(e.name, e.entity_type) for e in entities}
     for d in dirs_seen:
         canon = _normalize_name(d, "file")
         key = (canon, "file")
-        if key not in {(e.name, e.entity_type) for e in entities}:
-            entities.append(ExtractedEntity(
-                name=canon,
-                display_name=d,
-                entity_type="file",
-                metadata={"is_directory": True},
-            ))
+        if key not in existing_entity_keys:
+            entities.append(
+                ExtractedEntity(
+                    name=canon,
+                    display_name=d,
+                    entity_type="file",
+                    metadata={"is_directory": True},
+                )
+            )
+            existing_entity_keys.add(key)
+
+    if truncated_reasons:
+        logger.warning(
+            "KG relation extraction truncated: reasons=%s entities=%d considered=%d "
+            "relations=%d",
+            ",".join(sorted(truncated_reasons)),
+            len(entities),
+            len(entities_for_relations),
+            len(relations),
+        )
 
     return relations
 

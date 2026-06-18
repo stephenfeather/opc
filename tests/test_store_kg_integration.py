@@ -7,7 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from scripts.core.store_learning import store_learning_v2
+from scripts.core.kg_extractor import MAX_KG_CONTENT_CHARS
+from scripts.core.store_learning import _try_backfill_kg, _try_index_kg, store_learning_v2
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -79,6 +80,63 @@ async def test_store_learning_v2_calls_kg_extractor():
         assert result["kg_stats"] == kg_result
         mock_extract_ents.assert_called_once()
         mock_store_kg.assert_called_once_with(mid, mock_extract_ents.return_value, [])
+
+
+@pytest.mark.asyncio
+async def test_try_index_kg_truncates_content_before_extraction():
+    """Live KG indexing mirrors the backfill content cap before regex extraction."""
+    memory_id = str(uuid.uuid4())
+    oversized = "x" * (MAX_KG_CONTENT_CHARS + 5000)
+
+    with (
+        patch(
+            "scripts.core.kg_extractor.extract_entities",
+            return_value=[MagicMock(name="pytest", entity_type="tool")],
+        ) as mock_extract_ents,
+        patch("scripts.core.kg_extractor.extract_relations", return_value=[]),
+        patch(
+            "scripts.core.kg_extractor.store_entities_and_edges",
+            new_callable=AsyncMock,
+            return_value={"entities": 1, "edges": 0, "mentions": 1},
+        ),
+    ):
+        await _try_index_kg(memory_id, oversized)
+
+    passed_content = mock_extract_ents.call_args.args[0]
+    assert len(passed_content) == MAX_KG_CONTENT_CHARS
+
+
+@pytest.mark.asyncio
+async def test_try_backfill_kg_truncates_content_before_extraction():
+    """Dedup KG backfill uses the same live-store extraction cap."""
+    existing_id = str(uuid.uuid4())
+    oversized = "x" * (MAX_KG_CONTENT_CHARS + 5000)
+
+    mock_conn = AsyncMock()
+    mock_conn.fetchval.return_value = existing_id
+    acm = AsyncMock()
+    acm.__aenter__.return_value = mock_conn
+    acm.__aexit__.return_value = False
+    mock_pool = MagicMock()
+    mock_pool.acquire.return_value = acm
+
+    with (
+        patch(
+            "scripts.core.db.postgres_pool.get_pool",
+            new_callable=AsyncMock,
+            return_value=mock_pool,
+        ),
+        patch(
+            "scripts.core.kg_extractor.extract_entities",
+            return_value=[MagicMock(name="pytest", entity_type="tool")],
+        ) as mock_extract_ents,
+        patch("scripts.core.kg_extractor.extract_relations", return_value=[]),
+        patch("scripts.core.kg_extractor.store_entities_and_edges", new_callable=AsyncMock),
+    ):
+        await _try_backfill_kg("hash", oversized)
+
+    passed_content = mock_extract_ents.call_args.args[0]
+    assert len(passed_content) == MAX_KG_CONTENT_CHARS
 
 
 @pytest.mark.asyncio
@@ -191,7 +249,11 @@ async def test_store_learning_v2_dedup_backfills_kg():
         patch("scripts.core.store_learning.create_memory_service", return_value=svc),
         patch("scripts.core.store_learning.get_default_backend", return_value="postgres"),
         patch("scripts.core.store_learning.EmbeddingService", return_value=embedder),
-        patch("scripts.core.db.postgres_pool.get_pool", new_callable=AsyncMock, return_value=mock_pool),
+        patch(
+            "scripts.core.db.postgres_pool.get_pool",
+            new_callable=AsyncMock,
+            return_value=mock_pool,
+        ),
         patch(
             "scripts.core.kg_extractor.extract_entities",
             return_value=[MagicMock(name="pytest", entity_type="tool")],

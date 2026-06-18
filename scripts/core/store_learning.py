@@ -575,11 +575,13 @@ async def _try_index_kg(memory_id: str, content: str) -> dict[str, Any] | None:
     """
     try:
         from scripts.core.kg_extractor import (
+            MAX_KG_CONTENT_CHARS,
             extract_entities,
             extract_relations,
             store_entities_and_edges,
         )
 
+        content = content[:MAX_KG_CONTENT_CHARS]
         entities = extract_entities(content)
         if not entities:
             return None
@@ -606,6 +608,7 @@ async def _try_backfill_kg(content_hash: str, content: str) -> None:
     try:
         from scripts.core.db.postgres_pool import get_pool
         from scripts.core.kg_extractor import (
+            MAX_KG_CONTENT_CHARS,
             extract_entities,
             extract_relations,
             store_entities_and_edges,
@@ -620,6 +623,7 @@ async def _try_backfill_kg(content_hash: str, content: str) -> None:
         if not existing_id:
             return
         existing_id_str = str(existing_id)
+        content = content[:MAX_KG_CONTENT_CHARS]
         entities = extract_entities(content)
         if not entities:
             return

@@ -29,7 +29,7 @@ coverage.xml
 # Claude Code
 .claude/
 CLAUDE.md
-AGENT.md
+AGENTS.md
 
 # Worktrees
 .worktrees/

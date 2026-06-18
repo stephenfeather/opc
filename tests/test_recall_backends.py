@@ -983,6 +983,27 @@ class TestStopwordFallbackSkipsTsquery:
             assert "to_tsquery" not in sql, sql[:160]
         assert any("ILIKE" in sql for sql in db.executed), "ILIKE fallback expected"
 
+    async def test_nonempty_query_with_only_sanitized_away_terms_uses_ilike(
+        self, monkeypatch,
+    ):
+        """Issue #179: if sanitization removes every token, use fallback SQL."""
+        from scripts.core import recall_backends as rb
+
+        rb.reset_project_column_cache()
+        db = _FakeRecallDb(missing_columns=set())
+        self._patch_pool(monkeypatch, db)
+
+        # ``a|b`` sanitizes to ``ab`` and is discarded for being <=2 chars;
+        # ``!!`` sanitizes to empty. The raw query is non-empty, so the search
+        # should use the ILIKE fallback instead of short-circuiting.
+        results = await rb.search_learnings_text_only_postgres("a|b !!", k=3)
+
+        assert results == []
+        assert db.executed, "expected the ILIKE fallback SQL to run"
+        for sql in db.executed:
+            assert "to_tsquery" not in sql, sql[:160]
+        assert any("ILIKE" in sql for sql in db.executed), "ILIKE fallback expected"
+
     async def test_empty_query_returns_immediately_without_db_calls(self, monkeypatch):
         from scripts.core import recall_backends as rb
 

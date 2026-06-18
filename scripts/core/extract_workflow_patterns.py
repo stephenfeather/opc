@@ -21,12 +21,18 @@ import re
 import sys
 from collections import Counter
 from pathlib import Path
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Types
 # ---------------------------------------------------------------------------
 
 PatternStep = str | tuple[str, ...]
+type ToolInput = dict[str, Any]
+type ToolEntry = dict[str, Any]
+type PatternResult = dict[str, Any]
+type SummaryResult = dict[str, Any]
+type JsonObject = dict[str, Any]
 
 
 # ---------------------------------------------------------------------------
@@ -45,7 +51,7 @@ INPUT_EXTRACTORS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _extract_input(tool_name: str, tool_input: dict) -> dict:
+def _extract_input(tool_name: str, tool_input: ToolInput) -> ToolInput:
     """Extract the relevant fields from tool input based on tool type."""
     fields = INPUT_EXTRACTORS.get(tool_name)
     if fields is None:
@@ -101,7 +107,7 @@ def _redact_command(command: str) -> str:
     return command
 
 
-def redact_input(inp: dict) -> dict:
+def redact_input(inp: ToolInput) -> ToolInput:
     """Return a copy of a tool input dict with secrets redacted from commands.
 
     Only the 'command' field is redacted; file paths and other fields pass
@@ -135,17 +141,17 @@ def _matches_step(tool_name: str, step: PatternStep) -> bool:
 
 
 def _match_pattern_at(
-    tool_uses: list[dict],
+    tool_uses: list[ToolEntry],
     pat_steps: list[PatternStep],
     start: int,
-) -> tuple[list[dict], int, int] | None:
+) -> tuple[list[ToolEntry], int, int] | None:
     """Try to match a pattern starting at position start.
 
     Returns (matched_entries, first_match_index, end_index) if the full
     pattern is found, None otherwise. first_match_index is where the
     first step matched; end_index is after the last consumed entry.
     """
-    matched: list[dict] = []
+    matched: list[ToolEntry] = []
     step_idx = 0
     j = start
     first_match_idx = -1
@@ -165,7 +171,7 @@ def _match_pattern_at(
     return None
 
 
-def _determine_success(matched: list[dict]) -> bool | None:
+def _determine_success(matched: list[ToolEntry]) -> bool | None:
     """Determine success from matched tool entries.
 
     Finds the last Bash entry; if present, returns its status (or None
@@ -191,7 +197,7 @@ def _determine_success(matched: list[dict]) -> bool | None:
     return None
 
 
-def _collect_files(matched: list[dict]) -> list[str]:
+def _collect_files(matched: list[ToolEntry]) -> list[str]:
     """Extract unique file paths from matched entries, preserving order."""
     return list(dict.fromkeys(
         m["input"].get("file_path", "")
@@ -200,7 +206,7 @@ def _collect_files(matched: list[dict]) -> list[str]:
     ))
 
 
-def _build_pattern_result(pat_name: str, matched: list[dict]) -> dict:
+def _build_pattern_result(pat_name: str, matched: list[ToolEntry]) -> PatternResult:
     """Build a pattern result dict from matched tool entries."""
     return {
         "pattern_type": pat_name,
@@ -220,7 +226,7 @@ def _spans_overlap(
     return any(s < end and start < e for s, e in consumed)
 
 
-def detect_workflow_sequences(tool_uses: list[dict]) -> list[dict]:
+def detect_workflow_sequences(tool_uses: list[ToolEntry]) -> list[PatternResult]:
     """Identify common workflow patterns in the tool use sequence.
 
     Patterns are matched longest-first (WORKFLOW_PATTERNS order matters).
@@ -230,7 +236,7 @@ def detect_workflow_sequences(tool_uses: list[dict]) -> list[dict]:
         pattern_type, tools (list of tool entries), files (list),
         success (bool|None)
     """
-    patterns_found: list[dict] = []
+    patterns_found: list[PatternResult] = []
     consumed_spans: list[tuple[int, int]] = []
 
     for pat_name, pat_steps, min_len in WORKFLOW_PATTERNS:
@@ -256,7 +262,7 @@ def detect_workflow_sequences(tool_uses: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def summarize_tool_usage(tool_uses: list[dict]) -> dict:
+def summarize_tool_usage(tool_uses: list[ToolEntry]) -> SummaryResult:
     """Summarize tool usage frequency and files touched."""
     tool_counts = dict(Counter(tu["tool_name"] for tu in tool_uses))
 
@@ -285,7 +291,7 @@ def summarize_tool_usage(tool_uses: list[dict]) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def format_pattern_as_learning(pattern: dict) -> str:
+def format_pattern_as_learning(pattern: PatternResult) -> str:
     """Format a detected workflow pattern as a learning string."""
     pat_type = pattern["pattern_type"]
     tools = pattern["tools"]
@@ -321,8 +327,8 @@ def format_pattern_as_learning(pattern: dict) -> str:
 
 
 def _parse_tool_use_entry(
-    item: dict, data: dict, line_num: int,
-) -> dict | None:
+    item: JsonObject, data: JsonObject, line_num: int,
+) -> ToolEntry | None:
     """Parse a single tool_use content item into a tool entry dict."""
     if not isinstance(item, dict) or item.get("type") != "tool_use":
         return None
@@ -340,14 +346,16 @@ def _parse_tool_use_entry(
     }
 
 
-def _parse_tool_result(item: dict) -> tuple[str, bool] | None:
+def _parse_tool_result(item: JsonObject) -> tuple[str, bool] | None:
     """Parse a tool_result content item. Returns (tool_use_id, is_error)."""
     if not isinstance(item, dict) or item.get("type") != "tool_result":
         return None
     return (item.get("tool_use_id", ""), item.get("is_error", False))
 
 
-def extract_tool_uses(jsonl_path: Path, max_entries: int | None = None) -> list[dict]:
+def extract_tool_uses(
+    jsonl_path: Path, max_entries: int | None = None,
+) -> list[ToolEntry]:
     """Stream through JSONL and extract tool_use blocks with their results.
 
     Returns ordered list of dicts with:
@@ -364,7 +372,7 @@ def extract_tool_uses(jsonl_path: Path, max_entries: int | None = None) -> list[
     if max_entries is not None and max_entries <= 0:
         return []
 
-    tool_uses: list[dict] = []
+    tool_uses: list[ToolEntry] = []
     pending_ids: dict[str, int] = {}
     cap_reached = False
 
@@ -420,16 +428,16 @@ def extract_tool_uses(jsonl_path: Path, max_entries: int | None = None) -> list[
 
 
 def _format_output(
-    patterns: list[dict],
-    tool_uses: list[dict],
+    patterns: list[PatternResult],
+    tool_uses: list[ToolEntry],
     fmt: str,
     patterns_only: bool,
 ) -> str:
     """Format results for output."""
     if patterns_only:
-        result = patterns
+        output_obj: list[PatternResult] | dict[str, Any] = patterns
     else:
-        result = {
+        output_obj = {
             "tool_uses": [
                 {
                     "tool_name": t["tool_name"],
@@ -444,13 +452,13 @@ def _format_output(
         }
 
     if fmt == "json":
-        return json.dumps(result, indent=2)
+        return json.dumps(output_obj, indent=2)
 
     if patterns_only:
         lines = [format_pattern_as_learning(p) for p in patterns]
         return "\n\n".join(lines) if lines else "No patterns detected."
 
-    return json.dumps(result, indent=2)
+    return json.dumps(output_obj, indent=2)
 
 
 def _write_output(

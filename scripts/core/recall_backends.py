@@ -107,39 +107,46 @@ def reset_construct_inflight() -> None:
 
 
 async def _construct_embedder_off_thread(provider: str) -> Any:
-    """Construct an ``EmbeddingService`` on a daemon thread (issue #152).
+    """Acquire an ``EmbeddingService``, bounding only the slow cold local load.
 
-    The LOCAL provider's ``__init__`` synchronously loads the BGE model
-    (~14s cold) -- uncancellable CPU/IO. Running it on a daemon thread lets the
-    caller reclaim control at the ``QUERY_EMBED_TIMEOUT`` deadline (via the
-    wrapping ``wait_for``) and degrade to text-only, while the abandoned load
-    keeps running only long enough to populate the process-level model cache so
-    the *next* recall constructs instantly. A daemon thread never blocks
-    interpreter shutdown, so a short-lived caller (the memory-awareness hook
-    subprocess) exits promptly after degrading instead of joining the load.
+    Three paths (issue #152, rounds 1-3):
 
-    For the LOCAL provider only, raises ``RuntimeError`` (which the caller's
-    degrade guard catches) when ``_MAX_CONSTRUCT_INFLIGHT`` loads are already
-    running, so a stuck cold load cannot accumulate unbounded worker threads
-    (round 1, finding 2). The cap is scoped to local because only local has a
-    slow/uncancellable model load — fast providers (voyage/openai/ollama) read
-    env in their __init__ and must not be rejected because local loads are
-    occupying the budget (round 2, finding 3).
+    * **Inline fast path** — fast providers (voyage/openai/ollama, env-only
+      ``__init__``) and a *warm* local cache hit construct inline on the event
+      loop. This is the common case after the first load, so it must NOT pay
+      the daemon-thread / Future / call_soon_threadsafe cost nor be subject to
+      the cold-load cap (round 3, finding 1).
+    * **Cold local load** — only a local construction whose BGE model is not
+      yet cached runs on a daemon thread, so the caller can reclaim control at
+      the ``QUERY_EMBED_TIMEOUT`` deadline and degrade to text-only while the
+      abandoned (uncancellable, ~14s) load keeps running just long enough to
+      warm the process model cache for the next recall. A daemon thread never
+      blocks interpreter shutdown, so a short-lived caller (the memory-awareness
+      hook subprocess) exits promptly after degrading.
+    * **Cap** — a cold local load raises ``RuntimeError`` (caught by the
+      caller's degrade guard) once ``_MAX_CONSTRUCT_INFLIGHT`` cold loads are
+      already running, so a stuck load cannot accumulate unbounded worker
+      threads (round 1, finding 2). Scoped to local because only local has a
+      slow load (round 2, finding 3).
 
     Imported lazily so test monkeypatches of ``EmbeddingService`` take effect.
     """
+    from scripts.core.db import embedding_providers
     from scripts.core.db.embedding_service import EmbeddingService
 
+    # Inline fast path: no thread, no cap. A warm local hit resolves via a
+    # lock-free cache read inside the constructor, so this stays cheap.
+    if provider != "local" or embedding_providers.local_model_cached():
+        return EmbeddingService(provider=provider)
+
     global _construct_inflight
-    capped = provider == "local"
-    if capped:
-        with _construct_inflight_lock:
-            if _construct_inflight >= _MAX_CONSTRUCT_INFLIGHT:
-                raise RuntimeError(
-                    f"local embedder construction backlog ({_construct_inflight} "
-                    "loads in flight); degrading to text-only"
-                )
-            _construct_inflight += 1
+    with _construct_inflight_lock:
+        if _construct_inflight >= _MAX_CONSTRUCT_INFLIGHT:
+            raise RuntimeError(
+                f"local embedder construction backlog ({_construct_inflight} "
+                "loads in flight); degrading to text-only"
+            )
+        _construct_inflight += 1
 
     loop = asyncio.get_running_loop()
     fut: asyncio.Future = loop.create_future()
@@ -165,12 +172,23 @@ async def _construct_embedder_off_thread(provider: str) -> Any:
         finally:
             # Decrement only when the load actually finishes (not when the
             # caller times out) — that is what keeps the count an accurate
-            # ceiling on live worker threads. Mirrors the increment: local only.
-            if capped:
-                with _construct_inflight_lock:
-                    _construct_inflight -= 1
+            # ceiling on live worker threads.
+            with _construct_inflight_lock:
+                _construct_inflight -= 1
 
-    threading.Thread(target=_build, name="recall-embedder-build", daemon=True).start()
+    try:
+        threading.Thread(
+            target=_build, name="recall-embedder-build", daemon=True
+        ).start()
+    except BaseException:
+        # Thread never started, so _build (which decrements) will not run.
+        # Roll back the increment or the cap permanently leaks under OS
+        # thread-exhaustion, eventually wedging all local recalls (round 3,
+        # finding 2).
+        with _construct_inflight_lock:
+            _construct_inflight -= 1
+        raise
+
     return await fut
 
 

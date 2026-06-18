@@ -246,9 +246,12 @@ def create_provider(
         )
 
     if name == "local":
-        from scripts.core.db.embedding_providers import LocalEmbeddingProvider
+        from scripts.core.db.embedding_providers import (
+            DEFAULT_LOCAL_MODEL,
+            LocalEmbeddingProvider,
+        )
 
-        local_model = model if model is not None else "BAAI/bge-large-en-v1.5"
+        local_model = model if model is not None else DEFAULT_LOCAL_MODEL
         device = kwargs.get("device", None)
         return LocalEmbeddingProvider(model=local_model, device=device)
 

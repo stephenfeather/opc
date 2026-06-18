@@ -566,6 +566,10 @@ class TestHybridEmbedFallback:
         import threading as _threading
 
         from scripts.core import recall_backends as rb
+        from scripts.core.db import embedding_providers as ep
+
+        # Force the cold local path (the only path that uses a worker thread).
+        monkeypatch.setattr(ep, "local_model_cached", lambda *a, **k: False)
 
         captured: dict[str, Any] = {}
         real_thread_cls = _threading.Thread
@@ -577,7 +581,7 @@ class TestHybridEmbedFallback:
         monkeypatch.setattr(rb.threading, "Thread", _spy_thread)
         _patch_embedder(monkeypatch, _OkEmbedder)
 
-        embedder = await rb._construct_embedder_off_thread("voyage")
+        embedder = await rb._construct_embedder_off_thread("local")
 
         assert isinstance(embedder, _OkEmbedder)
         assert captured.get("daemon") is True
@@ -586,11 +590,14 @@ class TestHybridEmbedFallback:
         """A constructor that raises in the worker thread propagates to the
         awaiting caller (so the degrade guard catches it), not silently."""
         from scripts.core import recall_backends as rb
+        from scripts.core.db import embedding_providers as ep
 
+        # Cold local path so the error is marshalled back from the worker thread.
+        monkeypatch.setattr(ep, "local_model_cached", lambda *a, **k: False)
         _patch_embedder(monkeypatch, _ConstructRaisingEmbedder)
 
         with pytest.raises(ValueError):
-            await rb._construct_embedder_off_thread("voyage")
+            await rb._construct_embedder_off_thread("local")
 
     async def test_settle_future_result_is_noop_when_done(self):
         """A late worker-thread settle on an already-cancelled future (caller
@@ -613,7 +620,10 @@ class TestHybridEmbedFallback:
         import threading as _threading
 
         from scripts.core import recall_backends as rb
+        from scripts.core.db import embedding_providers as ep
 
+        # Cold local path (warm would bypass the cap), cap fully saturated.
+        monkeypatch.setattr(ep, "local_model_cached", lambda *a, **k: False)
         monkeypatch.setattr(rb, "_MAX_CONSTRUCT_INFLIGHT", 0)
 
         spawned = {"n": 0}
@@ -647,6 +657,62 @@ class TestHybridEmbedFallback:
         # ...yet a voyage construction still succeeds (not capped).
         embedder = await rb._construct_embedder_off_thread("voyage")
         assert isinstance(embedder, _OkEmbedder)
+
+    async def test_warm_local_constructs_inline(self, monkeypatch):
+        """Issue #152 round 3 (finding 1): a warm local cache hit must construct
+        inline — no worker thread, and not subject to the cold-load cap — so the
+        common steady-state recall does not pay the thread/Future cost."""
+        import threading as _threading
+
+        from scripts.core import recall_backends as rb
+        from scripts.core.db import embedding_providers as ep
+
+        # Model already cached → warm.
+        monkeypatch.setattr(ep, "local_model_cached", lambda *a, **k: True)
+        # Cap saturated: if warm went through the cap it would wrongly raise.
+        monkeypatch.setattr(rb, "_MAX_CONSTRUCT_INFLIGHT", 0)
+
+        spawned = {"n": 0}
+        real_thread_cls = _threading.Thread
+
+        def _spy_thread(*a: Any, **kw: Any):
+            spawned["n"] += 1
+            return real_thread_cls(*a, **kw)
+
+        monkeypatch.setattr(rb.threading, "Thread", _spy_thread)
+        _patch_embedder(monkeypatch, _OkEmbedder)
+
+        embedder = await rb._construct_embedder_off_thread("local")
+
+        assert isinstance(embedder, _OkEmbedder)
+        assert spawned["n"] == 0  # inline, no worker thread
+
+    async def test_construct_inflight_rolled_back_on_thread_start_failure(
+        self, monkeypatch
+    ):
+        """Issue #152 round 3 (finding 2): if Thread.start() raises (OS thread
+        exhaustion), the in-flight counter must roll back — otherwise the cap
+        leaks and eventually wedges all local recalls until process restart."""
+        from scripts.core import recall_backends as rb
+        from scripts.core.db import embedding_providers as ep
+
+        monkeypatch.setattr(ep, "local_model_cached", lambda *a, **k: False)
+        _patch_embedder(monkeypatch, _OkEmbedder)
+
+        class _BadThread:
+            def __init__(self, *a: Any, **kw: Any) -> None: ...
+
+            def start(self) -> None:
+                raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(rb.threading, "Thread", _BadThread)
+
+        before = rb._construct_inflight
+        with pytest.raises(RuntimeError):
+            await rb._construct_embedder_off_thread("local")
+
+        # Counter restored: the failed start did not leak a permanent +1.
+        assert rb._construct_inflight == before
 
 
 class TestLocalLoadOutputSafety:

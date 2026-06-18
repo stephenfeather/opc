@@ -367,6 +367,11 @@ class VoyageEmbeddingProvider(EmbeddingProvider):
 # Local model cache (issue #152)
 # ---------------------------------------------------------------------------
 
+# Default local model. Single-sourced here (issue #152 round 3) so the warm-
+# cache check below and create_provider() agree on the cache key for a no-arg
+# local construction (the path recall uses).
+DEFAULT_LOCAL_MODEL = "BAAI/bge-large-en-v1.5"
+
 # Process-level cache of loaded sentence-transformers models, keyed by
 # (model, device). Loading the BGE model is ~14s cold; before #152 it ran on
 # every EmbeddingService(provider="local"), so each hybrid recall paid it.
@@ -387,6 +392,20 @@ def reset_local_model_cache() -> None:
     """Drop all cached local models (test isolation; issue #152)."""
     with _LOCAL_MODEL_CACHE_LOCK:
         _LOCAL_MODEL_CACHE.clear()
+
+
+def local_model_cached(model: str | None = None, device: str | None = None) -> bool:
+    """True when the (defaulted) local model is already loaded (issue #152 r3).
+
+    A warm hit means a subsequent ``EmbeddingService(provider="local")`` is a
+    lock-free cache read, not an uncancellable cold load — so recall can build
+    it inline instead of paying the deadline-bounded off-thread machinery. The
+    cache only grows (entries are never evicted except by the test-only reset),
+    so a True result stays true. Lock-free by design: ``dict`` membership is
+    atomic under the GIL and never blocks behind an in-progress cold load.
+    """
+    resolved = model if model is not None else DEFAULT_LOCAL_MODEL
+    return (resolved, device) in _LOCAL_MODEL_CACHE
 
 
 def _load_sentence_transformer(model: str, device: str | None) -> Any:
@@ -456,7 +475,7 @@ class LocalEmbeddingProvider(EmbeddingProvider):
 
     def __init__(
         self,
-        model: str = "BAAI/bge-large-en-v1.5",
+        model: str = DEFAULT_LOCAL_MODEL,
         device: str | None = None,
     ):
         self.model_name = model

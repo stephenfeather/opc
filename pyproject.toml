@@ -123,9 +123,11 @@ pythonVersion = "3.13"
 # sentence_transformers, pytest, ...) are found in editors, not just under `uv run`.
 venvPath = "."
 venv = ".venv"
-# Mirror the pytest `pythonpath` so first-party imports (scripts.*, src/runtime,
-# sibling modules like artifact_query) resolve.
-extraPaths = ["src", ".", "scripts"]
+# Mirror the pytest `pythonpath` exactly so first-party imports (scripts.*,
+# src/runtime) resolve. Note: `scripts` is deliberately NOT added as a root —
+# doing so puts the local `scripts/mcp` package ahead of the installed `mcp`
+# dependency in resolution, shadowing it and producing false diagnostics.
+extraPaths = ["src", "."]
 typeCheckingMode = "basic"
 include = ["scripts", "src", "tests"]
 exclude = [

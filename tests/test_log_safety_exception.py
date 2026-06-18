@@ -160,47 +160,170 @@ def test_redaction_applies_across_multiline_traceback():
 
 
 # ---------------------------------------------------------------------------
-# safe_exception — pgcode bracketing
+# safe_exception — structured-diagnostics ALLOWLIST (DB exceptions)
+#
+# For DB exceptions the free-text message is DROPPED entirely: psycopg/asyncpg
+# messages leak DB VALUES in forms the regex misses (double-quoted values,
+# DETAIL row contents, CONTEXT echoes). Only SAFE structured IDENTIFIER fields
+# (schema/table/column/datatype/constraint) plus the SQLSTATE code are rendered.
 # ---------------------------------------------------------------------------
 
 
-class _FakePgError(Exception):
-    """psycopg2-style exception exposing SQLSTATE via .pgcode."""
+class _FakeDiag:
+    """psycopg2-style .diag namespace exposing structured identifier fields."""
 
-    def __init__(self, msg: str, pgcode: str) -> None:
+    def __init__(self, **fields: object) -> None:
+        # Default every known field to None; override with provided values.
+        for name in (
+            "schema_name",
+            "table_name",
+            "column_name",
+            "datatype_name",
+            "constraint_name",
+        ):
+            setattr(self, name, None)
+        for name, value in fields.items():
+            setattr(self, name, value)
+
+
+class _FakePgError(Exception):
+    """psycopg2-style exception: SQLSTATE via .pgcode, identifiers via .diag."""
+
+    def __init__(self, msg: str, pgcode: object, **diag_fields: object) -> None:
         super().__init__(msg)
         self.pgcode = pgcode
+        self.diag = _FakeDiag(**diag_fields)
 
 
-def test_safe_exception_includes_pgcode_bracket_and_redacts():
-    e = _FakePgError("duplicate key value violates unique constraint", "23505")
+class _FakeAsyncpgError(Exception):
+    """asyncpg-style exception: SQLSTATE via .sqlstate, identifiers as attrs."""
+
+    def __init__(self, msg: str, sqlstate: object, **fields: object) -> None:
+        super().__init__(msg)
+        self.sqlstate = sqlstate
+        for name, value in fields.items():
+            setattr(self, name, value)
+
+
+def test_safe_exception_psycopg_renders_code_and_identifiers_drops_message():
+    e = _FakePgError(
+        "duplicate key value violates unique constraint",
+        "23505",
+        table_name="sessions",
+        constraint_name="sessions_pkey",
+    )
     out = safe_exception(e)
-    assert out.startswith("_FakePgError[23505]: ")
-    assert "duplicate key value" in out
+    assert out == "_FakePgError[23505] table=sessions constraint=sessions_pkey"
+    # Free-text message is dropped.
+    assert "duplicate key value" not in out
 
 
-def test_safe_exception_redacts_single_quoted_value_with_pgcode():
-    e = _FakePgError("INSERT failed for id = 'secret'", "23505")
+def test_safe_exception_psycopg_identifier_order_schema_to_constraint():
+    e = _FakePgError(
+        "msg",
+        "23505",
+        constraint_name="c",
+        datatype_name="d",
+        column_name="col",
+        table_name="t",
+        schema_name="public",
+    )
     out = safe_exception(e)
-    assert "secret" not in out
-    assert "'<redacted>'" in out
-    assert out.startswith("_FakePgError[23505]: ")
+    assert out == "_FakePgError[23505] schema=public table=t column=col datatype=d constraint=c"
 
 
-def test_safe_exception_plain_exception_has_no_bracket():
+def test_safe_exception_asyncpg_uses_sqlstate_and_direct_attrs():
+    e = _FakeAsyncpgError(
+        "duplicate key",
+        "23505",
+        table_name="users",
+        column_name="email",
+    )
+    out = safe_exception(e)
+    assert out == "_FakeAsyncpgError[23505] table=users column=email"
+    assert "duplicate key" not in out
+
+
+def test_safe_exception_db_with_code_but_no_identifiers_drops_message():
+    # UndefinedTable: code present, every diag field None → code alone.
+    e = _FakePgError("relation \"secret_tbl\" does not exist", "42P01")
+    out = safe_exception(e)
+    assert out == "_FakePgError[42P01]"
+    assert "secret_tbl" not in out
+
+
+def test_safe_exception_db_with_identifiers_but_no_code():
+    # Identifiers present but pgcode None → still a DB exception (no bracket).
+    e = _FakePgError("msg", None, table_name="t")
+    out = safe_exception(e)
+    assert out == "_FakePgError table=t"
+    assert "msg" not in out
+
+
+# ---------------------------------------------------------------------------
+# safe_exception — reviewer leak cases (message MUST be dropped for DB errors)
+# ---------------------------------------------------------------------------
+
+
+class _LeakyPgError(Exception):
+    """DB exception whose __str__ returns a value-bearing free-text message."""
+
+    def __init__(self, leaky_text: str) -> None:
+        self._text = leaky_text
+        self.pgcode = "22P02"
+        self.diag = _FakeDiag(table_name="t")
+
+    def __str__(self) -> str:  # noqa: D401
+        return self._text
+
+
+def test_safe_exception_drops_double_quoted_value_leak():
+    e = _LeakyPgError('invalid input syntax for type uuid: "sk-secret"')
+    out = safe_exception(e)
+    assert "sk-secret" not in out
+    assert out == "_LeakyPgError[22P02] table=t"
+
+
+def test_safe_exception_drops_detail_failing_row_leak():
+    e = _LeakyPgError("DETAIL:  Failing row contains (1, sk-secret, ...).")
+    out = safe_exception(e)
+    assert "sk-secret" not in out
+
+
+def test_safe_exception_drops_context_copy_leak():
+    e = _LeakyPgError('CONTEXT:  COPY t, line 1, column c: "sk-secret"')
+    out = safe_exception(e)
+    assert "sk-secret" not in out
+
+
+# ---------------------------------------------------------------------------
+# safe_exception — non-DB exceptions keep redacted free-text message
+# ---------------------------------------------------------------------------
+
+
+def test_safe_exception_non_db_keeps_redacted_message():
     out = safe_exception(ValueError("boom 'secret'"))
     assert out == "ValueError: boom '<redacted>'"
 
 
-def test_safe_exception_none_pgcode_has_no_bracket():
-    e = _FakePgError("msg", None)  # type: ignore[arg-type]
-    out = safe_exception(e)
-    assert out == "_FakePgError: msg"
+def test_safe_exception_non_db_plain_message_unchanged():
+    out = safe_exception(ValueError("plain"))
+    assert out == "ValueError: plain"
+
+
+def test_safe_exception_non_db_empty_message_renders_class_only():
+    out = safe_exception(ValueError(""))
+    assert out == "ValueError"
+
+
+# ---------------------------------------------------------------------------
+# safe_exception — hostile / defensive cases (never raises)
+# ---------------------------------------------------------------------------
 
 
 def test_safe_exception_hostile_pgcode_property_does_not_raise():
-    # A hostile exception whose .pgcode property raises must not propagate
-    # out of the logging helper; it falls back to no [code] bracket (Finding 2).
+    # A hostile .pgcode property that raises must not propagate; with no
+    # identifiers it is treated as a non-DB exception (no [code] bracket).
     class HostilePgcodeError(Exception):
         @property
         def pgcode(self):
@@ -212,26 +335,23 @@ def test_safe_exception_hostile_pgcode_property_does_not_raise():
     assert out == "HostilePgcodeError: msg"
 
 
-# ---------------------------------------------------------------------------
-# safe_exception — composes with safe() (control chars + truncation)
-# ---------------------------------------------------------------------------
+def test_safe_exception_hostile_diag_property_does_not_raise():
+    # A hostile .diag property that raises must not propagate.
+    class HostileDiagError(Exception):
+        pgcode = "23505"
 
+        @property
+        def diag(self):
+            raise RuntimeError("diag boom")
 
-def test_safe_exception_escapes_control_chars():
-    out = safe_exception(ValueError("line1\nline2"))
-    assert "\n" not in out
-    assert "\\x0a" in out
-
-
-def test_safe_exception_truncates_long_message():
-    long_msg = "x" * 1000
-    out = safe_exception(ValueError(long_msg), max_len=50)
-    assert "truncated" in out
-    # The escaped+truncated form is far shorter than the raw 1000 chars.
-    assert len(out) < 200
+    out = safe_exception(HostileDiagError("msg"))
+    assert isinstance(out, str)
+    # Code still rendered; no identifiers; message dropped (DB exception).
+    assert out == "HostileDiagError[23505]"
 
 
 def test_safe_exception_hostile_str_does_not_raise():
+    # Non-DB exception whose __str__ raises → sentinel, no raise.
     class HostileError(Exception):
         def __str__(self) -> str:
             raise RuntimeError("nope")
@@ -241,20 +361,28 @@ def test_safe_exception_hostile_str_does_not_raise():
     assert "unrepresentable" in out
 
 
-def test_safe_exception_empty_message_renders_class_only():
-    out = safe_exception(ValueError(""))
-    assert out == "ValueError"
-
-
 # ---------------------------------------------------------------------------
-# Regression: realistic psycopg error string
+# safe_exception — composes with safe() (control chars + truncation)
 # ---------------------------------------------------------------------------
 
 
-def test_regression_realistic_psycopg_error_redacts_secret_keeps_identifier():
-    msg = "column \"evil\" does not exist\nLINE 1: ... WHERE id = 'sk-secret-value'\n"
-    out = safe_exception(ValueError(msg))
-    assert "sk-secret-value" not in out
-    assert '"evil"' in out  # identifier survives
-    assert out.startswith("ValueError: ")
-    assert "'<redacted>'" in out
+def test_safe_exception_escapes_control_chars_in_non_db_message():
+    out = safe_exception(ValueError("line1\nline2"))
+    assert "\n" not in out
+    assert "\\x0a" in out
+
+
+def test_safe_exception_escapes_control_char_in_identifier():
+    # A control char smuggled into a structured identifier is escaped by safe().
+    e = _FakePgError("msg", "23505", table_name="bad\nname")
+    out = safe_exception(e)
+    assert "\n" not in out
+    assert "\\x0a" in out
+    assert out.startswith("_FakePgError[23505] table=bad")
+
+
+def test_safe_exception_truncates_long_non_db_message():
+    long_msg = "x" * 1000
+    out = safe_exception(ValueError(long_msg), max_len=50)
+    assert "truncated" in out
+    assert len(out) < 200

@@ -223,39 +223,119 @@ def redact_db_values(text: object) -> str:
     return coerced
 
 
-def safe_exception(e: object, *, max_len: int = _DEFAULT_MAX_LEN) -> str:
-    """Render an exception for logging with DB values scrubbed and escaped.
+def _safe_getattr(obj: object, name: str) -> object:
+    """``getattr(obj, name, None)`` that never raises a non-system Exception.
 
-    Composes :func:`redact_db_values` (remove DB-sourced VALUES) with
-    :func:`safe` (printable-ASCII-only + truncation) so the full output
-    contract of ``safe()`` still holds — the return value contains only
-    ``\\t`` or printable ASCII and is bounded by ``max_len``.
-
-    Output shape:
-
-    - ``name = type(e).__name__``
-    - ``code = getattr(e, "pgcode", None)`` — psycopg2 exposes SQLSTATE as
-      ``.pgcode``; non-DB exceptions yield ``None``. Read defensively (a
-      hostile ``pgcode`` property that raises falls back to ``None``).
-    - ``prefix = f"{name}[{code}]"`` when a code is present, else ``name``.
-    - With a (redacted, non-empty) message: ``f"{prefix}: {msg}"``.
-    - With an empty message: ``prefix`` alone.
-
-    Never raises a non-system Exception (delegates coercion to ``_coerce``
-    via ``redact_db_values``/``safe``).
+    Hostile exception objects may expose ``pgcode``/``diag``/identifier
+    fields as properties that raise. Narrow to ``Exception`` (NOT
+    ``BaseException``) so ``KeyboardInterrupt``/``SystemExit`` still
+    propagate, mirroring ``_coerce``.
     """
-    name = type(e).__name__
     try:
-        code = getattr(e, "pgcode", None)
-    except Exception:  # noqa: BLE001
-        # A hostile exception may expose ``pgcode`` as a property that raises.
-        # Narrow to Exception (NOT BaseException) so KeyboardInterrupt and
-        # SystemExit still propagate, mirroring ``_coerce``. Falling back to
-        # ``None`` drops the ``[code]`` bracket rather than letting the error
-        # escape this logging helper (#117 review, Finding 2).
-        code = None
-    msg = redact_db_values(_coerce(e))
-    prefix = f"{name}[{code}]" if code else name
-    if msg:
-        return safe(f"{prefix}: {msg}", max_len=max_len)
-    return safe(prefix, max_len=max_len)
+        return getattr(obj, name, None)
+    except Exception:  # noqa: BLE001 - hostile property must not break logging
+        return None
+
+
+_SENTINEL_NAME = "Exception"
+
+# Structured IDENTIFIER fields (schema metadata, NOT row data — SAFE to log),
+# rendered in this fixed order. Each tuple is ``(label, attr_name)`` where the
+# label is the short ``key=`` shown in the output and the attr is the psycopg2
+# ``.diag`` field / asyncpg direct attribute.
+_IDENTIFIER_FIELDS: tuple[tuple[str, str], ...] = (
+    ("schema", "schema_name"),
+    ("table", "table_name"),
+    ("column", "column_name"),
+    ("datatype", "datatype_name"),
+    ("constraint", "constraint_name"),
+)
+
+
+def safe_exception(e: object, *, max_len: int = _DEFAULT_MAX_LEN) -> str:
+    """Render an exception for logging via a structured-diagnostics ALLOWLIST.
+
+    Composes the structured fields with :func:`safe` (printable-ASCII-only +
+    truncation) so the full output contract of ``safe()`` still holds — the
+    return value contains only ``\\t`` or printable ASCII and is bounded by
+    ``max_len``.
+
+    **DB exceptions drop the free-text message.** psycopg/asyncpg messages
+    embed DB VALUES in forms that free-text regex redaction cannot reliably
+    catch — double-quoted values
+    (``invalid input syntax for type uuid: "secret"``),
+    ``DETAIL: Failing row contains (1, secret, ...)``, and
+    ``CONTEXT: COPY ...: "secret"``. Postgres uses double quotes for BOTH
+    identifiers and values, so regex on free text cannot be leak-tight
+    (#117 review, HIGH design finding). For DB exceptions we therefore render
+    ONLY an allowlist of safe structured fields and discard the message.
+
+    A DB exception is one where a SQLSTATE code is present OR at least one
+    structured identifier was found:
+
+    - ``code = e.pgcode or e.sqlstate`` — psycopg2 exposes SQLSTATE as
+      ``.pgcode``, asyncpg as ``.sqlstate``.
+    - IDENTIFIER fields (``schema_name``, ``table_name``, ``column_name``,
+      ``datatype_name``, ``constraint_name``) are read from the psycopg2
+      ``.diag`` namespace, falling back to direct attributes for asyncpg.
+      These are schema metadata, not row data, and are SAFE to log. The
+      value-bearing diag fields (``message_*``, ``context``, ``detail``,
+      ``hint``, ``internal_query``, ``*query``, ``message``) are NEVER read.
+
+    Render rules:
+
+    - DB exception → ``ClassName`` + ``[CODE]`` (if a code is present) +
+      space-joined ``label=value`` identifier pairs in the fixed order
+      schema, table, column, datatype, constraint. Free-text message dropped.
+      Example: ``UniqueViolation[23505] table=sessions constraint=sessions_pkey``.
+    - Non-DB exception (no code, no identifiers) →
+      ``f"{name}: {redact_db_values(_coerce(e))}"`` (the best-effort regex is
+      still applied to ordinary Python exceptions whose message may
+      incidentally contain a quoted value). An empty coerced message renders
+      ``name`` alone.
+
+    The whole assembled string is passed through ``safe()`` so a control char
+    smuggled into an identifier is escaped and the output is truncated.
+
+    Never raises a non-system Exception. Any unexpected error during assembly
+    falls back to ``safe(name, ...)`` (or a fixed sentinel if even the type
+    name is unreadable).
+    """
+    try:
+        name = type(e).__name__
+    except Exception:  # noqa: BLE001 - hostile metaclass must not break logging
+        name = _SENTINEL_NAME
+
+    try:
+        # SQLSTATE: psycopg2 uses .pgcode, asyncpg uses .sqlstate.
+        raw_code = _safe_getattr(e, "pgcode") or _safe_getattr(e, "sqlstate")
+        code = _coerce(raw_code) if raw_code else ""
+
+        # Structured identifiers: prefer the psycopg2 .diag value, else the
+        # asyncpg direct attr. Keep only non-empty values.
+        diag = _safe_getattr(e, "diag")
+        identifiers: list[str] = []
+        for label, attr in _IDENTIFIER_FIELDS:
+            value = _safe_getattr(diag, attr) if diag is not None else None
+            if not value:
+                value = _safe_getattr(e, attr)
+            if value:
+                identifiers.append(f"{label}={_coerce(value)}")
+
+        is_db_exception = bool(code) or bool(identifiers)
+
+        if is_db_exception:
+            assembled = f"{name}[{code}]" if code else name
+            if identifiers:
+                assembled = assembled + " " + " ".join(identifiers)
+            return safe(assembled, max_len=max_len)
+
+        # Non-DB exception: keep the best-effort regex-redacted message.
+        msg = redact_db_values(_coerce(e))
+        if msg:
+            return safe(f"{name}: {msg}", max_len=max_len)
+        return safe(name, max_len=max_len)
+    except Exception:  # noqa: BLE001 - assembly must never break logging
+        # Defensive worst-case fallback: render just the class name (or the
+        # sentinel if even that is unavailable).
+        return safe(name, max_len=max_len)

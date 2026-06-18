@@ -260,6 +260,23 @@ def test_safe_exception_db_with_identifiers_but_no_code():
     assert "msg" not in out
 
 
+def test_safe_exception_asyncpg_data_type_name_alias_rendered():
+    # asyncpg's direct datatype attribute is ``data_type_name`` (underscores),
+    # while psycopg2 ``.diag`` uses ``datatype_name``. The datatype field must
+    # fall back to the asyncpg attribute name so asyncpg datatype diagnostics
+    # are not silently dropped (#117 review, Finding 2). The OUTPUT label stays
+    # ``datatype=`` regardless of which source attribute supplied the value.
+    e = _FakeAsyncpgError(
+        "invalid input",
+        "22P02",
+        table_name="users",
+        data_type_name="uuid",
+    )
+    out = safe_exception(e)
+    assert out == "_FakeAsyncpgError[22P02] table=users datatype=uuid"
+    assert "invalid input" not in out
+
+
 # ---------------------------------------------------------------------------
 # safe_exception — reviewer leak cases (message MUST be dropped for DB errors)
 # ---------------------------------------------------------------------------

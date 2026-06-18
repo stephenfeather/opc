@@ -240,15 +240,23 @@ def _safe_getattr(obj: object, name: str) -> object:
 _SENTINEL_NAME = "Exception"
 
 # Structured IDENTIFIER fields (schema metadata, NOT row data — SAFE to log),
-# rendered in this fixed order. Each tuple is ``(label, attr_name)`` where the
-# label is the short ``key=`` shown in the output and the attr is the psycopg2
-# ``.diag`` field / asyncpg direct attribute.
-_IDENTIFIER_FIELDS: tuple[tuple[str, str], ...] = (
-    ("schema", "schema_name"),
-    ("table", "table_name"),
-    ("column", "column_name"),
-    ("datatype", "datatype_name"),
-    ("constraint", "constraint_name"),
+# rendered in this fixed order. Each tuple is ``(label, attr_names)`` where the
+# label is the short ``key=`` shown in the output and ``attr_names`` is the
+# tuple of source attribute names tried in order (first non-empty wins). The
+# rendered LABEL is fixed regardless of which source attribute supplied the
+# value.
+#
+# Most fields share a name between psycopg2 ``.diag`` and asyncpg direct attrs.
+# The datatype field is the exception: psycopg2 ``.diag`` exposes
+# ``datatype_name`` while asyncpg's direct attribute is ``data_type_name``
+# (with underscores). Trying both keeps asyncpg datatype diagnostics from
+# being silently dropped (#117 review, Finding 2).
+_IDENTIFIER_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("schema", ("schema_name",)),
+    ("table", ("table_name",)),
+    ("column", ("column_name",)),
+    ("datatype", ("datatype_name", "data_type_name")),
+    ("constraint", ("constraint_name",)),
 )
 
 
@@ -315,10 +323,15 @@ def safe_exception(e: object, *, max_len: int = _DEFAULT_MAX_LEN) -> str:
         # asyncpg direct attr. Keep only non-empty values.
         diag = _safe_getattr(e, "diag")
         identifiers: list[str] = []
-        for label, attr in _IDENTIFIER_FIELDS:
-            value = _safe_getattr(diag, attr) if diag is not None else None
-            if not value:
-                value = _safe_getattr(e, attr)
+        for label, attr_names in _IDENTIFIER_FIELDS:
+            value = None
+            for attr in attr_names:
+                if diag is not None:
+                    value = _safe_getattr(diag, attr)
+                if not value:
+                    value = _safe_getattr(e, attr)
+                if value:
+                    break
             if value:
                 identifiers.append(f"{label}={_coerce(value)}")
 

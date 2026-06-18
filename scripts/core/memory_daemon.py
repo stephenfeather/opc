@@ -168,7 +168,7 @@ except Exception:
 from scripts.core.config import get_config as _get_config
 
 # Log-field sanitizer for DB-sourced / subprocess-sourced strings (#104).
-from scripts.core.log_safety import redact_db_values, safe, safe_exception  # noqa: E402
+from scripts.core.log_safety import safe, safe_exception  # noqa: E402
 
 # Re-exports from memory_daemon_core (D12: shims per step)
 from scripts.core.memory_daemon_core import (  # noqa: E402
@@ -1003,15 +1003,19 @@ def daemon_loop():
             if DEBUG:
                 import traceback
 
-                # Traceback may include exception messages that transit
-                # DB content (psycopg errors embed query parameters).
-                # redact_db_values() strips the bound parameter VALUES
-                # (single-quoted literals + unique-violation DETAIL echo);
-                # safe() then collapses the traceback to a single line with
-                # \x0a markers, which is noisier for humans but keeps both
-                # the DB-value leak (#117) and the injection boundary
-                # (#104) closed.
-                log(f"[DEBUG] traceback: {safe(redact_db_values(traceback.format_exc()))}")
+                # Log only the STACK FRAMES plus the leak-tight
+                # safe_exception() render. The exception MESSAGE is
+                # intentionally EXCLUDED: traceback.format_exc() appends it,
+                # and psycopg/asyncpg messages embed DB VALUES in forms the
+                # regex scrubber cannot reliably catch (double-quoted values,
+                # "Failing row contains (...)", COPY CONTEXT echoes) — exactly
+                # what safe_exception()'s allowlist was redesigned to drop
+                # (#117 review, Finding 1). format_tb() renders only
+                # File/line/source (code, not data); safe() then collapses it
+                # to a single line with \x0a markers, keeping the injection
+                # boundary (#104) closed.
+                frames = "".join(traceback.format_tb(e.__traceback__))
+                log(f"[DEBUG] {safe_exception(e)} | frames: {safe(frames)}")
         time.sleep(_poll_interval())
 
 

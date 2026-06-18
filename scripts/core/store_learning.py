@@ -492,14 +492,17 @@ def _query_rejection_count(session_id: str) -> int:
     import psycopg2
 
     conn = psycopg2.connect(url)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT COUNT(*) FROM learning_rejections WHERE session_id = %s",
-        (session_id,),
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else 0
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COUNT(*) FROM learning_rejections WHERE session_id = %s",
+            (session_id,),
+        )
+        row = cur.fetchone()
+        cur.close()
+        return row[0] if row else 0
+    finally:
+        conn.close()
 
 
 def get_rejection_count(session_id: str) -> int:

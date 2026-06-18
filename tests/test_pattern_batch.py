@@ -862,6 +862,22 @@ class TestEnableFaulthandler:
         assert captured["file"] is sys.stderr
         assert captured["all_threads"] is True
 
+    def test_closes_previous_handle_on_second_call(self, monkeypatch, tmp_path):
+        """Calling twice must close the first handle before reassigning (no fd leak)."""
+        handles = [MagicMock(name="handle0"), MagicMock(name="handle1")]
+        opened = iter(handles)
+
+        monkeypatch.setattr("faulthandler.enable", lambda *, file, all_threads: None)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(Path, "mkdir", lambda *a, **k: None)
+        monkeypatch.setattr(Path, "open", lambda *a, **k: next(opened))
+
+        _enable_faulthandler()
+        handles[0].close.assert_not_called()
+
+        _enable_faulthandler()
+        handles[0].close.assert_called_once()
+
 
 class TestDebugEnabled:
     def test_verbose_flag_enables(self):

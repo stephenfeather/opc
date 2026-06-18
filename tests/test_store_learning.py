@@ -616,3 +616,19 @@ class TestQueryRejectionCount:
             patch("psycopg2.connect", side_effect=Exception("conn failed")),
         ):
             assert get_rejection_count("s1") == 0
+
+    def test_closes_connection_when_query_raises(self) -> None:
+        """A query error must still close the connection (no fd leak) and re-raise."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_cur.execute.side_effect = Exception("query failed")
+        mock_conn.cursor.return_value = mock_cur
+
+        with (
+            patch("scripts.core.store_learning._pg_url", return_value="postgresql://test"),
+            patch("psycopg2.connect", return_value=mock_conn),
+        ):
+            with pytest.raises(Exception, match="query failed"):
+                _query_rejection_count("s1")
+
+        mock_conn.close.assert_called_once()

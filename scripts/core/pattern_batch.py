@@ -36,12 +36,19 @@ _FAULT_HANDLER_LOG: Any | None = None
 def _enable_faulthandler() -> None:
     """Enable faulthandler without breaking if the log path is unavailable."""
     global _FAULT_HANDLER_LOG  # noqa: PLW0603
+    if _FAULT_HANDLER_LOG is not None:
+        try:
+            _FAULT_HANDLER_LOG.close()
+        except Exception:
+            pass
+        _FAULT_HANDLER_LOG = None
     crash_log = Path.home() / ".claude" / "logs" / "opc_crash.log"
     try:
         crash_log.parent.mkdir(parents=True, exist_ok=True)
         _FAULT_HANDLER_LOG = crash_log.open("a", encoding="utf-8")
         faulthandler.enable(file=_FAULT_HANDLER_LOG, all_threads=True)
     except OSError:
+        _FAULT_HANDLER_LOG = None
         faulthandler.enable(file=sys.stderr, all_threads=True)
 
 

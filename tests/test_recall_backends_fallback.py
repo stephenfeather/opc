@@ -758,3 +758,212 @@ class TestLocalLoadOutputSafety:
         # stdout(1)/stderr(2) must never be redirected by the load path.
         assert 1 not in dup2_targets
         assert 2 not in dup2_targets
+
+
+# Representative text row the fake DB returns from the ILIKE text fallback.
+_VECTOR_TEXT_ROW = {
+    "id": "22222222-2222-2222-2222-222222222222",
+    "session_id": "s-vec",
+    "content": "vector path fallback hit",
+    "metadata": {"type": "session_learning"},
+    "created_at": None,
+    "similarity": 0.5,
+}
+
+
+def _patch_vector_pool(monkeypatch) -> None:
+    """Patch get_pool/init_pgvector for the vector backend.
+
+    ``fetchrow`` reports embeddings present (cnt>0); ``fetch`` returns a row
+    only for the ILIKE text-fallback branch (every probe / vector query
+    returns empty), so a degraded recall surfaces exactly one text row.
+    """
+    import scripts.core.db.postgres_pool as pool_mod
+
+    class FakeConn:
+        async def fetchrow(self, _sql: str, *_args: Any) -> dict[str, Any]:
+            return {"cnt": 5}
+
+        async def fetch(self, sql: str, *_args: Any) -> list[Any]:
+            if "ILIKE" in sql:
+                return [dict(_VECTOR_TEXT_ROW)]
+            return []
+
+        async def execute(self, _sql: str, *_args: Any) -> str:
+            return "SET"
+
+    class FakeAcquire:
+        async def __aenter__(self) -> FakeConn:
+            return FakeConn()
+
+        async def __aexit__(self, *_exc: Any) -> bool:
+            return False
+
+    class FakePool:
+        def acquire(self) -> FakeAcquire:
+            return FakeAcquire()
+
+    async def fake_get_pool():
+        return FakePool()
+
+    async def fake_init_pgvector(_conn: Any) -> None:
+        return None
+
+    monkeypatch.setattr(pool_mod, "get_pool", fake_get_pool)
+    monkeypatch.setattr(pool_mod, "init_pgvector", fake_init_pgvector)
+
+
+class TestVectorEmbedFallback:
+    """Issue #199: the vector / --vector-only backend now acquires its embedder
+    through the same deadline-bounded off-thread helper as hybrid (#152), with
+    construction INSIDE the degrade guard. A cold/wedged LOCAL model load
+    degrades to text instead of blocking the event loop, and a constructor
+    failure degrades like an embed failure instead of crashing recall."""
+
+    def test_vector_embed_timeout_is_generous(self):
+        """The vector deadline honors the explicit --vector-only request: it is
+        generous enough to cover a cold BGE load (~14.6s), not the hook's 2.0s
+        budget. Only a genuinely wedged load trips it."""
+        from scripts.core import recall_backends as rb
+
+        assert rb.VECTOR_EMBED_TIMEOUT >= 14.6
+        assert rb.VECTOR_EMBED_TIMEOUT > rb.QUERY_EMBED_TIMEOUT
+
+    async def test_slow_construction_degrades_within_deadline(self, monkeypatch):
+        """A cold LOCAL construction that blocks far past the deadline degrades
+        to text quickly — it must not hang the caller through the synchronous
+        load (the pre-#199 bug, where construction sat outside the guard with no
+        deadline)."""
+        from scripts.core import recall_backends as rb
+        from scripts.core.db import embedding_providers as ep
+
+        monkeypatch.setattr(rb, "VECTOR_EMBED_TIMEOUT", 0.05)
+        monkeypatch.setattr(ep, "local_model_cached", lambda *a, **k: False)
+        _patch_embedder(monkeypatch, _SlowConstructEmbedder)
+        _patch_vector_pool(monkeypatch)
+
+        start = time.monotonic()
+        results = await rb.search_learnings_postgres(
+            "query terms", k=3, provider="local", text_fallback=True,
+        )
+        elapsed = time.monotonic() - start
+
+        assert results == [rb.format_text_result(dict(_VECTOR_TEXT_ROW))]
+        # Well under the 5s construct sleep; pre-#199 this blocked ~5s.
+        assert elapsed < 3.0, f"degrade took {elapsed:.2f}s; construction not bounded"
+
+    async def test_wedged_construction_without_fallback_returns_empty(self, monkeypatch):
+        """A cold LOCAL construction past the deadline with text_fallback=False
+        returns [] (no hang), honoring the no-fallback contract."""
+        from scripts.core import recall_backends as rb
+        from scripts.core.db import embedding_providers as ep
+
+        monkeypatch.setattr(rb, "VECTOR_EMBED_TIMEOUT", 0.05)
+        monkeypatch.setattr(ep, "local_model_cached", lambda *a, **k: False)
+        _patch_embedder(monkeypatch, _SlowConstructEmbedder)
+        _patch_vector_pool(monkeypatch)
+
+        start = time.monotonic()
+        results = await rb.search_learnings_postgres(
+            "query terms", k=3, provider="local", text_fallback=False,
+        )
+        elapsed = time.monotonic() - start
+
+        assert results == []
+        assert elapsed < 3.0, f"degrade took {elapsed:.2f}s; construction not bounded"
+
+    async def test_constructor_failure_degrades_to_text(self, monkeypatch):
+        """A constructor that raises (now INSIDE the try) degrades to the text
+        fallback rather than propagating and crashing recall (pre-#199 the
+        construct sat outside the guard, so this exception escaped)."""
+        from scripts.core import recall_backends as rb
+        from scripts.core.db import embedding_providers as ep
+
+        # Warm-local inline path so the constructor raises directly in-coroutine.
+        monkeypatch.setattr(ep, "local_model_cached", lambda *a, **k: True)
+        _patch_embedder(monkeypatch, _ConstructRaisingEmbedder)
+        _patch_vector_pool(monkeypatch)
+
+        results = await rb.search_learnings_postgres(
+            "query terms", k=3, provider="local", text_fallback=True,
+        )
+        assert results == [rb.format_text_result(dict(_VECTOR_TEXT_ROW))]
+
+    async def test_constructor_failure_without_text_fallback_returns_empty(
+        self, monkeypatch
+    ):
+        """Constructor failure with text_fallback=False returns [] (degrade
+        guard honors the flag), never raises."""
+        from scripts.core import recall_backends as rb
+        from scripts.core.db import embedding_providers as ep
+
+        monkeypatch.setattr(ep, "local_model_cached", lambda *a, **k: True)
+        _patch_embedder(monkeypatch, _ConstructRaisingEmbedder)
+        _patch_vector_pool(monkeypatch)
+
+        results = await rb.search_learnings_postgres(
+            "query terms", k=3, provider="local", text_fallback=False,
+        )
+        assert results == []
+
+    async def test_vector_routes_through_off_thread_helper(self, monkeypatch):
+        """Consistency with hybrid (acceptance #2): the vector path acquires its
+        embedder via _construct_embedder_off_thread, not a bare
+        EmbeddingService() construction."""
+        from scripts.core import recall_backends as rb
+
+        _patch_embedder(monkeypatch, _OkEmbedder)
+        _patch_vector_pool(monkeypatch)
+
+        calls: list[str] = []
+        real_helper = rb._construct_embedder_off_thread
+
+        async def _spy(provider: str):
+            calls.append(provider)
+            return await real_helper(provider)
+
+        monkeypatch.setattr(rb, "_construct_embedder_off_thread", _spy)
+
+        await rb.search_learnings_postgres(
+            "query terms", k=3, provider="local", text_fallback=True,
+        )
+        assert calls == ["local"]
+
+    async def test_nonlocal_provider_embed_not_cancelled_by_deadline(self, monkeypatch):
+        """Codex PR #203 (P2): a non-local provider (voyage) governs its own
+        network embed via httpx timeout + retries. The vector-path deadline is
+        scoped to LOCAL only, so a slow-but-healthy voyage embed must run to
+        completion — NOT be cancelled by VECTOR_EMBED_TIMEOUT and degraded to
+        text (which would silently drop the provider's retry path)."""
+        from scripts.core import recall_backends as rb
+
+        class _SlowCompletingVoyageEmbedder:
+            completions: list[bool] = []
+
+            def __init__(self, *a: Any, **kw: Any) -> None: ...
+
+            @property
+            def model_label(self) -> str:
+                return "voyage-code-3"
+
+            async def embed(self, *_a: Any, **_kw: Any) -> list[float]:
+                # Longer than the (tiny) deadline below. If the deadline were
+                # (wrongly) applied to voyage, this sleep would be cancelled and
+                # completions would stay empty.
+                await asyncio.sleep(0.2)
+                type(self).completions.append(True)
+                return [0.1] * 8
+
+            async def aclose(self) -> None: ...
+
+        _SlowCompletingVoyageEmbedder.completions = []
+        # A deadline that WOULD trip if it were applied to the 0.2s embed.
+        monkeypatch.setattr(rb, "VECTOR_EMBED_TIMEOUT", 0.05)
+        _patch_embedder(monkeypatch, _SlowCompletingVoyageEmbedder)
+        _patch_vector_pool(monkeypatch)
+
+        await rb.search_learnings_postgres(
+            "query terms", k=3, provider="voyage", text_fallback=True,
+        )
+        # The embed ran to completion — voyage was not bounded by the deadline.
+        assert _SlowCompletingVoyageEmbedder.completions == [True]

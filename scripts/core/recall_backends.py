@@ -64,6 +64,20 @@ _EMBED_DEGRADE_WARNED = False
 # embed on timeout (cancelling an httpx request is safe).
 QUERY_EMBED_TIMEOUT = 2.0
 
+# Issue #199: a deadline for the vector / --vector-only backend's LOCAL-provider
+# construction+embed only. The LOCAL provider is the one with the event-loop
+# hazard — a synchronous cold/wedged BGE construction — so its acquisition runs
+# off-thread (via _construct_embedder_off_thread, same as hybrid, #152) and is
+# bounded here. Unlike hybrid, --vector-only is an explicit, non-hook,
+# non-budgeted request, so this deadline is deliberately generous rather than
+# the hook's 2.0s: a legitimate cold LOCAL BGE load (~14.6s) should complete and
+# return real vector results, and only a genuinely wedged load (e.g. a hung HF
+# download) trips it and degrades to text. Non-local providers (voyage/openai/
+# ollama) are NOT wrapped in this deadline — they construct from env instantly
+# and bound their own network embed via the provider's httpx timeout + retries;
+# an outer cap would cancel those retries mid-flight (Codex PR #203 P2).
+VECTOR_EMBED_TIMEOUT = 30.0
+
 
 def _settle_future_result(fut: asyncio.Future, value: Any) -> None:
     """Resolve ``fut`` with ``value`` unless it is already done (issue #152).
@@ -1588,13 +1602,57 @@ async def search_learnings_postgres(
     # embedding space (issue #151). None for the text-fallback branch.
     model_label: str | None = None
     if has_embeddings:
-        embedder = EmbeddingService(provider=provider)
+        # Issue #199: construction routes through the same off-thread helper as
+        # hybrid (#152) and sits INSIDE this try, so a cold/wedged LOCAL model
+        # load no longer blocks the event-loop thread synchronously and a
+        # constructor failure degrades through the fallback instead of crashing
+        # recall (pre-#199 the construction sat OUTSIDE the try with no
+        # deadline). The holder keeps at most one entry, appended only after
+        # construction succeeds, so a construction that times out or raises
+        # leaves the finally with nothing to aclose (mirrors #152).
+        embedder_holder: list[EmbeddingService] = []
+
+        async def _acquire() -> tuple[str | None, list[float]]:
+            embedder = await _construct_embedder_off_thread(provider)
+            embedder_holder.append(embedder)
+            # Capture the embedding-space label before the finally closes the
+            # embedder; bound into the vector leg so the query never
+            # cross-compares spaces (issue #151). getattr guards custom
+            # embedders that predate model_label.
+            label = getattr(embedder, "model_label", None)
+            emb = await embedder.embed(query, input_type="query")
+            return label, emb
+
         try:
-            model_label = getattr(embedder, "model_label", None)
-            query_embedding = await embedder.embed(query, input_type="query")
+            if provider == "local":
+                # Only the LOCAL provider has the event-loop hazard #199
+                # addresses: a synchronous cold/wedged BGE construction. Bound
+                # it with a generous VECTOR_EMBED_TIMEOUT so a wedged load
+                # degrades, while a legitimate cold load (~14.6s) still
+                # completes and returns real vector results (--vector-only is an
+                # explicit, non-budgeted request — not the hook's 2.0s).
+                model_label, query_embedding = await asyncio.wait_for(
+                    _acquire(),
+                    timeout=VECTOR_EMBED_TIMEOUT,
+                )
+            else:
+                # Non-local providers (voyage/openai/ollama) construct from env
+                # in __init__ (no blocking load) and bound their own network
+                # embed via the provider's httpx timeout + retries. An outer
+                # deadline here would cancel those retries mid-flight and
+                # degrade a slow-but-healthy request to text (Codex PR #203 P2),
+                # so honor the provider's own budget and degrade only on a real
+                # error. Construction still sits inside the try, so a missing-key
+                # constructor failure degrades the same as an embed failure.
+                model_label, query_embedding = await _acquire()
         except Exception:
+            # The branch returns [] when text_fallback is off, so word the
+            # warning to match the behavior the operator actually gets
+            # (Copilot PR #203).
             logger.warning(
-                "Embedding generation failed, falling back to text search",
+                "Embedding generation failed; %s",
+                "falling back to text search" if text_fallback
+                else "text fallback disabled, returning no results",
                 exc_info=True,
             )
             if text_fallback:
@@ -1602,7 +1660,15 @@ async def search_learnings_postgres(
             else:
                 return []
         finally:
-            await embedder.aclose()
+            # Only close a successfully-constructed embedder; a construction
+            # that timed out or raised leaves the holder empty. A raise here
+            # must never override the pending fallback return, so swallow
+            # cleanup failures to the debug log (mirrors #152 hybrid).
+            if embedder_holder:
+                try:
+                    await embedder_holder[0].aclose()
+                except Exception:  # noqa: BLE001 - cleanup is best-effort
+                    logger.debug("embedder close failed", exc_info=True)
 
     async def _fetch_with_chain_fallback(
         conn: Any,

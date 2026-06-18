@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
+from typing import Any
 
 import httpx
 
@@ -349,6 +351,111 @@ class VoyageEmbeddingProvider(EmbeddingProvider):
         return self.model
 
 
+# ---------------------------------------------------------------------------
+# Local model cache (issue #152)
+# ---------------------------------------------------------------------------
+
+# Process-level cache of loaded sentence-transformers models, keyed by
+# (model, device). Loading the BGE model is ~14s cold; before #152 it ran on
+# every EmbeddingService(provider="local"), so each hybrid recall paid it.
+# Caching the loaded object means the cost is paid at most once per process --
+# which also makes recall's deadline-bounded off-thread construction pay off:
+# an abandoned cold load still populates this cache, so the next recall
+# constructs instantly and succeeds within QUERY_EMBED_TIMEOUT.
+_LOCAL_MODEL_CACHE: dict[tuple[str, str | None], Any] = {}
+# Serialises concurrent cold loads (avoids a thundering-herd double-load) and
+# safely publishes the model to other threads -- recall constructs the local
+# provider on a worker thread (#152). The fast-path read below is lock-free
+# (dict.get is atomic under the GIL), so a warm load never blocks behind an
+# in-progress cold load.
+_LOCAL_MODEL_CACHE_LOCK = threading.Lock()
+
+
+def reset_local_model_cache() -> None:
+    """Drop all cached local models (test isolation; issue #152)."""
+    with _LOCAL_MODEL_CACHE_LOCK:
+        _LOCAL_MODEL_CACHE.clear()
+
+
+def _load_sentence_transformer(model: str, device: str | None) -> Any:
+    """Load (or return a process-cached) SentenceTransformer (issue #152).
+
+    The heavy load runs at most once per (model, device). Native stdout/stderr
+    from the loader is redirected to /dev/null and noisy library loggers are
+    quieted for the duration of the load only. Raises ImportError with install
+    guidance when sentence-transformers is absent.
+    """
+    key = (model, device)
+    # Lock-free fast path: an already-loaded model is returned without taking
+    # the lock, so it never blocks behind another thread's in-flight cold load.
+    cached = _LOCAL_MODEL_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError:
+        raise ImportError(
+            "sentence-transformers required for local embeddings. "
+            "Install with: pip install sentence-transformers torch"
+        )
+
+    import faulthandler
+    import logging as _logging
+
+    _enable_faulthandler(faulthandler)
+
+    with _LOCAL_MODEL_CACHE_LOCK:
+        # Re-check under the lock: another thread may have loaded it while we
+        # waited (double-checked locking).
+        cached = _LOCAL_MODEL_CACHE.get(key)
+        if cached is not None:
+            return cached
+
+        loggers_to_quiet = [
+            "sentence_transformers",
+            "transformers",
+            "safetensors",
+            "torch",
+        ]
+        prev_levels = {name: _logging.getLogger(name).level for name in loggers_to_quiet}
+        for name in loggers_to_quiet:
+            _logging.getLogger(name).setLevel(_logging.ERROR)
+        prev_env = os.environ.get("TQDM_DISABLE")
+        os.environ["TQDM_DISABLE"] = "1"
+        # fd-level redirection of stdout/stderr is process-global and not
+        # thread-safe; the lock above guarantees only one thread does it at a
+        # time.
+        devnull_fd = -1
+        old_stdout_fd = -1
+        old_stderr_fd = -1
+        try:
+            devnull_fd = os.open(os.devnull, os.O_WRONLY)
+            old_stdout_fd = os.dup(1)
+            old_stderr_fd = os.dup(2)
+            os.dup2(devnull_fd, 1)
+            os.dup2(devnull_fd, 2)
+            loaded = SentenceTransformer(model, device=device)
+        finally:
+            if old_stderr_fd >= 0:
+                os.dup2(old_stderr_fd, 2)
+                os.close(old_stderr_fd)
+            if old_stdout_fd >= 0:
+                os.dup2(old_stdout_fd, 1)
+                os.close(old_stdout_fd)
+            if devnull_fd >= 0:
+                os.close(devnull_fd)
+            if prev_env is None:
+                os.environ.pop("TQDM_DISABLE", None)
+            else:
+                os.environ["TQDM_DISABLE"] = prev_env
+            for name in loggers_to_quiet:
+                _logging.getLogger(name).setLevel(prev_levels[name])
+
+        _LOCAL_MODEL_CACHE[key] = loaded
+        return loaded
+
+
 class LocalEmbeddingProvider(EmbeddingProvider):
     """Local embedding provider using sentence-transformers.
 
@@ -373,56 +480,10 @@ class LocalEmbeddingProvider(EmbeddingProvider):
         model: str = "BAAI/bge-large-en-v1.5",
         device: str | None = None,
     ):
-        try:
-            from sentence_transformers import SentenceTransformer
-        except ImportError:
-            raise ImportError(
-                "sentence-transformers required for local embeddings. "
-                "Install with: pip install sentence-transformers torch"
-            )
-
-        import faulthandler
-        import logging as _logging
-
-        _enable_faulthandler(faulthandler)
-
         self.model_name = model
-        loggers_to_quiet = [
-            "sentence_transformers",
-            "transformers",
-            "safetensors",
-            "torch",
-        ]
-        prev_levels = {name: _logging.getLogger(name).level for name in loggers_to_quiet}
-        for name in loggers_to_quiet:
-            _logging.getLogger(name).setLevel(_logging.ERROR)
-        prev_env = os.environ.get("TQDM_DISABLE")
-        os.environ["TQDM_DISABLE"] = "1"
-        devnull_fd = -1
-        old_stdout_fd = -1
-        old_stderr_fd = -1
-        try:
-            devnull_fd = os.open(os.devnull, os.O_WRONLY)
-            old_stdout_fd = os.dup(1)
-            old_stderr_fd = os.dup(2)
-            os.dup2(devnull_fd, 1)
-            os.dup2(devnull_fd, 2)
-            self._model = SentenceTransformer(model, device=device)
-        finally:
-            if old_stderr_fd >= 0:
-                os.dup2(old_stderr_fd, 2)
-                os.close(old_stderr_fd)
-            if old_stdout_fd >= 0:
-                os.dup2(old_stdout_fd, 1)
-                os.close(old_stdout_fd)
-            if devnull_fd >= 0:
-                os.close(devnull_fd)
-            if prev_env is None:
-                os.environ.pop("TQDM_DISABLE", None)
-            else:
-                os.environ["TQDM_DISABLE"] = prev_env
-            for name in loggers_to_quiet:
-                _logging.getLogger(name).setLevel(prev_levels[name])
+        # Process-cached load (issue #152): the ~14s cold model load happens at
+        # most once per (model, device) for the whole process.
+        self._model = _load_sentence_transformer(model, device)
         self._dimension = self._model.get_sentence_embedding_dimension()
 
     async def embed(self, text: str, **kwargs) -> list[float]:

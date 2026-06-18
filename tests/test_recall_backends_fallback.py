@@ -98,6 +98,26 @@ class _SlowEmbedder:
         self.closed = True
 
 
+class _SlowConstructEmbedder:
+    """__init__ blocks far past the recall deadline (simulating a cold LOCAL
+    sentence-transformers model load, ~14s). embed() would succeed instantly if
+    construction ever finished. Issue #152: construction must run inside the
+    QUERY_EMBED_TIMEOUT budget so a budgeted caller degrades instead of hanging
+    through the synchronous load."""
+
+    CONSTRUCT_SLEEP = 5.0
+
+    def __init__(self, *a: Any, **kw: Any) -> None:
+        import time as _time
+
+        _time.sleep(self.CONSTRUCT_SLEEP)
+
+    async def embed(self, *_a: Any, **_kw: Any) -> list[float]:
+        return [0.1] * 8
+
+    async def aclose(self) -> None: ...
+
+
 @pytest.fixture(autouse=True)
 def _reset_degrade_latch():
     """Reset the once-per-process stderr warning latch AND the module-level
@@ -484,3 +504,101 @@ class TestHybridEmbedFallback:
         # Redaction + no query text still hold.
         assert "first query" not in err
         assert "second query" not in err
+
+    async def test_slow_construction_degrades_within_deadline(self, monkeypatch):
+        """Issue #152: EmbeddingService construction (the LOCAL model load) now
+        runs INSIDE the QUERY_EMBED_TIMEOUT budget. A construction that blocks
+        far past the deadline must degrade to text-only quickly — not hang the
+        caller through the synchronous load (the pre-#152 bug)."""
+        from scripts.core import recall_backends as rb
+
+        monkeypatch.setattr(rb, "QUERY_EMBED_TIMEOUT", 0.05)
+        _patch_embedder(monkeypatch, _SlowConstructEmbedder)
+        _patch_pool(monkeypatch)
+
+        async def fake_text_only(query, k=10, *, project=None):
+            return [dict(_TEXT_RESULT)]
+
+        monkeypatch.setattr(rb, "search_learnings_text_only_postgres", fake_text_only)
+
+        start = time.monotonic()
+        results = await rb.search_learnings_hybrid_rrf(
+            "query terms",
+            k=3,
+            provider="local",
+        )
+        elapsed = time.monotonic() - start
+
+        assert results == [dict(_TEXT_RESULT)]
+        # Well under the 5s construct sleep (and the hook's 5s budget). With the
+        # pre-#152 synchronous construction this blocked the loop for ~5s.
+        assert elapsed < 3.0, f"degrade took {elapsed:.2f}s; construction not bounded"
+
+    async def test_slow_construction_emits_timeout_warning(self, monkeypatch, capsys):
+        """A construction that exceeds the deadline flows into the same latched,
+        redacted, provider-named 'timed out' warning as a stalled embed."""
+        from scripts.core import recall_backends as rb
+
+        monkeypatch.setattr(rb, "QUERY_EMBED_TIMEOUT", 0.05)
+        _patch_embedder(monkeypatch, _SlowConstructEmbedder)
+        _patch_pool(monkeypatch)
+
+        async def fake_text_only(query, k=10, *, project=None):
+            return [dict(_TEXT_RESULT)]
+
+        monkeypatch.setattr(rb, "search_learnings_text_only_postgres", fake_text_only)
+
+        await rb.search_learnings_hybrid_rrf("secret query", k=3, provider="local")
+
+        err = capsys.readouterr().err
+        assert "warning" in err.lower()
+        assert "timed out" in err.lower()
+        assert "local" in err.lower()
+        assert "secret query" not in err
+
+    async def test_construct_off_thread_uses_daemon_thread(self, monkeypatch):
+        """Issue #152: the construction worker MUST be a daemon thread so a
+        short-lived caller (the memory-awareness hook subprocess) exits promptly
+        after degrading instead of joining an uncancellable ~14s model load at
+        interpreter shutdown."""
+        import threading as _threading
+
+        from scripts.core import recall_backends as rb
+
+        captured: dict[str, Any] = {}
+        real_thread_cls = _threading.Thread
+
+        def _spy_thread(*a: Any, **kw: Any):
+            captured["daemon"] = kw.get("daemon")
+            return real_thread_cls(*a, **kw)
+
+        monkeypatch.setattr(rb.threading, "Thread", _spy_thread)
+        _patch_embedder(monkeypatch, _OkEmbedder)
+
+        embedder = await rb._construct_embedder_off_thread("voyage")
+
+        assert isinstance(embedder, _OkEmbedder)
+        assert captured.get("daemon") is True
+
+    async def test_construct_off_thread_marshals_construct_error(self, monkeypatch):
+        """A constructor that raises in the worker thread propagates to the
+        awaiting caller (so the degrade guard catches it), not silently."""
+        from scripts.core import recall_backends as rb
+
+        _patch_embedder(monkeypatch, _ConstructRaisingEmbedder)
+
+        with pytest.raises(ValueError):
+            await rb._construct_embedder_off_thread("voyage")
+
+    async def test_settle_future_result_is_noop_when_done(self):
+        """A late worker-thread settle on an already-cancelled future (caller
+        degraded on timeout) must be a no-op, never InvalidStateError."""
+        from scripts.core import recall_backends as rb
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        fut.cancel()
+
+        # Must not raise.
+        rb._settle_future_result(fut, object())
+        rb._settle_future_exc(fut, RuntimeError("late"))

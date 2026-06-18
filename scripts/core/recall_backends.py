@@ -16,6 +16,7 @@ import json
 import logging
 import re
 import sys
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -62,6 +63,66 @@ _EMBED_DEGRADE_WARNED = False
 # recall_learnings.py (issue #140); asyncio.wait_for cancels the in-flight
 # embed on timeout (cancelling an httpx request is safe).
 QUERY_EMBED_TIMEOUT = 2.0
+
+
+def _settle_future_result(fut: asyncio.Future, value: Any) -> None:
+    """Resolve ``fut`` with ``value`` unless it is already done (issue #152).
+
+    The wrapping ``wait_for`` may have cancelled ``fut`` on timeout; setting a
+    result on a cancelled/done future raises ``InvalidStateError``. A late
+    construction that lands after the caller already degraded still did its job
+    -- it warmed the process-level model cache -- so the discarded embedder is
+    simply dropped.
+    """
+    if not fut.done():
+        fut.set_result(value)
+
+
+def _settle_future_exc(fut: asyncio.Future, exc: BaseException) -> None:
+    """Fail ``fut`` with ``exc`` unless it is already done (issue #152)."""
+    if not fut.done():
+        fut.set_exception(exc)
+
+
+async def _construct_embedder_off_thread(provider: str) -> Any:
+    """Construct an ``EmbeddingService`` on a daemon thread (issue #152).
+
+    The LOCAL provider's ``__init__`` synchronously loads the BGE model
+    (~14s cold) -- uncancellable CPU/IO. Running it on a daemon thread lets the
+    caller reclaim control at the ``QUERY_EMBED_TIMEOUT`` deadline (via the
+    wrapping ``wait_for``) and degrade to text-only, while the abandoned load
+    keeps running only long enough to populate the process-level model cache so
+    the *next* recall constructs instantly. A daemon thread never blocks
+    interpreter shutdown, so a short-lived caller (the memory-awareness hook
+    subprocess) exits promptly after degrading instead of joining the load.
+
+    Imported lazily so test monkeypatches of ``EmbeddingService`` take effect.
+    """
+    from scripts.core.db.embedding_service import EmbeddingService
+
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future = loop.create_future()
+
+    def _settle(settler, arg) -> None:
+        # The loop may already be closed if the caller degraded and the process
+        # moved on (or exited) before this late load finished. The load's real
+        # post-timeout value -- a warmed model cache -- is already in place, so
+        # there is nothing left to deliver.
+        try:
+            loop.call_soon_threadsafe(settler, fut, arg)
+        except RuntimeError:
+            pass
+
+    def _build() -> None:
+        try:
+            embedder = EmbeddingService(provider=provider)
+        except BaseException as exc:  # noqa: BLE001 - marshalled to the loop
+            _settle(_settle_future_exc, exc)
+        else:
+            _settle(_settle_future_result, embedder)
+
+    threading.Thread(target=_build, name="recall-embedder-build", daemon=True).start()
+    return await fut
 
 
 # ---------------------------------------------------------------------------
@@ -1098,20 +1159,37 @@ async def search_learnings_hybrid_rrf(
     # failures (e.g. VoyageEmbeddingProvider raising when VOYAGE_API_KEY is
     # absent, or a local model load error) degrade like embed() failures
     # rather than bypassing the fallback (review round 1).
-    embedder: EmbeddingService | None = None
+    # ``embedder_holder`` lets the finally close a successfully-constructed
+    # embedder even though construction now happens inside the deadline-guarded
+    # coroutine (issue #152). It holds at most one entry, appended only once
+    # construction succeeds — so a construction that times out or raises leaves
+    # it empty and the finally skips aclose (which would crash on a half-built
+    # or never-built embedder).
+    embedder_holder: list[EmbeddingService] = []
     model_label: str | None = None
     try:
-        # Construction is non-network (provider __init__ only reads env), so
-        # it stays outside wait_for and remains visible to the finally below.
-        embedder = EmbeddingService(provider=provider)
-        # Capture the embedding-space label before the finally closes the
-        # embedder; bound into the recall vector leg so the query never
-        # cross-compares spaces (issue #151). getattr guards custom embedders
-        # that predate model_label — they degrade to the unfiltered (pre-#151)
-        # path rather than erroring.
-        model_label = getattr(embedder, "model_label", None)
-        query_embedding = await asyncio.wait_for(
-            embedder.embed(query, input_type="query"),
+        # Issue #152: construction AND embed share a single QUERY_EMBED_TIMEOUT
+        # budget. Construction runs on a daemon thread because the LOCAL
+        # provider's model load is a synchronous ~14s cold load — outside the
+        # deadline it would hang a budgeted caller (the memory-awareness hook)
+        # with no degradation. wait_for hands control back at the deadline; the
+        # abandoned daemon load still warms the process model cache so the next
+        # recall constructs instantly. (Pre-#152 construction sat outside
+        # wait_for as "non-network", which held only for the API providers.)
+        async def _acquire() -> tuple[str | None, list[float]]:
+            embedder = await _construct_embedder_off_thread(provider)
+            embedder_holder.append(embedder)
+            # Capture the embedding-space label before the finally closes the
+            # embedder; bound into the recall vector leg so the query never
+            # cross-compares spaces (issue #151). getattr guards custom
+            # embedders that predate model_label — they degrade to the
+            # unfiltered (pre-#151) path rather than erroring.
+            label = getattr(embedder, "model_label", None)
+            emb = await embedder.embed(query, input_type="query")
+            return label, emb
+
+        model_label, query_embedding = await asyncio.wait_for(
+            _acquire(),
             timeout=QUERY_EMBED_TIMEOUT,
         )
     except Exception as exc:  # noqa: BLE001 - degrade, do not crash recall
@@ -1148,12 +1226,16 @@ async def search_learnings_hybrid_rrf(
             query, k, project=project,
         )
     finally:
-        if embedder is not None:
+        if embedder_holder:
             # A raise here would override the pending fallback return
             # (FIX A): cleanup failure must never abort recall. Swallow it
-            # to the debug log only.
+            # to the debug log only. Note: a construction that lands AFTER the
+            # deadline (the abandoned daemon load, #152) is never added to the
+            # holder, so its discarded embedder is not closed here — for LOCAL
+            # (the only slow-construct provider) aclose is a no-op, and the
+            # warmed model cache is the intended residue.
             try:
-                await embedder.aclose()
+                await embedder_holder[0].aclose()
             except Exception:  # noqa: BLE001 - cleanup is best-effort
                 logger.debug("embedder close failed", exc_info=True)
 

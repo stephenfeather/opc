@@ -389,17 +389,21 @@ def generate_mini_handoff(
 # ---------------------------------------------------------------------------
 
 try:
-    from scripts.core.store_learning import get_rejection_count
+    from scripts.core.store_learning import _query_rejection_count
 except ImportError:
-    get_rejection_count = None  # type: ignore[assignment]
+    _query_rejection_count = None  # type: ignore[assignment]
 
 
 def count_session_rejections(session_id: str) -> int | None:
-    """Count rejected learnings for a session. Returns None on error."""
+    """Count rejected learnings for a session. Returns None on error.
+
+    Calls the raising query helper so a real DB failure surfaces as None (and
+    a WARNING) rather than a false-confidence 0 (Issue #98).
+    """
     try:
-        if get_rejection_count is None:
+        if _query_rejection_count is None:
             return None
-        return get_rejection_count(session_id)
+        return _query_rejection_count(session_id)
     except Exception as e:
         logger.warning(
             "Rejection count failed for %s: %s", safe(session_id), safe(e)

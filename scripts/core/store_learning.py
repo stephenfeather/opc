@@ -478,26 +478,39 @@ def _record_rejection(
         logger.debug("Failed to record rejection: %s", e)
 
 
-def get_rejection_count(session_id: str) -> int:
-    """Return the number of rejected (skipped) learnings for a session.
+def _query_rejection_count(session_id: str) -> int:
+    """Query the rejected-learning count for a session, raising on DB error.
 
-    Returns 0 if no rejections recorded or on error.
+    Returns 0 for the legitimate non-error cases (no PG url configured, or an
+    empty/None result row). A real DB failure (missing table, broken
+    connection, schema drift) propagates so callers can distinguish an
+    unavailable count from a genuine zero (Issue #98).
     """
     url = _pg_url()
     if not url:
         return 0
-    try:
-        import psycopg2
+    import psycopg2
 
-        conn = psycopg2.connect(url)
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT COUNT(*) FROM learning_rejections WHERE session_id = %s",
-            (session_id,),
-        )
-        row = cur.fetchone()
-        conn.close()
-        return row[0] if row else 0
+    conn = psycopg2.connect(url)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COUNT(*) FROM learning_rejections WHERE session_id = %s",
+        (session_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
+def get_rejection_count(session_id: str) -> int:
+    """Return the number of rejected (skipped) learnings for a session.
+
+    Returns 0 if no rejections recorded or on error. Thin wrapper over
+    _query_rejection_count that preserves the swallow-on-error contract for
+    callers that only need a best-effort count.
+    """
+    try:
+        return _query_rejection_count(session_id)
     except Exception:
         return 0
 

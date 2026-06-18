@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from scripts.core.store_learning import (  # noqa: E402
     CONFIDENCE_LEVELS,
     LEARNING_TYPES,
+    _query_rejection_count,
     build_learning_content,
     build_metadata,
     check_dedup_result,
@@ -557,6 +558,59 @@ class TestGetRejectionCount:
             assert get_rejection_count("s1") == 5
 
     def test_returns_zero_on_exception(self) -> None:
+        with (
+            patch("scripts.core.store_learning._pg_url", return_value="postgresql://test"),
+            patch("psycopg2.connect", side_effect=Exception("conn failed")),
+        ):
+            assert get_rejection_count("s1") == 0
+
+
+class TestQueryRejectionCount:
+    """Tests for _query_rejection_count() — raising variant (Issue #98).
+
+    Distinguishes a real DB failure (raises) from a genuine zero count,
+    so observability does not report false-confidence zeros.
+    """
+
+    def test_returns_zero_when_no_pg_url(self) -> None:
+        with patch("scripts.core.store_learning._pg_url", return_value=None):
+            assert _query_rejection_count("s1") == 0
+
+    def test_returns_count_from_db(self) -> None:
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_cur.fetchone.return_value = (5,)
+        mock_conn.cursor.return_value = mock_cur
+
+        with (
+            patch("scripts.core.store_learning._pg_url", return_value="postgresql://test"),
+            patch("psycopg2.connect", return_value=mock_conn),
+        ):
+            assert _query_rejection_count("s1") == 5
+
+    def test_returns_zero_on_empty_result(self) -> None:
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_cur.fetchone.return_value = None
+        mock_conn.cursor.return_value = mock_cur
+
+        with (
+            patch("scripts.core.store_learning._pg_url", return_value="postgresql://test"),
+            patch("psycopg2.connect", return_value=mock_conn),
+        ):
+            assert _query_rejection_count("s1") == 0
+
+    def test_raises_on_db_failure(self) -> None:
+        """A real DB failure must propagate, not be swallowed as 0."""
+        with (
+            patch("scripts.core.store_learning._pg_url", return_value="postgresql://test"),
+            patch("psycopg2.connect", side_effect=Exception("conn failed")),
+        ):
+            with pytest.raises(Exception, match="conn failed"):
+                _query_rejection_count("s1")
+
+    def test_public_wrapper_returns_zero_on_same_failure(self) -> None:
+        """Contract: public get_rejection_count still returns 0 on DB failure."""
         with (
             patch("scripts.core.store_learning._pg_url", return_value="postgresql://test"),
             patch("psycopg2.connect", side_effect=Exception("conn failed")),

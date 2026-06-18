@@ -356,22 +356,26 @@ class TestArchiveSessionJsonl:
 
 
 class TestCountSessionRejections:
-    """count_session_rejections wraps store_learning.get_rejection_count."""
+    """count_session_rejections wraps store_learning._query_rejection_count.
 
-    @patch("scripts.core.memory_daemon_extractors.get_rejection_count", return_value=3)
+    Issue #98: it must call the RAISING variant so a real DB failure
+    surfaces as None + WARNING rather than a false-confidence 0.
+    """
+
+    @patch("scripts.core.memory_daemon_extractors._query_rejection_count", return_value=3)
     def test_returns_count(self, mock_get):
         from scripts.core.memory_daemon_extractors import count_session_rejections
 
         assert count_session_rejections("s1") == 3
 
-    @patch("scripts.core.memory_daemon_extractors.get_rejection_count",
+    @patch("scripts.core.memory_daemon_extractors._query_rejection_count",
            side_effect=Exception("db error"))
     def test_returns_none_on_error(self, mock_get):
         from scripts.core.memory_daemon_extractors import count_session_rejections
 
         assert count_session_rejections("s1") is None
 
-    @patch("scripts.core.memory_daemon_extractors.get_rejection_count",
+    @patch("scripts.core.memory_daemon_extractors._query_rejection_count",
            side_effect=Exception("db error"))
     def test_logs_on_error(self, mock_get, caplog):
         """Issue #98 — the previously-silent except path must log the
@@ -388,7 +392,7 @@ class TestCountSessionRejections:
             "rejection" in r.getMessage().lower() for r in caplog.records
         ), f"Expected a logged rejection-count failure, got {caplog.records}"
 
-    @patch("scripts.core.memory_daemon_extractors.get_rejection_count",
+    @patch("scripts.core.memory_daemon_extractors._query_rejection_count",
            side_effect=Exception("db error"))
     def test_log_redacts_exception(self, mock_get, caplog):
         """The logged failure must route the exception through safe()."""
@@ -402,6 +406,29 @@ class TestCountSessionRejections:
         # safe() is the module redaction helper used throughout; the
         # exception text should appear (proving we logged the cause).
         assert any("db error" in r.getMessage() for r in caplog.records)
+
+    def test_real_db_failure_returns_none_and_warns(self, caplog):
+        """Issue #98 KEY regression: drive the REAL helper failure path.
+
+        Previously count_session_rejections called get_rejection_count, which
+        swallowed DB errors and returned 0 — so a true DB outage was logged as
+        rejections=0 (false confidence). Patching the underlying DB connection
+        to raise must now yield None AND a WARNING via the real raising helper.
+        """
+        import logging
+
+        from scripts.core.memory_daemon_extractors import count_session_rejections
+
+        with (
+            patch("scripts.core.store_learning._pg_url", return_value="postgresql://test"),
+            patch("psycopg2.connect", side_effect=Exception("db down")),
+            caplog.at_level(logging.WARNING, logger="memory-daemon"),
+        ):
+            assert count_session_rejections("s1") is None
+
+        assert any(
+            "rejection" in r.getMessage().lower() for r in caplog.records
+        ), f"Expected a logged rejection-count failure, got {caplog.records}"
 
 
 # ---------------------------------------------------------------------------

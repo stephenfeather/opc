@@ -5,6 +5,7 @@ Phase 2 of S30 TDD+FP refactor. Each step adds tests before moving functions.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -765,6 +766,18 @@ class TestCountSessionLearningsDb:
 
         assert count_session_learnings("sess-1") is None
 
+    @patch("scripts.core.memory_daemon_db.use_postgres", return_value=True)
+    @patch("scripts.core.memory_daemon_db.pg_connect", side_effect=Exception("db down"))
+    def test_logs_warning_on_error(self, mock_pg, mock_use, caplog):
+        from scripts.core.memory_daemon_db import count_session_learnings
+
+        with caplog.at_level(logging.WARNING, logger="memory-daemon"):
+            assert count_session_learnings("sess-1") is None
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings, "expected a WARNING record for swallowed DB error"
+        assert "count_session_learnings failed" in warnings[0].getMessage()
+
 
 class TestSeedLastPatternRunDb:
     """seed_last_pattern_run reads latest pattern detection timestamp."""
@@ -796,3 +809,15 @@ class TestSeedLastPatternRunDb:
         from scripts.core.memory_daemon_db import seed_last_pattern_run
 
         assert seed_last_pattern_run() == 0
+
+    @patch("scripts.core.memory_daemon_db.use_postgres", return_value=True)
+    @patch("scripts.core.memory_daemon_db.pg_connect", side_effect=Exception("db down"))
+    def test_logs_warning_on_error(self, mock_pg, mock_use, caplog):
+        from scripts.core.memory_daemon_db import seed_last_pattern_run
+
+        with caplog.at_level(logging.WARNING, logger="memory-daemon"):
+            assert seed_last_pattern_run() == 0
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings, "expected a WARNING record for swallowed DB error"
+        assert "seed_last_pattern_run failed" in warnings[0].getMessage()

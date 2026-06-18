@@ -15,17 +15,51 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import faulthandler
 import json
 import logging
 import os
 import sys
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from dotenv import load_dotenv
+
+_FAULT_HANDLER_LOG: Any | None = None
+
+
+def _enable_faulthandler() -> None:
+    """Enable faulthandler without breaking if the log path is unavailable."""
+    global _FAULT_HANDLER_LOG  # noqa: PLW0603
+    if _FAULT_HANDLER_LOG is not None:
+        try:
+            _FAULT_HANDLER_LOG.close()
+        except Exception:
+            pass
+        _FAULT_HANDLER_LOG = None
+    crash_log = Path.home() / ".claude" / "logs" / "opc_crash.log"
+    try:
+        crash_log.parent.mkdir(parents=True, exist_ok=True)
+        _FAULT_HANDLER_LOG = crash_log.open("a", encoding="utf-8")
+        faulthandler.enable(file=_FAULT_HANDLER_LOG, all_threads=True)
+    except OSError:
+        _FAULT_HANDLER_LOG = None
+        faulthandler.enable(file=sys.stderr, all_threads=True)
+
+
+def _debug_enabled(verbose: bool, env: Mapping[str, str]) -> bool:
+    """Return True when verbose flag is set or MEMORY_DAEMON_DEBUG is truthy."""
+    return verbose or env.get("MEMORY_DAEMON_DEBUG", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 # Load env files
 global_env = Path.home() / ".claude" / ".env"
@@ -444,14 +478,17 @@ async def run_pattern_detection(
     start = time.monotonic()
     run_id = str(uuid.uuid4())
 
+    logger.debug("Stage: connection pool setup (run_id=%s, dry_run=%s)", run_id, dry_run)
     pool = await _get_pool()
 
     # Ensure tables exist
     if not dry_run:
+        logger.debug("Stage: ensuring tables exist")
         if not await _ensure_tables(pool):
             return {"success": False, "error": "Failed to create tables"}
 
     # Load data
+    logger.debug("Stage: loading learnings")
     logger.info("Loading learnings...")
     learnings, rejected = await load_learnings(pool)
     logger.info("Loaded %d learnings (%d rejected)", len(learnings), rejected)
@@ -481,9 +518,11 @@ async def run_pattern_detection(
         )
 
     # Enrich tags from memory_tags table (immutable)
+    logger.debug("Stage: loading tags")
     logger.info("Loading tags...")
     learning_ids = [lrn.id for lrn in learnings]
     db_tags = await load_tags_for_learnings(pool, learning_ids)
+    logger.debug("Stage: merging tags into learnings")
     learnings = merge_tags(learnings, db_tags)
 
     # Build classifier
@@ -501,6 +540,7 @@ async def run_pattern_detection(
         logger.info("Using LLM-based pattern classifier")
 
     # Run detection
+    logger.debug("Stage: detecting patterns")
     logger.info("Running pattern detection...")
     patterns = await detect_patterns(
         learnings,
@@ -516,15 +556,19 @@ async def run_pattern_detection(
     # Write results
     written = 0
     if not dry_run:
+        logger.debug("Stage: writing patterns to database")
         logger.info("Writing patterns to database...")
         written = await write_patterns(pool, patterns, run_id)
         logger.info("Wrote %d patterns", written)
+    else:
+        logger.debug("Stage: skipping write (dry-run)")
 
     duration = round(time.monotonic() - start, 2)
 
     if dry_run and patterns:
         print(format_dry_run_output(patterns))
 
+    logger.debug("Stage: building run summary")
     return build_run_summary(
         run_id=run_id,
         learnings_count=len(learnings),
@@ -542,6 +586,7 @@ async def run_pattern_detection(
 
 
 def main():
+    _enable_faulthandler()
     parser = argparse.ArgumentParser(
         description="Cross-session pattern detection batch job"
     )
@@ -585,8 +630,9 @@ def main():
     )
     args = parser.parse_args()
 
+    debug_enabled = _debug_enabled(args.verbose, os.environ)
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
+        level=logging.DEBUG if debug_enabled else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
 

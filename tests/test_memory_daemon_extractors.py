@@ -155,6 +155,41 @@ class TestExtractMemoriesImpl:
         assert 999 in ae
         mock_popen.assert_called_once()
 
+    def test_successful_extraction_spawns_with_stdin_devnull(self, tmp_path):
+        # Issue #98 hardening: the extraction Popen must close stdin
+        # (stdin=subprocess.DEVNULL) so the child cannot block on or read
+        # from the daemon's stdin.
+        import subprocess
+
+        from scripts.core.memory_daemon_extractors import extract_memories_impl
+
+        jsonl = tmp_path / "session.jsonl"
+        jsonl.write_text('{"type":"msg"}\n')
+        mock_proc = MagicMock()
+        mock_proc.pid = 999
+        mock_popen = MagicMock(return_value=mock_proc)
+        cfg = MagicMock()
+        cfg.extraction_model = "sonnet"
+        cfg.extraction_max_turns = 10
+
+        result = extract_memories_impl(
+            session_id="s1",
+            project_dir=str(tmp_path),
+            transcript_path=str(jsonl),
+            active_extractions={},
+            subprocess_popen=mock_popen,
+            is_blocked_fn=lambda _: False,
+            mark_extracted_fn=MagicMock(),
+            mark_failed_fn=MagicMock(),
+            log_fn=MagicMock(),
+            daemon_cfg=cfg,
+            allowed_models=frozenset({"sonnet", "haiku", "opus"}),
+            strip_frontmatter_fn=lambda c: c,
+        )
+
+        assert result is True
+        assert mock_popen.call_args.kwargs["stdin"] == subprocess.DEVNULL
+
     def test_live_extraction_env_lacks_inherited_source_time(self, tmp_path):
         # Issue #52 Round 3: a daemon launched with a stale CLAUDE_SOURCE_TIME
         # in its environment must NOT pass it to live extraction (which sets the
@@ -219,6 +254,101 @@ class TestArchiveSessionJsonl:
         archive_session_jsonl("s1", None, log_fn=mock_log,
                               mark_archived_fn=MagicMock())
 
+    def test_success_path_spawns_with_stdin_devnull(self, monkeypatch, tmp_path):
+        # Issue #98 hardening: zstd compress + aws s3 cp must both pass
+        # stdin=subprocess.DEVNULL so child processes never read the
+        # daemon's stdin.
+        import subprocess
+
+        from scripts.core.memory_daemon_extractors import archive_session_jsonl
+
+        monkeypatch.setenv("CLAUDE_SESSION_ARCHIVE_BUCKET", "test-bucket")
+        jsonl = tmp_path / "session.jsonl"
+        jsonl.write_text("{}\n")
+
+        ok = MagicMock()
+        ok.returncode = 0
+        mock_run = MagicMock(return_value=ok)
+        monkeypatch.setattr(
+            "scripts.core.memory_daemon_extractors.subprocess.run", mock_run
+        )
+
+        archive_session_jsonl("s1", jsonl, log_fn=MagicMock(),
+                              mark_archived_fn=MagicMock())
+
+        # First call: zstd compress. Second call: aws s3 cp.
+        assert mock_run.call_count == 2
+        for call in mock_run.call_args_list:
+            assert call.kwargs["stdin"] == subprocess.DEVNULL
+
+    def test_s3_fail_rollback_spawns_with_stdin_devnull(self, monkeypatch, tmp_path):
+        # Issue #98 hardening: the zstd -d rollback after an S3 upload
+        # failure must also pass stdin=subprocess.DEVNULL.
+        import subprocess
+
+        from scripts.core.memory_daemon_extractors import archive_session_jsonl
+
+        monkeypatch.setenv("CLAUDE_SESSION_ARCHIVE_BUCKET", "test-bucket")
+        jsonl = tmp_path / "session.jsonl"
+        jsonl.write_text("{}\n")
+
+        compress_ok = MagicMock()
+        compress_ok.returncode = 0
+        s3_fail = MagicMock()
+        s3_fail.returncode = 1
+        s3_fail.stderr = b"boom"
+        rollback = MagicMock()
+        rollback.returncode = 0
+        mock_run = MagicMock(side_effect=[compress_ok, s3_fail, rollback])
+        monkeypatch.setattr(
+            "scripts.core.memory_daemon_extractors.subprocess.run", mock_run
+        )
+
+        archive_session_jsonl("s1", jsonl, log_fn=MagicMock(),
+                              mark_archived_fn=MagicMock())
+
+        # compress, s3 cp, then rollback decompress.
+        assert mock_run.call_count == 3
+        for call in mock_run.call_args_list:
+            assert call.kwargs["stdin"] == subprocess.DEVNULL
+
+    def test_timeout_rollback_spawns_with_stdin_devnull(self, monkeypatch, tmp_path):
+        # Issue #98 hardening: the zstd -d rollback in the TimeoutExpired
+        # branch must also pass stdin=subprocess.DEVNULL.
+        import subprocess
+
+        from scripts.core.memory_daemon_extractors import archive_session_jsonl
+
+        monkeypatch.setenv("CLAUDE_SESSION_ARCHIVE_BUCKET", "test-bucket")
+        jsonl = tmp_path / "session.jsonl"
+        jsonl.write_text("{}\n")
+        zst = jsonl.with_suffix(".jsonl.zst")
+
+        def _run(cmd, *args, **kwargs):
+            # First call (zstd compress): simulate the rename effect so the
+            # timeout rollback branch's guard (zst exists, jsonl gone) passes,
+            # then raise TimeoutExpired.
+            if mock_run.call_count == 1:
+                jsonl.unlink()
+                zst.write_text("compressed")
+                raise subprocess.TimeoutExpired(cmd=cmd, timeout=300)
+            rollback = MagicMock()
+            rollback.returncode = 0
+            return rollback
+
+        mock_run = MagicMock(side_effect=_run)
+        monkeypatch.setattr(
+            "scripts.core.memory_daemon_extractors.subprocess.run", mock_run
+        )
+
+        archive_session_jsonl("s1", jsonl, log_fn=MagicMock(),
+                              mark_archived_fn=MagicMock())
+
+        # compress (timeout) then rollback decompress.
+        assert mock_run.call_count == 2
+        for call in mock_run.call_args_list:
+            assert call.kwargs["stdin"] == subprocess.DEVNULL
+
 
 # ---------------------------------------------------------------------------
 # Step 4.3d — _count_session_rejections
@@ -226,20 +356,79 @@ class TestArchiveSessionJsonl:
 
 
 class TestCountSessionRejections:
-    """count_session_rejections wraps store_learning.get_rejection_count."""
+    """count_session_rejections wraps store_learning._query_rejection_count.
 
-    @patch("scripts.core.memory_daemon_extractors.get_rejection_count", return_value=3)
+    Issue #98: it must call the RAISING variant so a real DB failure
+    surfaces as None + WARNING rather than a false-confidence 0.
+    """
+
+    @patch("scripts.core.memory_daemon_extractors._query_rejection_count", return_value=3)
     def test_returns_count(self, mock_get):
         from scripts.core.memory_daemon_extractors import count_session_rejections
 
         assert count_session_rejections("s1") == 3
 
-    @patch("scripts.core.memory_daemon_extractors.get_rejection_count",
+    @patch("scripts.core.memory_daemon_extractors._query_rejection_count",
            side_effect=Exception("db error"))
     def test_returns_none_on_error(self, mock_get):
         from scripts.core.memory_daemon_extractors import count_session_rejections
 
         assert count_session_rejections("s1") is None
+
+    @patch("scripts.core.memory_daemon_extractors._query_rejection_count",
+           side_effect=Exception("db error"))
+    def test_logs_on_error(self, mock_get, caplog):
+        """Issue #98 — the previously-silent except path must log the
+        failure via the module logger so the swallowed error is visible.
+        """
+        import logging
+
+        from scripts.core.memory_daemon_extractors import count_session_rejections
+
+        with caplog.at_level(logging.WARNING, logger="memory-daemon"):
+            assert count_session_rejections("s1") is None
+
+        assert any(
+            "rejection" in r.getMessage().lower() for r in caplog.records
+        ), f"Expected a logged rejection-count failure, got {caplog.records}"
+
+    @patch("scripts.core.memory_daemon_extractors._query_rejection_count",
+           side_effect=Exception("db error"))
+    def test_log_redacts_exception(self, mock_get, caplog):
+        """The logged failure must route the exception through safe()."""
+        import logging
+
+        from scripts.core.memory_daemon_extractors import count_session_rejections
+
+        with caplog.at_level(logging.WARNING, logger="memory-daemon"):
+            count_session_rejections("s1")
+
+        # safe() is the module redaction helper used throughout; the
+        # exception text should appear (proving we logged the cause).
+        assert any("db error" in r.getMessage() for r in caplog.records)
+
+    def test_real_db_failure_returns_none_and_warns(self, caplog):
+        """Issue #98 KEY regression: drive the REAL helper failure path.
+
+        Previously count_session_rejections called get_rejection_count, which
+        swallowed DB errors and returned 0 — so a true DB outage was logged as
+        rejections=0 (false confidence). Patching the underlying DB connection
+        to raise must now yield None AND a WARNING via the real raising helper.
+        """
+        import logging
+
+        from scripts.core.memory_daemon_extractors import count_session_rejections
+
+        with (
+            patch("scripts.core.store_learning._pg_url", return_value="postgresql://test"),
+            patch("psycopg2.connect", side_effect=Exception("db down")),
+            caplog.at_level(logging.WARNING, logger="memory-daemon"),
+        ):
+            assert count_session_rejections("s1") is None
+
+        assert any(
+            "rejection" in r.getMessage().lower() for r in caplog.records
+        ), f"Expected a logged rejection-count failure, got {caplog.records}"
 
 
 # ---------------------------------------------------------------------------

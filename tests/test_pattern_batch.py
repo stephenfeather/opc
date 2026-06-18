@@ -25,6 +25,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts.core.pattern_batch import (  # noqa: E402
+    _debug_enabled,
+    _enable_faulthandler,
     build_run_summary,
     count_by_type,
     format_dry_run_output,
@@ -814,4 +816,111 @@ class TestRunPatternDetection:
         # write_patterns should NOT have been called
         assert conn.execute.call_count == 0
         assert conn.fetchval.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics: faulthandler, debug toggle, stage logging (#100)
+# ---------------------------------------------------------------------------
+
+
+class TestEnableFaulthandler:
+    def test_enables_with_log_file(self, monkeypatch, tmp_path):
+        """Happy path: passes an open file and all_threads=True to faulthandler."""
+        captured = {}
+
+        def fake_enable(*, file, all_threads):
+            captured["file"] = file
+            captured["all_threads"] = all_threads
+
+        monkeypatch.setattr("faulthandler.enable", fake_enable)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        _enable_faulthandler()
+
+        assert captured["all_threads"] is True
+        # File should be a writable, open handle (not stderr)
+        assert captured["file"] is not sys.stderr
+        assert hasattr(captured["file"], "write")
+
+    def test_falls_back_to_stderr_on_oserror(self, monkeypatch):
+        """If the log dir cannot be created/opened, fall back to stderr without raising."""
+        captured = {}
+
+        def fake_enable(*, file, all_threads):
+            captured["file"] = file
+            captured["all_threads"] = all_threads
+
+        def boom(*args, **kwargs):
+            raise OSError("cannot create directory")
+
+        monkeypatch.setattr("faulthandler.enable", fake_enable)
+        monkeypatch.setattr(Path, "mkdir", boom)
+
+        # Should not raise
+        _enable_faulthandler()
+
+        assert captured["file"] is sys.stderr
+        assert captured["all_threads"] is True
+
+    def test_closes_previous_handle_on_second_call(self, monkeypatch, tmp_path):
+        """Calling twice must close the first handle before reassigning (no fd leak)."""
+        handles = [MagicMock(name="handle0"), MagicMock(name="handle1")]
+        opened = iter(handles)
+
+        monkeypatch.setattr("faulthandler.enable", lambda *, file, all_threads: None)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(Path, "mkdir", lambda *a, **k: None)
+        monkeypatch.setattr(Path, "open", lambda *a, **k: next(opened))
+
+        _enable_faulthandler()
+        handles[0].close.assert_not_called()
+
+        _enable_faulthandler()
+        handles[0].close.assert_called_once()
+
+
+class TestDebugEnabled:
+    def test_verbose_flag_enables(self):
+        assert _debug_enabled(True, {}) is True
+
+    def test_no_verbose_no_env_disabled(self):
+        assert _debug_enabled(False, {}) is False
+
+    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "Yes", "on", "ON"])
+    def test_truthy_env_values_enable(self, value):
+        assert _debug_enabled(False, {"MEMORY_DAEMON_DEBUG": value}) is True
+
+    @pytest.mark.parametrize("value", ["", "0", "false", "no", "off", "  "])
+    def test_falsy_env_values_disabled(self, value):
+        assert _debug_enabled(False, {"MEMORY_DAEMON_DEBUG": value}) is False
+
+    def test_verbose_overrides_falsy_env(self):
+        assert _debug_enabled(True, {"MEMORY_DAEMON_DEBUG": "0"}) is True
+
+
+class TestStageLogging:
+    @pytest.mark.asyncio
+    @patch("scripts.core.pattern_batch._get_pool")
+    @patch("scripts.core.pattern_batch._ensure_tables")
+    @patch("scripts.core.pattern_batch.detect_patterns")
+    async def test_pipeline_emits_debug_stage_logs(
+        self, mock_detect, mock_ensure, mock_get_pool, caplog
+    ):
+        """run_pattern_detection emits DEBUG stage markers gated on log level."""
+        import logging
+
+        pool, conn = _make_pool()
+        mock_get_pool.return_value = pool
+        mock_ensure.return_value = True
+        conn.fetch = AsyncMock(side_effect=[[_make_db_row()], []])
+        mock_detect.return_value = []
+
+        with caplog.at_level(logging.DEBUG, logger="scripts.core.pattern_batch"):
+            await run_pattern_detection(dry_run=True)
+
+        debug_messages = [
+            r.message for r in caplog.records if r.levelno == logging.DEBUG
+        ]
+        # At least one stage marker should be present at DEBUG level.
+        assert debug_messages, "expected DEBUG stage logging in pipeline"
         assert conn.executemany.call_count == 0

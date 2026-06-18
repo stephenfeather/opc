@@ -31,6 +31,7 @@ import argparse
 import logging
 import logging.handlers
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -603,6 +604,110 @@ def _timed_stage(name, fn):
         debug(f"stage {name}: {elapsed_ms:.1f} ms")
 
 
+def _drain_proc_stderr(proc, *, max_bytes: int = 65536, timeout: float = 0.0) -> str:
+    """Read and close an extraction child's stderr pipe without blocking.
+
+    Issue #98: shared by both the reap path and the watchdog-killed path so a
+    stuck extractor surfaces the same diagnostic regardless of how it ended.
+
+    A plain ``read(max_bytes)`` blocks until EOF or ``max_bytes`` bytes — and
+    EOF only arrives once EVERY descendant that inherited the ``stderr=PIPE``
+    write end has closed it. ``proc.poll()`` confirms only the direct child is
+    gone, not that the pipe reached EOF, so a surviving grandchild could hang
+    the daemon inside reap/watchdog. To make draining safe regardless of the
+    process tree, read the raw fd in non-blocking mode, bounded by both
+    ``max_bytes`` and a wall-clock ``timeout``; stop on EOF, on no-data-ready
+    within the budget, or once the cap is hit.
+
+    ``timeout`` defaults to 0.0 — a purely opportunistic poll-and-read that
+    grabs whatever bytes (and EOF) are already buffered without ever waiting.
+    This is the right behavior on the hot daemon-tick path: a normally-exited
+    child already has its stderr flushed and write end closed, so EOF is
+    instant, and ``reap_completed_extractions`` calls this for every completed
+    extraction. Callers capturing failure diagnostics pass a small non-zero
+    budget to tolerate a post-exit flush race (failures are rare).
+
+    The non-blocking ``select``/``os.read`` path is POSIX-only — on Windows
+    ``select.select`` accepts sockets but not pipe fds. Non-POSIX platforms
+    (and non-fd streams such as ``io.BytesIO`` in tests) fall back to a single
+    bounded ``read`` only when a budget is given (``timeout > 0``); a 0.0
+    budget never blocks. Always closes the stream; returns the last 500 chars
+    of the captured text, or ``""`` when there is nothing to read.
+    """
+    stream = getattr(proc, "stderr", None)
+    if not stream:
+        return ""
+
+    # select() on a raw fd only works for pipes on POSIX. On Windows the fd
+    # path would raise and drop the diagnostic, so restrict it to POSIX and
+    # let everything else take the bounded-read fallback below.
+    fd = None
+    if os.name == "posix":
+        try:
+            candidate = stream.fileno()
+            if isinstance(candidate, int):
+                fd = candidate
+        except Exception:
+            fd = None
+
+    chunks: list[bytes] = []
+    try:
+        if fd is not None:
+            try:
+                os.set_blocking(fd, False)
+            except Exception:
+                pass
+            deadline = time.monotonic() + timeout
+            total = 0
+            while total < max_bytes:
+                remaining = deadline - time.monotonic()
+                # timeout=0.0 is an intentional non-blocking poll: select with a
+                # 0 timeout still drains whatever is already buffered. Only a
+                # positive budget that has elapsed terminates the loop (a plain
+                # ``remaining <= 0`` broke the 0.0 case before the first poll).
+                if remaining <= 0 and timeout > 0:
+                    break
+                try:
+                    ready, _, _ = select.select([fd], [], [], max(0.0, remaining))
+                except (OSError, ValueError):
+                    break
+                if not ready:
+                    break  # no data ready (poll) or within the time budget
+                try:
+                    chunk = os.read(fd, min(65536, max_bytes - total))
+                except InterruptedError:
+                    continue  # EINTR — retry
+                except BlockingIOError:
+                    break  # spurious readiness; stop rather than spin
+                except OSError:
+                    break
+                if not chunk:
+                    break  # EOF — all write ends closed
+                chunks.append(chunk)
+                total += len(chunk)
+        elif timeout > 0:
+            # Non-POSIX / non-fd fallback: a bounded blocking read. Only when a
+            # budget is requested — a 0.0 budget must never block the hot path
+            # (on Windows we cannot poll a pipe without blocking).
+            try:
+                data = stream.read(max_bytes)
+                if isinstance(data, bytes):
+                    chunks.append(data)
+            except Exception:
+                pass
+    finally:
+        try:
+            stream.close()
+        except (OSError, ValueError):
+            pass
+
+    raw = b"".join(chunks)
+    try:
+        return raw.decode("utf-8", errors="replace").strip()[-500:]
+    except Exception:
+        return ""
+
+
 def reap_completed_extractions():
     """Check for completed extraction processes and remove from active set."""
     ae = get_active_extractions()
@@ -621,18 +726,21 @@ def reap_completed_extractions():
             log(f"Extraction completed for {safe(session_id)} "
                 f"(pid={pid}, project={safe(project)}, "
                 f"exit={exit_code}, elapsed={elapsed}s{learnings_info}{rejections_info})")
-            # Safe to read(): proc.poll() already returned, so child has exited
-            # and the write end of the pipe is closed. No deadlock risk.
+            # poll() returned, so the DIRECT child has exited — but a surviving
+            # descendant could still hold the stderr write end open, so EOF is
+            # not guaranteed. _drain_proc_stderr is non-blocking/time-bounded
+            # precisely so this read cannot deadlock regardless of the tree.
             stderr_text = ""
-            if proc.stderr:
-                try:
-                    if exit_code != 0:
-                        raw = proc.stderr.read(65536)  # bounded read, ~64KB max
-                        stderr_text = raw.decode("utf-8", errors="replace").strip()[-500:]
-                        if stderr_text:
-                            log(f"  stderr: {safe(stderr_text)}")
-                finally:
-                    proc.stderr.close()
+            if exit_code != 0:
+                # Small idle budget tolerates a post-exit flush race while
+                # keeping the rare-failure latency negligible.
+                stderr_text = _drain_proc_stderr(proc, timeout=0.25)
+                if stderr_text:
+                    log(f"  stderr: {safe(stderr_text)}")
+            else:
+                # Success: opportunistic (timeout=0) close — never wait on the
+                # hot path just to reclaim the fd.
+                _drain_proc_stderr(proc)
 
             if exit_code == 0:
                 mark_extracted(session_id)
@@ -653,8 +761,10 @@ def reap_completed_extractions():
                     lambda: archive_session_jsonl(session_id, jsonl_path),
                 )
             else:
+                # safe() before persisting: last_error is interpolated raw
+                # into a downstream log line, so escape control chars here.
                 mark_extraction_failed(
-                    session_id, last_error=stderr_text or None
+                    session_id, last_error=safe(stderr_text) or None
                 )
 
     for pid in completed:
@@ -682,8 +792,23 @@ def watchdog_stuck_extractions():
                 proc.wait(timeout=5)
             except Exception as e:
                 log(f"Watchdog: failed to kill pid {pid}: {safe(e)}")
+            # Issue #98: capture the child's stderr for parity with the reap
+            # path so a watchdog-killed extractor leaves a diagnostic and the
+            # captured tail is persisted as last_error. _drain_proc_stderr reads
+            # the PIPE, which blocks until EOF if a descendant still holds the
+            # write end open — so only drain once poll() confirms the child has
+            # actually exited; otherwise record that it could not be drained.
+            if proc.poll() is not None:
+                stderr_text = _drain_proc_stderr(proc, timeout=0.25)
+                if stderr_text:
+                    log(f"  stderr: {safe(stderr_text)}")
+            else:
+                stderr_text = "watchdog kill timed out; stderr not drained"
+                log(f"  {stderr_text} (pid={pid})")
             killed.append(pid)
-            mark_extraction_failed(session_id)
+            # safe() before persisting: last_error is interpolated raw into a
+            # downstream log line, so escape control chars here (log-forgery).
+            mark_extraction_failed(session_id, last_error=safe(stderr_text) or None)
 
     for pid in killed:
         del ae[pid]

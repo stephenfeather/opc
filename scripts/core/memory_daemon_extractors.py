@@ -16,6 +16,7 @@ import logging
 import os
 import subprocess
 import time
+import traceback
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -24,9 +25,53 @@ from scripts.core.log_safety import safe
 from scripts.core.memory_daemon_core import (
     build_extraction_command,
     build_extraction_env,
+    debug,
 )
 
 logger = logging.getLogger("memory-daemon")
+
+
+# ---------------------------------------------------------------------------
+# Issue #98 — DEBUG-gated diagnostics helpers
+# ---------------------------------------------------------------------------
+#
+# These route through memory_daemon_core.debug(), the established DEBUG
+# primitive (Issue #96): it re-reads MEMORY_DAEMON_DEBUG on each call and only
+# invokes the thunk when DEBUG is truthy, so they cost nothing in normal runs.
+# The thunk form is required for eager-eval safety — see the debug() docstring.
+# (Per-stage timing lives in the orchestrator via memory_daemon._timed_stage.)
+
+
+def _debug_traceback(where: str) -> None:
+    """Emit the active exception traceback, but only under DEBUG.
+
+    Must be called from inside an ``except`` block — ``traceback.format_exc()``
+    reads the exception currently being handled. The one-line ``safe(e)``
+    summary still goes through the caller's ``log_fn`` regardless of DEBUG;
+    this adds the full traceback for triage without leaking it in normal runs.
+    """
+    # safe() the WHOLE line (not just the traceback body): the daemon log()
+    # does not escape messages, so a raw literal "\n" here would reintroduce
+    # multi-line/log-forgery output even with a safe()'d body. safe() collapses
+    # every newline — the literal separator and the traceback's own frames —
+    # into \x0a, keeping the DEBUG line single-line.
+    debug(lambda: safe(f"{where} traceback: {traceback.format_exc()}"))
+
+
+def _safe_file_size(path: Path) -> str:
+    """Return ``st_size`` as a string, or ``unavailable:<err>`` — never raises.
+
+    Used inside DEBUG thunks: a transcript can be removed, permission-flipped,
+    or otherwise become unstatable between the caller's ``exists()`` check and
+    the diagnostic. A diagnostic-only ``stat()`` must never raise into the
+    extraction control flow and abort a spawn.
+    """
+    try:
+        return str(path.stat().st_size)
+    except Exception as e:
+        # OSError is the expected case, but a non-Path argument would raise
+        # AttributeError on .stat(); either way the diagnostic must degrade.
+        return f"unavailable:{safe(e)}"
 
 
 # Fallback prompt used when CLAUDE_CONFIG_DIR/agents/memory-extractor.md is
@@ -136,6 +181,17 @@ def extract_memories_impl(
             max_turns=daemon_cfg.extraction_max_turns,
         )
 
+        # Issue #98: log the resolved JSONL path and size under DEBUG so a
+        # hung extraction can be correlated to its input. The size lookup runs
+        # only when DEBUG is on (thunk form) and via _safe_file_size so a
+        # mid-flight stat() race can never abort the spawn.
+        debug(
+            lambda: (
+                f"resolved jsonl for {safe(session_id)}: "
+                f"path={safe(jsonl_path)} size={_safe_file_size(jsonl_path)}"
+            )
+        )
+
         proc = subprocess_popen(
             cmd,
             stdin=subprocess.DEVNULL,
@@ -158,6 +214,7 @@ def extract_memories_impl(
         return True
     except Exception as e:
         log_fn(f"Failed to start extraction: {safe(e)}")
+        _debug_traceback("extract_memories_impl")
         return False
 
 
@@ -224,6 +281,7 @@ def archive_session_jsonl(
                 f"Archive DB update failed for {safe(session_id)} "
                 f"(file already in S3): {safe(e)}"
             )
+            _debug_traceback("archive_session_jsonl (DB update)")
 
         log_fn(f"Archived {safe(session_id)} -> {safe(s3_key)}")
 
@@ -239,8 +297,10 @@ def archive_session_jsonl(
                 )
             except (subprocess.TimeoutExpired, OSError) as restore_err:
                 log_fn(f"Archive cleanup failed for {safe(session_id)}: {safe(restore_err)}")
+                _debug_traceback("archive_session_jsonl (cleanup)")
     except Exception as e:
         log_fn(f"Archive error for {safe(session_id)}: {safe(e)}")
+        _debug_traceback("archive_session_jsonl")
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +328,7 @@ def calibrate_session_confidence(session_id: str, log_fn: Callable[[str], None])
             )
     except Exception as e:
         log_fn(f"Confidence calibration failed for {safe(session_id)}: {safe(e)}")
+        _debug_traceback("calibrate_session_confidence")
 
 
 # ---------------------------------------------------------------------------
@@ -326,10 +387,12 @@ def extract_and_store_workflows(
                     stored += 1
             except Exception as e:
                 log_fn(f"Failed to store workflow learning: {safe(e)}")
+                _debug_traceback("extract_and_store_workflows (store)")
 
         log_fn(f"Stored {stored} workflow patterns for {safe(session_id)}")
     except Exception as e:
         log_fn(f"Workflow extraction failed for {safe(session_id)}: {safe(e)}")
+        _debug_traceback("extract_and_store_workflows")
 
 
 # ---------------------------------------------------------------------------
@@ -380,8 +443,10 @@ def generate_mini_handoff(
                 log_fn(f"State file cleaned up for {safe(session_id)}")
             except OSError as cleanup_err:
                 log_fn(f"State file cleanup failed for {safe(session_id)}: {safe(cleanup_err)}")
+                _debug_traceback("generate_mini_handoff (cleanup)")
     except Exception as e:
         log_fn(f"Mini-handoff generation failed for {safe(session_id)}: {safe(e)}")
+        _debug_traceback("generate_mini_handoff")
 
 
 # ---------------------------------------------------------------------------

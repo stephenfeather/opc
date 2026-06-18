@@ -132,13 +132,20 @@ Parameters:
   mode: "file"
   file_path: "thoughts/shared/handoffs/{session_name}/{filename}.yaml"
 
-# Then mark the outcome
+# The response includes the stored row id, e.g.:
+#   { "success": true, "id": "48d985fb-...", "type": "handoff", "file": "..." }
+
+# Then mark the outcome, passing the id from the index response so the
+# correct row is updated even when peer sessions are active. Do NOT rely on
+# the bare "latest handoff" default, and do NOT query the database directly
+# to resolve the id — index_artifacts already returns it.
 Call MCP tool: mcp__opc-memory__mark_handoff
 Parameters:
+  handoff_id: "<id from the index_artifacts response>"
   outcome: "<USER_CHOICE>"  (SUCCEEDED, PARTIAL_PLUS, PARTIAL_MINUS, or FAILED)
 ```
 
-**IMPORTANT:** Replace `{session_name}` and `{filename}` with the actual values from step 1.
+**IMPORTANT:** Replace `{session_name}` and `{filename}` with the actual values from step 1, and `<id ...>` with the `id` field returned by `index_artifacts`.
 
 These MCP tools auto-detect the database (PostgreSQL if configured, SQLite fallback).
 

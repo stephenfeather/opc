@@ -19,6 +19,7 @@ Examples:
 """
 
 import argparse
+import json
 import os
 import re
 import sqlite3
@@ -278,24 +279,66 @@ def init_db(db_path: Path) -> sqlite3.Connection:
     return init_sqlite(db_path)
 
 
-def db_execute(conn, sql: str, params: tuple = (), table_hint: str = ""):
+def _append_returning_id(sql: str) -> str:
+    """Append a ``RETURNING id`` clause to an INSERT statement.
+
+    Works for both backends: PostgreSQL and SQLite (>= 3.35) support
+    ``RETURNING`` on INSERT / INSERT ... ON CONFLICT DO UPDATE / INSERT OR
+    REPLACE, returning the affected row regardless of whether it was inserted
+    or updated.
+    """
+    return sql.rstrip().rstrip(";").rstrip() + " RETURNING id"
+
+
+def db_execute(
+    conn,
+    sql: str,
+    params: tuple = (),
+    table_hint: str = "",
+    return_id: bool = False,
+):
     """Execute SQL on either SQLite or PostgreSQL connection.
 
     Handles the difference between SQLite (conn.execute) and
     PostgreSQL (conn.cursor().execute) interfaces.
+
+    When ``return_id`` is True the statement is treated as an INSERT, a
+    ``RETURNING id`` clause is appended, and the stored primary-key id is
+    fetched and returned as a string (None if no row was returned). The id is
+    the value the database actually persisted — a DB-generated UUID on
+    PostgreSQL, the deterministic file id on SQLite — so callers never have to
+    re-query for it. When False the original fire-and-forget behavior and
+    ``None`` return are preserved.
     """
     # Check if this is a PostgreSQL connection
-    is_pg = hasattr(conn, 'cursor') and not isinstance(conn, sqlite3.Connection)
+    is_pg = hasattr(conn, "cursor") and not isinstance(conn, sqlite3.Connection)
 
     if is_pg:
         # PostgreSQL: use adapted queries for existing schema
         sql, params = _adapt_for_postgres(sql, params, table_hint)
+        if return_id:
+            sql = _append_returning_id(sql)
         cur = conn.cursor()
-        cur.execute(sql, params)
-        cur.close()
-    else:
-        # SQLite: use directly
+        try:
+            cur.execute(sql, params)
+            row = cur.fetchone() if return_id else None
+        finally:
+            cur.close()
+        return str(row[0]) if (return_id and row) else None
+
+    # SQLite: use directly
+    if return_id:
+        # RETURNING requires SQLite >= 3.35. On older libraries fall back to a
+        # plain write: the id column is the first bound param (the deterministic
+        # file id we just inserted), so we can return it without re-querying.
+        if sqlite3.sqlite_version_info >= (3, 35, 0):
+            cur = conn.execute(_append_returning_id(sql), params)
+            row = cur.fetchone()
+            return str(row[0]) if row else None
         conn.execute(sql, params)
+        return str(params[0]) if params else None
+    conn.execute(sql, params)
+    return None
 
 
 
@@ -437,9 +480,14 @@ def index_continuity(conn, base_path: Path = Path(".")):
     return count
 
 
-def _index_handoff(conn, data: dict) -> None:
-    """Write handoff data to database."""
-    db_execute(
+def _index_handoff(conn, data: dict, return_id: bool = False) -> str | None:
+    """Write handoff data to database.
+
+    Returns the stored row id when ``return_id`` is True (single-file path),
+    else ``None``. Bulk callers leave it False to keep the fire-and-forget
+    write path, matching the plan/continuity bulk writers.
+    """
+    return db_execute(
         conn,
         """
         INSERT OR REPLACE INTO handoffs
@@ -466,12 +514,13 @@ def _index_handoff(conn, data: dict) -> None:
             data["braintrust_session_id"],
             data["created_at"],
         ),
+        return_id=return_id,
     )
 
 
-def _index_plan(conn, data: dict) -> None:
-    """Write plan data to database."""
-    db_execute(
+def _index_plan(conn, data: dict, return_id: bool = False) -> str | None:
+    """Write plan data to database. Returns the stored row id when requested."""
+    return db_execute(
         conn,
         """
         INSERT OR REPLACE INTO plans
@@ -487,12 +536,13 @@ def _index_plan(conn, data: dict) -> None:
             data["phases"],
             data["constraints"],
         ),
+        return_id=return_id,
     )
 
 
-def _index_continuity(conn, data: dict) -> None:
-    """Write continuity data to database."""
-    db_execute(
+def _index_continuity(conn, data: dict, return_id: bool = False) -> str | None:
+    """Write continuity data to database. Returns the stored row id when requested."""
+    return db_execute(
         conn,
         """
         INSERT OR REPLACE INTO continuity
@@ -511,6 +561,7 @@ def _index_continuity(conn, data: dict) -> None:
             data["key_decisions"],
             data["snapshot_reason"],
         ),
+        return_id=return_id,
     )
 
 
@@ -523,28 +574,52 @@ _INDEX_DISPATCH = {
 }
 
 
-def index_single_file(conn, file_path: Path) -> bool:
+def index_single_file(conn, file_path: Path) -> dict:
     """Index a single file based on its location/type.
 
-    Returns True if indexed successfully, False otherwise.
+    Returns a result dict that doubles as the machine-readable ``--json``
+    payload:
+
+    - success: ``{"success": True, "id", "type", "file"}`` where ``id`` is the
+      primary-key id the database actually persisted (a DB-generated UUID on
+      PostgreSQL, the deterministic file id on SQLite).
+    - failure: ``{"success": False, "error": <reason>}`` for an unknown file
+      type or any parser/writer/commit error.
+
+    Diagnostics are also echoed to stderr so the human (non-JSON) path keeps
+    stdout clean; the ``error`` is carried in the result so machine callers can
+    distinguish *why* indexing failed (bad path vs DB rejection vs commit).
     """
     file_path = Path(file_path).resolve()
     file_type = classify_file(file_path)
 
     if file_type is None:
-        print(f"Unknown file type, skipping: {file_path}")
-        return False
+        msg = f"Unknown file type, skipping: {file_path}"
+        print(msg, file=sys.stderr)
+        return {"success": False, "error": msg}
 
     parser, writer, label = _INDEX_DISPATCH[file_type]
     try:
         data = parser(file_path)
-        writer(conn, data)
+        row_id = writer(conn, data, return_id=True)
         conn.commit()
-        print(f"Indexed {label}: {file_path.name}")
-        return True
+        if row_id is None:
+            # The whole point is to surface the persisted PK; if the write
+            # returned no id, fail loudly rather than report a hollow success.
+            msg = f"Indexed {label} but no row id was returned: {file_path}"
+            print(msg, file=sys.stderr)
+            return {"success": False, "error": msg}
+        return {"success": True, "id": row_id, "type": label, "file": file_path.name}
     except Exception as e:
-        print(f"Error indexing {label} {file_path}: {e}")
-        return False
+        # Roll back the pending transaction so a reused connection isn't left
+        # in an aborted state. Guard for connections that lack rollback().
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        msg = f"Error indexing {label} {file_path}: {e}"
+        print(msg, file=sys.stderr)
+        return {"success": False, "error": msg}
 
 
 def main() -> int:
@@ -558,6 +633,11 @@ def main() -> int:
     parser.add_argument("--all", action="store_true", help="Index everything")
     parser.add_argument("--file", type=str, help="Index a single file (fast, for hooks)")
     parser.add_argument("--db", type=str, help="Custom database path (SQLite only)")
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit JSON (incl. the stored row id) for --file; for machine callers",
+    )
 
     args = parser.parse_args()
 
@@ -565,21 +645,37 @@ def main() -> int:
     using_pg = use_postgres() and not args.db  # Custom db path forces SQLite
     db_type = "PostgreSQL" if using_pg else "SQLite"
 
-    # Handle single file indexing (fast path for hooks)
+    # Handle single file indexing (fast path for hooks).
+    # With --json, stdout is kept strictly machine-readable: exactly one JSON
+    # object is printed on every path and all diagnostics go to stderr.
     if args.file:
         file_path = Path(args.file)
         if not file_path.exists():
-            print(f"File not found: {file_path}")
-            return 1
-
-        if using_pg:
-            conn = init_postgres()
+            msg = f"File not found: {file_path}"
+            print(msg, file=sys.stderr)
+            result = {"success": False, "error": msg}
         else:
-            conn = init_sqlite(get_db_path(args.db))
+            # Guard connection setup too: a failed init must still yield a JSON
+            # failure on stdout under --json, not an uncaught traceback.
+            try:
+                if using_pg:
+                    conn = init_postgres()
+                else:
+                    conn = init_sqlite(get_db_path(args.db))
+                try:
+                    result = index_single_file(conn, file_path)
+                finally:
+                    conn.close()
+            except Exception as e:
+                msg = f"Database connection or initialization failed: {e}"
+                print(msg, file=sys.stderr)
+                result = {"success": False, "error": msg}
 
-        success = index_single_file(conn, file_path)
-        conn.close()
-        return 0 if success else 1
+        if args.json:
+            print(json.dumps(result))
+        elif result["success"]:
+            print(f"Indexed {result['type']}: {result['file']}")
+        return 0 if result["success"] else 1
 
     if not any([args.handoffs, args.plans, args.continuity, args.all]):
         parser.print_help()

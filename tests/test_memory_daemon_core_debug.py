@@ -1241,9 +1241,69 @@ class TestDaemonLoopDebugTraceback:
         assert "frames:" not in blob
         assert "sk-secret" not in blob
 
+    def test_debug_traceback_not_truncated_at_500_chars(
+        self, monkeypatch, _loop_env
+    ):
+        """Issue #117 review Finding 3 (MEDIUM): a multi-frame traceback
+        whose format_tb() render exceeds 500 chars must NOT be clipped by
+        safe()'s default 500-char bound. Frames are CODE (leak-safe), and
+        the BOTTOM frames carry the most diagnostic value — truncating
+        them loses exactly the information DEBUG mode exists to surface.
+
+        The fix raises the bound to max_len=2000. This test drives a
+        deeply nested call chain so the rendered frames comfortably
+        exceed 500 chars, with a distinctive marker in the bottom frame
+        (the deepest source line). It asserts:
+          - the bottom-frame marker (well past char 500) is PRESENT, and
+          - the safe() 500-char truncation marker is ABSENT.
+        """
+        monkeypatch.setattr(memory_daemon, "DEBUG", True, raising=False)
+        monkeypatch.setattr(
+            memory_daemon, "daemon_tick", _raise_deep_traceback_error
+        )
+        with pytest.raises(_BreakLoopError):
+            memory_daemon.daemon_loop()
+
+        blob = "\n".join(_loop_env)
+        # Sanity: the rendered frames must actually exceed the old bound,
+        # otherwise the test would not exercise truncation at all.
+        frames_segment = blob.split("frames:", 1)[1]
+        assert len(frames_segment) > 500, (
+            f"Test setup too shallow: frames render is only "
+            f"{len(frames_segment)} chars; cannot prove >500 is kept."
+        )
+        # The deepest frame's distinctive marker must survive — it lives
+        # well past char 500 in the rendered frames.
+        assert "_deep_frame_bottom_marker" in blob, (
+            "Bottom traceback frame marker was truncated — frames clipped "
+            f"at 500 chars. Got: {blob}"
+        )
+        # safe()'s 500-char truncation suffix must NOT appear.
+        assert "[truncated" not in blob, (
+            "safe() truncation marker present — frames were clipped at the "
+            f"default 500-char bound. Got: {blob}"
+        )
+
 
 def _raise_leaky_db_error():
     raise _LeakyDbError()
+
+
+def _deep_frame_bottom_marker_raise():
+    # The function/source-line name embeds a distinctive marker so the
+    # rendered frames contain it in the DEEPEST frame, well past char 500.
+    raise _LeakyDbError()
+
+
+def _deep_5(): _deep_frame_bottom_marker_raise()
+def _deep_4(): _deep_5()
+def _deep_3(): _deep_4()
+def _deep_2(): _deep_3()
+def _deep_1(): _deep_2()
+
+
+def _raise_deep_traceback_error():
+    _deep_1()
 
 
 def _raise_break_loop(_seconds):

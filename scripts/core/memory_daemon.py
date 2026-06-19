@@ -1015,7 +1015,7 @@ def daemon_loop():
                 # to a single line with \x0a markers, keeping the injection
                 # boundary (#104) closed.
                 frames = "".join(traceback.format_tb(e.__traceback__))
-                log(f"[DEBUG] {safe_exception(e)} | frames: {safe(frames)}")
+                log(f"[DEBUG] {safe_exception(e)} | frames: {safe(frames, max_len=2000)}")
         time.sleep(_poll_interval())
 
 

@@ -12,7 +12,7 @@ import os
 import time
 from pathlib import Path
 
-from scripts.core.log_safety import safe_exception
+from scripts.core.log_safety import safe, safe_exception
 
 logger = logging.getLogger("memory-daemon")
 
@@ -604,7 +604,9 @@ def count_session_learnings(session_id: str) -> int | None:
         conn.close()
         return count
     except Exception as e:
-        logger.warning("count_session_learnings failed for %s: %s", session_id, safe_exception(e))
+        logger.warning(
+            "count_session_learnings failed for %s: %s", safe(session_id), safe_exception(e)
+        )
         return None
 
 

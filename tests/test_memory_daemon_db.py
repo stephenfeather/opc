@@ -797,6 +797,26 @@ class TestCountSessionLearningsDb:
         assert "sk-secret-value" not in msg
         assert "'<redacted>'" in msg
 
+    @patch("scripts.core.memory_daemon_db.use_postgres", return_value=True)
+    @patch("scripts.core.memory_daemon_db.pg_connect", side_effect=Exception("db down"))
+    def test_warning_escapes_db_sourced_session_id(self, mock_pg, mock_use, caplog):
+        # Issue #104: session_id is a DB-sourced string; logging it RAW is a
+        # log-injection/forgery vector. It must be wrapped with safe() so
+        # control chars are escaped (newline -> \x0a, ESC -> \x1b).
+        from scripts.core.memory_daemon_db import count_session_learnings
+
+        hostile = "s\n1\x1b[31m"
+        with caplog.at_level(logging.WARNING, logger="memory-daemon"):
+            assert count_session_learnings(hostile) is None
+
+        msg = caplog.records[0].getMessage()
+        # Raw control bytes must NOT survive into the log message.
+        assert "\n1" not in msg
+        assert "\x1b[31m" not in msg
+        # safe() renders them as escaped markers instead.
+        assert "\\x0a" in msg
+        assert "\\x1b" in msg
+
 
 class TestSeedLastPatternRunDb:
     """seed_last_pattern_run reads latest pattern detection timestamp."""

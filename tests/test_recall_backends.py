@@ -832,6 +832,59 @@ class TestProjectColumnProbe:
         assert conn.calls == 1  # downgrade did not trigger a re-probe
 
 
+class TestEmbeddingModelColumnProbe:
+    """embedding_model capability probe transient-failure redaction (#211).
+
+    The transient-probe WARNING must not dump a full traceback (asyncpg/psycopg
+    messages embed bound parameter values); it names the exception type instead,
+    mirroring the sibling project-column / pgvector probe convention.
+    """
+
+    def _make_conn(self, outcome: Exception | None):
+        class FakeConn:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.outcome: Exception | None = outcome
+
+            async def fetch(self, _sql: str, *args: Any) -> list[Any]:
+                self.calls += 1
+                if self.outcome is not None:
+                    raise self.outcome
+                return []
+
+        return FakeConn()
+
+    async def test_transient_failure_warning_omits_exc_info_and_names_type(self, caplog):
+        import logging
+
+        from scripts.core import recall_backends as rb
+
+        rb.reset_embedding_model_column_cache()
+        conn = self._make_conn(RuntimeError("WHERE id = 'sk-secret-value'"))
+        with caplog.at_level(logging.WARNING):
+            assert await rb.embedding_model_column_available(conn) is False
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings, "expected a WARNING record for the transient probe failure"
+        rec = warnings[0]
+        # No traceback attached (exc_info dropped).
+        assert rec.exc_info is None
+        msg = rec.getMessage()
+        assert "RuntimeError" in msg
+        # The exception's embedded value must not leak via the message.
+        assert "sk-secret-value" not in msg
+
+    async def test_transient_failure_not_cached(self):
+        from scripts.core import recall_backends as rb
+
+        rb.reset_embedding_model_column_cache()
+        conn = self._make_conn(RuntimeError("connection reset"))
+        assert await rb.embedding_model_column_available(conn) is False
+        conn.outcome = None  # transient issue clears
+        assert await rb.embedding_model_column_available(conn) is True
+        assert conn.calls == 2
+
+
 class _FakeRecallDb:
     """Fake pool/conn pair simulating a DB with missing additive columns."""
 

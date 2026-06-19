@@ -967,3 +967,40 @@ class TestVectorEmbedFallback:
         )
         # The embed ran to completion — voyage was not bounded by the deadline.
         assert _SlowCompletingVoyageEmbedder.completions == [True]
+
+    async def test_embed_failure_warning_omits_exc_info_and_names_type(
+        self, monkeypatch, caplog
+    ):
+        """#211: the embedding-generation-failure WARNING must not dump a full
+        traceback (asyncpg/psycopg embed messages carry DB values/DSNs); it
+        names the exception type instead, mirroring the probe convention. The
+        embedder message embeds a DSN secret that must not leak."""
+        import logging
+
+        from scripts.core import recall_backends as rb
+
+        _patch_embedder(monkeypatch, _RaisingEmbedder)
+        _patch_vector_pool(monkeypatch)
+
+        with caplog.at_level(logging.WARNING):
+            await rb.search_learnings_postgres(
+                "query terms", k=3, provider="voyage", text_fallback=True,
+            )
+
+        warnings = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "Embedding generation failed" in r.getMessage()
+        ]
+        assert warnings, "expected an Embedding-generation-failed WARNING"
+        rec = warnings[0]
+        # No traceback attached (exc_info dropped).
+        assert rec.exc_info is None
+        msg = rec.getMessage()
+        # Exception type named; the existing fallback wording preserved.
+        assert "RuntimeError" in msg
+        assert "falling back to text search" in msg
+        # The DSN secret embedded in the embedder error must not leak.
+        assert "secret" not in msg
+        assert "user:secret@" not in msg

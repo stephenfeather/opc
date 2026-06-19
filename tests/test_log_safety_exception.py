@@ -36,6 +36,39 @@ def test_empty_single_quoted_literal_redacted():
 
 
 # ---------------------------------------------------------------------------
+# redact_db_values — SQL doubled-quote escaping inside a single literal
+#
+# Postgres escapes a single quote inside a string literal by doubling it
+# (``'O''Brien'`` is the one logical value ``O'Brien``). The literal regex must
+# treat the doubled ``''`` as part of ONE literal so the whole value collapses
+# to a single ``'<redacted>'`` and no inner value fragment survives between two
+# separately-matched literals (#211 Copilot review, Finding 1).
+# ---------------------------------------------------------------------------
+
+
+def test_doubled_quote_escaped_literal_fully_redacted():
+    # 'O''Brien' is one SQL value (O'Brien); none of its chars may leak.
+    out = redact_db_values("name = 'O''Brien'")
+    assert out == "name = '<redacted>'"
+    assert "Brien" not in out
+
+
+def test_doubled_quote_escaped_value_no_fragment_leaks():
+    out = redact_db_values("value = 'it''s a secret'")
+    assert out == "value = '<redacted>'"
+    assert "secret" not in out
+
+
+def test_multiple_doubled_quotes_in_one_literal_redacted():
+    # The literal 'a''b''c' (value a'b'c) collapses to a single redaction; no
+    # value fragment ('b') survives between separately-matched literals. (The
+    # marker text "redacted" itself contains a/c, so assert the exact output.)
+    out = redact_db_values("x = 'a''b''c'")
+    assert out == "x = '<redacted>'"
+    assert "'b'" not in out
+
+
+# ---------------------------------------------------------------------------
 # redact_db_values — unique-violation DETAIL echo
 # ---------------------------------------------------------------------------
 

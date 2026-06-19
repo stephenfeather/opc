@@ -24,7 +24,14 @@ _DEFAULT_MAX_LEN = 500
 # text (the SQL statement and ``LINE ...`` context echo them). Double-quoted
 # identifiers (column/table names) are intentionally NOT matched — they carry
 # no user data and are valuable for diagnosis.
-_SINGLE_QUOTED_LITERAL = re.compile(r"'[^']*'")
+#
+# SQL escapes a single quote inside a string literal by DOUBLING it
+# (``'O''Brien'`` is the one logical value ``O'Brien``). ``(?:[^']|'')*``
+# consumes those doubled quotes as part of the same literal so the whole value
+# collapses to one ``'<redacted>'`` instead of splitting into two literals and
+# leaking an inner value fragment between them. Over-redaction is the safe
+# direction; never leak a fragment (#211 review, Finding 1).
+_SINGLE_QUOTED_LITERAL = re.compile(r"'(?:[^']|'')*'")
 
 # Unique-violation DETAIL echo: ``DETAIL: Key (col)=(value) already exists.``
 # Redact only the value group — the paren-pair after ``=`` — leaving the
@@ -265,8 +272,10 @@ def safe_exception(e: object, *, max_len: int = _DEFAULT_MAX_LEN) -> str:
 
     Composes the structured fields with :func:`safe` (printable-ASCII-only +
     truncation) so the full output contract of ``safe()`` still holds — the
-    return value contains only ``\\t`` or printable ASCII and is bounded by
-    ``max_len``.
+    return value contains only ``\\t`` or printable ASCII. As with ``safe()``,
+    over-length input is truncated to ``max_len`` raw characters and then the
+    marker ``"...[truncated N characters]"`` is appended, so the returned
+    string may exceed ``max_len`` by the length of that marker.
 
     **DB exceptions drop the free-text message.** psycopg/asyncpg messages
     embed DB VALUES in forms that free-text regex redaction cannot reliably

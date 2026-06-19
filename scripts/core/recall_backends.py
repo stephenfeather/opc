@@ -972,11 +972,11 @@ async def project_column_available(conn: Any) -> bool:
         )
         _project_column_cache = False
         return False
-    except Exception:
+    except Exception as exc:
         logger.warning(
             "project column probe failed transiently; degrading this recall "
-            "to no-project SQL and retrying the probe on the next call",
-            exc_info=True,
+            "to no-project SQL and retrying the probe on the next call (%s)",
+            type(exc).__name__,
         )
         return False
     _project_column_cache = True
@@ -1036,11 +1036,11 @@ async def embedding_model_column_available(conn: Any) -> bool:
         )
         _embedding_model_column_cache = False
         return False
-    except Exception:
+    except Exception as exc:
         logger.warning(
             "embedding_model column probe failed transiently; degrading this "
-            "recall to unfiltered SQL and retrying the probe on the next call",
-            exc_info=True,
+            "recall to unfiltered SQL and retrying the probe on the next call (%s)",
+            type(exc).__name__,
         )
         return False
     _embedding_model_column_cache = True
@@ -1645,15 +1645,17 @@ async def search_learnings_postgres(
                 # error. Construction still sits inside the try, so a missing-key
                 # constructor failure degrades the same as an embed failure.
                 model_label, query_embedding = await _acquire()
-        except Exception:
+        except Exception as exc:
             # The branch returns [] when text_fallback is off, so word the
             # warning to match the behavior the operator actually gets
-            # (Copilot PR #203).
+            # (Copilot PR #203). Name the exception type instead of dumping a
+            # full traceback — asyncpg/psycopg embed errors carry DB values /
+            # DSNs that exc_info would leak (#211 review, Finding 3).
             logger.warning(
-                "Embedding generation failed; %s",
+                "Embedding generation failed; %s (%s)",
                 "falling back to text search" if text_fallback
                 else "text fallback disabled, returning no results",
-                exc_info=True,
+                type(exc).__name__,
             )
             if text_fallback:
                 has_embeddings = False

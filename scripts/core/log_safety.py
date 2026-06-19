@@ -14,9 +14,34 @@ See ``thoughts/shared/plans/issue-104-log-injection-sanitization.md``.
 
 from __future__ import annotations
 
-__all__ = ["safe"]
+import re
+
+__all__ = ["safe", "redact_db_values", "safe_exception"]
 
 _DEFAULT_MAX_LEN = 500
+
+# Single-quoted literals delimit bound-parameter VALUES in Postgres error
+# text (the SQL statement and ``LINE ...`` context echo them). Double-quoted
+# identifiers (column/table names) are intentionally NOT matched — they carry
+# no user data and are valuable for diagnosis.
+#
+# SQL escapes a single quote inside a string literal by DOUBLING it
+# (``'O''Brien'`` is the one logical value ``O'Brien``). ``(?:[^']|'')*``
+# consumes those doubled quotes as part of the same literal so the whole value
+# collapses to one ``'<redacted>'`` instead of splitting into two literals and
+# leaking an inner value fragment between them. Over-redaction is the safe
+# direction; never leak a fragment (#211 review, Finding 1).
+_SINGLE_QUOTED_LITERAL = re.compile(r"'(?:[^']|'')*'")
+
+# Unique-violation DETAIL echo: ``DETAIL: Key (col)=(value) already exists.``
+# Redact only the value group — the paren-pair after ``=`` — leaving the
+# column-name group intact. The value is matched GREEDILY through the LAST
+# ``)`` on the same line (``[^\n]*``): a value containing its own right paren
+# (e.g. ``(foo)bar)``) must not leak its suffix. ``[^\n]`` keeps the match on
+# one line so multiline tracebacks are not over-collapsed. Over-redacting a
+# trailing same-line parenthetical is the accepted safe direction; leaking any
+# value char is the bug this guards against (#117 review, Finding 1).
+_DETAIL_KEY_VALUE = re.compile(r"\)=\([^\n]*\)")
 _NONE_MARKER = "<none>"
 _UNREPRESENTABLE = "<unrepresentable>"
 
@@ -165,3 +190,174 @@ def safe(value: object, *, max_len: int = _DEFAULT_MAX_LEN) -> str:
         dropped = raw_len - max_len
         return _escape_controls(head) + f"...[truncated {dropped} characters]"
     return _escape_controls(coerced)
+
+
+def redact_db_values(text: object) -> str:
+    """Strip DB-sourced VALUES from Postgres/psycopg error text.
+
+    Addresses GitHub issue #117: psycopg2/asyncpg exception messages embed
+    the failing SQL statement plus its bound parameter values (in the
+    message, the ``LINE ...`` context, and the unique-violation ``DETAIL:``
+    echo). Logging that text raw leaks DB content. This helper removes the
+    two real leak vectors while preserving the error class and identifiers
+    needed to diagnose the failure:
+
+    1. **Single-quoted literals** — every ``'...'`` (regex ``'[^']*'``) is
+       replaced with ``'<redacted>'``. Single quotes delimit VALUES in
+       Postgres. Double-quoted identifiers (``"column"``/``"table"``) are
+       deliberately LEFT INTACT — they carry no user data and are useful
+       for diagnosis.
+    2. **Unique-violation DETAIL echo** — psycopg emits
+       ``DETAIL: Key (col)=(value) already exists.``; the value group
+       ``)=(...)`` (regex ``\\)=\\([^\\n]*\\)``, greedy to the LAST ``)`` on
+       the line so a value containing its own paren cannot leak) is replaced
+       with ``)=(<redacted>)``, leaving the column-name group intact.
+
+    Both substitutions are global (all occurrences) and operate uniformly on
+    the whole string, so the same call works for a single exception message
+    or a full ``traceback.format_exc()``.
+
+    Control characters are **not** escaped here — that is ``safe()``'s job.
+    Callers that log the result should wrap it with ``safe()`` (or use
+    ``safe_exception()``, which composes the two).
+
+    Never raises a non-system Exception: non-``str`` input is coerced via the
+    same never-raises path ``safe()`` uses (``_coerce``).
+    """
+    coerced = _coerce(text)
+    coerced = _SINGLE_QUOTED_LITERAL.sub("'<redacted>'", coerced)
+    coerced = _DETAIL_KEY_VALUE.sub(")=(<redacted>)", coerced)
+    return coerced
+
+
+def _safe_getattr(obj: object, name: str) -> object:
+    """``getattr(obj, name, None)`` that never raises a non-system Exception.
+
+    Hostile exception objects may expose ``pgcode``/``diag``/identifier
+    fields as properties that raise. Narrow to ``Exception`` (NOT
+    ``BaseException``) so ``KeyboardInterrupt``/``SystemExit`` still
+    propagate, mirroring ``_coerce``.
+    """
+    try:
+        return getattr(obj, name, None)
+    except Exception:  # noqa: BLE001 - hostile property must not break logging
+        return None
+
+
+_SENTINEL_NAME = "Exception"
+
+# Structured IDENTIFIER fields (schema metadata, NOT row data — SAFE to log),
+# rendered in this fixed order. Each tuple is ``(label, attr_names)`` where the
+# label is the short ``key=`` shown in the output and ``attr_names`` is the
+# tuple of source attribute names tried in order (first non-empty wins). The
+# rendered LABEL is fixed regardless of which source attribute supplied the
+# value.
+#
+# Most fields share a name between psycopg2 ``.diag`` and asyncpg direct attrs.
+# The datatype field is the exception: psycopg2 ``.diag`` exposes
+# ``datatype_name`` while asyncpg's direct attribute is ``data_type_name``
+# (with underscores). Trying both keeps asyncpg datatype diagnostics from
+# being silently dropped (#117 review, Finding 2).
+_IDENTIFIER_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("schema", ("schema_name",)),
+    ("table", ("table_name",)),
+    ("column", ("column_name",)),
+    ("datatype", ("datatype_name", "data_type_name")),
+    ("constraint", ("constraint_name",)),
+)
+
+
+def safe_exception(e: object, *, max_len: int = _DEFAULT_MAX_LEN) -> str:
+    """Render an exception for logging via a structured-diagnostics ALLOWLIST.
+
+    Composes the structured fields with :func:`safe` (printable-ASCII-only +
+    truncation) so the full output contract of ``safe()`` still holds — the
+    return value contains only ``\\t`` or printable ASCII. As with ``safe()``,
+    over-length input is truncated to ``max_len`` raw characters and then the
+    marker ``"...[truncated N characters]"`` is appended, so the returned
+    string may exceed ``max_len`` by the length of that marker.
+
+    **DB exceptions drop the free-text message.** psycopg/asyncpg messages
+    embed DB VALUES in forms that free-text regex redaction cannot reliably
+    catch — double-quoted values
+    (``invalid input syntax for type uuid: "secret"``),
+    ``DETAIL: Failing row contains (1, secret, ...)``, and
+    ``CONTEXT: COPY ...: "secret"``. Postgres uses double quotes for BOTH
+    identifiers and values, so regex on free text cannot be leak-tight
+    (#117 review, HIGH design finding). For DB exceptions we therefore render
+    ONLY an allowlist of safe structured fields and discard the message.
+
+    A DB exception is one where a SQLSTATE code is present OR at least one
+    structured identifier was found:
+
+    - ``code = e.pgcode or e.sqlstate`` — psycopg2 exposes SQLSTATE as
+      ``.pgcode``, asyncpg as ``.sqlstate``.
+    - IDENTIFIER fields (``schema_name``, ``table_name``, ``column_name``,
+      ``datatype_name``, ``constraint_name``) are read from the psycopg2
+      ``.diag`` namespace, falling back to direct attributes for asyncpg.
+      These are schema metadata, not row data, and are SAFE to log. The
+      value-bearing diag fields (``message_*``, ``context``, ``detail``,
+      ``hint``, ``internal_query``, ``*query``, ``message``) are NEVER read.
+
+    Render rules:
+
+    - DB exception → ``ClassName`` + ``[CODE]`` (if a code is present) +
+      space-joined ``label=value`` identifier pairs in the fixed order
+      schema, table, column, datatype, constraint. Free-text message dropped.
+      Example: ``UniqueViolation[23505] table=sessions constraint=sessions_pkey``.
+    - Non-DB exception (no code, no identifiers) →
+      ``f"{name}: {redact_db_values(_coerce(e))}"`` (the best-effort regex is
+      still applied to ordinary Python exceptions whose message may
+      incidentally contain a quoted value). An empty coerced message renders
+      ``name`` alone.
+
+    The whole assembled string is passed through ``safe()`` so a control char
+    smuggled into an identifier is escaped and the output is truncated.
+
+    Never raises a non-system Exception. Any unexpected error during assembly
+    falls back to ``safe(name, ...)`` (or a fixed sentinel if even the type
+    name is unreadable).
+    """
+    try:
+        name = type(e).__name__
+    except Exception:  # noqa: BLE001 - hostile metaclass must not break logging
+        name = _SENTINEL_NAME
+
+    try:
+        # SQLSTATE: psycopg2 uses .pgcode, asyncpg uses .sqlstate.
+        raw_code = _safe_getattr(e, "pgcode") or _safe_getattr(e, "sqlstate")
+        code = _coerce(raw_code) if raw_code else ""
+
+        # Structured identifiers: prefer the psycopg2 .diag value, else the
+        # asyncpg direct attr. Keep only non-empty values.
+        diag = _safe_getattr(e, "diag")
+        identifiers: list[str] = []
+        for label, attr_names in _IDENTIFIER_FIELDS:
+            value = None
+            for attr in attr_names:
+                if diag is not None:
+                    value = _safe_getattr(diag, attr)
+                if not value:
+                    value = _safe_getattr(e, attr)
+                if value:
+                    break
+            if value:
+                identifiers.append(f"{label}={_coerce(value)}")
+
+        is_db_exception = bool(code) or bool(identifiers)
+
+        if is_db_exception:
+            assembled = f"{name}[{code}]" if code else name
+            if identifiers:
+                assembled = assembled + " " + " ".join(identifiers)
+            return safe(assembled, max_len=max_len)
+
+        # Non-DB exception: keep the best-effort regex-redacted message.
+        msg = redact_db_values(_coerce(e))
+        if msg:
+            return safe(f"{name}: {msg}", max_len=max_len)
+        return safe(name, max_len=max_len)
+    except Exception:  # noqa: BLE001 - assembly must never break logging
+        # Defensive worst-case fallback: render just the class name (or the
+        # sentinel if even that is unavailable).
+        return safe(name, max_len=max_len)

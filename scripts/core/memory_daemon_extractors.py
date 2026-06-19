@@ -55,7 +55,10 @@ def _debug_traceback(where: str) -> None:
     # multi-line/log-forgery output even with a safe()'d body. safe() collapses
     # every newline — the literal separator and the traceback's own frames —
     # into \x0a, keeping the DEBUG line single-line.
-    debug(lambda: safe(f"{where} traceback: {traceback.format_exc()}"))
+    # max_len=4096: the most useful part of a traceback (the exception type
+    # and failing line) is at the END, which safe()'s default 500-char cap
+    # would truncate away (Gemini). A wider budget under DEBUG preserves it.
+    debug(lambda: safe(f"{where} traceback: {traceback.format_exc()}", max_len=4096))
 
 
 def _safe_file_size(path: Path) -> str:

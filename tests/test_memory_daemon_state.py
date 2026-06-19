@@ -572,6 +572,39 @@ class TestWatchdogStuckExtractions:
             if read_fd != -1:
                 os.close(read_fd)
 
+    def test_fallback_read_is_time_bounded(self):
+        """Codex/Copilot: the non-POSIX / non-fd fallback must not block. A
+        stream whose read() blocks until close() (a Windows pipe with a
+        descendant holding the write end) must still return within the
+        budget — the read runs in a joined daemon thread."""
+        import threading
+        import time as _time
+
+        from scripts.core.memory_daemon import _drain_proc_stderr
+
+        class _BlockingStream:
+            def __init__(self):
+                self._closed = threading.Event()
+
+            def fileno(self):
+                raise OSError("no fd")  # force the non-fd fallback path
+
+            def read(self, _n):
+                self._closed.wait(5)  # block until close() or 5s safety cap
+                return b""
+
+            def close(self):
+                self._closed.set()
+
+        proc = MagicMock()
+        proc.stderr = _BlockingStream()
+
+        start = _time.monotonic()
+        _drain_proc_stderr(proc, timeout=0.2)
+        elapsed = _time.monotonic() - start
+
+        assert elapsed < 2.0, f"fallback blocked for {elapsed:.1f}s (should be bounded)"
+
 
 # ---------------------------------------------------------------------------
 # Step 5.1 — Daemon lifecycle tests

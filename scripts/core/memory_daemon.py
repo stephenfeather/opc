@@ -645,7 +645,9 @@ def _drain_proc_stderr(proc, *, max_bytes: int = 65536, timeout: float = 0.0) ->
     if os.name == "posix":
         try:
             candidate = stream.fileno()
-            if isinstance(candidate, int):
+            # A valid fd is a non-negative int (Gemini): guard before use so
+            # set_blocking/select never fire on a bogus descriptor.
+            if isinstance(candidate, int) and candidate >= 0:
                 fd = candidate
         except Exception:
             fd = None
@@ -686,15 +688,31 @@ def _drain_proc_stderr(proc, *, max_bytes: int = 65536, timeout: float = 0.0) ->
                 chunks.append(chunk)
                 total += len(chunk)
         elif timeout > 0:
-            # Non-POSIX / non-fd fallback: a bounded blocking read. Only when a
-            # budget is requested — a 0.0 budget must never block the hot path
-            # (on Windows we cannot poll a pipe without blocking).
-            try:
-                data = stream.read(max_bytes)
-                if isinstance(data, bytes):
-                    chunks.append(data)
-            except Exception:
-                pass
+            # Non-POSIX / non-fd fallback. We cannot poll the fd here, and a
+            # plain read() would block until EOF if a descendant holds the pipe
+            # open — reintroducing the very hang this helper prevents on Windows
+            # (Copilot/Codex). Run the read in a daemon thread and join for the
+            # budget so the CALLER is always bounded; if the read outlives the
+            # budget we return what we have and let the orphaned daemon thread
+            # die with the process. A 0.0 budget never reaches here (skipped),
+            # so the hot-path success close never spawns a thread.
+            import threading
+
+            box: list[bytes] = []
+
+            def _read_into_box():
+                try:
+                    data = stream.read(max_bytes)
+                    if isinstance(data, bytes):
+                        box.append(data)
+                except Exception:
+                    pass
+
+            reader = threading.Thread(target=_read_into_box, daemon=True)
+            reader.start()
+            reader.join(timeout)
+            if box:
+                chunks.append(box[0])
     finally:
         try:
             stream.close()

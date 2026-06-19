@@ -336,6 +336,50 @@ class TestReapCompletedExtractions:
         assert count == 1
         mock_fail.assert_called_once_with("sess-1", last_error="some error")
 
+    @patch("scripts.core.memory_daemon.archive_session_jsonl")
+    @patch("scripts.core.memory_daemon._generate_mini_handoff")
+    @patch("scripts.core.memory_daemon._extract_and_store_workflows")
+    @patch("scripts.core.memory_daemon._calibrate_session_confidence")
+    @patch("scripts.core.memory_daemon.mark_extracted")
+    @patch("scripts.core.memory_daemon._count_session_rejections", return_value=None)
+    @patch("scripts.core.memory_daemon._count_session_learnings", return_value=None)
+    @patch("scripts.core.memory_daemon.log")
+    def test_success_reap_does_not_block_on_open_stderr_pipes(
+        self, mock_log, mock_count, mock_rej,
+        mock_mark, mock_cal, mock_wf, mock_hoff, mock_arch
+    ):
+        """The success-path pipe close must be opportunistic (timeout=0). Reap
+        of N completed extractions whose stderr write ends stay open must
+        finish near-instantly — not N * the failure-diagnostic budget."""
+        import os
+        import time as _time
+
+        open_write_fds = []
+        try:
+            for i in range(4):
+                read_fd, write_fd = os.pipe()
+                open_write_fds.append(write_fd)
+                os.write(write_fd, b"noise")  # buffered; write end never closed
+                proc = MagicMock()
+                proc.poll.return_value = 0
+                proc.pid = 100 + i
+                proc.stderr = os.fdopen(read_fd, "rb", buffering=0)
+                self.state.active_extractions[100 + i] = (
+                    f"sess-{i}", proc, Path("/t.jsonl"), "proj", 0
+                )
+
+            from scripts.core.memory_daemon import reap_completed_extractions
+
+            start = _time.monotonic()
+            count = reap_completed_extractions()
+            elapsed = _time.monotonic() - start
+
+            assert count == 4
+            assert elapsed < 0.5, f"reap blocked for {elapsed:.2f}s on open pipes"
+        finally:
+            for write_fd in open_write_fds:
+                os.close(write_fd)
+
 
 # ---------------------------------------------------------------------------
 # Issue #98 — per-stage pipeline timing helper (_timed_stage)
@@ -383,6 +427,183 @@ class TestTimedStage:
         assert messages == [], (
             f"Expected zero log output with DEBUG off, got {messages}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue #98 — watchdog stderr parity + non-blocking _drain_proc_stderr
+# ---------------------------------------------------------------------------
+
+
+class TestWatchdogStuckExtractions:
+    """The watchdog-killed path captures the child stderr for parity with the
+    reap path, using the shared non-blocking _drain_proc_stderr helper."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_state(self):
+        import scripts.core.memory_daemon as mod
+
+        self.mod = mod
+        self.state = mod.create_daemon_state()
+        self.original = mod._daemon_state
+        mod._daemon_state = self.state
+        yield
+        mod._daemon_state = self.original
+
+    @patch("scripts.core.memory_daemon.mark_extraction_failed")
+    @patch("scripts.core.memory_daemon.log")
+    def test_captures_stderr_on_kill(self, mock_log, mock_fail):
+        import io
+
+        mock_proc = MagicMock()
+        mock_proc.stderr = io.BytesIO(b"hung child traceback")
+        # start_time 0 → elapsed is effectively "now", far past any timeout.
+        self.state.active_extractions[42] = (
+            "sess-1", mock_proc, Path("/t.jsonl"), "proj", 0
+        )
+
+        from scripts.core.memory_daemon import watchdog_stuck_extractions
+
+        killed = watchdog_stuck_extractions()
+
+        assert killed == 1
+        logged = " ".join(str(c.args[0]) for c in mock_log.call_args_list)
+        assert "hung child traceback" in logged
+        assert mock_fail.call_count == 1
+        assert "hung child traceback" in (
+            mock_fail.call_args.kwargs.get("last_error") or ""
+        )
+
+    @patch("scripts.core.memory_daemon.mark_extraction_failed")
+    @patch("scripts.core.memory_daemon.log")
+    def test_skips_blocking_drain_when_kill_times_out(self, mock_log, mock_fail):
+        """If kill()/wait() fails and the child is still alive, the watchdog
+        must NOT call the blocking stderr read — doing so would hang the daemon
+        waiting for EOF on a pipe whose write-end is still open."""
+        import subprocess
+
+        mock_proc = MagicMock()
+        mock_proc.wait.side_effect = subprocess.TimeoutExpired(cmd="claude", timeout=5)
+        mock_proc.poll.return_value = None  # still alive after failed kill
+        mock_proc.stderr = MagicMock()
+        self.state.active_extractions[42] = (
+            "sess-1", mock_proc, Path("/t.jsonl"), "proj", 0
+        )
+
+        from scripts.core.memory_daemon import watchdog_stuck_extractions
+
+        killed = watchdog_stuck_extractions()
+
+        assert killed == 1
+        mock_proc.stderr.read.assert_not_called()
+        assert mock_fail.call_count == 1
+        assert "not drained" in (mock_fail.call_args.kwargs.get("last_error") or "")
+
+    @patch("scripts.core.memory_daemon.mark_extraction_failed")
+    @patch("scripts.core.memory_daemon.log")
+    def test_persisted_last_error_is_sanitized(self, mock_log, mock_fail):
+        """Captured stderr is persisted to last_error, which is interpolated
+        raw into a downstream log line. It must be control-char sanitized
+        (no raw newlines/ESC) before storage."""
+        import io
+
+        mock_proc = MagicMock()
+        mock_proc.stderr = io.BytesIO(b"forged\nlog line\x1b[31mred")
+        self.state.active_extractions[42] = (
+            "sess-1", mock_proc, Path("/t.jsonl"), "proj", 0
+        )
+
+        from scripts.core.memory_daemon import watchdog_stuck_extractions
+
+        watchdog_stuck_extractions()
+
+        last_error = mock_fail.call_args.kwargs.get("last_error") or ""
+        assert "\n" not in last_error
+        assert "\x1b" not in last_error
+        assert "forged" in last_error
+
+    def test_drain_is_time_bounded_when_write_end_stays_open(self):
+        """Even when the parent has 'exited', a surviving descendant can keep
+        the stderr write-end open so EOF never arrives. The drain must return
+        within its time budget and still surface partial bytes."""
+        import os
+        import time as _time
+
+        from scripts.core.memory_daemon import _drain_proc_stderr
+
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, b"partial diagnostic before hang")
+            reader = os.fdopen(read_fd, "rb", buffering=0)
+            read_fd = -1
+            proc = MagicMock()
+            proc.stderr = reader
+
+            start = _time.monotonic()
+            text = _drain_proc_stderr(proc, timeout=0.3)
+            elapsed = _time.monotonic() - start
+
+            assert elapsed < 3.0, f"drain blocked for {elapsed:.1f}s (should be bounded)"
+            assert "partial diagnostic before hang" in text
+        finally:
+            os.close(write_fd)
+            if read_fd != -1:
+                os.close(read_fd)
+
+    def test_drain_timeout_zero_still_reads_buffered_data(self):
+        """timeout=0.0 is an opportunistic non-blocking poll, not a no-op: it
+        must still drain bytes already buffered in the pipe."""
+        import os
+
+        from scripts.core.memory_daemon import _drain_proc_stderr
+
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, b"buffered before the loop")
+            reader = os.fdopen(read_fd, "rb", buffering=0)
+            read_fd = -1
+            proc = MagicMock()
+            proc.stderr = reader
+
+            text = _drain_proc_stderr(proc, timeout=0.0)
+
+            assert "buffered before the loop" in text
+        finally:
+            os.close(write_fd)
+            if read_fd != -1:
+                os.close(read_fd)
+
+    def test_fallback_read_is_time_bounded(self):
+        """Codex/Copilot: the non-POSIX / non-fd fallback must not block. A
+        stream whose read() blocks until close() (a Windows pipe with a
+        descendant holding the write end) must still return within the
+        budget — the read runs in a joined daemon thread."""
+        import threading
+        import time as _time
+
+        from scripts.core.memory_daemon import _drain_proc_stderr
+
+        class _BlockingStream:
+            def __init__(self):
+                self._closed = threading.Event()
+
+            def fileno(self):
+                raise OSError("no fd")  # force the non-fd fallback path
+
+            def read(self, _n):
+                self._closed.wait(5)  # block until close() or 5s safety cap
+                return b""
+
+            def close(self):
+                self._closed.set()
+
+        proc = MagicMock()
+        proc.stderr = _BlockingStream()
+
+        start = _time.monotonic()
+        _drain_proc_stderr(proc, timeout=0.2)
+        elapsed = _time.monotonic() - start
+
+        assert elapsed < 2.0, f"fallback blocked for {elapsed:.1f}s (should be bounded)"
 
 
 # ---------------------------------------------------------------------------

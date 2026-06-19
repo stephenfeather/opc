@@ -351,8 +351,152 @@ class TestArchiveSessionJsonl:
 
 
 # ---------------------------------------------------------------------------
-# Step 4.3d — _count_session_rejections
+# Issue #98 — DEBUG diagnostics: jsonl size + per-handler tracebacks
 # ---------------------------------------------------------------------------
+
+
+class TestExtractionDebugDiagnostics:
+    """extract_memories_impl emits a DEBUG-gated resolved-jsonl path+size line
+    so hung extractions can be triaged, and the size lookup never aborts the
+    spawn if the transcript races away."""
+
+    def test_resolved_jsonl_size_logged_under_debug(self, tmp_path, monkeypatch):
+        from scripts.core import memory_daemon, memory_daemon_core
+        from scripts.core.memory_daemon_extractors import extract_memories_impl
+
+        messages: list[str] = []
+        monkeypatch.setattr(memory_daemon, "log", messages.append, raising=True)
+        monkeypatch.setattr(memory_daemon_core, "log", messages.append, raising=False)
+        monkeypatch.setenv("MEMORY_DAEMON_DEBUG", "1")
+
+        jsonl = tmp_path / "session.jsonl"
+        jsonl.write_text('{"type":"msg"}\n')
+        mock_proc = MagicMock()
+        mock_proc.pid = 7
+        cfg = MagicMock()
+        cfg.extraction_model = "sonnet"
+        cfg.extraction_max_turns = 10
+
+        extract_memories_impl(
+            session_id="s1",
+            project_dir=str(tmp_path),
+            transcript_path=str(jsonl),
+            active_extractions={},
+            subprocess_popen=MagicMock(return_value=mock_proc),
+            is_blocked_fn=lambda _: False,
+            mark_extracted_fn=MagicMock(),
+            mark_failed_fn=MagicMock(),
+            log_fn=MagicMock(),
+            daemon_cfg=cfg,
+            allowed_models=frozenset({"sonnet"}),
+            strip_frontmatter_fn=lambda c: c,
+        )
+
+        size = jsonl.stat().st_size
+        assert any(f"size={size}" in m for m in messages), messages
+
+    def test_size_diagnostic_is_nonfatal_when_stat_races(self, tmp_path, monkeypatch):
+        """exists() succeeds, then the DEBUG-thunk stat() raises (file vanished
+        mid-flight). Extraction must still start; the diagnostic degrades."""
+        from scripts.core import memory_daemon, memory_daemon_core
+        from scripts.core.memory_daemon_extractors import extract_memories_impl
+
+        messages: list[str] = []
+        monkeypatch.setattr(memory_daemon, "log", messages.append, raising=True)
+        monkeypatch.setattr(memory_daemon_core, "log", messages.append, raising=False)
+        monkeypatch.setenv("MEMORY_DAEMON_DEBUG", "1")
+
+        jsonl = tmp_path / "session.jsonl"
+        jsonl.write_text('{"type":"msg"}\n')
+
+        real_stat = Path.stat
+        calls = {"n": 0}
+
+        def flaky_stat(self, *args, **kwargs):
+            if self.name == "session.jsonl":
+                calls["n"] += 1
+                if calls["n"] >= 2:
+                    raise OSError("transcript vanished")
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", flaky_stat)
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 7
+        mock_popen = MagicMock(return_value=mock_proc)
+        cfg = MagicMock()
+        cfg.extraction_model = "sonnet"
+        cfg.extraction_max_turns = 10
+
+        result = extract_memories_impl(
+            session_id="s1",
+            project_dir=str(tmp_path),
+            transcript_path=str(jsonl),
+            active_extractions={},
+            subprocess_popen=mock_popen,
+            is_blocked_fn=lambda _: False,
+            mark_extracted_fn=MagicMock(),
+            mark_failed_fn=MagicMock(),
+            log_fn=MagicMock(),
+            daemon_cfg=cfg,
+            allowed_models=frozenset({"sonnet"}),
+            strip_frontmatter_fn=lambda c: c,
+        )
+
+        assert result is True
+        mock_popen.assert_called_once()
+        assert any("size=unavailable" in m for m in messages), messages
+
+
+class TestPipelineDebugTraceback:
+    """Under DEBUG, the previously-silent pipeline-stage handlers emit the
+    full traceback as a single sanitized line; without DEBUG they stay quiet."""
+
+    def _spy(self, monkeypatch):
+        from scripts.core import memory_daemon, memory_daemon_core
+
+        messages: list[str] = []
+        monkeypatch.setattr(memory_daemon, "log", messages.append, raising=True)
+        monkeypatch.setattr(memory_daemon_core, "log", messages.append, raising=False)
+        return messages
+
+    def test_traceback_emitted_single_line_under_debug(self, monkeypatch):
+        messages = self._spy(monkeypatch)
+        monkeypatch.setenv("MEMORY_DAEMON_DEBUG", "1")
+
+        async def _boom(_sid):
+            raise RuntimeError("calibrate exploded")
+
+        monkeypatch.setattr(
+            "scripts.core.confidence_calibrator.calibrate_session", _boom
+        )
+        from scripts.core.memory_daemon_extractors import calibrate_session_confidence
+
+        calibrate_session_confidence("s1", log_fn=MagicMock())
+
+        tb_msgs = [m for m in messages if "Traceback" in m]
+        assert tb_msgs, messages
+        # safe() collapses every newline → single-line, no log forgery.
+        assert all("\n" not in m for m in tb_msgs), tb_msgs
+
+    def test_no_traceback_without_debug(self, monkeypatch):
+        messages = self._spy(monkeypatch)
+        monkeypatch.delenv("MEMORY_DAEMON_DEBUG", raising=False)
+
+        async def _boom(_sid):
+            raise RuntimeError("calibrate exploded")
+
+        monkeypatch.setattr(
+            "scripts.core.confidence_calibrator.calibrate_session", _boom
+        )
+        log_fn = MagicMock()
+        from scripts.core.memory_daemon_extractors import calibrate_session_confidence
+
+        calibrate_session_confidence("s1", log_fn=log_fn)
+
+        assert not any("Traceback" in m for m in messages)
+        joined = " ".join(str(c.args[0]) for c in log_fn.call_args_list)
+        assert "calibrate exploded" in joined
 
 
 class TestCountSessionRejections:

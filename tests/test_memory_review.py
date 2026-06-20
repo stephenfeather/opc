@@ -144,6 +144,7 @@ def _pool_returning(rows):
     conn = MagicMock()
     conn.fetch = AsyncMock(return_value=rows)
     conn.fetchval = AsyncMock(return_value=0)
+    conn.fetchrow = AsyncMock(return_value=None)
     conn.execute = AsyncMock()
     txn_ctx = MagicMock()
     txn_ctx.__aenter__ = AsyncMock(return_value=conn)
@@ -305,6 +306,99 @@ class TestFormatReportTimeout:
         out = format_report(report)
         assert "exceeded its time budget" in out
         assert "--promote-only" in out
+
+    def test_timeout_does_not_read_as_zero(self):
+        # Regression (round 2): a timed-out scan must not render "(0 ...)" or fall
+        # through to the merges "(none)" line.
+        report = ReviewReport(project="opc", total_active=6400, merges_timed_out=True)
+        out = format_report(report)
+        assert "not scanned: timed out" in out
+        assert "0 near-duplicate pairs" not in out
+        # Isolate the merges section and confirm it has no "(none)" placeholder.
+        merges_section = out.split("### 2.")[1].split("### 3.")[0]
+        assert "(none)" not in merges_section
+
+
+class TestFormatReportCoverage:
+    def test_partial_scan_disclosed(self):
+        report = ReviewReport(
+            project="opc",
+            total_active=100,
+            merge_scanned_model="voyage-code-3",
+            merge_skipped_rows=42,
+        )
+        out = format_report(report)
+        assert "partial scan" in out
+        assert "voyage-code-3" in out
+        assert "42" in out
+
+    def test_full_scan_no_disclosure(self):
+        report = ReviewReport(project="opc", total_active=100, merge_skipped_rows=0)
+        assert "partial scan" not in format_report(report)
+
+    def test_merge_pair_shows_ids(self):
+        report = ReviewReport(
+            project="opc",
+            total_active=100,
+            merges=[
+                MergeCandidate(
+                    id_a="abcd1234-0000",
+                    id_b="efgh5678-0000",
+                    similarity=0.95,
+                    preview_a="p",
+                    preview_b="q",
+                )
+            ],
+        )
+        out = format_report(report)
+        assert "abcd1234" in out
+        assert "efgh5678" in out
+
+
+class TestMergeSqlPreviewCanonicalization:
+    def test_previews_tied_to_canonical_ids(self):
+        # Regression (round 2): preview_lo/hi must follow LEAST/GREATEST id, not the
+        # directed (a, nn) roles, or the approval flow shows the wrong side's content.
+        from scripts.core.memory_review import _MERGE_SQL
+
+        assert "CASE WHEN a.id <= nn.id THEN a.content ELSE nn.content END" in _MERGE_SQL
+        assert "CASE WHEN a.id <= nn.id THEN nn.content ELSE a.content END" in _MERGE_SQL
+
+    def test_dominant_model_has_deterministic_tiebreak(self):
+        from scripts.core.memory_review import _MERGE_SQL
+
+        assert "COUNT(*) DESC, embedding_model ASC" in _MERGE_SQL
+
+
+class TestDefaultProject:
+    def test_worktree_path_resolves_to_repo(self, monkeypatch):
+        # Regression (round 2): running from a worktree must review the repo, not the
+        # branch directory name.
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        monkeypatch.setattr(
+            "scripts.core.memory_review.os.getcwd",
+            lambda: "/Users/x/opc/.claude/worktrees/agent-memory-review-detector",
+        )
+        from scripts.core.memory_review import _default_project
+
+        assert _default_project() == "opc"
+
+    def test_env_project_dir_honored(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/Users/x/binbrain")
+        from scripts.core.memory_review import _default_project
+
+        assert _default_project() == "binbrain"
+
+
+class TestMainProjectResolution:
+    async def test_unresolved_project_returns_error_code(self, monkeypatch):
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        monkeypatch.setattr("scripts.core.memory_review.canonicalize_project", lambda _x: None)
+        from scripts.core.memory_review import main
+
+        # Explicit but unresolvable project → non-zero exit, no DB call.
+        rc = await main(["   "])
+        assert rc == 2
 
 
 def test_defaults_are_sane():

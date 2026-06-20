@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,6 +25,10 @@ if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
 from scripts.core.db.postgres_pool import close_pool, get_pool  # noqa: E402
+from scripts.core.project_naming import (  # noqa: E402
+    canonicalize_project,
+    project_from_path,
+)
 
 # --- Constants -------------------------------------------------------------
 
@@ -45,6 +50,13 @@ STALE_OPEN_THREAD_DAYS = 30
 # Types absent from this map stay on-demand in archival_memory by design —
 # promoting WORKING_SOLUTION/ERROR_FIX/FAILED_APPROACH floods always-loaded
 # context with content that recall surfaces only when relevant.
+#
+# Known Phase-1 boundary: the promotion query filters by learning_type, so a
+# high-recall entry MISLABELED as a stay-on-demand (or unknown/future) type is not
+# surfaced for promotion. This is a deliberate scope decision — a type-agnostic
+# sweep that re-judges every high-recall entry's true type is a Phase-2 concern
+# (it ~5x's candidate volume). Cleaning mislabels is the data-quality path, not this
+# detector's job in Phase 1.
 _ROUTING: dict[str, str] = {
     "USER_PREFERENCE": "rules/",
     "ARCHITECTURAL_DECISION": "CLAUDE.md",
@@ -89,6 +101,8 @@ class ReviewReport:
     stale_buckets: list[StaleBucket] = field(default_factory=list)
     stale_open_threads: int = 0
     merges_timed_out: bool = False
+    merge_scanned_model: str | None = None
+    merge_skipped_rows: int = 0
 
 
 # --- Pure functions --------------------------------------------------------
@@ -135,24 +149,34 @@ def format_report(report: ReviewReport) -> str:
     lines.append("")
 
     # 2. Cleanup — near-duplicate merges
-    lines.append(f"### 2. Cleanup — merges ({len(report.merges)} near-duplicate pairs)")
     if report.merges_timed_out:
-        # Cost is one HNSW probe per active learning, so it scales with corpus size,
-        # NOT with --threshold (the nearest neighbor is found before the threshold
-        # filters output). The real levers are a smaller corpus or skipping merges.
+        # Incomplete scan — must NOT read as "zero duplicates found". Cost is one HNSW
+        # probe per active learning, so it scales with corpus size, NOT with --threshold
+        # (the nearest neighbor is found before the threshold filters output). The real
+        # levers are a smaller corpus or skipping merges.
+        lines.append("### 2. Cleanup — merges (not scanned: timed out)")
         lines.append(
             f"  ⚠️ merge scan exceeded its time budget on {report.total_active} "
-            "learnings (cost scales with corpus size). Re-run with --promote-only to "
-            "skip it, or scan a smaller project."
+            "learnings (cost scales with corpus size). This is NOT a zero result — the "
+            "scan did not complete. Re-run with --promote-only to skip it, or scan a "
+            "smaller project."
         )
-    if report.merges:
-        for m in sorted(report.merges, key=lambda m: m.similarity, reverse=True):
-            lines.append(
-                f"      • [{m.similarity:.3f}] {_truncate(m.preview_a, 60)} "
-                f"⇄ {_truncate(m.preview_b, 60)}"
-            )
     else:
-        lines.append("  (none)")
+        lines.append(f"### 2. Cleanup — merges ({len(report.merges)} near-duplicate pairs)")
+        if report.merge_skipped_rows > 0:
+            lines.append(
+                f"  ⚠️ partial scan: only the '{report.merge_scanned_model}' embedding "
+                f"space was scanned; {report.merge_skipped_rows} embedded row(s) in other "
+                "spaces were skipped (re-embed in progress?)."
+            )
+        if report.merges:
+            for m in sorted(report.merges, key=lambda m: m.similarity, reverse=True):
+                lines.append(
+                    f"      • [{m.similarity:.3f}] ({m.id_a[:8]} ⇄ {m.id_b[:8]}) "
+                    f"{_truncate(m.preview_a, 55)} ⇄ {_truncate(m.preview_b, 55)}"
+                )
+        else:
+            lines.append("  (none)")
     lines.append("")
 
     # 3. Cleanup — stale
@@ -204,7 +228,10 @@ _MERGE_SQL = """
           AND superseded_by IS NULL
           AND embedding IS NOT NULL
         GROUP BY embedding_model
-        ORDER BY COUNT(*) DESC
+        -- Deterministic tie-break so a 50/50 split never flips the scanned space
+        -- between runs. Coverage disclosure (see fetch_embedding_model_coverage)
+        -- tells the user when a partial re-embed leaves rows in other spaces.
+        ORDER BY COUNT(*) DESC, embedding_model ASC
         LIMIT 1
     ),
     scoped AS (
@@ -219,8 +246,13 @@ _MERGE_SQL = """
         SELECT LEAST(a.id, nn.id) AS lo,
                GREATEST(a.id, nn.id) AS hi,
                (1 - (a.embedding <=> nn.embedding))::float AS similarity,
-               LEFT(a.content, 90) AS preview_lo,
-               LEFT(nn.content, 90) AS preview_hi
+               -- Tie previews to the canonical ids, not to the directed (a, nn)
+               -- roles: lo is the smaller id, so its preview must be that row's
+               -- content regardless of which side the lateral emitted it from.
+               LEFT(CASE WHEN a.id <= nn.id THEN a.content ELSE nn.content END, 90)
+                   AS preview_lo,
+               LEFT(CASE WHEN a.id <= nn.id THEN nn.content ELSE a.content END, 90)
+                   AS preview_hi
         FROM scoped a
         CROSS JOIN LATERAL (
             SELECT b.id, b.content, b.embedding
@@ -245,6 +277,29 @@ _MERGE_SQL = """
     FROM canonical
     ORDER BY similarity DESC
     LIMIT $3
+"""
+
+# Coverage for the merge scan: which embedding space was scanned and how many
+# embedded rows were left out (i.e. live in a different embedding_model). Lets the
+# report disclose a partial scan after a re-embed instead of silently under-reporting.
+_MERGE_COVERAGE_SQL = """
+    WITH embedded AS (
+        SELECT embedding_model
+        FROM archival_memory
+        WHERE LOWER(project) = LOWER($1)
+          AND superseded_by IS NULL
+          AND embedding IS NOT NULL
+    ),
+    ranked AS (
+        SELECT embedding_model, COUNT(*) AS n
+        FROM embedded
+        GROUP BY embedding_model
+        ORDER BY n DESC, embedding_model ASC
+    )
+    SELECT
+        (SELECT embedding_model FROM ranked LIMIT 1) AS scanned_model,
+        COALESCE((SELECT n FROM ranked LIMIT 1), 0) AS scanned_rows,
+        (SELECT COUNT(*) FROM embedded) AS total_embedded
 """
 
 _STALE_SQL = """
@@ -346,6 +401,21 @@ async def fetch_merge_candidates(
     ]
 
 
+async def fetch_merge_coverage(pool, project: str) -> tuple[str | None, int]:
+    """Return (scanned_model, skipped_embedded_rows) for the merge scan.
+
+    skipped = embedded rows that live in an embedding_model OTHER than the one the
+    merge scan covers, so the report can disclose a partial scan after a re-embed.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(_MERGE_COVERAGE_SQL, project)
+    if row is None:
+        return None, 0
+    scanned_model = row["scanned_model"]
+    skipped = int(row["total_embedded"]) - int(row["scanned_rows"])
+    return scanned_model, max(0, skipped)
+
+
 async def fetch_stale_summary(pool, project: str) -> tuple[list[StaleBucket], int]:
     async with pool.acquire() as conn:
         bucket_rows = await conn.fetch(_STALE_SQL, project)
@@ -378,10 +448,13 @@ async def build_review(
     stale_buckets: list[StaleBucket] = []
     stale_open_threads = 0
     merges_timed_out = False
+    merge_scanned_model: str | None = None
+    merge_skipped_rows = 0
 
     if promote:
         promotions = await fetch_promotion_candidates(pool, project, min_recall)
     if cleanup:
+        merge_scanned_model, merge_skipped_rows = await fetch_merge_coverage(pool, project)
         try:
             merges = await fetch_merge_candidates(
                 pool, project, threshold, ef_search=ef_search, timeout=merge_timeout
@@ -401,11 +474,16 @@ async def build_review(
         stale_buckets=stale_buckets,
         stale_open_threads=stale_open_threads,
         merges_timed_out=merges_timed_out,
+        merge_scanned_model=merge_scanned_model,
+        merge_skipped_rows=merge_skipped_rows,
     )
 
 
-def _default_project() -> str:
-    return Path.cwd().name
+def _default_project() -> str | None:
+    """Worktree-aware default project: resolves .claude/worktrees/<branch> to the
+    real repo (issue #130), so a worktree session reviews the right corpus rather
+    than the branch name. Honors CLAUDE_PROJECT_DIR when set."""
+    return project_from_path(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -432,9 +510,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-async def main(argv: list[str] | None = None) -> None:
+async def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
-    project = args.project or _default_project()
+    # Explicit arg wins (canonicalized to match stored project values); otherwise
+    # derive worktree-aware from the cwd so we never review the branch name.
+    project = canonicalize_project(args.project) if args.project else _default_project()
+    if not project:
+        print(
+            "memory-review: could not resolve a project. Pass one explicitly, "
+            "e.g. `memory-review opc`.",
+            file=sys.stderr,
+        )
+        return 2
     promote = not args.cleanup_only
     cleanup = not args.promote_only
 
@@ -450,14 +537,24 @@ async def main(argv: list[str] | None = None) -> None:
         cleanup=cleanup,
     )
     print(format_report(report))
+    if report.total_active == 0:
+        # A zero-active corpus usually means the project name is wrong (typo or an
+        # unresolved worktree path), not that the project is genuinely empty. Make
+        # that visible rather than letting an empty report read as "all clean".
+        print(
+            f"\nmemory-review: project '{project}' has 0 active learnings — "
+            "verify the project name is correct.",
+            file=sys.stderr,
+        )
+    return 0
 
 
-async def _cli_main(argv: list[str] | None = None) -> None:
+async def _cli_main(argv: list[str] | None = None) -> int:
     try:
-        await main(argv)
+        return await main(argv)
     finally:
         await close_pool()
 
 
 if __name__ == "__main__":
-    asyncio.run(_cli_main())
+    sys.exit(asyncio.run(_cli_main()))

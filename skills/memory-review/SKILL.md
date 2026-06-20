@@ -87,3 +87,10 @@ committed docs) goes through the worktree + PR workflow; never hard-delete an
 - Promotion never deletes the source archival row (recall must keep working).
 - Stay-on-demand types (WORKING_SOLUTION, ERROR_FIX, FAILED_APPROACH) are intentionally
   never promoted — they flood always-loaded context.
+- **Phase-1 limitation:** the promotion detector filters by `learning_type`, so a
+  high-recall entry *mislabeled* as a stay-on-demand or unknown type is not surfaced for
+  promotion. A type-agnostic sweep that re-judges every high-recall entry is a Phase-2
+  concern; for now, fixing mislabels is the data-quality path.
+- **Merge scan is single-space:** it scans only the project's dominant `embedding_model`.
+  After a partial re-embed the report discloses how many rows in other spaces were
+  skipped — treat a "partial scan" note as a signal the merge results are incomplete.

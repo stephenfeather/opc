@@ -475,6 +475,70 @@ class TestMainProjectResolution:
         assert rc == 2
 
 
+class TestArgValidation:
+    # Security (MEDIUM-1/LOW-1): reject inputs that would defeat the scan guard or
+    # crash the GUC, before they ever reach Postgres.
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["opc", "--merge-timeout", "0"],
+            ["opc", "--merge-timeout", "-5"],
+            ["opc", "--ef-search", "0"],
+            ["opc", "--ef-search", "-1"],
+            ["opc", "--min-recall", "-1"],
+            ["opc", "--threshold", "1.5"],
+            ["opc", "--threshold", "-0.1"],
+        ],
+    )
+    def test_invalid_values_rejected(self, argv):
+        from scripts.core.memory_review import _parse_args
+
+        with pytest.raises(SystemExit):
+            _parse_args(argv)
+
+    def test_valid_boundary_values_accepted(self):
+        from scripts.core.memory_review import _parse_args
+
+        ns = _parse_args(["opc", "--ef-search", "1", "--merge-timeout", "0.5", "--min-recall", "0"])
+        assert ns.ef_search == 1
+        assert ns.merge_timeout == 0.5
+        assert ns.min_recall == 0
+
+
+class TestMergeGuardClamps:
+    # Defense-in-depth for programmatic callers that bypass argparse.
+    async def test_nonpositive_timeout_does_not_set_statement_timeout(self):
+        pool, conn = _pool_returning([])
+        await fetch_merge_candidates(pool, "opc", "voyage-code-3", threshold=0.9, timeout=0)
+        executed = [c.args[0] for c in conn.execute.call_args_list]
+        # statement_timeout=0 means "no limit" in Postgres — must never be sent.
+        assert not any("statement_timeout" in s for s in executed)
+        # asyncpg client timeout must be coerced to None, not passed as 0/negative.
+        assert conn.fetch.call_args.kwargs.get("timeout") is None
+
+    async def test_ef_search_clamped_to_minimum_one(self):
+        pool, conn = _pool_returning([])
+        await fetch_merge_candidates(pool, "opc", "voyage-code-3", threshold=0.9, ef_search=0)
+        executed = [c.args[0] for c in conn.execute.call_args_list]
+        assert any("hnsw.ef_search = 1" in s for s in executed)
+
+
+class TestMainDbErrorHandling:
+    async def test_db_error_returns_clean_exit_code(self, monkeypatch):
+        # Security (LOW-2): DB failures fail cleanly, no traceback/DSN leak.
+        from asyncpg.exceptions import PostgresError
+
+        import scripts.core.memory_review as mr
+
+        async def _boom():
+            raise PostgresError("connection refused to claude:secret@host")
+
+        monkeypatch.setattr(mr, "_default_project", lambda: "opc")
+        monkeypatch.setattr(mr, "get_pool", _boom)
+        rc = await mr.main(["opc"])
+        assert rc == 1
+
+
 def test_defaults_are_sane():
     assert DEFAULT_MIN_RECALL == 10
     assert DEFAULT_SIMILARITY_THRESHOLD == 0.90

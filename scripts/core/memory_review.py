@@ -24,7 +24,7 @@ _repo_root = str(Path(__file__).resolve().parent.parent.parent)
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
-from asyncpg.exceptions import QueryCanceledError  # noqa: E402
+from asyncpg.exceptions import PostgresError, QueryCanceledError  # noqa: E402
 
 from scripts.core.db.postgres_pool import close_pool, get_pool  # noqa: E402
 from scripts.core.project_naming import (  # noqa: E402
@@ -388,11 +388,18 @@ async def fetch_merge_candidates(
     # statement_timeout makes Postgres itself cancel the scan (raising QueryCanceledError)
     # so the backend stops and the connection is freed — the asyncpg client `timeout=` is
     # only a secondary guard that does not stop server-side work on its own.
-    safe_ef = int(ef_search)
+    # Defense-in-depth clamps (the CLI also validates, but this is also called
+    # programmatically): ef_search must be >= 1 or Postgres rejects the GUC; a
+    # non-positive timeout must NOT reach the backend — statement_timeout = 0 means
+    # "no limit" in Postgres, which would silently disable the degradation guard on a
+    # large O(n^2) scan, and a negative asyncpg timeout raises ValueError. Treat any
+    # non-positive timeout as "no explicit budget".
+    safe_ef = max(1, int(ef_search))
+    safe_timeout = timeout if (timeout is not None and timeout > 0) else None
     async with pool.acquire() as conn, conn.transaction():
         await conn.execute(f"SET LOCAL hnsw.ef_search = {safe_ef}")
-        if timeout is not None:
-            await conn.execute(f"SET LOCAL statement_timeout = {int(timeout * 1000)}")
+        if safe_timeout is not None:
+            await conn.execute(f"SET LOCAL statement_timeout = {int(safe_timeout * 1000)}")
         rows = await conn.fetch(
             _MERGE_SQL,
             project,
@@ -400,7 +407,7 @@ async def fetch_merge_candidates(
             int(limit),
             int(neighbors),
             model,
-            timeout=timeout,
+            timeout=safe_timeout,
         )
     return [
         MergeCandidate(
@@ -510,24 +517,56 @@ def _default_project() -> str | None:
     return project_from_path(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
 
 
+def _positive_int(raw: str) -> int:
+    """argparse type: an int >= 1 (rejects 0/negative before they reach the GUC)."""
+    value = int(raw)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {value}")
+    return value
+
+
+def _positive_float(raw: str) -> float:
+    """argparse type: a float > 0 (a non-positive timeout disables the scan guard)."""
+    value = float(raw)
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"must be > 0, got {value}")
+    return value
+
+
+def _non_negative_int(raw: str) -> int:
+    """argparse type: an int >= 0 (min-recall of 0 selects everything; negative is invalid)."""
+    value = int(raw)
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"must be >= 0, got {value}")
+    return value
+
+
+def _unit_float(raw: str) -> float:
+    """argparse type: a cosine threshold in [0, 1]."""
+    value = float(raw)
+    if not 0.0 <= value <= 1.0:
+        raise argparse.ArgumentTypeError(f"must be in [0, 1], got {value}")
+    return value
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Detect memory promotion / merge / stale candidates (issue #63). Read-only."
     )
     p.add_argument("project", nargs="?", default=None, help="Project to review (default: cwd name)")
-    p.add_argument("--min-recall", type=int, default=DEFAULT_MIN_RECALL)
-    p.add_argument("--threshold", type=float, default=DEFAULT_SIMILARITY_THRESHOLD)
+    p.add_argument("--min-recall", type=_non_negative_int, default=DEFAULT_MIN_RECALL)
+    p.add_argument("--threshold", type=_unit_float, default=DEFAULT_SIMILARITY_THRESHOLD)
     p.add_argument(
         "--ef-search",
-        type=int,
+        type=_positive_int,
         default=DEFAULT_EF_SEARCH,
-        help="HNSW ef_search for the merge scan; lower = faster, less complete",
+        help="HNSW ef_search for the merge scan (>= 1); lower = faster, less complete",
     )
     p.add_argument(
         "--merge-timeout",
-        type=float,
+        type=_positive_float,
         default=DEFAULT_MERGE_TIMEOUT_S,
-        help="Seconds before the merge scan degrades gracefully (pool cap is 60s)",
+        help="Seconds before the merge scan degrades gracefully (> 0; pool cap is 60s)",
     )
     p.add_argument("--promote-only", action="store_true", help="Skip cleanup detectors")
     p.add_argument("--cleanup-only", action="store_true", help="Skip promotion detector")
@@ -549,17 +588,23 @@ async def main(argv: list[str] | None = None) -> int:
     promote = not args.cleanup_only
     cleanup = not args.promote_only
 
-    pool = await get_pool()
-    report = await build_review(
-        pool,
-        project,
-        min_recall=args.min_recall,
-        threshold=args.threshold,
-        ef_search=args.ef_search,
-        merge_timeout=args.merge_timeout,
-        promote=promote,
-        cleanup=cleanup,
-    )
+    try:
+        pool = await get_pool()
+        report = await build_review(
+            pool,
+            project,
+            min_recall=args.min_recall,
+            threshold=args.threshold,
+            ef_search=args.ef_search,
+            merge_timeout=args.merge_timeout,
+            promote=promote,
+            cleanup=cleanup,
+        )
+    except (OSError, PostgresError) as exc:
+        # Connection/DB failures (DB down, bad DSN, refused) should fail cleanly with
+        # a concise message — never dump a traceback that could echo the DSN/host.
+        print(f"memory-review: database error ({type(exc).__name__}).", file=sys.stderr)
+        return 1
     print(format_report(report))
     if report.total_active == 0:
         # A zero-active corpus usually means the project name is wrong (typo or an

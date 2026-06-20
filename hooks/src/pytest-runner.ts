@@ -98,6 +98,9 @@ async function main() {
       timeout: 120_000,
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
+      // UV_FROZEN=1: a hook-triggered `uv run pytest` must not re-resolve/rewrite
+      // the project's uv.lock as a side effect (issue #71 follow-up).
+      env: { ...process.env, UV_FROZEN: '1' },
     });
 
     // Tests passed — extract summary

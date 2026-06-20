@@ -190,7 +190,9 @@ print(json.dumps(output))
       encoding: "utf-8",
       timeout: 5e3,
       cwd: projectDir,
-      stdio: ["pipe", "pipe", "pipe"]
+      stdio: ["pipe", "pipe", "pipe"],
+      // Never rewrite the project's uv.lock from a hook-triggered uv run (issue #71).
+      env: { ...process.env, UV_FROZEN: "1" }
     });
     if (result.status !== 0 || !result.stdout) {
       return null;

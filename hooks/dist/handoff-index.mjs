@@ -143,7 +143,9 @@ ${content}`;
       const child = spawn("uv", ["run", "python", indexScript, "--file", fullPath], {
         cwd: projectDir,
         detached: true,
-        stdio: "ignore"
+        stdio: "ignore",
+        // Never rewrite the project's uv.lock from a hook-triggered uv run (issue #71).
+        env: { ...process.env, UV_FROZEN: "1" }
       });
       child.unref();
     }

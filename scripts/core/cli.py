@@ -90,6 +90,11 @@ COMMANDS: dict[CommandKey, Command] = {
         "Analyze near-duplicate learning density",
         "Patterns & Metrics",
     ),
+    ("memory-review",): Command(
+        "memory_review.py",
+        "Detect memory promotion/merge/stale candidates (read-only)",
+        "Patterns & Metrics",
+    ),
     ("confidence", "calibrate"): Command(
         "confidence_calibrator.py",
         "Calibrate learning confidence scores",

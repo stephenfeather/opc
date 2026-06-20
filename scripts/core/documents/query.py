@@ -1,10 +1,10 @@
 """Scoped query orchestration: embed the question, retrieve, map to results.
 
-The DB layer enforces the scope gate. When scope_all is True the sentinel
-'all' is forwarded and db.query_chunks is responsible for treating it as
-"no scope filter" — see the WHERE-clause note in db.query_chunks. For v1,
-db.query_chunks only matches a literal scope value, so 'all' is wired here
-but the DB layer is extended in Step 4 to honour it.
+The DB layer enforces the scope gate. The default query is global-only;
+restricted collections (medical/legal records) are reachable ONLY by naming
+the collection explicitly. There is deliberately no "all scopes" switch — a
+single blanket flag surfacing every restricted record at once is too wide a
+leak surface, so the only way to reach restricted content is `collection=...`.
 """
 
 from __future__ import annotations
@@ -39,22 +39,20 @@ async def query_documents(
     embedder: QueryEmbedder,
     *,
     collection: str | None = None,
-    scope_all: bool = False,
     limit: int = DEFAULT_LIMIT,
 ) -> list[QueryResult]:
-    """Embed query_text and retrieve the nearest chunks under the chosen scope.
+    """Embed query_text and retrieve the nearest chunks under the scope gate.
 
     Scoping:
-        collection set      -> that collection only (overrides scope_all).
-        scope_all=True       -> every collection, any scope.
-        neither              -> global collections only (the safe default).
+        collection set  -> that collection only (the ONLY way to reach a
+                           restricted collection).
+        collection None -> global collections only (the safe default).
     """
     if not query_text.strip():
         return []
 
     embedding = await embedder.embed(query_text)
-    scope = "all" if scope_all else "global"
-    rows = await query_chunks(embedding, scope=scope, collection=collection, limit=limit)
+    rows = await query_chunks(embedding, scope="global", collection=collection, limit=limit)
     return [
         QueryResult(
             content=row["content"],

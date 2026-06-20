@@ -15,7 +15,11 @@ from pathlib import Path
 from typing import Protocol
 
 from scripts.core.documents.chunk import chunk_pages
-from scripts.core.documents.db import get_document_by_path, upsert_document_with_chunks
+from scripts.core.documents.db import (
+    get_document_by_path,
+    reconcile_chunk_scope,
+    upsert_document_with_chunks,
+)
 from scripts.core.documents.extract import extract_text
 from scripts.core.documents.registry import Collection
 
@@ -38,6 +42,7 @@ class IngestReport:
     skipped_unsupported: int = 0
     needs_ocr: int = 0
     errors: int = 0
+    rescoped: int = 0
 
 
 def compute_file_hash(path: Path) -> str:
@@ -71,6 +76,13 @@ async def ingest_collection(collection: Collection, embedder: Embedder) -> Inges
         file_hash = compute_file_hash(file_path)
         existing = await get_document_by_path(collection.name, str(file_path))
         if existing is not None and existing["file_hash"] == file_hash:
+            # Bytes unchanged, but the registry scope may have changed since the
+            # last scan (e.g. a folder reclassified global -> restricted). Scope
+            # lives on the chunks, not the hash, so reconcile it explicitly —
+            # otherwise stale-scoped chunks keep leaking into default queries.
+            report.rescoped += await reconcile_chunk_scope(
+                collection.name, str(file_path), collection.scope
+            )
             report.skipped_unchanged += 1
             continue
 

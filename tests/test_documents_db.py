@@ -12,6 +12,7 @@ from scripts.core.documents.db import (
     collection_stats,
     get_document_by_path,
     query_chunks,
+    reconcile_chunk_scope,
     upsert_document_with_chunks,
 )
 
@@ -144,23 +145,43 @@ async def test_query_chunks_respects_scope() -> None:
     await _cleanup("test-col-restricted")
 
 
-async def test_query_chunks_scope_all_sees_restricted() -> None:
-    await _cleanup("test-col-all")
+async def test_reconcile_scope_hides_reclassified_chunks_from_default_query() -> None:
+    # Regression for the global->restricted reclassification leak: a file
+    # ingested as global, then reclassified, must stop appearing in default
+    # (global) queries once its chunk scope is reconciled — even though the
+    # file bytes never changed.
+    col = "test-col-reclassify"
+    await _cleanup(col)
     await upsert_document_with_chunks(
-        collection_name="test-col-all",
-        scope="restricted",
-        file_path="/tmp/all.txt",
-        file_hash="ha",
+        collection_name=col,
+        scope="global",
+        file_path="/tmp/reclass.txt",
+        file_hash="hr1",
         file_size_bytes=1,
         page_count=1,
         extraction_status="extracted",
         error=None,
-        chunks=[Chunk(0, "findable everywhere", 1)],
+        chunks=[Chunk(0, "sensitive once-global content", 1)],
         embeddings=[_vec()],
     )
-    results = await query_chunks(_vec(), scope="all", collection=None, limit=10)
-    assert "findable everywhere" in {r["content"] for r in results}
-    await _cleanup("test-col-all")
+    # Visible in a default global query before reclassification.
+    before = await query_chunks(_vec(), scope="global", collection=None, limit=10)
+    assert "sensitive once-global content" in {r["content"] for r in before}
+
+    # Reclassify to restricted without touching the file hash.
+    changed = await reconcile_chunk_scope(col, "/tmp/reclass.txt", "restricted")
+    assert changed == 1
+
+    # Now gone from the default global query...
+    after = await query_chunks(_vec(), scope="global", collection=None, limit=10)
+    assert "sensitive once-global content" not in {r["content"] for r in after}
+    # ...but still reachable by explicit collection targeting.
+    targeted = await query_chunks(_vec(), scope="global", collection=col, limit=10)
+    assert "sensitive once-global content" in {r["content"] for r in targeted}
+
+    # Idempotent: a second reconcile to the same scope changes nothing.
+    assert await reconcile_chunk_scope(col, "/tmp/reclass.txt", "restricted") == 0
+    await _cleanup(col)
 
 
 async def test_collection_stats() -> None:

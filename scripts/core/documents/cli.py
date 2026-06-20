@@ -91,12 +91,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_query.add_argument(
         "--collection",
         default=None,
-        help="target one collection (unlocks a restricted collection)",
-    )
-    p_query.add_argument(
-        "--scope-all",
-        action="store_true",
-        help="search every collection regardless of scope",
+        help="target one collection by name — the ONLY way to reach a "
+        "restricted collection; the default search is global-only",
     )
     p_query.add_argument("--limit", type=int, default=8, help="max results")
 
@@ -170,7 +166,6 @@ def _cmd_query(args: argparse.Namespace) -> int:
             args.text,
             embedder,
             collection=args.collection,
-            scope_all=args.scope_all,
             limit=args.limit,
         )
     )

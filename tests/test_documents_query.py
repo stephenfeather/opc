@@ -31,14 +31,29 @@ async def test_query_documents_collection_targeting_forwarded() -> None:
     assert mock_q.await_args.kwargs["collection"] == "caleb-records"
 
 
-async def test_query_documents_scope_all_forwarded() -> None:
+async def test_query_documents_always_passes_global_scope() -> None:
+    # Regression guard: there is no "all scopes" switch. query_documents must
+    # ALWAYS pass scope='global' to the DB layer, so restricted collections are
+    # unreachable except by an explicit collection name.
     with patch(
         "scripts.core.documents.query.query_chunks",
         new=AsyncMock(return_value=[]),
     ) as mock_q:
-        await query_documents("x", _FakeEmbedder(), scope_all=True)
-    # scope_all means: do not gate by scope. Sentinel 'all' is passed through.
-    assert mock_q.await_args.kwargs["scope"] == "all"
+        await query_documents("x", _FakeEmbedder())
+    assert mock_q.await_args.kwargs["scope"] == "global"
+
+
+async def test_query_documents_global_scope_even_with_collection() -> None:
+    # Targeting a collection still passes scope='global'; the DB layer's
+    # collection branch is what unlocks the named (possibly restricted)
+    # collection — never a scope widening.
+    with patch(
+        "scripts.core.documents.query.query_chunks",
+        new=AsyncMock(return_value=[]),
+    ) as mock_q:
+        await query_documents("x", _FakeEmbedder(), collection="caleb-records")
+    assert mock_q.await_args.kwargs["scope"] == "global"
+    assert mock_q.await_args.kwargs["collection"] == "caleb-records"
 
 
 async def test_query_documents_maps_rows_to_results() -> None:

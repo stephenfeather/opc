@@ -114,18 +114,17 @@ async def query_chunks(
 
     Gating rules:
         collection is not None -> search ONLY that collection (any scope).
-        scope == 'all'         -> search every chunk regardless of scope.
         otherwise              -> search every chunk whose scope == `scope`.
 
     A default query passes scope='global', collection=None, so 'restricted'
-    collections never surface unless explicitly targeted.
+    collections never surface unless explicitly targeted by name. There is
+    deliberately NO "all scopes" path: restricted collections (medical/legal
+    records) are reachable only via an explicit collection name, never through
+    a blanket flag.
     """
     if collection is not None:
         where = "dc.collection_name = $2"
         scope_arg = collection
-    elif scope == "all":
-        where = "TRUE OR $2 = $2"  # $2 referenced to keep arg arity fixed
-        scope_arg = scope
     else:
         where = "dc.scope = $2"
         scope_arg = scope
@@ -151,6 +150,39 @@ async def query_chunks(
             limit,
         )
     return [dict(row) for row in rows]
+
+
+async def reconcile_chunk_scope(collection_name: str, file_path: str, scope: str) -> int:
+    """Force every chunk of a document to the given scope; return rows changed.
+
+    Scope lives on document_chunks, not on the file hash. A folder that is
+    reclassified in the registry (e.g. global -> restricted) for a file whose
+    bytes are unchanged would otherwise keep its old chunk scope and keep
+    leaking into default queries. Ingest calls this on the skip-unchanged path
+    so a scope change always takes effect, independent of file content.
+
+    Only rows whose scope already differs are touched, so this is a cheap no-op
+    when nothing changed.
+    """
+    async with get_transaction() as conn:
+        result = await conn.execute(
+            """
+            UPDATE document_chunks SET scope = $1
+            WHERE scope <> $1
+              AND document_id = (
+                  SELECT id FROM documents
+                  WHERE collection_name = $2 AND file_path = $3
+              )
+            """,
+            scope,
+            collection_name,
+            file_path,
+        )
+    # asyncpg returns a status string like "UPDATE 3"; parse the row count.
+    try:
+        return int(result.split()[-1])
+    except (AttributeError, ValueError, IndexError):
+        return 0
 
 
 async def collection_stats(collection_name: str) -> dict[str, Any]:

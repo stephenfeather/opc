@@ -34,7 +34,7 @@ async def test_ingest_collection_skips_unchanged_files(tmp_path: Path) -> None:
     doc = tmp_path / "note.txt"
     doc.write_text("hello there")
     collection = Collection(
-        name="c", path=str(tmp_path), scope="global", extensions=[".txt"], ocr=False
+        name="c", path=str(tmp_path), scope="restricted", extensions=[".txt"], ocr=False
     )
     with (
         patch(
@@ -45,10 +45,18 @@ async def test_ingest_collection_skips_unchanged_files(tmp_path: Path) -> None:
             "scripts.core.documents.ingest.upsert_document_with_chunks",
             new=AsyncMock(),
         ) as mock_upsert,
+        patch(
+            "scripts.core.documents.ingest.reconcile_chunk_scope",
+            new=AsyncMock(return_value=2),
+        ) as mock_reconcile,
     ):
         report = await ingest_collection(collection, _FakeEmbedder())
     mock_upsert.assert_not_called()
+    # Even when bytes are unchanged, the current registry scope is reconciled
+    # so a reclassified folder cannot keep leaking stale-scoped chunks.
+    mock_reconcile.assert_awaited_once_with("c", str(doc), "restricted")
     assert report.skipped_unchanged == 1
+    assert report.rescoped == 2
     assert report.ingested == 0
 
 

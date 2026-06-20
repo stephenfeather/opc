@@ -651,7 +651,9 @@ def read_text_within_root(
 
         try:
             handle = os.fdopen(leaf_fd, "r", encoding="utf-8")
-        except OSError:
+        except (OSError, ValueError):
+            # io.open may raise ValueError on an unexpected fd/mode edge case;
+            # honor the "never raises" contract and fail closed.
             return None
         # fdopen now owns leaf_fd; drop it from manual cleanup so the context
         # manager is its sole closer (no double-close if read() raises).
@@ -659,7 +661,7 @@ def read_text_within_root(
         with handle:
             try:
                 return handle.read()
-            except (OSError, UnicodeError):
+            except (OSError, UnicodeError, ValueError):
                 return None
     finally:
         for fd in open_fds:

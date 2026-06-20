@@ -10,10 +10,11 @@ from scripts.core.db.postgres_pool import close_pool, get_connection, reset_pool
 from scripts.core.documents.chunk import Chunk
 from scripts.core.documents.db import (
     collection_stats,
+    delete_document_by_path,
     delete_documents_not_in,
     get_document_by_path,
     query_chunks,
-    reconcile_chunk_scope,
+    reconcile_collection_scope,
     upsert_document_with_chunks,
 )
 
@@ -169,8 +170,8 @@ async def test_reconcile_scope_hides_reclassified_chunks_from_default_query() ->
     before = await query_chunks(_vec(), scope="global", collection=None, limit=10)
     assert "sensitive once-global content" in {r["content"] for r in before}
 
-    # Reclassify to restricted without touching the file hash.
-    changed = await reconcile_chunk_scope(col, "/tmp/reclass.txt", "restricted")
+    # Reclassify the whole collection to restricted (bulk, once per scan).
+    changed = await reconcile_collection_scope(col, "restricted")
     assert changed == 1
 
     # Now gone from the default global query...
@@ -181,7 +182,30 @@ async def test_reconcile_scope_hides_reclassified_chunks_from_default_query() ->
     assert "sensitive once-global content" in {r["content"] for r in targeted}
 
     # Idempotent: a second reconcile to the same scope changes nothing.
-    assert await reconcile_chunk_scope(col, "/tmp/reclass.txt", "restricted") == 0
+    assert await reconcile_collection_scope(col, "restricted") == 0
+    await _cleanup(col)
+
+
+async def test_delete_document_by_path_removes_single_doc() -> None:
+    col = "test-col-del-one"
+    await _cleanup(col)
+    for name in ("a.txt", "b.txt"):
+        await upsert_document_with_chunks(
+            collection_name=col,
+            scope="global",
+            file_path=f"/tmp/{name}",
+            file_hash=name,
+            file_size_bytes=1,
+            page_count=1,
+            extraction_status="extracted",
+            error=None,
+            chunks=[Chunk(0, f"content {name}", 1)],
+            embeddings=[_vec()],
+        )
+    removed = await delete_document_by_path(col, "/tmp/a.txt")
+    assert removed == 1
+    assert await get_document_by_path(col, "/tmp/a.txt") is None
+    assert await get_document_by_path(col, "/tmp/b.txt") is not None
     await _cleanup(col)
 
 

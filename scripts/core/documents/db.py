@@ -129,7 +129,13 @@ async def query_chunks(
         where = "dc.scope = $2"
         scope_arg = scope
 
-    async with get_connection() as conn:
+    # A filtered query over a single global HNSW index can under-return (fewer
+    # than LIMIT rows) when the WHERE filter is selective — e.g. a small
+    # restricted collection embedded among many global chunks. pgvector 0.8's
+    # iterative scan keeps probing until LIMIT rows pass the filter (or the
+    # index is exhausted), preserving recall without a per-collection index.
+    async with get_transaction() as conn:
+        await conn.execute("SET LOCAL hnsw.iterative_scan = strict_order")
         rows = await conn.fetch(
             f"""
             SELECT
@@ -152,33 +158,44 @@ async def query_chunks(
     return [dict(row) for row in rows]
 
 
-async def reconcile_chunk_scope(collection_name: str, file_path: str, scope: str) -> int:
-    """Force every chunk of a document to the given scope; return rows changed.
+async def reconcile_collection_scope(collection_name: str, scope: str) -> int:
+    """Force every chunk in a collection to `scope`; return rows changed.
 
-    Scope lives on document_chunks, not on the file hash. A folder that is
-    reclassified in the registry (e.g. global -> restricted) for a file whose
-    bytes are unchanged would otherwise keep its old chunk scope and keep
-    leaking into default queries. Ingest calls this on the skip-unchanged path
-    so a scope change always takes effect, independent of file content.
-
-    Only rows whose scope already differs are touched, so this is a cheap no-op
-    when nothing changed.
+    Scope lives on document_chunks, not on the file hash. A folder reclassified
+    in the registry (e.g. global -> restricted) for files whose bytes are
+    unchanged would otherwise keep its old chunk scope and keep leaking into
+    default queries. Ingest calls this ONCE per collection per scan (not per
+    file), so a scope change always takes effect cheaply: a single set-based
+    UPDATE that touches only mismatched rows and no-ops when scope is unchanged.
     """
     async with get_transaction() as conn:
         result = await conn.execute(
             """
             UPDATE document_chunks SET scope = $1
-            WHERE scope <> $1
-              AND document_id = (
-                  SELECT id FROM documents
-                  WHERE collection_name = $2 AND file_path = $3
-              )
+            WHERE collection_name = $2 AND scope <> $1
             """,
             scope,
             collection_name,
-            file_path,
         )
     # asyncpg returns a status string like "UPDATE 3"; parse the row count.
+    try:
+        return int(result.split()[-1])
+    except (AttributeError, ValueError, IndexError):
+        return 0
+
+
+async def delete_document_by_path(collection_name: str, file_path: str) -> int:
+    """Delete one document (and its chunks via cascade) by path; return count.
+
+    Used when a file can no longer be represented faithfully — e.g. it grew past
+    the size ceiling — so its now-stale chunks must not remain queryable.
+    """
+    async with get_transaction() as conn:
+        result = await conn.execute(
+            "DELETE FROM documents WHERE collection_name = $1 AND file_path = $2",
+            collection_name,
+            file_path,
+        )
     try:
         return int(result.split()[-1])
     except (AttributeError, ValueError, IndexError):

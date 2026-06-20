@@ -17,9 +17,10 @@ from typing import Protocol
 
 from scripts.core.documents.chunk import chunk_pages
 from scripts.core.documents.db import (
+    delete_document_by_path,
     delete_documents_not_in,
     get_document_by_path,
-    reconcile_chunk_scope,
+    reconcile_collection_scope,
     upsert_document_with_chunks,
 )
 from scripts.core.documents.extract import extract_text
@@ -28,6 +29,7 @@ from scripts.core.documents.registry import Collection
 _HASH_CHUNK_BYTES = 1 << 20  # 1 MiB read buffer
 EMBEDDING_DIM = 1024  # must match document_chunks.embedding vector(1024)
 _DEFAULT_MAX_FILE_MB = 25
+_DEFAULT_MAX_CHUNKS = 5000
 _ERROR_MSG_MAX = 500
 
 
@@ -39,6 +41,16 @@ def _max_file_bytes() -> int:
     except (TypeError, ValueError):
         mb = _DEFAULT_MAX_FILE_MB
     return int(mb * 1024 * 1024)
+
+
+def _max_chunks_per_file() -> int:
+    """Cap on chunks embedded from one file, bounding a single embed_batch /
+    insert payload even for an allowed-size but chunk-dense file. Override with
+    OPC_DOC_MAX_CHUNKS."""
+    try:
+        return int(os.getenv("OPC_DOC_MAX_CHUNKS", str(_DEFAULT_MAX_CHUNKS)))
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_CHUNKS
 
 
 class Embedder(Protocol):
@@ -99,25 +111,26 @@ async def _process_file(
     embedder: Embedder,
     file_path: Path,
     max_bytes: int,
+    max_chunks: int,
     report: IngestReport,
 ) -> None:
     """Process one file, mutating report. Raises on unexpected failures so the
     caller can isolate them per-file rather than aborting the whole scan."""
     size = file_path.stat().st_size
     if size > max_bytes:
+        # Fail closed: if this path was previously ingested (smaller) and has
+        # now grown past the ceiling, its stored chunks are stale and must not
+        # remain queryable. Delete them; do not leave them indexed.
+        await delete_document_by_path(collection.name, str(file_path))
         report.skipped_too_large += 1
         return
 
     file_hash = compute_file_hash(file_path)
     existing = await get_document_by_path(collection.name, str(file_path))
     if existing is not None and existing["file_hash"] == file_hash:
-        # Bytes unchanged, but the registry scope may have changed since the
-        # last scan (e.g. a folder reclassified global -> restricted). Scope
-        # lives on the chunks, not the hash, so reconcile it explicitly —
-        # otherwise stale-scoped chunks keep leaking into default queries.
-        report.rescoped += await reconcile_chunk_scope(
-            collection.name, str(file_path), collection.scope
-        )
+        # Bytes unchanged -> nothing to do here. Scope reconciliation is handled
+        # once per collection in ingest_collection (one bulk UPDATE), not per
+        # file, so an all-unchanged cron scan does no per-file writes.
         report.skipped_unchanged += 1
         return
 
@@ -129,6 +142,24 @@ async def _process_file(
 
     if result.status == "extracted":
         chunks = chunk_pages(result.pages)
+        if len(chunks) > max_chunks:
+            # Allowed size but chunk-dense: bound the embed_batch / insert
+            # payload by refusing it as a terminal error rather than risking a
+            # provider failure or memory spike. Recorded with zero chunks.
+            await upsert_document_with_chunks(
+                collection_name=collection.name,
+                scope=collection.scope,
+                file_path=str(file_path),
+                file_hash=file_hash,
+                file_size_bytes=size,
+                page_count=0,
+                extraction_status="error",
+                error=f"too many chunks ({len(chunks)} > {max_chunks}); raise OPC_DOC_MAX_CHUNKS",
+                chunks=[],
+                embeddings=[],
+            )
+            report.errors += 1
+            return
         embeddings = await embedder.embed_batch([c.content for c in chunks]) if chunks else []
         _validate_embeddings(chunks, embeddings)
         await upsert_document_with_chunks(
@@ -217,12 +248,18 @@ async def ingest_collection(collection: Collection, embedder: Embedder) -> Inges
 
     report = IngestReport(collection=collection.name)
     max_bytes = _max_file_bytes()
+    max_chunks = _max_chunks_per_file()
     seen_paths: set[str] = set()
+
+    # Scope reconciliation, once per collection: a single bulk UPDATE brings any
+    # mismatched chunks to the registry scope (cheap no-op when unchanged), so a
+    # global -> restricted reclassification takes effect without a per-file write.
+    report.rescoped = await reconcile_collection_scope(collection.name, collection.scope)
 
     for file_path in _iter_files(root, collection.extensions):
         seen_paths.add(str(file_path))
         try:
-            await _process_file(collection, embedder, file_path, max_bytes, report)
+            await _process_file(collection, embedder, file_path, max_bytes, max_chunks, report)
         except Exception as exc:  # noqa: BLE001 - isolate per-file failures
             report.errors += 1
             await _record_error_best_effort(collection, file_path, exc)

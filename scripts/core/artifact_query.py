@@ -563,11 +563,25 @@ def read_text_within_root(
     canonicalized away as ``Path.resolve()`` would do, so the read target either
     matches the policy-authorized resolved path exactly (no symlinks present) or
     is refused. The final component is ``fstat``-checked for a regular file on the
-    same fd it is read from. Never raises: returns ``None`` on any rejection or
-    I/O failure.
+    same fd it is read from, and its (device, inode) is compared against the
+    policy-authorized resolved target so a non-symlink directory swap that
+    substitutes a same-named file across the check/read boundary is also refused.
+    Never raises: returns ``None`` on any rejection or I/O failure.
     """
-    if safe_artifact_read_path(candidate, root, suffixes=suffixes) is None:
+    safe = safe_artifact_read_path(candidate, root, suffixes=suffixes)
+    if safe is None:
         return None
+
+    # Capture the identity (device, inode) of the authorized resolved target so
+    # the leaf we ultimately read can be proven to be that same inode. O_NOFOLLOW
+    # blocks symlink swaps, but a *non-symlink* directory swap between this check
+    # and the walk could otherwise substitute a same-named file; binding identity
+    # across the policy/read boundary fails closed on that race too.
+    try:
+        authorized = os.stat(safe)
+    except OSError:
+        return None
+    authorized_id = (authorized.st_dev, authorized.st_ino)
 
     walk_anchor = anchor if anchor is not None else root
 
@@ -611,18 +625,33 @@ def read_text_within_root(
             leaf_fd = os.open(rel_parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=open_fds[-1])
         except OSError:
             return None
+        # Track leaf_fd in open_fds so the finally closes it until fdopen takes
+        # ownership; this avoids a double-close on the read-error path.
+        open_fds.append(leaf_fd)
 
         try:
-            if not stat.S_ISREG(os.fstat(leaf_fd).st_mode):
-                os.close(leaf_fd)
-                return None
-            # fdopen takes ownership of leaf_fd; its context manager closes it.
-            with os.fdopen(leaf_fd, "r", encoding="utf-8") as handle:
-                return handle.read()
-        except (OSError, UnicodeError):
-            with contextlib.suppress(OSError):
-                os.close(leaf_fd)
+            leaf_stat = os.fstat(leaf_fd)
+        except OSError:
             return None
+        if not stat.S_ISREG(leaf_stat.st_mode):
+            return None
+        # Bind authorization to the opened inode: the leaf must be the exact
+        # device/inode that passed policy, defeating non-symlink swap races.
+        if (leaf_stat.st_dev, leaf_stat.st_ino) != authorized_id:
+            return None
+
+        try:
+            handle = os.fdopen(leaf_fd, "r", encoding="utf-8")
+        except OSError:
+            return None
+        # fdopen now owns leaf_fd; drop it from manual cleanup so the context
+        # manager is its sole closer (no double-close if read() raises).
+        open_fds.pop()
+        with handle:
+            try:
+                return handle.read()
+            except (OSError, UnicodeError):
+                return None
     finally:
         for fd in open_fds:
             with contextlib.suppress(OSError):

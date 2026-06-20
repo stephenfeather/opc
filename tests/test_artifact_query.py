@@ -994,6 +994,33 @@ class TestReadTextWithinRoot:
             read_text_within_root(root, candidate, suffixes=self._SUFFIXES, anchor=tmp_path) is None
         )
 
+    def test_inode_mismatch_returns_none(self, tmp_path, monkeypatch):
+        """The opened leaf must be the exact inode that passed policy.
+
+        Simulates a non-symlink swap that O_NOFOLLOW cannot catch: policy
+        authorizes ``decoy.md`` (its inode), but the lexical path actually opened
+        resolves to a different same-suffix file ``actual.md``. The (device,
+        inode) binding must refuse the mismatched read (review #166 round 2).
+        """
+        import scripts.core.artifact_query as aq
+
+        decoy = tmp_path / "decoy.md"
+        decoy.write_text("AUTHORIZED")
+        actual = tmp_path / "actual.md"
+        actual.write_text("SWAPPED")
+        monkeypatch.setattr(aq, "safe_artifact_read_path", lambda *a, **k: decoy)
+        assert aq.read_text_within_root(tmp_path, actual, suffixes=self._SUFFIXES) is None
+
+    def test_undecodable_content_returns_none(self, tmp_path):
+        """A decode error on the read path returns None without fd mishandling.
+
+        Exercises the fdopen-owned read-error branch (the leaf fd is owned by the
+        context manager, not double-closed by the function).
+        """
+        target = tmp_path / "bad.md"
+        target.write_bytes(b"\xff\xfe not valid utf-8 \xff")
+        assert read_text_within_root(tmp_path, target, suffixes=self._SUFFIXES) is None
+
 
 class TestIsSafeDirRoot:
     """Tests for is_safe_dir_root — fail-closed trust-root validation."""

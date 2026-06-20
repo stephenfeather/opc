@@ -20,7 +20,6 @@ Examples:
 
 import argparse
 import json
-import os
 import re
 import sqlite3
 import sys
@@ -38,6 +37,10 @@ try:
         parse_handoff_yaml_content,
         parse_plan_content,
     )
+    from scripts.core.db.backend_resolution import (
+        get_active_backend,
+        get_connection_url,
+    )
 except ModuleNotFoundError:
     from artifact_index_core import (  # type: ignore[no-redef]
         adapt_for_postgres as _adapt_for_postgres,
@@ -48,6 +51,10 @@ except ModuleNotFoundError:
         parse_handoff_content,
         parse_handoff_yaml_content,
         parse_plan_content,
+    )
+    from db.backend_resolution import (  # type: ignore[no-redef]
+        get_active_backend,
+        get_connection_url,
     )
 
 
@@ -83,12 +90,23 @@ def _bootstrap() -> None:
 # =============================================================================
 
 def get_postgres_url() -> str | None:
-    """Get PostgreSQL URL from environment variables (canonical first)."""
-    return os.environ.get("CONTINUOUS_CLAUDE_DB_URL") or os.environ.get("DATABASE_URL")
+    """Get PostgreSQL URL via the shared resolver (issue #71).
+
+    Precedence: CONTINUOUS_CLAUDE_DB_URL > DATABASE_URL > OPC_POSTGRES_URL.
+    """
+    return get_connection_url()
 
 
 def use_postgres() -> bool:
-    """Check if PostgreSQL should be used as backend."""
+    """Check if PostgreSQL is the active backend and usable.
+
+    Honors the unified backend decision (issue #71): an explicit
+    AGENTICA_MEMORY_BACKEND=sqlite override keeps artifact indexing on sqlite
+    even when a PostgreSQL URL is configured, so artifacts land in the same
+    backend as the rest of the memory pipeline (no split-brain).
+    """
+    if get_active_backend() != "postgres":
+        return False
     url = get_postgres_url()
     if not url:
         return False

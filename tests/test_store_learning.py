@@ -645,3 +645,45 @@ class TestQueryRejectionCount:
                 _query_rejection_count("s1")
 
         mock_conn.close.assert_called_once()
+
+
+class TestRejectionBackendGating:
+    """Issue #71: postgres-only rejection telemetry must honor an explicit
+    AGENTICA_MEMORY_BACKEND=sqlite override, even when a PostgreSQL URL is set,
+    so it stays on the same backend as the main learning write (no split-brain
+    side channel)."""
+
+    def test_record_rejection_skips_pg_under_sqlite_override(self) -> None:
+        from scripts.core.store_learning import _record_rejection
+
+        with (
+            patch("scripts.core.store_learning._pg_url", return_value="postgresql://test"),
+            patch.dict("os.environ", {"AGENTICA_MEMORY_BACKEND": "sqlite"}, clear=False),
+            patch("psycopg2.connect") as mock_connect,
+        ):
+            _record_rejection("s1", similarity=0.99, threshold=0.9)
+            mock_connect.assert_not_called()
+
+    def test_query_rejection_count_skips_pg_under_sqlite_override(self) -> None:
+        with (
+            patch("scripts.core.store_learning._pg_url", return_value="postgresql://test"),
+            patch.dict("os.environ", {"AGENTICA_MEMORY_BACKEND": "sqlite"}, clear=False),
+            patch("psycopg2.connect") as mock_connect,
+        ):
+            assert _query_rejection_count("s1") == 0
+            mock_connect.assert_not_called()
+
+    def test_rejection_still_uses_pg_without_override(self) -> None:
+        # No explicit override + URL present → telemetry still hits postgres.
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_cur.fetchone.return_value = (3,)
+        mock_conn.cursor.return_value = mock_cur
+
+        with (
+            patch("scripts.core.store_learning._pg_url", return_value="postgresql://test"),
+            patch.dict("os.environ", {"AGENTICA_MEMORY_BACKEND": ""}, clear=False),
+            patch("psycopg2.connect", return_value=mock_conn) as mock_connect,
+        ):
+            assert _query_rejection_count("s1") == 3
+            mock_connect.assert_called_once()

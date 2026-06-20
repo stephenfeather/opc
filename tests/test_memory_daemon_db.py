@@ -39,9 +39,19 @@ class TestGetPostgresUrl:
     def test_returns_none_when_neither_set(self, monkeypatch):
         monkeypatch.delenv("CONTINUOUS_CLAUDE_DB_URL", raising=False)
         monkeypatch.delenv("DATABASE_URL", raising=False)
+        monkeypatch.delenv("OPC_POSTGRES_URL", raising=False)
         from scripts.core.memory_daemon_db import get_postgres_url
 
         assert get_postgres_url() is None
+
+    def test_falls_back_to_opc_postgres_url(self, monkeypatch):
+        # Issue #71: the daemon now honors the legacy OPC_POSTGRES_URL too.
+        monkeypatch.delenv("CONTINUOUS_CLAUDE_DB_URL", raising=False)
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        monkeypatch.setenv("OPC_POSTGRES_URL", "postgresql://legacy")
+        from scripts.core.memory_daemon_db import get_postgres_url
+
+        assert get_postgres_url() == "postgresql://legacy"
 
     def test_canonical_takes_precedence(self, monkeypatch):
         monkeypatch.setenv("CONTINUOUS_CLAUDE_DB_URL", "postgresql://canon")
@@ -57,6 +67,18 @@ class TestUsePostgres:
     def test_false_when_no_url(self, monkeypatch):
         monkeypatch.delenv("CONTINUOUS_CLAUDE_DB_URL", raising=False)
         monkeypatch.delenv("DATABASE_URL", raising=False)
+        monkeypatch.delenv("OPC_POSTGRES_URL", raising=False)
+        from scripts.core.memory_daemon_db import use_postgres
+
+        assert use_postgres() is False
+
+    def test_false_when_sqlite_override_with_url(self, monkeypatch):
+        # Issue #71 split-brain fix: an explicit AGENTICA_MEMORY_BACKEND=sqlite
+        # override must win for the daemon too, even when a PostgreSQL URL is
+        # present, so the daemon stays on the same backend as store/recall.
+        monkeypatch.setenv("AGENTICA_MEMORY_BACKEND", "sqlite")
+        monkeypatch.setenv("CONTINUOUS_CLAUDE_DB_URL", "postgresql://canon")
+        monkeypatch.setenv("OPC_POSTGRES_URL", "postgresql://legacy")
         from scripts.core.memory_daemon_db import use_postgres
 
         assert use_postgres() is False

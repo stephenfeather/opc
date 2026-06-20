@@ -127,6 +127,29 @@ def _pg_url() -> str | None:
     return get_connection_url()
 
 
+def _pg_telemetry_url() -> str | None:
+    """Return the postgres URL for rejection telemetry, or None when disabled.
+
+    Rejection rows live in a postgres-only table, so we only touch postgres when
+    a URL is configured AND the unified backend resolves to postgres. An explicit
+    AGENTICA_MEMORY_BACKEND=sqlite override therefore disables this side channel,
+    keeping it on the same backend as the main learning write (issue #71
+    split-brain fix). The resolved URL is fed back into resolve_backend so the
+    decision depends only on the override and the URL we actually have — not on a
+    separate read of the URL env vars.
+    """
+    url = _pg_url()
+    if not url:
+        return None
+    backend = resolve_backend(
+        {
+            "AGENTICA_MEMORY_BACKEND": os.environ.get("AGENTICA_MEMORY_BACKEND", ""),
+            "DATABASE_URL": url,
+        }
+    )
+    return url if backend == "postgres" else None
+
+
 def detect_backend(env: dict[str, str], fallback: str | None = None) -> str:
     """Determine storage backend from environment variables.
 
@@ -440,7 +463,7 @@ def _record_rejection(
     rejection counts and details after extraction completes.
     Non-fatal -- failures are logged and swallowed.
     """
-    url = _pg_url()
+    url = _pg_telemetry_url()
     if not url:
         return
     try:
@@ -482,7 +505,7 @@ def _query_rejection_count(session_id: str) -> int:
     connection, schema drift) propagates so callers can distinguish an
     unavailable count from a genuine zero (Issue #98).
     """
-    url = _pg_url()
+    url = _pg_telemetry_url()
     if not url:
         return 0
     import psycopg2

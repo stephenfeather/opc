@@ -30,7 +30,17 @@ def get_postgres_url() -> str | None:
 
 
 def use_postgres() -> bool:
-    """Check if PostgreSQL is available."""
+    """Check if PostgreSQL is the active backend and usable.
+
+    Honors the unified backend decision (issue #71): an explicit
+    AGENTICA_MEMORY_BACKEND=sqlite override keeps the daemon on sqlite even when
+    a PostgreSQL URL is configured, so the daemon stays on the same backend as
+    store/recall (no split-brain). Requires a URL and an importable psycopg2.
+    """
+    from scripts.core.db.backend_resolution import get_active_backend
+
+    if get_active_backend() != "postgres":
+        return False
     url = get_postgres_url()
     if not url:
         return False

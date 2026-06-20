@@ -562,11 +562,13 @@ def read_text_within_root(
     present at open time is refused by ``O_NOFOLLOW`` rather than silently
     canonicalized away as ``Path.resolve()`` would do, so the read target either
     matches the policy-authorized resolved path exactly (no symlinks present) or
-    is refused. The final component is ``fstat``-checked for a regular file on the
-    same fd it is read from, and its (device, inode) is compared against the
-    policy-authorized resolved target so a non-symlink directory swap that
-    substitutes a same-named file across the check/read boundary is also refused.
-    Never raises: returns ``None`` on any rejection or I/O failure.
+    is refused. The final component is ``fstat``-checked on the same fd it is read
+    from: it must be a single-link (``st_nlink == 1``) regular file whose
+    (device, inode) matches the policy-authorized resolved target. The link-count
+    check rejects an attacker's hardlink aliasing an out-of-policy secret into an
+    allowed path; the identity check rejects a non-symlink directory swap that
+    substitutes a same-named file across the check/read boundary. Never raises:
+    returns ``None`` on any rejection or I/O failure.
     """
     safe = safe_artifact_read_path(candidate, root, suffixes=suffixes)
     if safe is None:
@@ -634,6 +636,13 @@ def read_text_within_root(
         except OSError:
             return None
         if not stat.S_ISREG(leaf_stat.st_mode):
+            return None
+        # Reject hardlinked content: a legitimate artifact is a single-link file.
+        # A multi-link regular file may be an attacker's hardlink aliasing an
+        # out-of-policy secret (.env, settings.local.json) into an allowed path;
+        # O_NOFOLLOW and the inode binding cannot distinguish that alias because
+        # the hardlink and the secret share one inode (review #166 round 3).
+        if leaf_stat.st_nlink != 1:
             return None
         # Bind authorization to the opened inode: the leaf must be the exact
         # device/inode that passed policy, defeating non-symlink swap races.

@@ -1021,6 +1021,20 @@ class TestReadTextWithinRoot:
         target.write_bytes(b"\xff\xfe not valid utf-8 \xff")
         assert read_text_within_root(tmp_path, target, suffixes=self._SUFFIXES) is None
 
+    def test_hardlinked_file_returns_none(self, tmp_path):
+        """A multi-link regular file is refused (hardlink-aliasing defense).
+
+        ``alias.md`` is a hardlink to ``secret.txt``; both share one inode with
+        ``st_nlink == 2``. The path/suffix policy and the inode binding both pass
+        (the hardlink IS the authorized inode), so only the link-count check
+        refuses it — closing the hardlink bypass from review #166 round 3.
+        """
+        secret = tmp_path / "secret.txt"
+        secret.write_text("SECRET")
+        alias = tmp_path / "alias.md"
+        alias.hardlink_to(secret)
+        assert read_text_within_root(tmp_path, alias, suffixes=self._SUFFIXES) is None
+
 
 class TestIsSafeDirRoot:
     """Tests for is_safe_dir_root — fail-closed trust-root validation."""
@@ -1295,6 +1309,32 @@ class TestHandleSpanIdLookupPathTraversal:
         result = handle_span_id_lookup(populated_db, "span-abc123", with_content=True)
         assert result is not None
         assert result["ledger"]["content"] == "ledger content"
+
+    def test_hardlinked_secret_in_handoffs_not_read(self, populated_db, tmp_path, monkeypatch):
+        """A secret hardlinked into an allowed handoffs path is not disclosed.
+
+        The attacker hardlinks an out-of-policy secret to an allowed ``.yaml``
+        path under ``thoughts/shared/handoffs`` and poisons the DB row to it. The
+        path/suffix policy and the inode binding both pass (the hardlink shares
+        the secret's inode), so the link-count check is what fails closed and
+        keeps ``content`` out of the result (review #166 round 3).
+        """
+        monkeypatch.chdir(tmp_path)
+        secret = tmp_path / "secret.env"
+        secret.write_text("SECRET_TOKEN=abc123")
+        handoffs_dir = tmp_path / "thoughts" / "shared" / "handoffs" / "auth-session"
+        handoffs_dir.mkdir(parents=True)
+        alias = handoffs_dir / "task-1.yaml"
+        alias.hardlink_to(secret)
+        populated_db.execute(
+            "UPDATE handoffs SET file_path = ? WHERE id = 'h1'",
+            ("thoughts/shared/handoffs/auth-session/task-1.yaml",),
+        )
+        populated_db.commit()
+
+        result = handle_span_id_lookup(populated_db, "span-abc123", with_content=True)
+        assert result is not None
+        assert "content" not in result
 
 
 # ===========================================================================

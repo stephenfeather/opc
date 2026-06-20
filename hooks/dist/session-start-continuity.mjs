@@ -266,7 +266,8 @@ function ensureMemoryDaemon() {
     const child = spawn("uv", ["run", daemonScript, "start"], {
       cwd: opcCwd,
       stdio: "ignore",
-      detached: true
+      detached: true,
+      env: { ...process.env, UV_FROZEN: "1" }
     });
     child.unref();
     return "Memory daemon: Started";

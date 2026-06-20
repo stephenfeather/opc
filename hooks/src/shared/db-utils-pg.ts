@@ -97,6 +97,9 @@ ${pythonCode}
       cwd: opcDir,
       env: {
         ...process.env,
+        // Never rewrite opc's uv.lock from a hook-triggered uv run (issue #71
+        // follow-up); use the lock as-is. Intentional updates use `uv lock`.
+        UV_FROZEN: '1',
         CONTINUOUS_CLAUDE_DB_URL: resolvedDbUrl,
         _OPC_DIR: opcDir,
       },
@@ -1080,6 +1083,9 @@ ${pythonCode}
       cwd: opcDir,
       env: {
         ...process.env,
+        // Never rewrite opc's uv.lock from a hook-triggered uv run (issue #71
+        // follow-up); the frequent heartbeat path runs through here.
+        UV_FROZEN: '1',
         CONTINUOUS_CLAUDE_DB_URL: resolvedDbUrl,
       },
     });

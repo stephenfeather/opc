@@ -291,6 +291,8 @@ function checkMemoryRelevance(intent, projectDir) {
     cwd: opcDir,
     env: {
       ...process.env,
+      // Never rewrite opc's uv.lock from a hook-triggered uv run (issue #71).
+      UV_FROZEN: "1",
       PYTHONPATH: opcDir
     },
     timeout: 5e3

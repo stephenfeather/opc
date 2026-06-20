@@ -80,6 +80,19 @@ def test_extract_xml(tmp_path: Path) -> None:
     assert "<a>" not in result.pages[0].text
 
 
+def test_extract_xml_rejects_entity_expansion(tmp_path: Path) -> None:
+    # Billion-laughs / XXE guard: defusedxml must refuse DTD entity definitions
+    # rather than expand them. extract_text turns the rejection into 'error',
+    # never a hang or memory blow-up.
+    f = tmp_path / "bomb.xml"
+    f.write_text(
+        '<?xml version="1.0"?>\n' '<!DOCTYPE lolz [<!ENTITY lol "lol">]>\n' "<root>&lol;</root>"
+    )
+    result = extract_text(f)
+    assert result.status == "error"
+    assert result.pages == []
+
+
 def test_extract_result_dataclass_shape() -> None:
     result = ExtractionResult(pages=[], status="error", error="boom", page_count=0)
     assert result.status == "error"

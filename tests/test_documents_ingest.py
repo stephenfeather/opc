@@ -49,6 +49,10 @@ async def test_ingest_collection_skips_unchanged_files(tmp_path: Path) -> None:
             "scripts.core.documents.ingest.reconcile_chunk_scope",
             new=AsyncMock(return_value=2),
         ) as mock_reconcile,
+        patch(
+            "scripts.core.documents.ingest.delete_documents_not_in",
+            new=AsyncMock(return_value=0),
+        ),
     ):
         report = await ingest_collection(collection, _FakeEmbedder())
     mock_upsert.assert_not_called()
@@ -75,6 +79,10 @@ async def test_ingest_collection_ingests_new_file(tmp_path: Path) -> None:
             "scripts.core.documents.ingest.upsert_document_with_chunks",
             new=AsyncMock(return_value="doc-uuid"),
         ) as mock_upsert,
+        patch(
+            "scripts.core.documents.ingest.delete_documents_not_in",
+            new=AsyncMock(return_value=0),
+        ),
     ):
         report = await ingest_collection(collection, _FakeEmbedder())
     mock_upsert.assert_awaited_once()
@@ -98,6 +106,10 @@ async def test_ingest_collection_records_needs_ocr_without_embedding(tmp_path: P
             "scripts.core.documents.ingest.upsert_document_with_chunks",
             new=AsyncMock(return_value="doc-uuid"),
         ) as mock_upsert,
+        patch(
+            "scripts.core.documents.ingest.delete_documents_not_in",
+            new=AsyncMock(return_value=0),
+        ),
     ):
         report = await ingest_collection(collection, _FakeEmbedder())
     # The file is still recorded (so we don't re-try it every scan), but with
@@ -109,3 +121,92 @@ async def test_ingest_collection_records_needs_ocr_without_embedding(tmp_path: P
         "error",
     )
     assert report.needs_ocr + report.errors == 1
+
+
+class _BoomEmbedder:
+    """Raises for any chunk containing 'boom', succeeds otherwise."""
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        if any("boom" in t for t in texts):
+            raise RuntimeError("provider exploded")
+        return [[0.01] * 1024 for _ in texts]
+
+
+async def test_ingest_skips_oversize_file(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("OPC_DOC_MAX_FILE_MB", "0")  # any non-empty file is too large
+    big = tmp_path / "big.txt"
+    big.write_text("this content exceeds the zero-byte ceiling")
+    collection = Collection(
+        name="c", path=str(tmp_path), scope="global", extensions=[".txt"], ocr=False
+    )
+    with (
+        patch("scripts.core.documents.ingest.get_document_by_path", new=AsyncMock()),
+        patch(
+            "scripts.core.documents.ingest.upsert_document_with_chunks", new=AsyncMock()
+        ) as mock_upsert,
+        patch(
+            "scripts.core.documents.ingest.delete_documents_not_in",
+            new=AsyncMock(return_value=0),
+        ),
+    ):
+        report = await ingest_collection(collection, _FakeEmbedder())
+    # Too-large files are skipped without embedding or a DB write.
+    mock_upsert.assert_not_called()
+    assert report.skipped_too_large == 1
+    assert report.ingested == 0
+
+
+async def test_ingest_isolates_per_file_failure(tmp_path: Path) -> None:
+    (tmp_path / "a_boom.txt").write_text("boom")  # sorts first; embedder raises
+    (tmp_path / "b_good.txt").write_text("good")  # must still be ingested
+    collection = Collection(
+        name="c", path=str(tmp_path), scope="global", extensions=[".txt"], ocr=False
+    )
+    with (
+        patch(
+            "scripts.core.documents.ingest.get_document_by_path",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "scripts.core.documents.ingest.upsert_document_with_chunks",
+            new=AsyncMock(return_value="doc-uuid"),
+        ) as mock_upsert,
+        patch(
+            "scripts.core.documents.ingest.delete_documents_not_in",
+            new=AsyncMock(return_value=0),
+        ),
+    ):
+        report = await ingest_collection(collection, _BoomEmbedder())
+    # One file blew up but the scan continued and ingested the other.
+    assert report.errors == 1
+    assert report.ingested == 1
+    # The failed file is recorded with status='error' so cron will not wedge.
+    statuses = [c.kwargs["extraction_status"] for c in mock_upsert.await_args_list]
+    assert "error" in statuses
+    assert "extracted" in statuses
+
+
+async def test_ingest_purges_deleted_files(tmp_path: Path) -> None:
+    doc = tmp_path / "keep.txt"
+    doc.write_text("still here")
+    collection = Collection(
+        name="c", path=str(tmp_path), scope="global", extensions=[".txt"], ocr=False
+    )
+    with (
+        patch(
+            "scripts.core.documents.ingest.get_document_by_path",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "scripts.core.documents.ingest.upsert_document_with_chunks",
+            new=AsyncMock(return_value="doc-uuid"),
+        ),
+        patch(
+            "scripts.core.documents.ingest.delete_documents_not_in",
+            new=AsyncMock(return_value=3),
+        ) as mock_purge,
+    ):
+        report = await ingest_collection(collection, _FakeEmbedder())
+    # Deletion reconciliation runs with exactly the paths seen on disk.
+    mock_purge.assert_awaited_once_with("c", {str(doc)})
+    assert report.purged == 3

@@ -12,7 +12,11 @@ import re
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
-from xml.etree import ElementTree
+
+# defusedxml hardens parsing against billion-laughs / XXE / external-entity
+# attacks. The folders this layer ingests can contain arbitrary user / web
+# documents, so XML must not be parsed with the stdlib's unsafe defaults.
+from defusedxml.ElementTree import fromstring as _xml_fromstring
 
 SUPPORTED_EXTENSIONS = (
     ".pdf",
@@ -118,7 +122,9 @@ def _extract_html(path: Path) -> list[ExtractedPage]:
 
 
 def _extract_xml(path: Path) -> list[ExtractedPage]:
-    root = ElementTree.fromstring(path.read_text(errors="replace"))
+    # defusedxml raises (EntitiesForbidden / DTDForbidden / etc.) on hostile
+    # XML; the caller's try/except turns that into status='error'.
+    root = _xml_fromstring(path.read_text(errors="replace"))
     text = " ".join(t.strip() for t in root.itertext() if t.strip()).strip()
     return [ExtractedPage(page_number=1, text=text)] if text.strip() else []
 

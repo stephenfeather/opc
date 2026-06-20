@@ -10,6 +10,7 @@ from scripts.core.db.postgres_pool import close_pool, get_connection, reset_pool
 from scripts.core.documents.chunk import Chunk
 from scripts.core.documents.db import (
     collection_stats,
+    delete_documents_not_in,
     get_document_by_path,
     query_chunks,
     reconcile_chunk_scope,
@@ -181,6 +182,39 @@ async def test_reconcile_scope_hides_reclassified_chunks_from_default_query() ->
 
     # Idempotent: a second reconcile to the same scope changes nothing.
     assert await reconcile_chunk_scope(col, "/tmp/reclass.txt", "restricted") == 0
+    await _cleanup(col)
+
+
+async def test_delete_documents_not_in_purges_orphans() -> None:
+    # Deletion reconciliation: a file no longer present on disk must have its
+    # rows removed so it stops being retrievable.
+    col = "test-col-purge"
+    await _cleanup(col)
+    for name in ("keep.txt", "gone.txt"):
+        await upsert_document_with_chunks(
+            collection_name=col,
+            scope="global",
+            file_path=f"/tmp/{name}",
+            file_hash=name,
+            file_size_bytes=1,
+            page_count=1,
+            extraction_status="extracted",
+            error=None,
+            chunks=[Chunk(0, f"content of {name}", 1)],
+            embeddings=[_vec()],
+        )
+    # Only keep.txt is still on disk.
+    purged = await delete_documents_not_in(col, {"/tmp/keep.txt"})
+    assert purged == 1
+    assert await get_document_by_path(col, "/tmp/gone.txt") is None
+    assert await get_document_by_path(col, "/tmp/keep.txt") is not None
+    # Its chunks are gone too (cascade) — not retrievable any more.
+    remaining = await query_chunks(_vec(), scope="global", collection=col, limit=10)
+    assert "content of gone.txt" not in {r["content"] for r in remaining}
+
+    # Empty keep-set purges everything left in the collection.
+    assert await delete_documents_not_in(col, set()) == 1
+    assert await get_document_by_path(col, "/tmp/keep.txt") is None
     await _cleanup(col)
 
 

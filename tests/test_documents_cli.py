@@ -107,6 +107,26 @@ def test_run_scan_named_collection_calls_ingest(tmp_path: Path, monkeypatch) -> 
     mock_ingest.assert_awaited_once()
 
 
+def test_run_scan_all_scans_every_collection(tmp_path: Path, monkeypatch) -> None:
+    # Regression: scan --all must process every registered collection within a
+    # single event loop. A prior version called asyncio.run() per collection,
+    # which crashed on the 2nd collection ("event loop is closed") because the
+    # asyncpg pool binds to the first loop.
+    reg = tmp_path / "reg.yaml"
+    monkeypatch.setenv("OPC_DOC_REGISTRY", str(reg))
+    run(["create", "a", "--path", str(tmp_path), "--scope", "global", "--extensions", ".txt"])
+    run(["create", "b", "--path", str(tmp_path), "--scope", "restricted", "--extensions", ".txt"])
+    with (
+        patch("scripts.core.documents.cli.ingest_collection", new=AsyncMock()) as mock_ingest,
+        patch("scripts.core.documents.cli._build_embedder", return_value=object()),
+    ):
+        exit_code = run(["scan", "--all"])
+    assert exit_code == 0
+    assert mock_ingest.await_count == 2
+    scanned = {call.args[0].name for call in mock_ingest.await_args_list}
+    assert scanned == {"a", "b"}
+
+
 def test_run_scan_unknown_collection_returns_error(tmp_path: Path, monkeypatch) -> None:
     reg = tmp_path / "reg.yaml"
     monkeypatch.setenv("OPC_DOC_REGISTRY", str(reg))

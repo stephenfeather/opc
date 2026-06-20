@@ -116,15 +116,20 @@ def _cmd_create(args: argparse.Namespace) -> int:
     return 0
 
 
-async def _scan_one(collection: Collection) -> None:
+async def _scan_all(targets: list[Collection]) -> None:
+    # One event loop for the whole run: the asyncpg pool binds to the loop that
+    # created it, so a separate asyncio.run() per collection would leave the
+    # second collection acquiring dead connections ("event loop is closed").
     embedder = _build_embedder()
-    report = await ingest_collection(collection, embedder)
-    print(
-        f"[{report.collection}] ingested={report.ingested} "
-        f"unchanged={report.skipped_unchanged} "
-        f"needs_ocr={report.needs_ocr} unsupported={report.skipped_unsupported} "
-        f"errors={report.errors}"
-    )
+    for collection in targets:
+        report = await ingest_collection(collection, embedder)
+        print(
+            f"[{report.collection}] ingested={report.ingested} "
+            f"unchanged={report.skipped_unchanged} rescoped={report.rescoped} "
+            f"needs_ocr={report.needs_ocr} unsupported={report.skipped_unsupported} "
+            f"too_large={report.skipped_too_large} purged={report.purged} "
+            f"errors={report.errors}"
+        )
 
 
 def _cmd_scan(args: argparse.Namespace) -> int:
@@ -139,9 +144,19 @@ def _cmd_scan(args: argparse.Namespace) -> int:
         if not targets:
             print(f"error: unknown collection '{args.name}'", file=sys.stderr)
             return 1
-    for collection in targets:
-        asyncio.run(_scan_one(collection))
+    asyncio.run(_scan_all(targets))
     return 0
+
+
+async def _list_all(collections: list[Collection]) -> None:
+    # Single event loop — see the note in _scan_all about the pool/loop binding.
+    for collection in collections:
+        stats = await collection_stats(collection.name)
+        print(
+            f"{collection.name}  scope={collection.scope}  "
+            f"path={collection.path}  docs={stats['document_count']}  "
+            f"chunks={stats['chunk_count']}  last_scan={stats['last_scanned_at']}"
+        )
 
 
 def _cmd_list(_args: argparse.Namespace) -> int:
@@ -149,13 +164,7 @@ def _cmd_list(_args: argparse.Namespace) -> int:
     if not collections:
         print("no collections registered")
         return 0
-    for collection in collections:
-        stats = asyncio.run(collection_stats(collection.name))
-        print(
-            f"{collection.name}  scope={collection.scope}  "
-            f"path={collection.path}  docs={stats['document_count']}  "
-            f"chunks={stats['chunk_count']}  last_scan={stats['last_scanned_at']}"
-        )
+    asyncio.run(_list_all(collections))
     return 0
 
 

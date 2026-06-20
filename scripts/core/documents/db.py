@@ -185,6 +185,43 @@ async def reconcile_chunk_scope(collection_name: str, file_path: str, scope: str
         return 0
 
 
+async def delete_documents_not_in(collection_name: str, keep_paths: set[str]) -> int:
+    """Delete documents (and their chunks via cascade) whose file_path is not in
+    keep_paths. Returns the number of documents removed.
+
+    This is the deletion-reconciliation step: a file removed from a tracked
+    folder must stop being retrievable. Without it, deleting a local
+    medical/legal file would leave its chunks queryable forever. Chunks cascade
+    on documents delete (ON DELETE CASCADE).
+
+    Caller MUST pass the set of paths actually observed on disk this scan. The
+    ingest path only reaches here after confirming the collection directory
+    exists, so a transient unmounted folder fails closed earlier and never
+    purges.
+    """
+    async with get_transaction() as conn:
+        if keep_paths:
+            result = await conn.execute(
+                """
+                DELETE FROM documents
+                WHERE collection_name = $1
+                  AND file_path <> ALL($2::text[])
+                """,
+                collection_name,
+                list(keep_paths),
+            )
+        else:
+            # No files observed at all -> every stored document is an orphan.
+            result = await conn.execute(
+                "DELETE FROM documents WHERE collection_name = $1",
+                collection_name,
+            )
+    try:
+        return int(result.split()[-1])
+    except (AttributeError, ValueError, IndexError):
+        return 0
+
+
 async def collection_stats(collection_name: str) -> dict[str, Any]:
     """Return document count, chunk count, and last scan time for a collection."""
     async with get_connection() as conn:

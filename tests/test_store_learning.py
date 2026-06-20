@@ -66,6 +66,19 @@ class TestDetectBackend:
         env = {"CONTINUOUS_CLAUDE_DB_URL": "postgresql://localhost/test"}
         assert detect_backend(env) == "postgres"
 
+    def test_returns_postgres_when_opc_postgres_url_set(self) -> None:
+        # Issue #71: the write path now honors OPC_POSTGRES_URL too, matching
+        # postgres_pool and the read path (no more split-brain).
+        env = {"OPC_POSTGRES_URL": "postgresql://legacy/db"}
+        assert detect_backend(env) == "postgres"
+
+    def test_explicit_backend_overrides_url(self) -> None:
+        env = {
+            "AGENTICA_MEMORY_BACKEND": "sqlite",
+            "DATABASE_URL": "postgresql://localhost/test",
+        }
+        assert detect_backend(env) == "sqlite"
+
     def test_prefers_postgres_over_fallback(self) -> None:
         env = {"DATABASE_URL": "postgresql://localhost/test"}
         assert detect_backend(env, fallback="sqlite") == "postgres"

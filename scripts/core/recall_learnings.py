@@ -84,6 +84,8 @@ load_dotenv()
 project_dir = os.environ.get("CLAUDE_PROJECT_DIR", str(Path(__file__).parent.parent.parent))
 sys.path.insert(0, project_dir)
 
+from scripts.core.db.backend_resolution import resolve_backend  # noqa: E402
+
 # Re-export search backends for backward compatibility (tests import these directly)
 from scripts.core.recall_backends import (  # noqa: E402, F401
     search_learnings_hybrid_rrf,
@@ -423,15 +425,14 @@ def select_output(
 
 
 def get_backend() -> str:
-    """Determine which backend to use (sqlite or postgres)."""
-    backend = os.environ.get("AGENTICA_MEMORY_BACKEND", "").lower()
-    if backend in ("sqlite", "postgres"):
-        return backend
+    """Determine which backend to use (sqlite or postgres).
 
-    if os.environ.get("CONTINUOUS_CLAUDE_DB_URL") or os.environ.get("DATABASE_URL"):
-        return "postgres"
-
-    return "sqlite"
+    Delegates to the shared resolver (issue #71): an explicit
+    AGENTICA_MEMORY_BACKEND wins, otherwise the presence of any connection URL
+    (CONTINUOUS_CLAUDE_DB_URL, DATABASE_URL, OPC_POSTGRES_URL) implies postgres,
+    otherwise sqlite.
+    """
+    return resolve_backend(os.environ, default="sqlite") or "sqlite"
 
 
 # ---------------------------------------------------------------------------

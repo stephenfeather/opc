@@ -95,6 +95,10 @@ LEARNING_TYPES = [
 CONFIDENCE_LEVELS = ["high", "medium", "low"]
 
 from scripts.core.config import get_config as _get_config  # noqa: E402
+from scripts.core.db.backend_resolution import (  # noqa: E402
+    get_connection_url,
+    resolve_backend,
+)
 from scripts.core.db.embedding_service import EmbeddingService  # noqa: E402
 from scripts.core.db.memory_factory import create_memory_service, get_default_backend  # noqa: E402
 
@@ -117,32 +121,24 @@ def _dedup_threshold() -> float:
 def _pg_url() -> str | None:
     """Return PostgreSQL connection URL from environment, or None.
 
-    Prefers CONTINUOUS_CLAUDE_DB_URL (canonical) over DATABASE_URL (fallback)
-    to match the resolution order used by recall_learnings and memory_daemon.
-    OPC_POSTGRES_URL is intentionally NOT included here — adding it would
-    create split-brain behavior with consumers that don't check it yet.
-    TODO: Unify all backend/URL resolution behind a shared function.
+    Delegates to the shared resolver (issue #71): CONTINUOUS_CLAUDE_DB_URL >
+    DATABASE_URL > OPC_POSTGRES_URL.
     """
-    return os.environ.get("CONTINUOUS_CLAUDE_DB_URL") or os.environ.get("DATABASE_URL") or None
+    return get_connection_url()
 
 
 def detect_backend(env: dict[str, str], fallback: str | None = None) -> str:
     """Determine storage backend from environment variables.
 
-    Takes an env dict and returns a backend name string. When no URL is found
-    and no fallback is provided, delegates to get_default_backend() which
-    reads os.environ and may raise.
-
-    Matches the precedence used by recall_learnings.get_backend():
-    CONTINUOUS_CLAUDE_DB_URL > DATABASE_URL > fallback.
-
-    NOTE: AGENTICA_MEMORY_BACKEND and OPC_POSTGRES_URL are intentionally
-    NOT checked here -- recall_learnings, memory_daemon, and confidence_calibrator
-    don't all honor them yet, so adding them here would create split-brain.
-    TODO: Unify all backend/URL resolution behind a shared function.
+    Delegates to the shared resolver (issue #71): an explicit
+    AGENTICA_MEMORY_BACKEND wins, otherwise the presence of any connection URL
+    (CONTINUOUS_CLAUDE_DB_URL, DATABASE_URL, OPC_POSTGRES_URL) implies postgres.
+    When nothing is determinable, falls back to ``fallback`` if given, else to
+    get_default_backend() (which reads os.environ, validates deps, and may raise).
     """
-    if env.get("CONTINUOUS_CLAUDE_DB_URL") or env.get("DATABASE_URL"):
-        return "postgres"
+    backend = resolve_backend(env, default=None)
+    if backend is not None:
+        return backend
     if fallback is not None:
         return fallback
     return get_default_backend()

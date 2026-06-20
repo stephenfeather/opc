@@ -256,12 +256,13 @@ def _pg_connect():
     """Get a PostgreSQL connection."""
     import psycopg2
 
-    db_url = os.environ.get("CONTINUOUS_CLAUDE_DB_URL") or os.environ.get(
-        "DATABASE_URL"
-    )
+    from scripts.core.db.backend_resolution import get_connection_url
+
+    db_url = get_connection_url()
     if not db_url:
         raise RuntimeError(
-            "No database URL configured; set CONTINUOUS_CLAUDE_DB_URL or DATABASE_URL"
+            "No database URL configured; set CONTINUOUS_CLAUDE_DB_URL, "
+            "DATABASE_URL, or OPC_POSTGRES_URL"
         )
     return psycopg2.connect(db_url)
 

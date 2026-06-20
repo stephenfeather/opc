@@ -525,32 +525,93 @@ def search_dispatch(
 # ---------------------------------------------------------------------------
 
 
-def read_text_nofollow(path: Path) -> str | None:
-    """Read a regular file without following symlinks; return None on any failure.
+def read_text_within_root(
+    root: Path, candidate: str | Path, *, suffixes: tuple[str, ...]
+) -> str | None:
+    """Authorize ``candidate`` under ``root`` and read it via an openat walk.
 
-    Opens with ``O_NOFOLLOW`` so a symlinked final component is refused (ELOOP),
-    and ``fstat``s the open fd to require a regular file. The validation and the
-    read share the same fd, eliminating the TOCTOU window between an existence
-    check and the read. Never raises: returns None on OSError (missing file,
-    symlink, directory, device, permission, decode error, ...).
+    Two layers:
+
+    1. **Policy** — :func:`safe_artifact_read_path` resolves ``candidate`` and
+       requires it to stay inside ``root`` (rejecting ``..`` escapes and symlinks
+       that point out of the root) and to carry an allowed suffix.
+
+    2. **No-TOCTOU read** — the authorized path is then read by opening the
+       trusted ``root`` directory once and walking each *lexical* component below
+       it with ``O_NOFOLLOW`` *relative to the previously-opened parent dirfd*
+       (``openat``-style). ``read_text_nofollow``'s single final-component
+       ``O_NOFOLLOW`` left every *intermediate* directory exposed: an attacker
+       who won a race on one between the resolve check and the open could
+       redirect the read (issue #166). Anchoring each open at its validated
+       parent fd means no component — intermediate or final — can be a symlink
+       (or be swapped for one) after the root boundary is established.
+
+    The walk uses the un-resolved (lexical) component names on purpose: a symlink
+    present at open time is refused by ``O_NOFOLLOW`` rather than silently
+    canonicalized away as ``Path.resolve()`` would do, so the read target either
+    matches the policy-authorized resolved path exactly (no symlinks present) or
+    is refused. The final component is ``fstat``-checked for a regular file on the
+    same fd it is read from. Never raises: returns ``None`` on any rejection or
+    I/O failure.
     """
+    if safe_artifact_read_path(candidate, root, suffixes=suffixes) is None:
+        return None
+
+    # Lexical (un-resolved) components of the candidate below the trusted root.
+    # Path.resolve() in the policy layer follows symlinks; here we deliberately
+    # keep the on-disk component names so the O_NOFOLLOW walk inspects reality.
+    cand_abs = Path(candidate)
+    if not cand_abs.is_absolute():
+        cand_abs = Path.cwd() / cand_abs
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        rel_parts = cand_abs.relative_to(root.absolute()).parts
+    except ValueError:
+        return None
+    if not rel_parts or any(part in ("..", ".") for part in rel_parts):
+        # No component below root, or a traversal component the openat walk
+        # would let escape the boundary — fail closed.
+        return None
+
+    # Open the established trust boundary; components below it are O_NOFOLLOW.
+    try:
+        dir_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     except OSError:
         return None
-    fd_owned = True
+
+    open_fds: list[int] = [dir_fd]
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        for part in rel_parts[:-1]:
+            try:
+                open_fds.append(
+                    os.open(
+                        part,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=open_fds[-1],
+                    )
+                )
+            except OSError:
+                return None
+
+        try:
+            leaf_fd = os.open(rel_parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=open_fds[-1])
+        except OSError:
             return None
-        # fdopen takes ownership of the fd; its context manager closes it.
-        fd_owned = False
-        with os.fdopen(fd, "r", encoding="utf-8") as handle:
-            return handle.read()
-    except (OSError, UnicodeError):
-        return None
+
+        try:
+            if not stat.S_ISREG(os.fstat(leaf_fd).st_mode):
+                os.close(leaf_fd)
+                return None
+            # fdopen takes ownership of leaf_fd; its context manager closes it.
+            with os.fdopen(leaf_fd, "r", encoding="utf-8") as handle:
+                return handle.read()
+        except (OSError, UnicodeError):
+            with contextlib.suppress(OSError):
+                os.close(leaf_fd)
+            return None
     finally:
-        if fd_owned:
-            os.close(fd)
+        for fd in open_fds:
+            with contextlib.suppress(OSError):
+                os.close(fd)
 
 
 def handle_span_id_lookup(
@@ -577,13 +638,11 @@ def handle_span_id_lookup(
 
         # Fail closed if the trusted handoffs root is itself reached via a symlink.
         if is_safe_dir_root(handoffs_root, allowed_root):
-            safe_path = safe_artifact_read_path(
-                handoff["file_path"], handoffs_root, suffixes=(".md", ".yaml", ".yml")
+            content = read_text_within_root(
+                handoffs_root, handoff["file_path"], suffixes=(".md", ".yaml", ".yml")
             )
-            if safe_path is not None:
-                content = read_text_nofollow(safe_path)
-                if content is not None:
-                    handoff["content"] = content
+            if content is not None:
+                handoff["content"] = content
 
         session_name = handoff.get("session_name")
         if not session_name and handoff.get("file_path"):
@@ -595,12 +654,7 @@ def handle_span_id_lookup(
 
         if session_name and is_safe_session_name(session_name):
             ledger_path = Path(f"CONTINUITY_CLAUDE-{session_name}.md")
-            safe_ledger = safe_artifact_read_path(
-                ledger_path, allowed_root, suffixes=(".md",)
-            )
-            ledger_content = (
-                read_text_nofollow(safe_ledger) if safe_ledger is not None else None
-            )
+            ledger_content = read_text_within_root(allowed_root, ledger_path, suffixes=(".md",))
             if ledger_content is not None:
                 handoff["ledger"] = {
                     "session_name": session_name,
@@ -664,13 +718,9 @@ def save_query(
 
 def _build_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser — pure construction, no side effects."""
-    parser = argparse.ArgumentParser(
-        description="Search the Context Graph for relevant precedent"
-    )
+    parser = argparse.ArgumentParser(description="Search the Context Graph for relevant precedent")
     parser.add_argument("query", nargs="*", help="Search query")
-    parser.add_argument(
-        "--type", choices=["handoffs", "plans", "continuity", "all"], default="all"
-    )
+    parser.add_argument("--type", choices=["handoffs", "plans", "continuity", "all"], default="all")
     parser.add_argument(
         "--outcome", choices=["SUCCEEDED", "PARTIAL_PLUS", "PARTIAL_MINUS", "FAILED"]
     )

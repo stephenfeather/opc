@@ -123,12 +123,16 @@ const CONVERSATIONAL_LEAD = new Set([
   'nvm', 'nevermind', 'oops', 'thanks', 'exactly', 'agreed'
 ]);
 
-// Imperative-on-a-bare-pronoun, e.g. "do it", "undo that", "extend it another".
-// The pronoun must end the prompt or be followed by a non-noun continuation
-// (again/now/another/...) so "fix that bug" / "change this function" are NOT
-// matched — there the pronoun is a determiner introducing a real noun.
+// Imperative on a *bare* pronoun that consumes the WHOLE remainder, e.g.
+// "do it", "undo that", "run it again", "extend it another 7 days". The match
+// is anchored to end-of-prompt: the pronoun must be followed only by meta
+// continuations (again/now/instead/...) or a bounded "another <n> <unit>"
+// quantity. This deliberately does NOT match when a real noun phrase follows —
+// "fix that bug", "change this function", "fix this instead with stored auth
+// pattern", "update this now using the pg v2 note" all carry memory-bearing
+// tails and fall through to recall.
 const PRONOUN_IMPERATIVE =
-  /^(do|redo|undo|run|rerun|try|retry|repeat|revert|keep|continue|extend|fix|change|update|move)\s+(it|that|this|them|those|these)(\s+(again|now|another|once|more|instead|please)\b|\s*[.!?,]*\s*$)/;
+  /^(?:do|redo|undo|run|rerun|try|retry|repeat|revert|keep|continue|extend|fix|change|update|move)\s+(?:it|that|this|them|those|these)(?:\s+(?:again|now|once|more|instead|please|too|another(?:\s+\w+){1,2}))*\s*[.!?]*\s*$/;
 
 /**
  * Decide whether a prompt is a short conversational/meta turn that should NOT
@@ -136,12 +140,15 @@ const PRONOUN_IMPERATIVE =
  *
  * The always-on hook fired on `"no, extend it another 7 days"` — a meta-command
  * about the live conversation — and surfaced unrelated cross-project learnings.
- * We gate such turns while letting genuine knowledge queries through:
- *  - more than 8 word-tokens -> treat as substantive, never gate;
- *  - a bare affirmation/negation, optionally with a trailing clause introduced
- *    by a comma ("no, ...", "yes, do that one");
- *  - an affirmation followed by a pronoun-imperative ("yeah do that");
- *  - a short pronoun-led imperative ("do it", "extend it another 7 days").
+ * The gate is intentionally biased toward LETTING prompts through: a missed
+ * banner is cheap (the user can /recall), but a wrong cross-project banner is
+ * noisy and erodes trust. We therefore strip any leading discourse marker and
+ * classify the REMAINDER, gating only when:
+ *  - the prompt is empty / pure affirmation ("yes", "no thanks", "ok sure");
+ *  - the remainder is a pronoun-imperative consuming the whole tail
+ *    ("do it", "yeah undo that", "no, extend it another 7 days").
+ * A real query after a marker ("no, explain pg pool leak") keeps its body and
+ * is NOT gated. Prompts over 8 tokens are treated as substantive outright.
  */
 export function isConversationalTurn(prompt: string): boolean {
   const trimmed = prompt.trim();
@@ -155,17 +162,15 @@ export function isConversationalTurn(prompt: string): boolean {
   if (tokens.length === 0) return true;
   if (tokens.length > 8) return false;  // substantive turn — let recall run
 
-  const lead = tokens[0];
-  const hasLeadComma = /^[a-z]+\s*,/.test(lower);
+  // Pure acknowledgement: every token is a conversational lead word
+  // ("yes", "no thanks", "ok sure", "nope nvm").
+  if (tokens.every(t => CONVERSATIONAL_LEAD.has(t))) return true;
 
-  // Bare affirmation/negation, or one used as a comma-led discourse marker.
-  if (CONVERSATIONAL_LEAD.has(lead) && (tokens.length <= 2 || hasLeadComma)) {
-    return true;
-  }
-
-  // Strip a leading discourse marker ("yeah do that" -> "do that") then test
-  // the pronoun-imperative pattern.
-  const rest = CONVERSATIONAL_LEAD.has(lead)
+  // Strip a single leading discourse marker ("yeah do that" -> "do that";
+  // "no, extend it..." -> "extend it..."), then require the REMAINDER to be a
+  // whole-tail pronoun-imperative. A substantive body ("no, explain pg pool
+  // leak") survives the strip and is not gated.
+  const rest = CONVERSATIONAL_LEAD.has(tokens[0])
     ? lower.replace(/^[a-z]+\s*,?\s*/, '')
     : lower;
   return PRONOUN_IMPERATIVE.test(rest);

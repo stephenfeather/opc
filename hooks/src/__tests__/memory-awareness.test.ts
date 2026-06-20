@@ -49,13 +49,17 @@ describe('isConversationalTurn', () => {
     }
   });
 
-  it('gates comma-led discourse markers', () => {
-    expect(isConversationalTurn('yes, do that one')).toBe(true);
-    expect(isConversationalTurn('ok, try the other approach')).toBe(true);
+  it('gates a marker followed by a pronoun-imperative remainder', () => {
+    expect(isConversationalTurn('no, do that')).toBe(true);
+    expect(isConversationalTurn('yeah do that')).toBe(true);
+    expect(isConversationalTurn('yeah, undo that')).toBe(true);
   });
 
-  it('gates affirmation followed by a pronoun-imperative', () => {
-    expect(isConversationalTurn('yeah do that')).toBe(true);
+  it('does NOT gate a marker followed by a real query body (review finding #1)', () => {
+    // Stripping the lead marker must not discard the substantive remainder.
+    expect(isConversationalTurn('no, explain pg pool leak')).toBe(false);
+    expect(isConversationalTurn('ok, recall auth pattern')).toBe(false);
+    expect(isConversationalTurn('yes, how does reranker work')).toBe(false);
   });
 
   it('gates short pronoun-led imperatives', () => {
@@ -74,6 +78,13 @@ describe('isConversationalTurn', () => {
     expect(isConversationalTurn('fix that bug in the parser')).toBe(false);
     expect(isConversationalTurn('change this function to async')).toBe(false);
     expect(isConversationalTurn('delete that migration file')).toBe(false);
+  });
+
+  it('does NOT gate a pronoun-imperative with a memory-bearing tail (review finding #2)', () => {
+    // The continuation must consume the whole tail; substantive trailing
+    // context after instead/now/etc. means it is not a bare meta turn.
+    expect(isConversationalTurn('fix this instead with stored auth pattern')).toBe(false);
+    expect(isConversationalTurn('update this now using the pg v2 note')).toBe(false);
   });
 
   it('lets substantive corrections through even when they start with "no,"', () => {

@@ -93,6 +93,18 @@ describe('isConversationalTurn', () => {
     }
   });
 
+  it('gates compact markers with no space after the delimiter (round-3 finding)', () => {
+    for (const p of ['no:do that', 'ok:run it', 'no-do that', 'no.do that']) {
+      expect(isConversationalTurn(p)).toBe(true);
+    }
+  });
+
+  it('does NOT split internal identifiers when de-gluing the lead marker', () => {
+    // "session-start" is not a lead word, so the hyphen is preserved and the
+    // prompt is treated as a substantive query, not a meta turn.
+    expect(isConversationalTurn('fix the bug in session-start')).toBe(false);
+  });
+
   it('handles the "another <n> <unit>" quantity grammar (round-2 finding #2)', () => {
     // Numeric quantity tails are meta and gated...
     expect(isConversationalTurn('extend it another 7 days')).toBe(true);

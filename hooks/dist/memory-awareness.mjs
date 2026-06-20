@@ -245,7 +245,11 @@ function isConversationalTurn(prompt) {
   const trimmed = prompt.trim();
   if (!trimmed) return true;
   const lower = trimmed.toLowerCase();
-  const tokens = lower.split(/\s+/).map((t) => t.replace(/^[^\w]+|[^\w]+$/g, "")).filter(Boolean);
+  const deglued = lower.replace(
+    /^([a-z]+)\s*[,:;.\-]+\s*/,
+    (match, word) => CONVERSATIONAL_LEAD.has(word) ? `${word} ` : match
+  );
+  const tokens = deglued.split(/\s+/).map((t) => t.replace(/^[^\w]+|[^\w]+$/g, "")).filter(Boolean);
   if (tokens.length === 0) return true;
   if (tokens.length > 8) return false;
   if (tokens.every((t) => CONVERSATIONAL_LEAD.has(t))) return true;

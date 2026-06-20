@@ -157,7 +157,16 @@ export function isConversationalTurn(prompt: string): boolean {
   if (!trimmed) return true;
 
   const lower = trimmed.toLowerCase();
-  const tokens = lower
+  // De-glue a leading conversational marker from a punctuation delimiter that
+  // has no following space ("no:do that", "no-do that", "no.do that") so the
+  // marker is recognized regardless of delimiter or spacing. Only the lead
+  // position is rewritten, so internal identifiers ("session-start",
+  // "memory_daemon.py") and decimals elsewhere are left intact.
+  const deglued = lower.replace(
+    /^([a-z]+)\s*[,:;.\-]+\s*/,
+    (match, word) => (CONVERSATIONAL_LEAD.has(word) ? `${word} ` : match)
+  );
+  const tokens = deglued
     .split(/\s+/)
     .map(t => t.replace(/^[^\w]+|[^\w]+$/g, ''))
     .filter(Boolean);

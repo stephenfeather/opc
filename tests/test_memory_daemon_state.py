@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 from dataclasses import fields
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -491,12 +491,39 @@ class TestWatchdogStuckExtractions:
 
         from scripts.core.memory_daemon import watchdog_stuck_extractions
 
+        watchdog_stuck_extractions()
+
+        mock_proc.stderr.read.assert_not_called()
+
+    @patch("scripts.core.memory_daemon.mark_extraction_failed")
+    @patch("scripts.core.memory_daemon.log")
+    def test_leaves_entry_tracked_when_kill_unconfirmed(self, mock_log, mock_fail):
+        """Issue #212: when poll() is still None after the kill (exit not
+        confirmed), the watchdog must NOT remove the entry from
+        active_extractions and must NOT mark the session failed. The live
+        process stays tracked so the next watchdog tick retries the kill,
+        avoiding a lost handle, a leaked stderr pipe, and a duplicate
+        extraction from premature re-queue."""
+        import subprocess
+
+        mock_proc = MagicMock()
+        mock_proc.wait.side_effect = subprocess.TimeoutExpired(cmd="claude", timeout=5)
+        mock_proc.poll.return_value = None  # still alive after failed kill
+        mock_proc.stderr = MagicMock()
+        self.state.active_extractions[42] = (
+            "sess-1", mock_proc, Path("/t.jsonl"), "proj", 0
+        )
+
+        from scripts.core.memory_daemon import watchdog_stuck_extractions
+
         killed = watchdog_stuck_extractions()
 
-        assert killed == 1
-        mock_proc.stderr.read.assert_not_called()
-        assert mock_fail.call_count == 1
-        assert "not drained" in (mock_fail.call_args.kwargs.get("last_error") or "")
+        assert killed == 0
+        assert 42 in self.state.active_extractions  # entry left for retry
+        mock_fail.assert_not_called()
+        # The unconfirmed kill is logged so the operator can see the retry.
+        logged = " ".join(str(c.args[0]) for c in mock_log.call_args_list)
+        assert "not drained" in logged or "still alive" in logged
 
     @patch("scripts.core.memory_daemon.mark_extraction_failed")
     @patch("scripts.core.memory_daemon.log")

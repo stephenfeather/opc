@@ -810,19 +810,24 @@ def watchdog_stuck_extractions():
                 proc.wait(timeout=5)
             except Exception as e:
                 log(f"Watchdog: failed to kill pid {pid}: {safe(e)}")
+            # Issue #212: only remove the entry / mark-failed once poll()
+            # confirms the child actually exited. If the kill did not confirm
+            # exit (poll() is None), leave the entry tracked so the next
+            # watchdog tick retries the kill. Dropping a still-live process here
+            # would lose the handle, leak its still-open stderr pipe, and risk a
+            # duplicate extraction if the session were re-queued alongside it.
+            if proc.poll() is None:
+                log(f"  watchdog kill unconfirmed (poll() is None); stderr not "
+                    f"drained, leaving pid {pid} tracked for retry")
+                continue
             # Issue #98: capture the child's stderr for parity with the reap
             # path so a watchdog-killed extractor leaves a diagnostic and the
-            # captured tail is persisted as last_error. _drain_proc_stderr reads
-            # the PIPE, which blocks until EOF if a descendant still holds the
-            # write end open — so only drain once poll() confirms the child has
-            # actually exited; otherwise record that it could not be drained.
-            if proc.poll() is not None:
-                stderr_text = _drain_proc_stderr(proc, timeout=0.25)
-                if stderr_text:
-                    log(f"  stderr: {safe(stderr_text)}")
-            else:
-                stderr_text = "watchdog kill timed out; stderr not drained"
-                log(f"  {stderr_text} (pid={pid})")
+            # captured tail is persisted as last_error. The poll()-guard above
+            # ensures the child has exited, so _drain_proc_stderr won't block on
+            # a PIPE whose write end a surviving descendant still holds open.
+            stderr_text = _drain_proc_stderr(proc, timeout=0.25)
+            if stderr_text:
+                log(f"  stderr: {safe(stderr_text)}")
             killed.append(pid)
             # safe() before persisting: last_error is interpolated raw into a
             # downstream log line, so escape control chars here (log-forgery).

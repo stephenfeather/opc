@@ -36,6 +36,11 @@ describe('sanitizeSearchTerm', () => {
   it('returns empty string for whitespace-only input', () => {
     expect(sanitizeSearchTerm('   ')).toBe('');
   });
+
+  it('returns empty string when the intent is only stripped chars (feeds the empty-term guard)', () => {
+    expect(sanitizeSearchTerm('___')).toBe('');
+    expect(sanitizeSearchTerm('/ _ /')).toBe('');
+  });
 });
 
 describe('isConversationalTurn', () => {
@@ -103,6 +108,36 @@ describe('isConversationalTurn', () => {
     // "session-start" is not a lead word, so the hyphen is preserved and the
     // prompt is treated as a substantive query, not a meta turn.
     expect(isConversationalTurn('fix the bug in session-start')).toBe(false);
+  });
+
+  it('gates selection-style meta imperatives (issue #213 / Copilot)', () => {
+    for (const p of [
+      'do the second one', 'do the next option', 'use the other approach',
+      'do the first', 'do the 2nd one', 'redo the last one', 'yeah, do the second one',
+      'do the second one please', 'do the next option now'
+    ]) {
+      expect(isConversationalTurn(p)).toBe(true);
+    }
+  });
+
+  it('does NOT gate selection-shaped prompts with a real trailing noun', () => {
+    expect(isConversationalTurn('run the second test suite')).toBe(false);
+    expect(isConversationalTurn('do the migration')).toBe(false);
+    expect(isConversationalTurn('select the first row')).toBe(false);
+  });
+
+  it('gates expanded acknowledgements and dev-verb pronoun-imperatives', () => {
+    expect(isConversationalTurn('cool, run that')).toBe(true);
+    expect(isConversationalTurn('great do it')).toBe(true);
+    expect(isConversationalTurn('apply it')).toBe(true);
+    expect(isConversationalTurn('show them')).toBe(true);
+    expect(isConversationalTurn('delete this')).toBe(true);
+  });
+
+  it('does NOT gate expanded verbs when a real noun phrase follows', () => {
+    expect(isConversationalTurn('test this auth flow')).toBe(false);
+    expect(isConversationalTurn('delete that migration file')).toBe(false);
+    expect(isConversationalTurn('make it fully async')).toBe(false);
   });
 
   it('handles the "another <n> <unit>" quantity grammar (round-2 finding #2)', () => {

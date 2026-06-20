@@ -120,7 +120,8 @@ export function sanitizeSearchTerm(intent: string): string {
 // Lead tokens that mark a conversational reply rather than a knowledge query.
 const CONVERSATIONAL_LEAD = new Set([
   'no', 'nope', 'nah', 'yes', 'yeah', 'yep', 'yup', 'ok', 'okay', 'sure',
-  'nvm', 'nevermind', 'oops', 'thanks', 'exactly', 'agreed'
+  'nvm', 'nevermind', 'oops', 'thanks', 'exactly', 'agreed',
+  'cool', 'great', 'awesome', 'perfect'
 ]);
 
 // Imperative on a *bare* pronoun that consumes the WHOLE remainder, e.g.
@@ -134,7 +135,16 @@ const CONVERSATIONAL_LEAD = new Set([
 // noun phrases: "fix that bug", "change this function", "fix this instead with
 // stored auth pattern", "update this now using the pg v2 note".
 const PRONOUN_IMPERATIVE =
-  /^(?:do|redo|undo|run|rerun|try|retry|repeat|revert|keep|continue|extend|fix|change|update|move)\s+(?:it|that|this|them|those|these)(?:\s+(?:again|now|once|more|instead|please|too|another\s+\d+(?:\s+\w+){1,2}))*$/;
+  /^(?:do|redo|undo|run|rerun|try|retry|repeat|revert|keep|continue|extend|fix|change|update|move|apply|test|save|delete|remove|show|add|create|make|use)\s+(?:it|that|this|them|those|these)(?:\s+(?:again|now|once|more|instead|please|too|another\s+\d+(?:\s+\w+){1,2}))*$/;
+
+// Selection-style meta imperative, e.g. "do the second one", "do the next
+// option", "use the other approach" — issue #213 lists these explicitly. The
+// object is "the <ordinal|next|other|...>" optionally followed by a generic
+// choice noun, anchored to end-of-string. A real noun phrase ("run the second
+// test suite", "do the migration") does NOT match because the trailing words
+// fall outside the bounded choice-noun set.
+const SELECTION_IMPERATIVE =
+  /^(?:do|redo|run|rerun|try|retry|repeat|use|pick|choose|select|take|apply|keep)\s+the\s+(?:first|second|third|fourth|fifth|sixth|last|next|previous|prior|other|another|latter|former|same|top|bottom|\d+(?:st|nd|rd|th)?)(?:\s+(?:one|ones|option|item|choice|approach|suggestion|result|match|idea|fix))?(?:\s+(?:again|now|please|instead|too))*$/;
 
 /**
  * Decide whether a prompt is a short conversational/meta turn that should NOT
@@ -148,7 +158,8 @@ const PRONOUN_IMPERATIVE =
  * classify the REMAINDER, gating only when:
  *  - the prompt is empty / pure affirmation ("yes", "no thanks", "ok sure");
  *  - the remainder is a pronoun-imperative consuming the whole tail
- *    ("do it", "yeah undo that", "no, extend it another 7 days").
+ *    ("do it", "yeah undo that", "no, extend it another 7 days");
+ *  - the remainder is a selection-style imperative ("do the second one").
  * A real query after a marker ("no, explain pg pool leak") keeps its body and
  * is NOT gated. Prompts over 8 tokens are treated as substantive outright.
  */
@@ -183,8 +194,8 @@ export function isConversationalTurn(prompt: string): boolean {
   // punctuation-stripped tokens, so any lead delimiter (comma, colon, dash,
   // period) is handled uniformly. A substantive body ("no, explain pg pool
   // leak") survives the drop and is not gated.
-  const body = CONVERSATIONAL_LEAD.has(tokens[0]) ? tokens.slice(1) : tokens;
-  return PRONOUN_IMPERATIVE.test(body.join(' '));
+  const body = (CONVERSATIONAL_LEAD.has(tokens[0]) ? tokens.slice(1) : tokens).join(' ');
+  return PRONOUN_IMPERATIVE.test(body) || SELECTION_IMPERATIVE.test(body);
 }
 
 /**
@@ -199,6 +210,9 @@ function checkMemoryRelevance(intent: string, projectDir: string): MemoryMatch |
   if (!opcDir) return null;  // Graceful degradation if OPC not available
 
   const searchTerm = sanitizeSearchTerm(intent);
+  // An intent of only stripped chars (e.g. "___") sanitizes to empty — don't
+  // spawn a recall process for a no-op query.
+  if (!searchTerm) return null;
 
   // Derive project tag from CLAUDE_PROJECT_DIR to boost relevance via --tags (not a hard filter)
   const projectTag = projectDir ? projectDir.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? '' : '';

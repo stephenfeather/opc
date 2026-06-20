@@ -238,9 +238,14 @@ var CONVERSATIONAL_LEAD = /* @__PURE__ */ new Set([
   "oops",
   "thanks",
   "exactly",
-  "agreed"
+  "agreed",
+  "cool",
+  "great",
+  "awesome",
+  "perfect"
 ]);
-var PRONOUN_IMPERATIVE = /^(?:do|redo|undo|run|rerun|try|retry|repeat|revert|keep|continue|extend|fix|change|update|move)\s+(?:it|that|this|them|those|these)(?:\s+(?:again|now|once|more|instead|please|too|another\s+\d+(?:\s+\w+){1,2}))*$/;
+var PRONOUN_IMPERATIVE = /^(?:do|redo|undo|run|rerun|try|retry|repeat|revert|keep|continue|extend|fix|change|update|move|apply|test|save|delete|remove|show|add|create|make|use)\s+(?:it|that|this|them|those|these)(?:\s+(?:again|now|once|more|instead|please|too|another\s+\d+(?:\s+\w+){1,2}))*$/;
+var SELECTION_IMPERATIVE = /^(?:do|redo|run|rerun|try|retry|repeat|use|pick|choose|select|take|apply|keep)\s+the\s+(?:first|second|third|fourth|fifth|sixth|last|next|previous|prior|other|another|latter|former|same|top|bottom|\d+(?:st|nd|rd|th)?)(?:\s+(?:one|ones|option|item|choice|approach|suggestion|result|match|idea|fix))?(?:\s+(?:again|now|please|instead|too))*$/;
 function isConversationalTurn(prompt) {
   const trimmed = prompt.trim();
   if (!trimmed) return true;
@@ -253,14 +258,15 @@ function isConversationalTurn(prompt) {
   if (tokens.length === 0) return true;
   if (tokens.length > 8) return false;
   if (tokens.every((t) => CONVERSATIONAL_LEAD.has(t))) return true;
-  const body = CONVERSATIONAL_LEAD.has(tokens[0]) ? tokens.slice(1) : tokens;
-  return PRONOUN_IMPERATIVE.test(body.join(" "));
+  const body = (CONVERSATIONAL_LEAD.has(tokens[0]) ? tokens.slice(1) : tokens).join(" ");
+  return PRONOUN_IMPERATIVE.test(body) || SELECTION_IMPERATIVE.test(body);
 }
 function checkMemoryRelevance(intent, projectDir) {
   if (!intent || intent.length < 3) return null;
   const opcDir = getOpcDir();
   if (!opcDir) return null;
   const searchTerm = sanitizeSearchTerm(intent);
+  if (!searchTerm) return null;
   const projectTag = projectDir ? projectDir.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? "" : "";
   const safeProjectTag = projectTag && !projectTag.startsWith("-") ? projectTag : "";
   const tagArgs = safeProjectTag ? ["--tags", safeProjectTag] : [];

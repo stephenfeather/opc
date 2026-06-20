@@ -240,7 +240,7 @@ var CONVERSATIONAL_LEAD = /* @__PURE__ */ new Set([
   "exactly",
   "agreed"
 ]);
-var PRONOUN_IMPERATIVE = /^(?:do|redo|undo|run|rerun|try|retry|repeat|revert|keep|continue|extend|fix|change|update|move)\s+(?:it|that|this|them|those|these)(?:\s+(?:again|now|once|more|instead|please|too|another(?:\s+\w+){1,2}))*\s*[.!?]*\s*$/;
+var PRONOUN_IMPERATIVE = /^(?:do|redo|undo|run|rerun|try|retry|repeat|revert|keep|continue|extend|fix|change|update|move)\s+(?:it|that|this|them|those|these)(?:\s+(?:again|now|once|more|instead|please|too|another\s+\d+(?:\s+\w+){1,2}))*$/;
 function isConversationalTurn(prompt) {
   const trimmed = prompt.trim();
   if (!trimmed) return true;
@@ -249,8 +249,8 @@ function isConversationalTurn(prompt) {
   if (tokens.length === 0) return true;
   if (tokens.length > 8) return false;
   if (tokens.every((t) => CONVERSATIONAL_LEAD.has(t))) return true;
-  const rest = CONVERSATIONAL_LEAD.has(tokens[0]) ? lower.replace(/^[a-z]+\s*,?\s*/, "") : lower;
-  return PRONOUN_IMPERATIVE.test(rest);
+  const body = CONVERSATIONAL_LEAD.has(tokens[0]) ? tokens.slice(1) : tokens;
+  return PRONOUN_IMPERATIVE.test(body.join(" "));
 }
 function checkMemoryRelevance(intent, projectDir) {
   if (!intent || intent.length < 3) return null;

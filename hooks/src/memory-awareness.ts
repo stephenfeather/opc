@@ -125,14 +125,16 @@ const CONVERSATIONAL_LEAD = new Set([
 
 // Imperative on a *bare* pronoun that consumes the WHOLE remainder, e.g.
 // "do it", "undo that", "run it again", "extend it another 7 days". The match
-// is anchored to end-of-prompt: the pronoun must be followed only by meta
-// continuations (again/now/instead/...) or a bounded "another <n> <unit>"
-// quantity. This deliberately does NOT match when a real noun phrase follows —
-// "fix that bug", "change this function", "fix this instead with stored auth
-// pattern", "update this now using the pg v2 note" all carry memory-bearing
-// tails and fall through to recall.
+// is anchored to end-of-string: the pronoun may be followed only by meta
+// continuations (again/now/instead/...) or a bounded numeric "another <n>
+// <unit>" quantity ("another 7 days", "another 7 business days"). It is tested
+// against a punctuation-stripped, whitespace-normalized token string, so the
+// `another` branch requires a DIGIT — a generic noun tail like "another auth
+// pattern" does NOT match. This deliberately falls through to recall for real
+// noun phrases: "fix that bug", "change this function", "fix this instead with
+// stored auth pattern", "update this now using the pg v2 note".
 const PRONOUN_IMPERATIVE =
-  /^(?:do|redo|undo|run|rerun|try|retry|repeat|revert|keep|continue|extend|fix|change|update|move)\s+(?:it|that|this|them|those|these)(?:\s+(?:again|now|once|more|instead|please|too|another(?:\s+\w+){1,2}))*\s*[.!?]*\s*$/;
+  /^(?:do|redo|undo|run|rerun|try|retry|repeat|revert|keep|continue|extend|fix|change|update|move)\s+(?:it|that|this|them|those|these)(?:\s+(?:again|now|once|more|instead|please|too|another\s+\d+(?:\s+\w+){1,2}))*$/;
 
 /**
  * Decide whether a prompt is a short conversational/meta turn that should NOT
@@ -166,14 +168,14 @@ export function isConversationalTurn(prompt: string): boolean {
   // ("yes", "no thanks", "ok sure", "nope nvm").
   if (tokens.every(t => CONVERSATIONAL_LEAD.has(t))) return true;
 
-  // Strip a single leading discourse marker ("yeah do that" -> "do that";
+  // Drop a single leading discourse marker ("yeah do that" -> "do that";
   // "no, extend it..." -> "extend it..."), then require the REMAINDER to be a
-  // whole-tail pronoun-imperative. A substantive body ("no, explain pg pool
-  // leak") survives the strip and is not gated.
-  const rest = CONVERSATIONAL_LEAD.has(tokens[0])
-    ? lower.replace(/^[a-z]+\s*,?\s*/, '')
-    : lower;
-  return PRONOUN_IMPERATIVE.test(rest);
+  // whole-tail pronoun-imperative. The remainder is rebuilt from the already
+  // punctuation-stripped tokens, so any lead delimiter (comma, colon, dash,
+  // period) is handled uniformly. A substantive body ("no, explain pg pool
+  // leak") survives the drop and is not gated.
+  const body = CONVERSATIONAL_LEAD.has(tokens[0]) ? tokens.slice(1) : tokens;
+  return PRONOUN_IMPERATIVE.test(body.join(' '));
 }
 
 /**

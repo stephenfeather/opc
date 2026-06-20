@@ -87,6 +87,21 @@ describe('isConversationalTurn', () => {
     expect(isConversationalTurn('update this now using the pg v2 note')).toBe(false);
   });
 
+  it('gates markers delimited by punctuation other than comma (round-2 finding #1)', () => {
+    for (const p of ['no: do that', 'no - do that', 'no. do that', 'ok: run it']) {
+      expect(isConversationalTurn(p)).toBe(true);
+    }
+  });
+
+  it('handles the "another <n> <unit>" quantity grammar (round-2 finding #2)', () => {
+    // Numeric quantity tails are meta and gated...
+    expect(isConversationalTurn('extend it another 7 days')).toBe(true);
+    expect(isConversationalTurn('extend it another 7 business days')).toBe(true);
+    // ...but a non-numeric "another <noun phrase>" can be memory-bearing.
+    expect(isConversationalTurn('try this another auth pattern')).toBe(false);
+    expect(isConversationalTurn('update this another pg pattern')).toBe(false);
+  });
+
   it('lets substantive corrections through even when they start with "no,"', () => {
     expect(
       isConversationalTurn(

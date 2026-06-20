@@ -177,6 +177,15 @@ def test_parser_json_flag_on_every_subcommand() -> None:
     )
 
 
+def test_parser_json_flag_accepted_before_subcommand() -> None:
+    # A machine wrapper may put a shared --json before the subcommand. Both
+    # placements (and the absence of the flag) must resolve to the right value.
+    parser = build_parser()
+    assert parser.parse_args(["--json", "list"]).json is True
+    assert parser.parse_args(["--json", "query", "q"]).json is True
+    assert parser.parse_args(["query", "q"]).json is False
+
+
 def test_run_query_json_emits_full_content(capsys) -> None:
     results = [
         QueryResult(
@@ -300,6 +309,64 @@ def test_run_scan_json_output(tmp_path: Path, monkeypatch, capsys) -> None:
             "purged": 3,
         }
     ]
+
+
+def test_run_scan_all_json_partial_success_keeps_completed_observable(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    # Regression: when a later collection fails (missing folder), the earlier
+    # completed collection's result must still be reported, and the failure must
+    # appear structurally — not swallow the whole batch behind a bare error line.
+    reg = tmp_path / "reg.yaml"
+    monkeypatch.setenv("OPC_DOC_REGISTRY", str(reg))
+    run(["create", "ok", "--path", str(tmp_path), "--scope", "global", "--extensions", ".txt"])
+    run(["create", "bad", "--path", "/tmp/bad", "--scope", "global", "--extensions", ".txt"])
+    capsys.readouterr()  # discard setup output
+
+    async def fake_ingest(collection, _embedder):
+        if collection.name == "bad":
+            raise FileNotFoundError("collection folder not found: /tmp/bad")
+        return IngestReport(collection="ok", ingested=5)
+
+    with (
+        patch("scripts.core.documents.cli.ingest_collection", new=fake_ingest),
+        patch("scripts.core.documents.cli._build_embedder", return_value=object()),
+    ):
+        exit_code = run(["scan", "--all", "--json"])
+    # Nonzero because one collection failed...
+    assert exit_code == 1
+    payload = json.loads(capsys.readouterr().out)
+    # ...but the completed collection's report is still present, and the failure
+    # is represented structurally.
+    by_name = {entry["collection"]: entry for entry in payload}
+    assert by_name["ok"]["ingested"] == 5
+    assert "error" in by_name["bad"]
+    assert "ingested" not in by_name["bad"]
+
+
+def test_run_scan_all_text_partial_success_reports_completed(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    reg = tmp_path / "reg.yaml"
+    monkeypatch.setenv("OPC_DOC_REGISTRY", str(reg))
+    run(["create", "ok", "--path", str(tmp_path), "--scope", "global", "--extensions", ".txt"])
+    run(["create", "bad", "--path", "/tmp/bad", "--scope", "global", "--extensions", ".txt"])
+    capsys.readouterr()
+
+    async def fake_ingest(collection, _embedder):
+        if collection.name == "bad":
+            raise FileNotFoundError("missing")
+        return IngestReport(collection="ok", ingested=5)
+
+    with (
+        patch("scripts.core.documents.cli.ingest_collection", new=fake_ingest),
+        patch("scripts.core.documents.cli._build_embedder", return_value=object()),
+    ):
+        exit_code = run(["scan", "--all"])
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert "[ok] ingested=5" in captured.out  # completed work on stdout
+    assert "bad" in captured.err  # failure on stderr
 
 
 def test_run_create_json_output(tmp_path: Path, monkeypatch, capsys) -> None:

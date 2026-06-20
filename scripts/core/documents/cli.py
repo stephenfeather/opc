@@ -42,7 +42,7 @@ load_dotenv()
 
 from scripts.core.db.embedding_service import EmbeddingService  # noqa: E402
 from scripts.core.documents.db import collection_stats  # noqa: E402
-from scripts.core.documents.ingest import ingest_collection  # noqa: E402
+from scripts.core.documents.ingest import IngestReport, ingest_collection  # noqa: E402
 from scripts.core.documents.query import query_documents  # noqa: E402
 from scripts.core.documents.registry import (  # noqa: E402
     Collection,
@@ -61,16 +61,17 @@ def _build_embedder() -> EmbeddingService:
 def build_parser() -> argparse.ArgumentParser:
     """Build the argparse parser for opc-docs."""
     parser = argparse.ArgumentParser(prog="opc-docs", description=__doc__)
+    # --json is accepted both before the subcommand (`opc-docs --json list`) and
+    # after it (`opc-docs list --json`) so a machine wrapper can place the flag
+    # wherever it builds its arg list. The root option supplies the default; the
+    # per-subcommand option (default=SUPPRESS) only sets the attribute when given,
+    # so it never clobbers a root-level --json back to False.
+    json_help = "emit machine-readable JSON to stdout instead of human-readable text"
+    parser.add_argument("--json", action="store_true", default=False, help=json_help)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # Shared --json flag: every subcommand can emit machine-readable JSON to
-    # stdout instead of human text, so the opc-memory MCP can wrap them.
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument(
-        "--json",
-        action="store_true",
-        help="emit machine-readable JSON to stdout instead of human-readable text",
-    )
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help=json_help)
 
     p_create = sub.add_parser("create", help="register a new collection", parents=[common])
     p_create.add_argument("name", help="unique collection name")
@@ -145,15 +146,26 @@ def _cmd_create(args: argparse.Namespace) -> int:
     return 0
 
 
-async def _scan_all(targets: list[Collection]) -> list:
+async def _scan_all(
+    targets: list[Collection],
+) -> list[tuple[Collection, IngestReport | None, str | None]]:
     # One event loop for the whole run: the asyncpg pool binds to the loop that
     # created it, so a separate asyncio.run() per collection would leave the
     # second collection acquiring dead connections ("event loop is closed").
+    #
+    # Failures are isolated per collection: a missing folder (FileNotFoundError)
+    # on one target must not erase the already-committed results of collections
+    # scanned before it, and must not abort the remaining targets. Each result is
+    # (collection, report_or_None, error_or_None).
     embedder = _build_embedder()
-    reports = []
+    results: list[tuple[Collection, IngestReport | None, str | None]] = []
     for collection in targets:
-        reports.append(await ingest_collection(collection, embedder))
-    return reports
+        try:
+            report = await ingest_collection(collection, embedder)
+            results.append((collection, report, None))
+        except FileNotFoundError as exc:
+            results.append((collection, None, str(exc)))
+    return results
 
 
 def _format_report(report) -> str:
@@ -183,17 +195,25 @@ def _cmd_scan(args: argparse.Namespace) -> int:
         if not targets:
             print(f"error: unknown collection '{args.name}'", file=sys.stderr)
             return 1
-    try:
-        reports = asyncio.run(_scan_all(targets))
-    except FileNotFoundError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
+    results = asyncio.run(_scan_all(targets))
     if args.json:
-        print(json.dumps([dataclasses.asdict(r) for r in reports]))
+        payload = []
+        for collection, report, error in results:
+            if error is not None:
+                payload.append({"collection": collection.name, "error": error})
+            else:
+                assert report is not None  # invariant: error is None => report set
+                payload.append(dataclasses.asdict(report))
+        print(json.dumps(payload))
     else:
-        for report in reports:
-            print(_format_report(report))
-    return 0
+        for collection, report, error in results:
+            if error is not None:
+                print(f"error: [{collection.name}] {error}", file=sys.stderr)
+            else:
+                print(_format_report(report))
+    # Nonzero if any collection failed, but only after every completed
+    # collection has been reported, so partial-success work stays observable.
+    return 1 if any(error is not None for _, _, error in results) else 0
 
 
 async def _list_all(collections: list[Collection]) -> list[tuple[Collection, dict]]:

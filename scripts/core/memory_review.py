@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+"""Memory-review candidate detector (issue #63).
+
+Phase 1 — read-only. Surfaces promotion / near-duplicate / stale candidates from
+``archival_memory`` for a single project using hard signals (recall_count, embedding
+cosine, age). Emits a grouped report; applies NOTHING. The ``/memory-review`` skill
+consumes this output, has the model judge destinations against the live memory layers,
+and presents the result for per-item user approval.
+
+Design: thoughts/shared/2026-06-20-issue-63-memory-organization-design.md
+SQL prototype: thoughts/shared/2026-06-20-issue-63-candidate-detection.sql
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+_repo_root = str(Path(__file__).resolve().parent.parent.parent)
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
+
+from scripts.core.db.postgres_pool import close_pool, get_pool  # noqa: E402
+
+# --- Constants -------------------------------------------------------------
+
+DEFAULT_MIN_RECALL = 10
+DEFAULT_SIMILARITY_THRESHOLD = 0.90
+DEFAULT_EF_SEARCH = 40
+DEFAULT_MERGE_LIMIT = 200
+# The merge scan runs one HNSW probe per active learning, so it grows with project
+# size and is the only slow detector. Bound it under the pool's 60s command_timeout
+# so a large project degrades to "scan skipped" instead of crashing the whole review.
+DEFAULT_MERGE_TIMEOUT_S = 50.0
+STALE_OPEN_THREAD_DAYS = 30
+
+# Promotion routing: learning_type -> always-loaded destination tier.
+# Types absent from this map stay on-demand in archival_memory by design —
+# promoting WORKING_SOLUTION/ERROR_FIX/FAILED_APPROACH floods always-loaded
+# context with content that recall surfaces only when relevant.
+_ROUTING: dict[str, str] = {
+    "USER_PREFERENCE": "rules/",
+    "ARCHITECTURAL_DECISION": "CLAUDE.md",
+    "CODEBASE_PATTERN": "MEMORY.md",
+}
+PROMOTABLE_TYPES: tuple[str, ...] = tuple(_ROUTING)
+
+
+# --- Data structures -------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PromotionCandidate:
+    id: str
+    content: str
+    recall_count: int
+    learning_type: str
+    destination: str
+
+
+@dataclass(frozen=True)
+class MergeCandidate:
+    id_a: str
+    id_b: str
+    similarity: float
+    preview_a: str
+    preview_b: str
+
+
+@dataclass(frozen=True)
+class StaleBucket:
+    label: str
+    count: int
+
+
+@dataclass(frozen=True)
+class ReviewReport:
+    project: str
+    total_active: int
+    promotions: list[PromotionCandidate] = field(default_factory=list)
+    merges: list[MergeCandidate] = field(default_factory=list)
+    stale_buckets: list[StaleBucket] = field(default_factory=list)
+    stale_open_threads: int = 0
+    merges_timed_out: bool = False
+
+
+# --- Pure functions --------------------------------------------------------
+
+
+def route_destination(learning_type: str) -> str | None:
+    """Map a learning_type to its always-loaded destination, or None to stay on-demand."""
+    return _ROUTING.get(learning_type)
+
+
+def is_promotable(learning_type: str) -> bool:
+    """True when the type benefits from promotion to an always-loaded tier."""
+    return route_destination(learning_type) is not None
+
+
+def _truncate(text: str, width: int = 90) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def format_report(report: ReviewReport) -> str:
+    """Render a grouped, approval-oriented text report. Changes nothing."""
+    lines: list[str] = []
+    lines.append(f"## Memory Review — project: {report.project}")
+    lines.append(f"({report.total_active} active learnings)")
+    lines.append("")
+
+    # 1. Promotions, grouped by destination
+    lines.append(f"### 1. Promotions ({len(report.promotions)} candidates)")
+    if report.promotions:
+        by_dest: dict[str, list[PromotionCandidate]] = {}
+        for c in report.promotions:
+            by_dest.setdefault(c.destination, []).append(c)
+        for dest in sorted(by_dest):
+            group = sorted(by_dest[dest], key=lambda c: c.recall_count, reverse=True)
+            lines.append(f"  → {dest}  ({len(group)})")
+            for c in group:
+                lines.append(
+                    f"      • [{c.learning_type}, recalled {c.recall_count}×] "
+                    f"{_truncate(c.content)}"
+                )
+    else:
+        lines.append("  (none)")
+    lines.append("")
+
+    # 2. Cleanup — near-duplicate merges
+    lines.append(f"### 2. Cleanup — merges ({len(report.merges)} near-duplicate pairs)")
+    if report.merges_timed_out:
+        # Cost is one HNSW probe per active learning, so it scales with corpus size,
+        # NOT with --threshold (the nearest neighbor is found before the threshold
+        # filters output). The real levers are a smaller corpus or skipping merges.
+        lines.append(
+            f"  ⚠️ merge scan exceeded its time budget on {report.total_active} "
+            "learnings (cost scales with corpus size). Re-run with --promote-only to "
+            "skip it, or scan a smaller project."
+        )
+    if report.merges:
+        for m in sorted(report.merges, key=lambda m: m.similarity, reverse=True):
+            lines.append(
+                f"      • [{m.similarity:.3f}] {_truncate(m.preview_a, 60)} "
+                f"⇄ {_truncate(m.preview_b, 60)}"
+            )
+    else:
+        lines.append("  (none)")
+    lines.append("")
+
+    # 3. Cleanup — stale
+    lines.append("### 3. Cleanup — stale")
+    if report.stale_buckets:
+        for b in report.stale_buckets:
+            lines.append(f"      • {b.label}: {b.count}")
+    lines.append(
+        f"      • stale OPEN_THREAD (>{STALE_OPEN_THREAD_DAYS}d, never recalled): "
+        f"{report.stale_open_threads}"
+    )
+    lines.append("")
+
+    lines.append(
+        "_Read-only proposal. No changes applied. Approve items individually before any write._"
+    )
+    return "\n".join(lines)
+
+
+# --- I/O handlers ----------------------------------------------------------
+
+_PROMOTION_SQL = """
+    SELECT id::text AS id,
+           content,
+           recall_count,
+           metadata->>'learning_type' AS learning_type
+    FROM archival_memory
+    WHERE LOWER(project) = LOWER($1)
+      AND superseded_by IS NULL
+      AND recall_count >= $2
+      AND metadata->>'learning_type' = ANY($3::text[])
+    ORDER BY recall_count DESC
+"""
+
+_MERGE_SQL = """
+    WITH scoped AS (
+        SELECT id, content, embedding
+        FROM archival_memory
+        WHERE LOWER(project) = LOWER($1)
+          AND superseded_by IS NULL
+          AND embedding IS NOT NULL
+    )
+    SELECT a.id::text AS id_a,
+           nn.id::text AS id_b,
+           (1 - (a.embedding <=> nn.embedding))::float AS similarity,
+           LEFT(a.content, 90) AS preview_a,
+           LEFT(nn.content, 90) AS preview_b
+    FROM scoped a
+    CROSS JOIN LATERAL (
+        SELECT b.id, b.content, b.embedding
+        FROM scoped b
+        WHERE b.id <> a.id
+        ORDER BY a.embedding <=> b.embedding
+        LIMIT 1
+    ) nn
+    WHERE a.id < nn.id
+      AND (1 - (a.embedding <=> nn.embedding)) >= $2
+    ORDER BY similarity DESC
+    LIMIT $3
+"""
+
+_STALE_SQL = """
+    WITH scoped AS (
+        SELECT recall_count, created_at
+        FROM archival_memory
+        WHERE LOWER(project) = LOWER($1) AND superseded_by IS NULL
+    )
+    SELECT bucket AS staleness_bucket, COUNT(*) AS learnings
+    FROM (
+        SELECT CASE
+            WHEN recall_count = 0 AND created_at < NOW() - INTERVAL '60 days'
+                THEN 'never recalled, >60d old'
+            WHEN recall_count = 0 AND created_at < NOW() - INTERVAL '30 days'
+                THEN 'never recalled, 30-60d old'
+            WHEN recall_count = 0
+                THEN 'never recalled, <30d old'
+            ELSE 'recalled at least once'
+        END AS bucket
+        FROM scoped
+    ) t
+    GROUP BY bucket
+    ORDER BY learnings DESC
+"""
+
+_STALE_OPEN_THREAD_SQL = """
+    SELECT COUNT(*)
+    FROM archival_memory
+    WHERE LOWER(project) = LOWER($1)
+      AND superseded_by IS NULL
+      AND metadata->>'learning_type' = 'OPEN_THREAD'
+      AND recall_count = 0
+      AND created_at < NOW() - make_interval(days => $2)
+"""
+
+_ACTIVE_TOTAL_SQL = """
+    SELECT COUNT(*)
+    FROM archival_memory
+    WHERE LOWER(project) = LOWER($1) AND superseded_by IS NULL
+"""
+
+
+async def fetch_active_total(pool, project: str) -> int:
+    async with pool.acquire() as conn:
+        return int(await conn.fetchval(_ACTIVE_TOTAL_SQL, project) or 0)
+
+
+async def fetch_promotion_candidates(
+    pool, project: str, min_recall: int = DEFAULT_MIN_RECALL
+) -> list[PromotionCandidate]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(_PROMOTION_SQL, project, int(min_recall), list(PROMOTABLE_TYPES))
+    out: list[PromotionCandidate] = []
+    for r in rows:
+        lt = r["learning_type"]
+        dest = route_destination(lt)
+        if dest is None:  # defensive: query already filters, but never trust the row
+            continue
+        out.append(
+            PromotionCandidate(
+                id=r["id"],
+                content=r["content"],
+                recall_count=int(r["recall_count"]),
+                learning_type=lt,
+                destination=dest,
+            )
+        )
+    return out
+
+
+async def fetch_merge_candidates(
+    pool,
+    project: str,
+    threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+    ef_search: int = DEFAULT_EF_SEARCH,
+    limit: int = DEFAULT_MERGE_LIMIT,
+    timeout: float | None = None,
+) -> list[MergeCandidate]:
+    # ef_search is a session GUC that cannot be parameterized; coerce to int so a
+    # caller-supplied value can never carry SQL. threshold/limit go as bind params.
+    # SET LOCAL must run inside a transaction or it is a no-op; the transaction also
+    # scopes ef_search to this query so it never leaks to the pooled connection.
+    safe_ef = int(ef_search)
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute(f"SET LOCAL hnsw.ef_search = {safe_ef}")
+        rows = await conn.fetch(_MERGE_SQL, project, float(threshold), int(limit), timeout=timeout)
+    return [
+        MergeCandidate(
+            id_a=r["id_a"],
+            id_b=r["id_b"],
+            similarity=float(r["similarity"]),
+            preview_a=r["preview_a"],
+            preview_b=r["preview_b"],
+        )
+        for r in rows
+    ]
+
+
+async def fetch_stale_summary(pool, project: str) -> tuple[list[StaleBucket], int]:
+    async with pool.acquire() as conn:
+        bucket_rows = await conn.fetch(_STALE_SQL, project)
+        open_threads = int(
+            await conn.fetchval(_STALE_OPEN_THREAD_SQL, project, STALE_OPEN_THREAD_DAYS) or 0
+        )
+    buckets = [
+        StaleBucket(label=r["staleness_bucket"], count=int(r["learnings"])) for r in bucket_rows
+    ]
+    return buckets, open_threads
+
+
+# --- Orchestrator ----------------------------------------------------------
+
+
+async def build_review(
+    pool,
+    project: str,
+    *,
+    min_recall: int = DEFAULT_MIN_RECALL,
+    threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+    ef_search: int = DEFAULT_EF_SEARCH,
+    merge_timeout: float = DEFAULT_MERGE_TIMEOUT_S,
+    promote: bool = True,
+    cleanup: bool = True,
+) -> ReviewReport:
+    total = await fetch_active_total(pool, project)
+    promotions: list[PromotionCandidate] = []
+    merges: list[MergeCandidate] = []
+    stale_buckets: list[StaleBucket] = []
+    stale_open_threads = 0
+    merges_timed_out = False
+
+    if promote:
+        promotions = await fetch_promotion_candidates(pool, project, min_recall)
+    if cleanup:
+        try:
+            merges = await fetch_merge_candidates(
+                pool, project, threshold, ef_search=ef_search, timeout=merge_timeout
+            )
+        except TimeoutError:
+            # The merge scan cost scales with project size; on large corpora it can
+            # exceed the timeout. Degrade gracefully — the rest of the review still
+            # ships, and the report tells the user how to narrow the scan.
+            merges_timed_out = True
+        stale_buckets, stale_open_threads = await fetch_stale_summary(pool, project)
+
+    return ReviewReport(
+        project=project,
+        total_active=total,
+        promotions=promotions,
+        merges=merges,
+        stale_buckets=stale_buckets,
+        stale_open_threads=stale_open_threads,
+        merges_timed_out=merges_timed_out,
+    )
+
+
+def _default_project() -> str:
+    return Path.cwd().name
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Detect memory promotion / merge / stale candidates (issue #63). Read-only."
+    )
+    p.add_argument("project", nargs="?", default=None, help="Project to review (default: cwd name)")
+    p.add_argument("--min-recall", type=int, default=DEFAULT_MIN_RECALL)
+    p.add_argument("--threshold", type=float, default=DEFAULT_SIMILARITY_THRESHOLD)
+    p.add_argument(
+        "--ef-search",
+        type=int,
+        default=DEFAULT_EF_SEARCH,
+        help="HNSW ef_search for the merge scan; lower = faster, less complete",
+    )
+    p.add_argument(
+        "--merge-timeout",
+        type=float,
+        default=DEFAULT_MERGE_TIMEOUT_S,
+        help="Seconds before the merge scan degrades gracefully (pool cap is 60s)",
+    )
+    p.add_argument("--promote-only", action="store_true", help="Skip cleanup detectors")
+    p.add_argument("--cleanup-only", action="store_true", help="Skip promotion detector")
+    return p.parse_args(argv)
+
+
+async def main(argv: list[str] | None = None) -> None:
+    args = _parse_args(argv)
+    project = args.project or _default_project()
+    promote = not args.cleanup_only
+    cleanup = not args.promote_only
+
+    pool = await get_pool()
+    report = await build_review(
+        pool,
+        project,
+        min_recall=args.min_recall,
+        threshold=args.threshold,
+        ef_search=args.ef_search,
+        merge_timeout=args.merge_timeout,
+        promote=promote,
+        cleanup=cleanup,
+    )
+    print(format_report(report))
+
+
+async def _cli_main(argv: list[str] | None = None) -> None:
+    try:
+        await main(argv)
+    finally:
+        await close_pool()
+
+
+if __name__ == "__main__":
+    asyncio.run(_cli_main())

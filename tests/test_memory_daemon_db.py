@@ -885,3 +885,174 @@ class TestSeedLastPatternRunDb:
         assert "seed_last_pattern_run failed" in msg
         # Exception rendered via safe_exception(): "ClassName: message".
         assert "Exception: db down" in msg
+
+
+# ---------------------------------------------------------------------------
+# Step 2.x — recall_log retention pruning (issue #146)
+# ---------------------------------------------------------------------------
+
+
+class _RowcountCursor:
+    """Fake DB cursor that scripts ``rowcount`` per DELETE batch.
+
+    Non-DELETE statements (the set_config latency-guard calls prune_recall_log
+    issues before the loop) are recorded in ``execute_calls`` but do not consume
+    the scripted rowcounts or count as batches, so tests assert on batch
+    behaviour via ``delete_count`` / ``delete_calls`` independent of the guards.
+    Each DELETE pops the next value from ``rowcounts`` and exposes it as
+    ``rowcount`` (psycopg2 semantics). When ``error_after`` is set, the
+    (error_after+1)-th DELETE raises, simulating a mid-loop DB failure.
+    """
+
+    def __init__(self, rowcounts, *, error_after=None):
+        self._rowcounts = list(rowcounts)
+        self._error_after = error_after
+        self.execute_count = 0
+        self.delete_count = 0
+        self.rowcount = 0
+        self.execute_calls: list[tuple] = []
+        self.delete_calls: list[tuple] = []
+
+    def execute(self, sql, params=None):
+        self.execute_count += 1
+        self.execute_calls.append((sql, params))
+        if "DELETE" not in sql:
+            return  # set_config / SET guard — not a batch
+        self.delete_count += 1
+        if self._error_after is not None and self.delete_count > self._error_after:
+            raise RuntimeError("boom mid-loop")
+        self.delete_calls.append((sql, params))
+        self.rowcount = self._rowcounts.pop(0) if self._rowcounts else 0
+
+
+class TestPruneRecallLog:
+    """prune_recall_log: batched retention delete for the recall_log table."""
+
+    @patch("scripts.core.memory_daemon_db.use_postgres", return_value=False)
+    def test_returns_zero_complete_without_postgres(self, mock_use):
+        from scripts.core.memory_daemon_db import prune_recall_log
+
+        assert prune_recall_log(90) == (0, True)
+
+    @patch("scripts.core.memory_daemon_db.use_postgres", return_value=True)
+    @patch("scripts.core.memory_daemon_db.pg_connect")
+    def test_disabled_when_retention_non_positive(self, mock_pg, mock_use):
+        from scripts.core.memory_daemon_db import prune_recall_log
+
+        assert prune_recall_log(0) == (0, True)
+        assert prune_recall_log(-5) == (0, True)
+        mock_pg.assert_not_called()
+
+    @patch("scripts.core.memory_daemon_db.use_postgres", return_value=True)
+    @patch("scripts.core.memory_daemon_db.pg_connect")
+    def test_single_partial_batch_is_complete(self, mock_pg, mock_use):
+        conn = MagicMock()
+        cur = _RowcountCursor([3])
+        conn.cursor.return_value = cur
+        mock_pg.return_value = conn
+
+        from scripts.core.memory_daemon_db import prune_recall_log
+
+        # 3 < batch_size -> drained, so complete is True.
+        assert prune_recall_log(90, batch_size=10) == (3, True)
+        assert cur.delete_count == 1
+        conn.commit.assert_called_once()
+        conn.close.assert_called_once()
+
+    @patch("scripts.core.memory_daemon_db.use_postgres", return_value=True)
+    @patch("scripts.core.memory_daemon_db.pg_connect")
+    def test_loops_until_batch_not_full(self, mock_pg, mock_use):
+        conn = MagicMock()
+        cur = _RowcountCursor([10, 10, 4])  # full, full, partial -> stop
+        conn.cursor.return_value = cur
+        mock_pg.return_value = conn
+
+        from scripts.core.memory_daemon_db import prune_recall_log
+
+        assert prune_recall_log(90, batch_size=10) == (24, True)
+        assert cur.delete_count == 3
+        # Commit after every batch so locks release between deletes.
+        assert conn.commit.call_count == 3
+        conn.close.assert_called_once()
+
+    @patch("scripts.core.memory_daemon_db.use_postgres", return_value=True)
+    @patch("scripts.core.memory_daemon_db.pg_connect")
+    def test_interval_is_parameterized_not_interpolated(self, mock_pg, mock_use):
+        conn = MagicMock()
+        cur = _RowcountCursor([0])
+        conn.cursor.return_value = cur
+        mock_pg.return_value = conn
+
+        from scripts.core.memory_daemon_db import prune_recall_log
+
+        prune_recall_log(90, batch_size=500)
+        sql, params = cur.delete_calls[0]
+        assert "recall_log" in sql
+        assert "make_interval" in sql
+        assert params == (90, 500)
+        # Retention/limit must never be string-formatted into the SQL text.
+        assert "90" not in sql
+        assert "500" not in sql
+
+    @patch("scripts.core.memory_daemon_db.use_postgres", return_value=True)
+    @patch("scripts.core.memory_daemon_db.pg_connect")
+    def test_cap_with_full_final_batch_is_incomplete(self, mock_pg, mock_use):
+        conn = MagicMock()
+        cur = _RowcountCursor([5] * 10)  # always full -> never drains
+        conn.cursor.return_value = cur
+        mock_pg.return_value = conn
+
+        from scripts.core.memory_daemon_db import prune_recall_log
+
+        # Cap hit with a still-full final batch -> backlog remains -> complete=False
+        # so the scheduler continues promptly instead of waiting a full interval.
+        assert prune_recall_log(90, batch_size=5, max_batches=3) == (15, False)
+        assert cur.delete_count == 3
+        conn.close.assert_called_once()
+
+    @patch("scripts.core.memory_daemon_db.use_postgres", return_value=True)
+    @patch("scripts.core.memory_daemon_db.pg_connect")
+    def test_sets_lock_and_statement_timeouts(self, mock_pg, mock_use):
+        conn = MagicMock()
+        cur = _RowcountCursor([0])
+        conn.cursor.return_value = cur
+        mock_pg.return_value = conn
+
+        from scripts.core.memory_daemon_db import prune_recall_log
+
+        prune_recall_log(90, lock_timeout_ms=2000, statement_timeout_ms=9000)
+        # The two non-DELETE guard statements run before any batch, binding the
+        # millisecond values as parameters (never interpolated into SQL).
+        guards = [c for c in cur.execute_calls if "DELETE" not in c[0]]
+        assert ("SELECT set_config('lock_timeout', %s, false)", ("2000",)) in guards
+        assert (
+            "SELECT set_config('statement_timeout', %s, false)",
+            ("9000",),
+        ) in guards
+
+    @patch("scripts.core.memory_daemon_db.use_postgres", return_value=True)
+    @patch("scripts.core.memory_daemon_db.pg_connect", side_effect=Exception("db down"))
+    def test_raises_on_connect_error(self, mock_pg, mock_use):
+        # Failures propagate (not swallowed) so the scheduler can tell a real
+        # failure from an empty prune and retry promptly (issue #146 review).
+        from scripts.core.memory_daemon_db import prune_recall_log
+
+        with pytest.raises(Exception, match="db down"):
+            prune_recall_log(90)
+
+    @patch("scripts.core.memory_daemon_db.use_postgres", return_value=True)
+    @patch("scripts.core.memory_daemon_db.pg_connect")
+    def test_raises_on_midloop_error_and_closes(self, mock_pg, mock_use):
+        conn = MagicMock()
+        cur = _RowcountCursor([10], error_after=1)  # batch 1 ok, batch 2 raises
+        conn.cursor.return_value = cur
+        mock_pg.return_value = conn
+
+        from scripts.core.memory_daemon_db import prune_recall_log
+
+        with pytest.raises(RuntimeError, match="boom mid-loop"):
+            prune_recall_log(90, batch_size=10)
+        # Batch 1 committed before the failure (committed batches persist)...
+        assert conn.commit.call_count == 1
+        # ...and the connection is always closed, even when a batch raises.
+        conn.close.assert_called_once()

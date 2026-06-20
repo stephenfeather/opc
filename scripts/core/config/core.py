@@ -53,6 +53,12 @@ _RANGE_RULES: dict[tuple[str, str], tuple[float | None, float | None]] = {
     ("daemon", "harvest_grace_period"): (0, None),
     ("daemon", "pattern_detection_interval_hours"): (1, None),
     ("daemon", "extraction_max_turns"): (1, None),
+    # 0 disables recall_log pruning; negative is invalid. Upper bounds guard
+    # against footguns: a retention far past any real policy (cap 10 years) or
+    # an interval so long it silently disables pruning (cap weekly) when the
+    # documented disable switch is retention=0 (issue #146 review).
+    ("daemon", "recall_log_retention_days"): (0, 3650),
+    ("daemon", "recall_log_prune_interval_hours"): (1, 168),
     ("reranker", "recency_half_life_days"): (0.1, None),
     ("reranker", "recall_log2_normalizer"): (1, None),
     ("reranker", "rrf_scale_factor"): (0.1, None),

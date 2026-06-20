@@ -26,6 +26,11 @@ class DaemonConfig:
     extraction_max_turns: int = 15
     log_rotation_days: int = 7
     log_backup_count: int = 4
+    # Issue #146: automated recall_log retention. Rows older than
+    # recall_log_retention_days are pruned by the daemon every
+    # recall_log_prune_interval_hours. Set retention to 0 to disable pruning.
+    recall_log_retention_days: int = 90
+    recall_log_prune_interval_hours: int = 24
 
 
 @dataclass(frozen=True)

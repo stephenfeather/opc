@@ -140,6 +140,33 @@ class TestBuildConfig:
         cfg = build_config({"dedup": {"threshold": 1.0}})
         assert cfg.dedup.threshold == 1.0
 
+    # Issue #146: recall_log retention bounds. 0 disables; oversized values are
+    # a retention footgun and must be rejected, not silently swallowed.
+    def test_recall_log_retention_days_above_max_rejected(self):
+        with pytest.raises(ConfigValidationError, match="above maximum"):
+            build_config({"daemon": {"recall_log_retention_days": 4000}})
+
+    def test_recall_log_retention_days_negative_rejected(self):
+        with pytest.raises(ConfigValidationError, match="below minimum"):
+            build_config({"daemon": {"recall_log_retention_days": -1}})
+
+    def test_recall_log_retention_days_boundaries_accepted(self):
+        # 0 is the documented disable switch; 3650 (10y) is the ceiling.
+        assert build_config(
+            {"daemon": {"recall_log_retention_days": 0}}
+        ).daemon.recall_log_retention_days == 0
+        assert build_config(
+            {"daemon": {"recall_log_retention_days": 3650}}
+        ).daemon.recall_log_retention_days == 3650
+
+    def test_recall_log_prune_interval_above_max_rejected(self):
+        with pytest.raises(ConfigValidationError, match="above maximum"):
+            build_config({"daemon": {"recall_log_prune_interval_hours": 200}})
+
+    def test_recall_log_prune_interval_zero_rejected(self):
+        with pytest.raises(ConfigValidationError, match="below minimum"):
+            build_config({"daemon": {"recall_log_prune_interval_hours": 0}})
+
     def test_vector_candidate_multiplier_loads_from_toml(self):
         # Issue #153: the new knob auto-wires from the [recall] section.
         cfg = build_config({"recall": {"vector_candidate_multiplier": 12}})

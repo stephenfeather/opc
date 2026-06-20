@@ -16,8 +16,12 @@
 -- Volume: ~1 row per user prompt (the memory-awareness hook fires per
 -- prompt). At that rate the table grows slowly.
 --
--- Retention: manual until automated pruning lands (follow-up issue). For now
--- pruning is operator-owned -- run the documented DELETE periodically, e.g.:
+-- Retention: automated (issue #146). The memory daemon prunes rows older than
+-- daemon.recall_log_retention_days (default 90) every
+-- daemon.recall_log_prune_interval_hours (default 24) via
+-- memory_daemon_db.prune_recall_log(), which deletes in bounded batches so the
+-- hot-path INSERT is never blocked. Set retention to 0 to disable. The
+-- equivalent manual prune (e.g. for ad-hoc operator use) is:
 --   DELETE FROM recall_log WHERE created_at < NOW() - INTERVAL '90 days';
 --
 -- Privacy: this table NEVER stores raw query text. Only canonical project

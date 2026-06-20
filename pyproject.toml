@@ -96,6 +96,7 @@ packages = ["src/runtime"]
 [tool.black]
 line-length = 100
 target-version = ["py313"]
+
 force-exclude = '''
 (
   ^/scripts/core/config/core\.py

@@ -412,8 +412,12 @@ WHERE created_at > NOW() - INTERVAL '30 days'
 GROUP BY caller_project ORDER BY empty_recalls DESC;
 ```
 
-**Retention:** manual until automated pruning lands (follow-up issue). Pruning
-is operator-owned for now — run the documented `DELETE` periodically, e.g.:
+**Retention:** automated (issue #146). The memory daemon prunes rows older than
+`daemon.recall_log_retention_days` (default `90`) every
+`daemon.recall_log_prune_interval_hours` (default `24`), deleting in bounded
+batches so the append-only hot-path INSERT is never blocked. Set
+`recall_log_retention_days` to `0` (or env `RECALL_LOG_RETENTION_DAYS=0`) to
+disable pruning. The equivalent manual prune for ad-hoc operator use:
 
 ```sql
 DELETE FROM recall_log WHERE created_at < NOW() - INTERVAL '90 days';

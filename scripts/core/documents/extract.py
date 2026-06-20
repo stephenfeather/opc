@@ -29,6 +29,12 @@ SUPPORTED_EXTENSIONS = (
     ".xml",
 )
 
+# Page ceiling for PDFs. The on-disk size guard (ingest) checks the *compressed*
+# file; a small but heavily-compressed or many-page PDF can still expand to far
+# more text/objects in memory. Refusing absurd page counts bounds extraction
+# memory/CPU so a hostile or pathological PDF cannot OOM a cron scan.
+_MAX_PDF_PAGES = 5000
+
 
 @dataclass(frozen=True)
 class ExtractedPage:
@@ -106,6 +112,10 @@ def _extract_pdf(path: Path) -> list[ExtractedPage]:
     from pypdf import PdfReader
 
     reader = PdfReader(str(path))
+    if len(reader.pages) > _MAX_PDF_PAGES:
+        raise ValueError(
+            f"PDF has {len(reader.pages)} pages (> {_MAX_PDF_PAGES}); refusing to extract"
+        )
     pages = []
     for index, page in enumerate(reader.pages, start=1):
         text = (page.extract_text() or "").strip()

@@ -84,7 +84,15 @@ def compute_file_hash(path: Path) -> str:
 
 
 def _iter_files(root: Path, extensions: list[str]) -> list[Path]:
-    """Return every file under root whose suffix is in extensions (recursive)."""
+    """Return every file under root whose suffix is in extensions (recursive).
+
+    Trust boundary: rglob follows symlinks, and the registry path is authored by
+    the (single, trusted) user, so tracked folders MUST be trusted and not shared
+    with less-trusted writers. If a tracked folder could receive symlinks planted
+    by another party, that symlink becomes an arbitrary-file-read into a scope the
+    planter influences — add is_symlink()/realpath containment checks before
+    ingesting shared directories.
+    """
     wanted = {e.lower() for e in extensions}
     return sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in wanted)
 

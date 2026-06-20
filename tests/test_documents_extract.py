@@ -93,6 +93,17 @@ def test_extract_xml_rejects_entity_expansion(tmp_path: Path) -> None:
     assert result.pages == []
 
 
+def test_extract_pdf_rejects_excessive_page_count(tmp_path: Path, monkeypatch) -> None:
+    # DoS guard: a PDF over the page ceiling is refused before extraction so a
+    # decompression-bomb / huge PDF cannot exhaust memory during a cron scan.
+    monkeypatch.setattr("scripts.core.documents.extract._MAX_PDF_PAGES", 0)
+    f = tmp_path / "huge.pdf"
+    f.write_bytes(_minimal_textless_pdf())  # a valid 1-page PDF; 1 > 0 -> refused
+    result = extract_text(f)
+    assert result.status == "error"
+    assert result.pages == []
+
+
 def test_extract_result_dataclass_shape() -> None:
     result = ExtractionResult(pages=[], status="error", error="boom", page_count=0)
     assert result.status == "error"

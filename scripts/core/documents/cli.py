@@ -49,6 +49,7 @@ from scripts.core.documents.registry import (  # noqa: E402
     RegistryError,
     append_collection,
     load_registry,
+    validate_collection,
 )
 
 
@@ -119,6 +120,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
         ocr=args.ocr,
     )
     try:
+        # Normalize first (e.g. "pdf" -> ".pdf") so the JSON we emit matches the
+        # canonical collection actually written to the registry, not the raw args.
+        collection = validate_collection(collection)
         append_collection(None, collection)
     except RegistryError as exc:
         print(f"error: {exc}", file=sys.stderr)

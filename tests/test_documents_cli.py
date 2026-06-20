@@ -328,3 +328,31 @@ def test_run_create_json_output(tmp_path: Path, monkeypatch, capsys) -> None:
         "ocr": False,
         "status": "registered",
     }
+
+
+def test_run_create_json_emits_normalized_extensions(tmp_path: Path, monkeypatch, capsys) -> None:
+    # Regression: create --json must emit the canonical collection that is
+    # actually written to the registry (extensions normalized to leading-dot),
+    # not the raw argparse values. Otherwise an MCP consumer that trusts the
+    # JSON sees "pdf" while the registry holds ".pdf".
+    reg = tmp_path / "reg.yaml"
+    monkeypatch.setenv("OPC_DOC_REGISTRY", str(reg))
+    exit_code = run(
+        [
+            "create",
+            "c",
+            "--path",
+            "/tmp/c",
+            "--scope",
+            "global",
+            "--extensions",
+            "pdf,docx",
+            "--json",
+        ]
+    )
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["extensions"] == [".pdf", ".docx"]
+    # The JSON contract must match what the registry actually stored.
+    assert ".pdf" in reg.read_text()
+    assert "\n- pdf\n" not in reg.read_text()

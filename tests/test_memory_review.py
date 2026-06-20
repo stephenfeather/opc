@@ -144,7 +144,15 @@ def _pool_returning(rows):
     conn = MagicMock()
     conn.fetch = AsyncMock(return_value=rows)
     conn.fetchval = AsyncMock(return_value=0)
-    conn.fetchrow = AsyncMock(return_value=None)
+    # Coverage query default: one embedding space, nothing skipped, so build_review
+    # resolves a non-None model and proceeds to the merge scan.
+    conn.fetchrow = AsyncMock(
+        return_value={
+            "scanned_model": "voyage-code-3",
+            "scanned_rows": 100,
+            "total_embedded": 100,
+        }
+    )
     conn.execute = AsyncMock()
     txn_ctx = MagicMock()
     txn_ctx.__aenter__ = AsyncMock(return_value=conn)
@@ -198,31 +206,41 @@ class TestFetchMergeCandidates:
             }
         ]
         pool, conn = _pool_returning(rows)
-        out = await fetch_merge_candidates(pool, "opc", 0.90)
+        out = await fetch_merge_candidates(pool, "opc", "voyage-code-3", threshold=0.90)
         assert len(out) == 1
         assert out[0].similarity == 0.97
 
     async def test_ef_search_is_integer_not_interpolated(self):
         pool, conn = _pool_returning([])
         # threshold/ef_search must never reach SQL as raw strings
-        await fetch_merge_candidates(pool, "opc", 0.90, ef_search=40)
+        await fetch_merge_candidates(pool, "opc", "voyage-code-3", threshold=0.90, ef_search=40)
         # a SET command should have run with an int-coerced value
         executed = [c.args[0] for c in conn.execute.call_args_list]
         assert any("hnsw.ef_search" in s for s in executed)
         assert any("40" in s for s in executed)
 
-    async def test_neighbors_passed_as_bound_param(self):
+    async def test_neighbors_and_model_passed_as_bound_params(self):
         pool, conn = _pool_returning([])
-        await fetch_merge_candidates(pool, "opc", 0.90, neighbors=7)
+        await fetch_merge_candidates(pool, "opc", "voyage-code-3", threshold=0.90, neighbors=7)
         args = conn.fetch.call_args.args
         assert 7 in args  # top-k neighbors bound, not interpolated
+        assert "voyage-code-3" in args  # model bound, not recomputed in SQL
+
+    async def test_statement_timeout_set_server_side(self):
+        pool, conn = _pool_returning([])
+        await fetch_merge_candidates(pool, "opc", "voyage-code-3", threshold=0.90, timeout=30.0)
+        executed = [c.args[0] for c in conn.execute.call_args_list]
+        # Server-enforced budget so the backend actually stops, not just the client.
+        assert any("statement_timeout" in s for s in executed)
+        assert any("30000" in s for s in executed)  # 30s -> ms
 
     def test_merge_sql_scopes_to_single_embedding_model(self):
         # Cross-model cosine is meaningless; the scan must restrict to one space.
-        from scripts.core.memory_review import _MERGE_SQL
+        # The model is resolved once (coverage) and bound as $5 here (round 3).
+        from scripts.core.memory_review import _MERGE_COVERAGE_SQL, _MERGE_SQL
 
-        assert "embedding_model" in _MERGE_SQL
-        assert "active_model" in _MERGE_SQL
+        assert "embedding_model = $5" in _MERGE_SQL
+        assert "embedding_model" in _MERGE_COVERAGE_SQL
 
     def test_merge_sql_canonicalizes_pairs_not_directed_filter(self):
         # The buggy "a.id < nn.id" directed filter drops real pairs; the fix uses
@@ -285,17 +303,64 @@ class TestBuildReview:
         assert report.merges_timed_out is True
         assert report.total_active == 6400
 
-    async def test_threads_ef_search_and_timeout_to_merge(self, monkeypatch):
+    async def test_query_canceled_degrades_gracefully(self, monkeypatch):
+        # Server-side statement_timeout raises QueryCanceledError; same graceful path.
+        from asyncpg.exceptions import QueryCanceledError
+
+        pool, conn = _pool_returning([])
+        conn.fetchval = AsyncMock(return_value=6400)
+
+        async def _raise(*a, **k):
+            raise QueryCanceledError
+
+        monkeypatch.setattr("scripts.core.memory_review.fetch_merge_candidates", _raise)
+        report = await build_review(pool, "opc")
+        assert report.merges == []
+        assert report.merges_timed_out is True
+
+    async def test_merge_skipped_when_no_embedding_model(self, monkeypatch):
+        # Empty/embedding-less corpus: coverage returns no model -> never run the scan.
+        pool, conn = _pool_returning([])
+        conn.fetchval = AsyncMock(return_value=0)
+        conn.fetchrow = AsyncMock(
+            return_value={"scanned_model": None, "scanned_rows": 0, "total_embedded": 0}
+        )
+        called = False
+
+        async def _should_not_run(*a, **k):
+            nonlocal called
+            called = True
+            return []
+
+        monkeypatch.setattr("scripts.core.memory_review.fetch_merge_candidates", _should_not_run)
+        report = await build_review(pool, "opc")
+        assert called is False
+        assert report.merges == []
+        assert report.merges_timed_out is False
+
+    async def test_coverage_model_reused_for_merge_no_drift(self, monkeypatch):
+        # The model the report discloses must be the exact model the merge scan used.
         pool, conn = _pool_returning([])
         conn.fetchval = AsyncMock(return_value=10)
+        conn.fetchrow = AsyncMock(
+            return_value={
+                "scanned_model": "bge",
+                "scanned_rows": 8,
+                "total_embedded": 10,
+            }
+        )
         captured = {}
 
-        async def _capture(_pool, _project, _threshold, **kwargs):
+        async def _capture(_pool, _project, model, **kwargs):
+            captured["model"] = model
             captured.update(kwargs)
             return []
 
         monkeypatch.setattr("scripts.core.memory_review.fetch_merge_candidates", _capture)
-        await build_review(pool, "opc", ef_search=20, merge_timeout=30.0)
+        report = await build_review(pool, "opc", ef_search=20, merge_timeout=30.0)
+        assert captured["model"] == "bge"  # same model coverage reported
+        assert report.merge_scanned_model == "bge"
+        assert report.merge_skipped_rows == 2
         assert captured["ef_search"] == 20
         assert captured["timeout"] == 30.0
 
@@ -365,9 +430,18 @@ class TestMergeSqlPreviewCanonicalization:
         assert "CASE WHEN a.id <= nn.id THEN nn.content ELSE a.content END" in _MERGE_SQL
 
     def test_dominant_model_has_deterministic_tiebreak(self):
+        # Model resolution lives in the coverage query (round 3); reused for the scan.
+        from scripts.core.memory_review import _MERGE_COVERAGE_SQL
+
+        assert "n DESC, embedding_model ASC" in _MERGE_COVERAGE_SQL
+
+    def test_merge_lateral_reads_base_table_not_materialized_cte(self):
+        # Regression (round 3): the lateral must read archival_memory directly so the
+        # CTE materialization boundary cannot strip index eligibility.
         from scripts.core.memory_review import _MERGE_SQL
 
-        assert "COUNT(*) DESC, embedding_model ASC" in _MERGE_SQL
+        assert "FROM archival_memory b" in _MERGE_SQL
+        assert "embedding_model = $5" in _MERGE_SQL
 
 
 class TestDefaultProject:

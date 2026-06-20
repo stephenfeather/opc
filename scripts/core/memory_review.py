@@ -24,6 +24,8 @@ _repo_root = str(Path(__file__).resolve().parent.parent.parent)
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
+from asyncpg.exceptions import QueryCanceledError  # noqa: E402
+
 from scripts.core.db.postgres_pool import close_pool, get_pool  # noqa: E402
 from scripts.core.project_naming import (  # noqa: E402
     canonicalize_project,
@@ -211,36 +213,31 @@ _PROMOTION_SQL = """
     ORDER BY recall_count DESC
 """
 
-# Near-duplicate detection. Two correctness guards:
+# Near-duplicate detection. Guards:
 #   1. Single embedding space — cosine across different embedding_models is
-#      meaningless (a partial re-embed leaves mixed BGE/Voyage rows). Scope to the
-#      project's dominant model so every comparison is within one space, matching
-#      how recall already filters by embedding_model.
+#      meaningless (a partial re-embed leaves mixed BGE/Voyage rows). The model is
+#      resolved ONCE by fetch_merge_coverage and passed in as $5, so the merge scan
+#      and the coverage disclosure can never describe different spaces (no drift), and
+#      the dominant-model scan is not duplicated on the hot path.
 #   2. Canonical unordered pairs — take the top-k nearest neighbors per row, then
 #      collapse to one row per {LEAST,GREATEST} id pair. A naive single-NN +
 #      "a.id < nn.id" filter drops real pairs (A's NN is C while B's NN is A is
 #      silently lost). Top-k + DISTINCT ON recovers them.
+#   3. The lateral reads archival_memory DIRECTLY (not a CTE alias): a multiply-
+#      referenced CTE is a materialization boundary, which strips index eligibility.
+#      NOTE: per-project near-dup is still inherently O(n^2) — the project filter is
+#      selective enough that the planner filter-sorts rather than using the global
+#      HNSW index (verified via EXPLAIN), even with iterative scan. The merge_timeout
+#      / statement_timeout guard is the real protection on large corpora, not the
+#      index. Small/medium projects complete fast; opc-scale degrades gracefully.
 _MERGE_SQL = """
-    WITH active_model AS (
-        SELECT embedding_model
-        FROM archival_memory
-        WHERE LOWER(project) = LOWER($1)
-          AND superseded_by IS NULL
-          AND embedding IS NOT NULL
-        GROUP BY embedding_model
-        -- Deterministic tie-break so a 50/50 split never flips the scanned space
-        -- between runs. Coverage disclosure (see fetch_embedding_model_coverage)
-        -- tells the user when a partial re-embed leaves rows in other spaces.
-        ORDER BY COUNT(*) DESC, embedding_model ASC
-        LIMIT 1
-    ),
-    scoped AS (
+    WITH scoped AS (
         SELECT id, content, embedding
         FROM archival_memory
         WHERE LOWER(project) = LOWER($1)
           AND superseded_by IS NULL
           AND embedding IS NOT NULL
-          AND embedding_model = (SELECT embedding_model FROM active_model)
+          AND embedding_model = $5
     ),
     pairs AS (
         SELECT LEAST(a.id, nn.id) AS lo,
@@ -256,8 +253,12 @@ _MERGE_SQL = """
         FROM scoped a
         CROSS JOIN LATERAL (
             SELECT b.id, b.content, b.embedding
-            FROM scoped b
-            WHERE b.id <> a.id
+            FROM archival_memory b
+            WHERE LOWER(b.project) = LOWER($1)
+              AND b.superseded_by IS NULL
+              AND b.embedding IS NOT NULL
+              AND b.embedding_model = $5
+              AND b.id <> a.id
             ORDER BY a.embedding <=> b.embedding
             LIMIT $4
         ) nn
@@ -373,21 +374,33 @@ async def fetch_promotion_candidates(
 async def fetch_merge_candidates(
     pool,
     project: str,
+    model: str,
     threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
     ef_search: int = DEFAULT_EF_SEARCH,
     limit: int = DEFAULT_MERGE_LIMIT,
     neighbors: int = DEFAULT_MERGE_NEIGHBORS,
     timeout: float | None = None,
 ) -> list[MergeCandidate]:
-    # ef_search is a session GUC that cannot be parameterized; coerce to int so a
-    # caller-supplied value can never carry SQL. threshold/limit/neighbors go as bind
-    # params. SET LOCAL must run inside a transaction or it is a no-op; the transaction
-    # also scopes ef_search to this query so it never leaks to the pooled connection.
+    # ef_search/statement_timeout are session GUCs that cannot be parameterized; coerce
+    # to int so a caller value can never carry SQL. threshold/limit/neighbors/model go as
+    # bind params. SET LOCAL must run inside a transaction or it is a no-op; the
+    # transaction also scopes both GUCs to this query so they never leak to the pool.
+    # statement_timeout makes Postgres itself cancel the scan (raising QueryCanceledError)
+    # so the backend stops and the connection is freed — the asyncpg client `timeout=` is
+    # only a secondary guard that does not stop server-side work on its own.
     safe_ef = int(ef_search)
     async with pool.acquire() as conn, conn.transaction():
         await conn.execute(f"SET LOCAL hnsw.ef_search = {safe_ef}")
+        if timeout is not None:
+            await conn.execute(f"SET LOCAL statement_timeout = {int(timeout * 1000)}")
         rows = await conn.fetch(
-            _MERGE_SQL, project, float(threshold), int(limit), int(neighbors), timeout=timeout
+            _MERGE_SQL,
+            project,
+            float(threshold),
+            int(limit),
+            int(neighbors),
+            model,
+            timeout=timeout,
         )
     return [
         MergeCandidate(
@@ -454,16 +467,27 @@ async def build_review(
     if promote:
         promotions = await fetch_promotion_candidates(pool, project, min_recall)
     if cleanup:
+        # Resolve the embedding space ONCE here; the same model string drives both the
+        # coverage disclosure and the merge scan, so they can never describe different
+        # spaces under a concurrent re-embed.
         merge_scanned_model, merge_skipped_rows = await fetch_merge_coverage(pool, project)
-        try:
-            merges = await fetch_merge_candidates(
-                pool, project, threshold, ef_search=ef_search, timeout=merge_timeout
-            )
-        except TimeoutError:
-            # The merge scan cost scales with project size; on large corpora it can
-            # exceed the timeout. Degrade gracefully — the rest of the review still
-            # ships, and the report tells the user how to narrow the scan.
-            merges_timed_out = True
+        if merge_scanned_model is not None:
+            try:
+                merges = await fetch_merge_candidates(
+                    pool,
+                    project,
+                    merge_scanned_model,
+                    threshold=threshold,
+                    ef_search=ef_search,
+                    timeout=merge_timeout,
+                )
+            except (TimeoutError, QueryCanceledError):
+                # The merge scan cost scales with project size; on large corpora it can
+                # exceed the timeout (client-side TimeoutError) or be cancelled by the
+                # server's statement_timeout (QueryCanceledError). Either way, degrade
+                # gracefully — the rest of the review still ships, and the report tells
+                # the user how to narrow the scan.
+                merges_timed_out = True
         stale_buckets, stale_open_threads = await fetch_stale_summary(pool, project)
 
     return ReviewReport(

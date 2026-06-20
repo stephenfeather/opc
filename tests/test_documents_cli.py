@@ -10,6 +10,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from scripts.core.documents.cli import build_parser, run
 from scripts.core.documents.ingest import IngestReport
 from scripts.core.documents.query import QueryResult
@@ -423,3 +425,53 @@ def test_run_create_json_emits_normalized_extensions(tmp_path: Path, monkeypatch
     # The JSON contract must match what the registry actually stored.
     assert ".pdf" in reg.read_text()
     assert "\n- pdf\n" not in reg.read_text()
+
+
+def test_run_scan_all_streams_completed_before_nonfnf_failure(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    # A failure other than FileNotFoundError (DB error, SIGTERM) deep in
+    # scan --all must not erase the cron log of collections already completed:
+    # each completed report is flushed the instant it finishes, before the
+    # later collection raises.
+    reg = tmp_path / "reg.yaml"
+    monkeypatch.setenv("OPC_DOC_REGISTRY", str(reg))
+    run(["create", "ok", "--path", str(tmp_path), "--scope", "global", "--extensions", ".txt"])
+    run(["create", "boom", "--path", str(tmp_path), "--scope", "global", "--extensions", ".txt"])
+    capsys.readouterr()
+
+    async def fake_ingest(collection, _embedder):
+        if collection.name == "boom":
+            raise RuntimeError("db exploded mid-scan")
+        return IngestReport(collection="ok", ingested=7)
+
+    with (
+        patch("scripts.core.documents.cli.ingest_collection", new=fake_ingest),
+        patch("scripts.core.documents.cli._build_embedder", return_value=object()),
+    ):
+        with pytest.raises(RuntimeError):
+            run(["scan", "--all"])
+    # The completed collection was reported before the crash propagated.
+    assert "[ok] ingested=7" in capsys.readouterr().out
+
+
+def test_run_query_rejects_over_limit() -> None:
+    # An MCP caller must not be able to request an unbounded full-content payload.
+    assert run(["query", "x", "--limit", "100000"]) == 1
+
+
+def test_run_query_rejects_nonpositive_limit() -> None:
+    assert run(["query", "x", "--limit", "0"]) == 1
+
+
+def test_run_query_allows_max_limit(capsys) -> None:
+    with (
+        patch(
+            "scripts.core.documents.cli.query_documents",
+            new=AsyncMock(return_value=[]),
+        ) as mock_query,
+        patch("scripts.core.documents.cli._build_embedder", return_value=object()),
+    ):
+        assert run(["query", "x", "--limit", "100", "--json"]) == 0
+    mock_query.assert_awaited_once()
+    assert json.loads(capsys.readouterr().out) == []

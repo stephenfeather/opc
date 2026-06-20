@@ -21,6 +21,7 @@ import dataclasses
 import json
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -51,6 +52,11 @@ from scripts.core.documents.registry import (  # noqa: E402
     load_registry,
     validate_collection,
 )
+
+# Hard ceiling on query results. --json emits full (untruncated) chunk content,
+# so an unbounded --limit from a machine caller could amplify one request into a
+# very large stdout payload. Cap it; callers asking for more get a clear error.
+MAX_QUERY_LIMIT = 100
 
 
 def _build_embedder() -> EmbeddingService:
@@ -148,24 +154,27 @@ def _cmd_create(args: argparse.Namespace) -> int:
 
 async def _scan_all(
     targets: list[Collection],
-) -> list[tuple[Collection, IngestReport | None, str | None]]:
+    on_result: Callable[[Collection, IngestReport | None, str | None], None],
+) -> None:
     # One event loop for the whole run: the asyncpg pool binds to the loop that
     # created it, so a separate asyncio.run() per collection would leave the
     # second collection acquiring dead connections ("event loop is closed").
     #
     # Failures are isolated per collection: a missing folder (FileNotFoundError)
     # on one target must not erase the already-committed results of collections
-    # scanned before it, and must not abort the remaining targets. Each result is
-    # (collection, report_or_None, error_or_None).
+    # scanned before it, and must not abort the remaining targets.
+    #
+    # on_result fires the instant each collection finishes, so the caller can
+    # flush completed reports BEFORE a later collection raises something other
+    # than FileNotFoundError (a DB error, SIGTERM, ...) — otherwise a hard
+    # failure deep in `scan --all` would erase the cron log of work already done.
     embedder = _build_embedder()
-    results: list[tuple[Collection, IngestReport | None, str | None]] = []
     for collection in targets:
         try:
             report = await ingest_collection(collection, embedder)
-            results.append((collection, report, None))
+            on_result(collection, report, None)
         except FileNotFoundError as exc:
-            results.append((collection, None, str(exc)))
-    return results
+            on_result(collection, None, str(exc))
 
 
 def _format_report(report) -> str:
@@ -195,7 +204,21 @@ def _cmd_scan(args: argparse.Namespace) -> int:
         if not targets:
             print(f"error: unknown collection '{args.name}'", file=sys.stderr)
             return 1
-    results = asyncio.run(_scan_all(targets))
+    results: list[tuple[Collection, IngestReport | None, str | None]] = []
+
+    def on_result(collection: Collection, report: IngestReport | None, error: str | None) -> None:
+        results.append((collection, report, error))
+        # Text/cron path: print each collection the moment it finishes so a later
+        # hard failure can't erase the log of work already done. JSON callers get
+        # one array at the end (a single-array contract can't be streamed
+        # incrementally; a mid-batch hard crash losing it is inherent to that).
+        if not args.json:
+            if error is not None:
+                print(f"error: [{collection.name}] {error}", file=sys.stderr)
+            else:
+                print(_format_report(report))
+
+    asyncio.run(_scan_all(targets, on_result))
     if args.json:
         payload = []
         for collection, report, error in results:
@@ -205,14 +228,7 @@ def _cmd_scan(args: argparse.Namespace) -> int:
                 assert report is not None  # invariant: error is None => report set
                 payload.append(dataclasses.asdict(report))
         print(json.dumps(payload))
-    else:
-        for collection, report, error in results:
-            if error is not None:
-                print(f"error: [{collection.name}] {error}", file=sys.stderr)
-            else:
-                print(_format_report(report))
-    # Nonzero if any collection failed, but only after every completed
-    # collection has been reported, so partial-success work stays observable.
+    # Nonzero if any collection failed (reported above as each finished).
     return 1 if any(error is not None for _, _, error in results) else 0
 
 
@@ -267,6 +283,14 @@ def _cmd_list(args: argparse.Namespace) -> int:
 
 
 def _cmd_query(args: argparse.Namespace) -> int:
+    # Validate before any work; errors go to stderr + exit 1 like every other
+    # subcommand, which is what the MCP wrapper keys off of (nonzero -> read stderr).
+    if args.limit < 1 or args.limit > MAX_QUERY_LIMIT:
+        print(
+            f"error: --limit must be between 1 and {MAX_QUERY_LIMIT}",
+            file=sys.stderr,
+        )
+        return 1
     embedder = _build_embedder()
     results = asyncio.run(
         query_documents(

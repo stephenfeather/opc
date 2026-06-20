@@ -97,12 +97,13 @@ packages = ["src/runtime"]
 line-length = 100
 target-version = ["py313"]
 
-force-exclude =
+force-exclude = '''
 (
   ^/scripts/core/config/core\.py
   | ^/scripts/core/config/handlers\.py
   | ^/scripts/core/config/models\.py
 )
+'''
 
 [tool.mypy]
 python_version = "3.13"

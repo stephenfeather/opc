@@ -11,6 +11,8 @@ import logging
 import time
 from pathlib import Path
 
+from scripts.core.log_safety import safe, safe_exception
+
 logger = logging.getLogger("memory-daemon")
 
 
@@ -73,7 +75,7 @@ def pg_connect(max_retries: int = 3, base_delay: float = 2.0):
                     attempt + 1,
                     max_retries,
                     delay,
-                    e,
+                    safe_exception(e),
                 )
                 time.sleep(delay)
     raise last_error
@@ -616,7 +618,9 @@ def count_session_learnings(session_id: str) -> int | None:
         conn.close()
         return count
     except Exception as e:
-        logger.warning("count_session_learnings failed for %s: %s", session_id, e)
+        logger.warning(
+            "count_session_learnings failed for %s: %s", safe(session_id), safe_exception(e)
+        )
         return None
 
 
@@ -637,5 +641,5 @@ def seed_last_pattern_run() -> float:
         if row and row[0]:
             return row[0].timestamp()
     except Exception as e:
-        logger.warning("seed_last_pattern_run failed: %s", e)
+        logger.warning("seed_last_pattern_run failed: %s", safe_exception(e))
     return 0

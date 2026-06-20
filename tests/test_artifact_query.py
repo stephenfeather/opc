@@ -36,7 +36,7 @@ from scripts.core.artifact_query import (
     is_safe_artifact_path,
     is_safe_dir_root,
     is_safe_session_name,
-    read_text_nofollow,
+    read_text_within_root,
     safe_artifact_read_path,
     save_query,
     search_continuity,
@@ -75,10 +75,17 @@ def populated_db(db_conn):
             what_failed, key_decisions, outcome, root_span_id, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            "h1", "auth-session", 1,
+            "h1",
+            "auth-session",
+            1,
             "thoughts/shared/handoffs/auth-session/task-1.yaml",
-            "Implement OAuth login flow", "Token refresh worked",
-            None, None, "SUCCEEDED", "span-abc123", "2026-01-01T00:00:00",
+            "Implement OAuth login flow",
+            "Token refresh worked",
+            None,
+            None,
+            "SUCCEEDED",
+            "span-abc123",
+            "2026-01-01T00:00:00",
         ),
     )
     db_conn.execute(
@@ -87,11 +94,17 @@ def populated_db(db_conn):
             what_failed, key_decisions, outcome, root_span_id, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            "h2", "debug-session", 2,
+            "h2",
+            "debug-session",
+            2,
             "thoughts/shared/handoffs/debug-session/task-2.yaml",
-            "Fix database connection timeout", None,
-            "Connection pool exhausted", None, "FAILED",
-            "span-def456", "2026-01-02T00:00:00",
+            "Fix database connection timeout",
+            None,
+            "Connection pool exhausted",
+            None,
+            "FAILED",
+            "span-def456",
+            "2026-01-02T00:00:00",
         ),
     )
 
@@ -101,8 +114,12 @@ def populated_db(db_conn):
            (id, title, overview, approach, file_path, created_at)
            VALUES (?, ?, ?, ?, ?, ?)""",
         (
-            "p1", "Auth Redesign", "Redesign authentication system",
-            "Use JWT with refresh tokens", "plans/auth.md", "2026-01-01",
+            "p1",
+            "Auth Redesign",
+            "Redesign authentication system",
+            "Use JWT with refresh tokens",
+            "plans/auth.md",
+            "2026-01-01",
         ),
     )
 
@@ -113,9 +130,15 @@ def populated_db(db_conn):
             state_done, state_now, state_next, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            "c1", "auth-session", "Complete OAuth implementation",
-            "JWT tokens work well", "Use refresh tokens",
-            "Setup done", "In progress", "Deploy", "2026-01-01",
+            "c1",
+            "auth-session",
+            "Complete OAuth implementation",
+            "JWT tokens work well",
+            "Use refresh tokens",
+            "Setup done",
+            "In progress",
+            "Deploy",
+            "2026-01-01",
         ),
     )
 
@@ -165,11 +188,13 @@ class TestGetDbPath:
 
     def test_default_path(self):
         from pathlib import Path
+
         result = get_db_path(None)
         assert result == Path(".claude/cache/artifact-index/context.db")
 
     def test_custom_path(self):
         from pathlib import Path
+
         result = get_db_path("/tmp/test.db")
         assert result == Path("/tmp/test.db")
 
@@ -215,40 +240,59 @@ class TestFormatHandoffs:
     """Tests for _format_handoffs — pure function."""
 
     def test_formats_with_status_icon(self):
-        items = [{
-            "outcome": "SUCCEEDED", "session_name": "sess1",
-            "task_number": 1, "task_summary": "Did stuff",
-            "file_path": "path/to/file",
-        }]
+        items = [
+            {
+                "outcome": "SUCCEEDED",
+                "session_name": "sess1",
+                "task_number": 1,
+                "task_summary": "Did stuff",
+                "file_path": "path/to/file",
+            }
+        ]
         result = _format_handoffs(items)
         assert "## Relevant Handoffs" in result
         assert "v" in result  # STATUS_ICONS["SUCCEEDED"]
         assert "sess1/task-1" in result
 
     def test_includes_what_worked_and_failed(self):
-        items = [{
-            "outcome": "FAILED", "session_name": "s",
-            "task_number": 1, "task_summary": "x",
-            "what_worked": "caching", "what_failed": "timeout",
-            "file_path": "f",
-        }]
+        items = [
+            {
+                "outcome": "FAILED",
+                "session_name": "s",
+                "task_number": 1,
+                "task_summary": "x",
+                "what_worked": "caching",
+                "what_failed": "timeout",
+                "file_path": "f",
+            }
+        ]
         result = _format_handoffs(items)
         assert "**What worked:** caching" in result
         assert "**What failed:** timeout" in result
 
     def test_unknown_outcome_shows_question_mark(self):
-        items = [{
-            "outcome": "WEIRD", "session_name": "s",
-            "task_number": 1, "task_summary": "x", "file_path": "f",
-        }]
+        items = [
+            {
+                "outcome": "WEIRD",
+                "session_name": "s",
+                "task_number": 1,
+                "task_summary": "x",
+                "file_path": "f",
+            }
+        ]
         result = _format_handoffs(items)
         assert "? s/task-1" in result
 
     def test_missing_optional_fields(self):
-        items = [{
-            "outcome": "SUCCEEDED", "session_name": "s",
-            "task_number": 1, "task_summary": "x", "file_path": "f",
-        }]
+        items = [
+            {
+                "outcome": "SUCCEEDED",
+                "session_name": "s",
+                "task_number": 1,
+                "task_summary": "x",
+                "file_path": "f",
+            }
+        ]
         result = _format_handoffs(items)
         assert "What worked" not in result
         assert "What failed" not in result
@@ -274,10 +318,13 @@ class TestFormatContinuity:
     """Tests for _format_continuity — pure function."""
 
     def test_formats_session(self):
-        items = [{
-            "session_name": "my-session", "goal": "Build feature",
-            "key_learnings": "Learned stuff",
-        }]
+        items = [
+            {
+                "session_name": "my-session",
+                "goal": "Build feature",
+                "key_learnings": "Learned stuff",
+            }
+        ]
         result = _format_continuity(items)
         assert "## Related Sessions" in result
         assert "### Session: my-session" in result
@@ -324,10 +371,15 @@ class TestFormatResults:
 
     def test_formats_handoffs_section(self):
         results = {
-            "handoffs": [{
-                "outcome": "SUCCEEDED", "session_name": "s",
-                "task_number": 1, "task_summary": "summary", "file_path": "f",
-            }],
+            "handoffs": [
+                {
+                    "outcome": "SUCCEEDED",
+                    "session_name": "s",
+                    "task_number": 1,
+                    "task_summary": "summary",
+                    "file_path": "f",
+                }
+            ],
         }
         result = format_results(results)
         assert "## Relevant Handoffs" in result
@@ -440,10 +492,15 @@ class TestGetHandoffBySpanId:
                 outcome, what_worked, root_span_id, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                "h3", "auth-session", 3,
+                "h3",
+                "auth-session",
+                3,
                 "thoughts/shared/handoffs/auth-session/task-3.yaml",
-                "Follow-up task", "SUCCEEDED", "All good",
-                "span-abc123", "2026-01-05T00:00:00",
+                "Follow-up task",
+                "SUCCEEDED",
+                "All good",
+                "span-abc123",
+                "2026-01-05T00:00:00",
             ),
         )
         populated_db.commit()
@@ -463,8 +520,14 @@ class TestGetHandoffBySpanId:
                 outcome, root_span_id, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                "h4", "auth-session", 4, "f4", "Newer task",
-                "SUCCEEDED", "span-abc123", "2026-01-10 12:00:00",
+                "h4",
+                "auth-session",
+                4,
+                "f4",
+                "Newer task",
+                "SUCCEEDED",
+                "span-abc123",
+                "2026-01-10 12:00:00",
             ),
         )
         populated_db.commit()
@@ -624,9 +687,7 @@ class TestHandleSpanIdLookup:
 
     def test_with_content_missing_file_preserves_key_decisions(self, populated_db):
         """Regression: key_decisions available even when file is missing."""
-        populated_db.execute(
-            "UPDATE handoffs SET key_decisions = 'Use JWT' WHERE id = 'h1'"
-        )
+        populated_db.execute("UPDATE handoffs SET key_decisions = 'Use JWT' WHERE id = 'h1'")
         populated_db.commit()
 
         result = handle_span_id_lookup(populated_db, "span-abc123", with_content=True)
@@ -673,9 +734,17 @@ class TestMain:
         file_conn.commit()
         file_conn.close()
 
-        with patch("sys.argv", [
-            "artifact_query.py", "--by-span-id", "span-x", "--json", "--db", str(db_file),
-        ]):
+        with patch(
+            "sys.argv",
+            [
+                "artifact_query.py",
+                "--by-span-id",
+                "span-x",
+                "--json",
+                "--db",
+                str(db_file),
+            ],
+        ):
             main()
 
         captured = capsys.readouterr()
@@ -692,9 +761,17 @@ class TestMain:
         file_conn.commit()
         file_conn.close()
 
-        with patch("sys.argv", [
-            "artifact_query.py", "test", "query", "--json", "--db", str(db_file),
-        ]):
+        with patch(
+            "sys.argv",
+            [
+                "artifact_query.py",
+                "test",
+                "query",
+                "--json",
+                "--db",
+                str(db_file),
+            ],
+        ):
             main()
 
         captured = capsys.readouterr()
@@ -704,9 +781,15 @@ class TestMain:
     def test_missing_db_prints_error(self, capsys, tmp_path):
         from scripts.core.artifact_query import main
 
-        with patch("sys.argv", [
-            "artifact_query.py", "query", "--db", str(tmp_path / "nonexistent.db"),
-        ]):
+        with patch(
+            "sys.argv",
+            [
+                "artifact_query.py",
+                "query",
+                "--db",
+                str(tmp_path / "nonexistent.db"),
+            ],
+        ):
             main()
 
         captured = capsys.readouterr()
@@ -775,16 +858,12 @@ class TestSafeArtifactReadPath:
     def test_returns_none_for_outside_dir(self, tmp_path):
         outside = tmp_path.parent / "outside.md"
         outside.write_text("x")
-        assert (
-            safe_artifact_read_path(outside, tmp_path, suffixes=self._SUFFIXES) is None
-        )
+        assert safe_artifact_read_path(outside, tmp_path, suffixes=self._SUFFIXES) is None
 
     def test_returns_none_for_wrong_suffix(self, tmp_path):
         target = tmp_path / "task-1.txt"
         target.write_text("x")
-        assert (
-            safe_artifact_read_path(target, tmp_path, suffixes=self._SUFFIXES) is None
-        )
+        assert safe_artifact_read_path(target, tmp_path, suffixes=self._SUFFIXES) is None
 
     def test_returns_none_for_escaping_symlink(self, tmp_path):
         outside_dir = tmp_path.parent / "outside_secret_dir2"
@@ -798,13 +877,27 @@ class TestSafeArtifactReadPath:
         assert safe_artifact_read_path(link, root, suffixes=self._SUFFIXES) is None
 
 
-class TestReadTextNofollow:
-    """Tests for read_text_nofollow — no-follow, no-TOCTOU I/O helper."""
+class TestReadTextWithinRoot:
+    """Tests for read_text_within_root — openat-traversal, no-TOCTOU reader.
+
+    Each path component below the trusted ``root`` is opened with ``O_NOFOLLOW``
+    relative to its already-opened parent dirfd, so no intermediate directory can
+    be swapped for a symlink after the containment check (the issue #166 TOCTOU).
+    """
+
+    _SUFFIXES = (".md", ".yaml", ".yml")
 
     def test_reads_regular_file(self, tmp_path):
         target = tmp_path / "file.md"
         target.write_text("hello content")
-        assert read_text_nofollow(target) == "hello content"
+        assert read_text_within_root(tmp_path, target, suffixes=self._SUFFIXES) == "hello content"
+
+    def test_reads_nested_regular_file(self, tmp_path):
+        nested = tmp_path / "thoughts" / "shared" / "handoffs" / "auth-session"
+        nested.mkdir(parents=True)
+        target = nested / "file.md"
+        target.write_text("nested content")
+        assert read_text_within_root(tmp_path, target, suffixes=self._SUFFIXES) == "nested content"
 
     def test_symlink_final_component_returns_none(self, tmp_path):
         real = tmp_path / "real.md"
@@ -812,15 +905,135 @@ class TestReadTextNofollow:
         link = tmp_path / "link.md"
         link.symlink_to(real)
         # O_NOFOLLOW must refuse the symlinked final component.
-        assert read_text_nofollow(link) is None
+        assert read_text_within_root(tmp_path, link, suffixes=self._SUFFIXES) is None
+
+    def test_symlinked_intermediate_dir_returns_none(self, tmp_path):
+        """The #166 fix: an intermediate directory that is a symlink is refused.
+
+        ``evil/file.md`` is a regular file under the root with a valid suffix, so
+        the resolve-based policy check passes. But it is reached through ``inter``,
+        a symlinked directory — exactly the intermediate component an attacker
+        could swap in after the containment check. The per-component O_NOFOLLOW
+        walk must refuse it rather than follow the link to the file's contents.
+        """
+        evil = tmp_path / "evil"
+        evil.mkdir()
+        (evil / "file.md").write_text("EVIL")
+        inter = tmp_path / "inter"
+        inter.symlink_to(evil, target_is_directory=True)
+        candidate = inter / "file.md"
+        assert read_text_within_root(tmp_path, candidate, suffixes=self._SUFFIXES) is None
 
     def test_directory_returns_none(self, tmp_path):
-        d = tmp_path / "adir"
+        d = tmp_path / "adir.md"
         d.mkdir()
-        assert read_text_nofollow(d) is None
+        assert read_text_within_root(tmp_path, d, suffixes=self._SUFFIXES) is None
 
     def test_missing_path_returns_none(self, tmp_path):
-        assert read_text_nofollow(tmp_path / "nope.md") is None
+        assert (
+            read_text_within_root(tmp_path, tmp_path / "nope.md", suffixes=self._SUFFIXES) is None
+        )
+
+    def test_path_outside_root_returns_none(self, tmp_path):
+        root = tmp_path / "root"
+        root.mkdir()
+        outside = tmp_path / "outside.md"
+        outside.write_text("secret")
+        assert read_text_within_root(root, outside, suffixes=self._SUFFIXES) is None
+
+    def test_wrong_suffix_returns_none(self, tmp_path):
+        target = tmp_path / "file.txt"
+        target.write_text("secret")
+        assert read_text_within_root(tmp_path, target, suffixes=self._SUFFIXES) is None
+
+    def test_root_itself_returns_none(self, tmp_path):
+        # Candidate resolving to root (no components below it) is not a readable file.
+        assert read_text_within_root(tmp_path, tmp_path, suffixes=self._SUFFIXES) is None
+
+    def test_lexical_dotdot_component_returns_none(self, tmp_path):
+        """A ``..`` component is refused even when it resolves back inside root.
+
+        ``sub/../file.md`` resolves to ``root/file.md`` (inside root, valid suffix),
+        so the resolve-based policy passes — but the lexical path still carries a
+        ``..`` the openat walk cannot traverse safely, so the function fails closed
+        rather than feed ``..`` to an ``openat`` against a dirfd.
+        """
+        (tmp_path / "file.md").write_text("data")
+        (tmp_path / "sub").mkdir()
+        candidate = tmp_path / "sub" / ".." / "file.md"
+        assert read_text_within_root(tmp_path, candidate, suffixes=self._SUFFIXES) is None
+
+    def test_reads_with_explicit_anchor_above_root(self, tmp_path):
+        """With an anchor above root, a clean (no-symlink) path still reads."""
+        root = tmp_path / "thoughts" / "shared" / "handoffs"
+        root.mkdir(parents=True)
+        target = root / "x.md"
+        target.write_text("legit")
+        result = read_text_within_root(root, target, suffixes=self._SUFFIXES, anchor=tmp_path)
+        assert result == "legit"
+
+    def test_symlinked_parent_of_root_returns_none(self, tmp_path):
+        """A symlinked component in root's OWN path is refused via a higher anchor.
+
+        Mirrors ``handle_span_id_lookup`` passing ``anchor=repo_root``: ``shared``
+        is a symlink along the containment root's path, so even though the
+        candidate resolves inside ``root.resolve()`` (policy passes), the
+        fd-relative walk from the anchor traverses ``thoughts/shared`` under
+        ``O_NOFOLLOW`` and refuses the swapped parent — closing the TOCTOU the
+        plain pathname open of ``root`` would otherwise leave (review #166).
+        """
+        real_shared = tmp_path / "realshared"
+        (real_shared / "handoffs").mkdir(parents=True)
+        (real_shared / "handoffs" / "x.md").write_text("SECRET")
+        thoughts = tmp_path / "thoughts"
+        thoughts.mkdir()
+        (thoughts / "shared").symlink_to(real_shared, target_is_directory=True)
+        root = tmp_path / "thoughts" / "shared" / "handoffs"
+        candidate = root / "x.md"
+        assert (
+            read_text_within_root(root, candidate, suffixes=self._SUFFIXES, anchor=tmp_path) is None
+        )
+
+    def test_inode_mismatch_returns_none(self, tmp_path, monkeypatch):
+        """The opened leaf must be the exact inode that passed policy.
+
+        Simulates a non-symlink swap that O_NOFOLLOW cannot catch: policy
+        authorizes ``decoy.md`` (its inode), but the lexical path actually opened
+        resolves to a different same-suffix file ``actual.md``. The (device,
+        inode) binding must refuse the mismatched read (review #166 round 2).
+        """
+        import scripts.core.artifact_query as aq
+
+        decoy = tmp_path / "decoy.md"
+        decoy.write_text("AUTHORIZED")
+        actual = tmp_path / "actual.md"
+        actual.write_text("SWAPPED")
+        monkeypatch.setattr(aq, "safe_artifact_read_path", lambda *a, **k: decoy)
+        assert aq.read_text_within_root(tmp_path, actual, suffixes=self._SUFFIXES) is None
+
+    def test_undecodable_content_returns_none(self, tmp_path):
+        """A decode error on the read path returns None without fd mishandling.
+
+        Exercises the fdopen-owned read-error branch (the leaf fd is owned by the
+        context manager, not double-closed by the function).
+        """
+        target = tmp_path / "bad.md"
+        target.write_bytes(b"\xff\xfe not valid utf-8 \xff")
+        assert read_text_within_root(tmp_path, target, suffixes=self._SUFFIXES) is None
+
+    def test_hardlinked_file_returns_none(self, tmp_path):
+        """A multi-link regular file is refused (hardlink-aliasing defense).
+
+        ``alias.md`` is a hardlink to ``secret.txt``; both share one inode with
+        ``st_nlink == 2``. The path/suffix policy and the inode binding both pass
+        (the hardlink IS the authorized inode), so only the link-count check
+        refuses it — closing the hardlink bypass from review #166 round 3.
+        """
+        secret = tmp_path / "secret.txt"
+        secret.write_text("SECRET")
+        alias = tmp_path / "alias.md"
+        alias.hardlink_to(secret)
+        assert read_text_within_root(tmp_path, alias, suffixes=self._SUFFIXES) is None
 
 
 class TestIsSafeDirRoot:
@@ -900,9 +1113,7 @@ def _make_handoff_file(tmp_path: Path, name: str, content: str) -> str:
 class TestHandleSpanIdLookupPathTraversal:
     """Tests for handle_span_id_lookup path-traversal hardening."""
 
-    def test_absolute_path_outside_cwd_not_read(
-        self, populated_db, tmp_path, monkeypatch
-    ):
+    def test_absolute_path_outside_cwd_not_read(self, populated_db, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         secret = tmp_path.parent / "secret_outside.txt"
         secret.write_text("SECRET")
@@ -966,9 +1177,7 @@ class TestHandleSpanIdLookupPathTraversal:
         assert result is not None
         assert "content" not in result
 
-    def test_settings_local_under_cwd_not_read(
-        self, populated_db, tmp_path, monkeypatch
-    ):
+    def test_settings_local_under_cwd_not_read(self, populated_db, tmp_path, monkeypatch):
         """Poisoned row pointing at .claude/settings.local.json must not be read."""
         monkeypatch.chdir(tmp_path)
         settings = tmp_path / ".claude" / "settings.local.json"
@@ -984,9 +1193,7 @@ class TestHandleSpanIdLookupPathTraversal:
         assert result is not None
         assert "content" not in result
 
-    def test_md_file_outside_handoffs_dir_not_read(
-        self, populated_db, tmp_path, monkeypatch
-    ):
+    def test_md_file_outside_handoffs_dir_not_read(self, populated_db, tmp_path, monkeypatch):
         """A .md file under cwd but outside handoffs dir proves the dir constraint."""
         monkeypatch.chdir(tmp_path)
         (tmp_path / "README.md").write_text("# secret readme")
@@ -1000,9 +1207,7 @@ class TestHandleSpanIdLookupPathTraversal:
         assert result is not None
         assert "content" not in result
 
-    def test_disallowed_suffix_in_handoffs_dir_not_read(
-        self, populated_db, tmp_path, monkeypatch
-    ):
+    def test_disallowed_suffix_in_handoffs_dir_not_read(self, populated_db, tmp_path, monkeypatch):
         """A non-allowlisted suffix even inside handoffs dir is rejected."""
         monkeypatch.chdir(tmp_path)
         rel = _make_handoff_file(tmp_path, "task-1.txt", "secret txt")
@@ -1016,9 +1221,7 @@ class TestHandleSpanIdLookupPathTraversal:
         assert result is not None
         assert "content" not in result
 
-    def test_symlinked_handoffs_root_skips_content(
-        self, populated_db, tmp_path, monkeypatch
-    ):
+    def test_symlinked_handoffs_root_skips_content(self, populated_db, tmp_path, monkeypatch):
         """If thoughts/shared/handoffs is a symlink, content enrichment is skipped
         even when file_path resolves under the symlink target."""
         monkeypatch.chdir(tmp_path)
@@ -1027,9 +1230,7 @@ class TestHandleSpanIdLookupPathTraversal:
         (real / "task-1.yaml").write_text("symlink-target content")
         shared = tmp_path / "thoughts" / "shared"
         shared.mkdir(parents=True)
-        (shared / "handoffs").symlink_to(
-            tmp_path / "real_handoffs", target_is_directory=True
-        )
+        (shared / "handoffs").symlink_to(tmp_path / "real_handoffs", target_is_directory=True)
         populated_db.execute(
             "UPDATE handoffs SET file_path = ? WHERE id = 'h1'",
             ("thoughts/shared/handoffs/auth-session/task-1.yaml",),
@@ -1040,9 +1241,7 @@ class TestHandleSpanIdLookupPathTraversal:
         assert result is not None
         assert "content" not in result
 
-    def test_unsafe_session_name_skips_ledger(
-        self, populated_db, tmp_path, monkeypatch
-    ):
+    def test_unsafe_session_name_skips_ledger(self, populated_db, tmp_path, monkeypatch):
         # Poison the session_name with traversal; legit handoff file under handoffs dir.
         monkeypatch.chdir(tmp_path)
         rel = _make_handoff_file(tmp_path, "task-1.yaml", "legit content")
@@ -1057,9 +1256,7 @@ class TestHandleSpanIdLookupPathTraversal:
         assert result["content"] == "legit content"
         assert "ledger" not in result
 
-    def test_legit_md_under_handoffs_returns_content(
-        self, populated_db, tmp_path, monkeypatch
-    ):
+    def test_legit_md_under_handoffs_returns_content(self, populated_db, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         rel = _make_handoff_file(tmp_path, "task-01.md", "happy path content")
         populated_db.execute(
@@ -1072,9 +1269,7 @@ class TestHandleSpanIdLookupPathTraversal:
         assert result is not None
         assert result["content"] == "happy path content"
 
-    def test_legit_yaml_under_handoffs_returns_content(
-        self, populated_db, tmp_path, monkeypatch
-    ):
+    def test_legit_yaml_under_handoffs_returns_content(self, populated_db, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         rel = _make_handoff_file(tmp_path, "task-1.yaml", "yaml content")
         populated_db.execute(
@@ -1087,9 +1282,7 @@ class TestHandleSpanIdLookupPathTraversal:
         assert result is not None
         assert result["content"] == "yaml content"
 
-    def test_legit_yml_under_handoffs_returns_content(
-        self, populated_db, tmp_path, monkeypatch
-    ):
+    def test_legit_yml_under_handoffs_returns_content(self, populated_db, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         rel = _make_handoff_file(tmp_path, "task-1.yml", "yml content")
         populated_db.execute(
@@ -1102,9 +1295,7 @@ class TestHandleSpanIdLookupPathTraversal:
         assert result is not None
         assert result["content"] == "yml content"
 
-    def test_legit_ledger_under_cwd_returned(
-        self, populated_db, tmp_path, monkeypatch
-    ):
+    def test_legit_ledger_under_cwd_returned(self, populated_db, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         rel = _make_handoff_file(tmp_path, "task-1.yaml", "handoff content")
         ledger_file = tmp_path / "CONTINUITY_CLAUDE-auth-session.md"
@@ -1118,6 +1309,32 @@ class TestHandleSpanIdLookupPathTraversal:
         result = handle_span_id_lookup(populated_db, "span-abc123", with_content=True)
         assert result is not None
         assert result["ledger"]["content"] == "ledger content"
+
+    def test_hardlinked_secret_in_handoffs_not_read(self, populated_db, tmp_path, monkeypatch):
+        """A secret hardlinked into an allowed handoffs path is not disclosed.
+
+        The attacker hardlinks an out-of-policy secret to an allowed ``.yaml``
+        path under ``thoughts/shared/handoffs`` and poisons the DB row to it. The
+        path/suffix policy and the inode binding both pass (the hardlink shares
+        the secret's inode), so the link-count check is what fails closed and
+        keeps ``content`` out of the result (review #166 round 3).
+        """
+        monkeypatch.chdir(tmp_path)
+        secret = tmp_path / "secret.env"
+        secret.write_text("SECRET_TOKEN=abc123")
+        handoffs_dir = tmp_path / "thoughts" / "shared" / "handoffs" / "auth-session"
+        handoffs_dir.mkdir(parents=True)
+        alias = handoffs_dir / "task-1.yaml"
+        alias.hardlink_to(secret)
+        populated_db.execute(
+            "UPDATE handoffs SET file_path = ? WHERE id = 'h1'",
+            ("thoughts/shared/handoffs/auth-session/task-1.yaml",),
+        )
+        populated_db.commit()
+
+        result = handle_span_id_lookup(populated_db, "span-abc123", with_content=True)
+        assert result is not None
+        assert "content" not in result
 
 
 # ===========================================================================
@@ -1195,9 +1412,7 @@ class TestSaveQueryUuid7:
 
     def test_stores_36_char_id(self, populated_db):
         save_query(populated_db, "uuid question", "answer", {})
-        cursor = populated_db.execute(
-            "SELECT id FROM queries WHERE question = 'uuid question'"
-        )
+        cursor = populated_db.execute("SELECT id FROM queries WHERE question = 'uuid question'")
         row = cursor.fetchone()
         assert row is not None
         assert len(row[0]) == 36
@@ -1209,9 +1424,7 @@ class TestSaveQueryUuid7:
         now = datetime(2026, 1, 1, 12, 0, 0)
         save_query(populated_db, "dup question", "a", {}, now=now)
         save_query(populated_db, "dup question", "a", {}, now=now)
-        cursor = populated_db.execute(
-            "SELECT id FROM queries WHERE question = 'dup question'"
-        )
+        cursor = populated_db.execute("SELECT id FROM queries WHERE question = 'dup question'")
         ids = [r[0] for r in cursor.fetchall()]
         assert len(ids) == 2
         assert ids[0] != ids[1]

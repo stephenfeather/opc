@@ -31,6 +31,10 @@ DEFAULT_MIN_RECALL = 10
 DEFAULT_SIMILARITY_THRESHOLD = 0.90
 DEFAULT_EF_SEARCH = 40
 DEFAULT_MERGE_LIMIT = 200
+# Top-k nearest neighbors examined per row before collapsing to canonical pairs.
+# k=1 silently drops real near-dup pairs in clustered data; a small k recovers them
+# without materially changing scan cost (the HNSW probe dominates, not the LIMIT).
+DEFAULT_MERGE_NEIGHBORS = 5
 # The merge scan runs one HNSW probe per active learning, so it grows with project
 # size and is the only slow detector. Bound it under the pool's 60s command_timeout
 # so a large project degrades to "scan skipped" instead of crashing the whole review.
@@ -183,29 +187,62 @@ _PROMOTION_SQL = """
     ORDER BY recall_count DESC
 """
 
+# Near-duplicate detection. Two correctness guards:
+#   1. Single embedding space — cosine across different embedding_models is
+#      meaningless (a partial re-embed leaves mixed BGE/Voyage rows). Scope to the
+#      project's dominant model so every comparison is within one space, matching
+#      how recall already filters by embedding_model.
+#   2. Canonical unordered pairs — take the top-k nearest neighbors per row, then
+#      collapse to one row per {LEAST,GREATEST} id pair. A naive single-NN +
+#      "a.id < nn.id" filter drops real pairs (A's NN is C while B's NN is A is
+#      silently lost). Top-k + DISTINCT ON recovers them.
 _MERGE_SQL = """
-    WITH scoped AS (
+    WITH active_model AS (
+        SELECT embedding_model
+        FROM archival_memory
+        WHERE LOWER(project) = LOWER($1)
+          AND superseded_by IS NULL
+          AND embedding IS NOT NULL
+        GROUP BY embedding_model
+        ORDER BY COUNT(*) DESC
+        LIMIT 1
+    ),
+    scoped AS (
         SELECT id, content, embedding
         FROM archival_memory
         WHERE LOWER(project) = LOWER($1)
           AND superseded_by IS NULL
           AND embedding IS NOT NULL
+          AND embedding_model = (SELECT embedding_model FROM active_model)
+    ),
+    pairs AS (
+        SELECT LEAST(a.id, nn.id) AS lo,
+               GREATEST(a.id, nn.id) AS hi,
+               (1 - (a.embedding <=> nn.embedding))::float AS similarity,
+               LEFT(a.content, 90) AS preview_lo,
+               LEFT(nn.content, 90) AS preview_hi
+        FROM scoped a
+        CROSS JOIN LATERAL (
+            SELECT b.id, b.content, b.embedding
+            FROM scoped b
+            WHERE b.id <> a.id
+            ORDER BY a.embedding <=> b.embedding
+            LIMIT $4
+        ) nn
+        WHERE (1 - (a.embedding <=> nn.embedding)) >= $2
+    ),
+    canonical AS (
+        SELECT DISTINCT ON (lo, hi)
+               lo, hi, similarity, preview_lo, preview_hi
+        FROM pairs
+        ORDER BY lo, hi, similarity DESC
     )
-    SELECT a.id::text AS id_a,
-           nn.id::text AS id_b,
-           (1 - (a.embedding <=> nn.embedding))::float AS similarity,
-           LEFT(a.content, 90) AS preview_a,
-           LEFT(nn.content, 90) AS preview_b
-    FROM scoped a
-    CROSS JOIN LATERAL (
-        SELECT b.id, b.content, b.embedding
-        FROM scoped b
-        WHERE b.id <> a.id
-        ORDER BY a.embedding <=> b.embedding
-        LIMIT 1
-    ) nn
-    WHERE a.id < nn.id
-      AND (1 - (a.embedding <=> nn.embedding)) >= $2
+    SELECT lo::text AS id_a,
+           hi::text AS id_b,
+           similarity,
+           preview_lo AS preview_a,
+           preview_hi AS preview_b
+    FROM canonical
     ORDER BY similarity DESC
     LIMIT $3
 """
@@ -284,16 +321,19 @@ async def fetch_merge_candidates(
     threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
     ef_search: int = DEFAULT_EF_SEARCH,
     limit: int = DEFAULT_MERGE_LIMIT,
+    neighbors: int = DEFAULT_MERGE_NEIGHBORS,
     timeout: float | None = None,
 ) -> list[MergeCandidate]:
     # ef_search is a session GUC that cannot be parameterized; coerce to int so a
-    # caller-supplied value can never carry SQL. threshold/limit go as bind params.
-    # SET LOCAL must run inside a transaction or it is a no-op; the transaction also
-    # scopes ef_search to this query so it never leaks to the pooled connection.
+    # caller-supplied value can never carry SQL. threshold/limit/neighbors go as bind
+    # params. SET LOCAL must run inside a transaction or it is a no-op; the transaction
+    # also scopes ef_search to this query so it never leaks to the pooled connection.
     safe_ef = int(ef_search)
     async with pool.acquire() as conn, conn.transaction():
         await conn.execute(f"SET LOCAL hnsw.ef_search = {safe_ef}")
-        rows = await conn.fetch(_MERGE_SQL, project, float(threshold), int(limit), timeout=timeout)
+        rows = await conn.fetch(
+            _MERGE_SQL, project, float(threshold), int(limit), int(neighbors), timeout=timeout
+        )
     return [
         MergeCandidate(
             id_a=r["id_a"],

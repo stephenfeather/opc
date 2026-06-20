@@ -210,6 +210,29 @@ class TestFetchMergeCandidates:
         assert any("hnsw.ef_search" in s for s in executed)
         assert any("40" in s for s in executed)
 
+    async def test_neighbors_passed_as_bound_param(self):
+        pool, conn = _pool_returning([])
+        await fetch_merge_candidates(pool, "opc", 0.90, neighbors=7)
+        args = conn.fetch.call_args.args
+        assert 7 in args  # top-k neighbors bound, not interpolated
+
+    def test_merge_sql_scopes_to_single_embedding_model(self):
+        # Cross-model cosine is meaningless; the scan must restrict to one space.
+        from scripts.core.memory_review import _MERGE_SQL
+
+        assert "embedding_model" in _MERGE_SQL
+        assert "active_model" in _MERGE_SQL
+
+    def test_merge_sql_canonicalizes_pairs_not_directed_filter(self):
+        # The buggy "a.id < nn.id" directed filter drops real pairs; the fix uses
+        # LEAST/GREATEST canonicalization with DISTINCT ON.
+        from scripts.core.memory_review import _MERGE_SQL
+
+        assert "LEAST" in _MERGE_SQL
+        assert "GREATEST" in _MERGE_SQL
+        assert "DISTINCT ON" in _MERGE_SQL
+        assert "a.id < nn.id" not in _MERGE_SQL
+
 
 class TestFetchStaleSummary:
     async def test_returns_buckets_and_open_thread_count(self):

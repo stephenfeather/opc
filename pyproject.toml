@@ -1,6 +1,6 @@
 [project]
 name = "mcp-execution"
-version = "0.7.8"
+version = "0.8.0"
 description = "Python implementation of Anthropic's 'Code Execution with MCP' enhanced with Skills system (99.6% token reduction), multi-transport support (stdio/SSE/HTTP), and optional container sandboxing"
 authors = []
 requires-python = ">=3.13"
@@ -35,6 +35,9 @@ dependencies = [
     "redis>=7.1.0",
     "sentence-transformers>=5.2.0",
     "torch>=2.9.1",
+    "pypdf>=5.1.0",
+    "python-docx>=1.1.2",
+    "pyyaml>=6.0.2",
 ]
 
 [project.optional-dependencies]

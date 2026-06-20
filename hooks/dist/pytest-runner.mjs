@@ -50,7 +50,10 @@ async function main() {
       cwd: projectDir,
       timeout: 12e4,
       encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"]
+      stdio: ["pipe", "pipe", "pipe"],
+      // UV_FROZEN=1: a hook-triggered `uv run pytest` must not re-resolve/rewrite
+      // the project's uv.lock as a side effect (issue #71 follow-up).
+      env: { ...process.env, UV_FROZEN: "1" }
     });
     const lines = result.trim().split("\n");
     const summaryLine = lines.find(

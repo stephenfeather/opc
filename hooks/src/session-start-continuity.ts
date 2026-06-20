@@ -378,11 +378,16 @@ function ensureMemoryDaemon(): string | null {
   const opcCwd = path.dirname(path.dirname(path.dirname(daemonScript))); // up to opc/
 
   try {
-    // uv run ... start will double-fork and return immediately
+    // uv run ... start will double-fork and return immediately.
+    // UV_FROZEN=1: never re-resolve/rewrite opc's uv.lock as a side effect of
+    // launching the daemon (issue #71 follow-up). With unpinned `>=` deps, an
+    // unfrozen `uv run` snaps the lock to the newest releases, leaving it
+    // perpetually dirty/uncommitted. Intentional updates still use `uv lock`.
     const child = spawn('uv', ['run', daemonScript, 'start'], {
       cwd: opcCwd,
       stdio: 'ignore',
       detached: true,
+      env: { ...process.env, UV_FROZEN: '1' },
     });
     child.unref();
     return 'Memory daemon: Started';

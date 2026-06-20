@@ -41,6 +41,8 @@ from pathlib import Path
 import asyncpg
 from asyncpg import Connection, Pool
 
+from scripts.core.db.backend_resolution import resolve_url
+
 # Issue #62: no hardcoded credentialed fallback. The connection URL must
 # always come from the environment (CONTINUOUS_CLAUDE_DB_URL, DATABASE_URL,
 # or OPC_POSTGRES_URL). For local Docker development, export these from
@@ -228,7 +230,13 @@ def resolve_connection_url(
     Raises:
         ValueError: If none of the three env-var inputs are set.
     """
-    url = continuous_claude_db_url or database_url or opc_postgres_url
+    url = resolve_url(
+        {
+            "CONTINUOUS_CLAUDE_DB_URL": continuous_claude_db_url or "",
+            "DATABASE_URL": database_url or "",
+            "OPC_POSTGRES_URL": opc_postgres_url or "",
+        }
+    )
     if url:
         return url
 

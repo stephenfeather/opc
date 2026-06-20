@@ -250,9 +250,22 @@ class TestGetBackend:
             "AGENTICA_MEMORY_BACKEND": "",
             "CONTINUOUS_CLAUDE_DB_URL": "",
             "DATABASE_URL": "",
+            "OPC_POSTGRES_URL": "",
         }
         with patch.dict("os.environ", env_clear, clear=False):
             assert get_backend() == "sqlite"
+
+    def test_opc_postgres_url_means_postgres(self):
+        # Issue #71: OPC_POSTGRES_URL is now honored on the read path, so it no
+        # longer silently falls back to sqlite (the split-brain fix).
+        env = {
+            "AGENTICA_MEMORY_BACKEND": "",
+            "CONTINUOUS_CLAUDE_DB_URL": "",
+            "DATABASE_URL": "",
+            "OPC_POSTGRES_URL": "postgresql://legacy/db",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            assert get_backend() == "postgres"
 
 
 # ---------------------------------------------------------------------------

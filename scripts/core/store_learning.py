@@ -95,6 +95,10 @@ LEARNING_TYPES = [
 CONFIDENCE_LEVELS = ["high", "medium", "low"]
 
 from scripts.core.config import get_config as _get_config  # noqa: E402
+from scripts.core.db.backend_resolution import (  # noqa: E402
+    get_connection_url,
+    resolve_backend,
+)
 from scripts.core.db.embedding_service import EmbeddingService  # noqa: E402
 from scripts.core.db.memory_factory import create_memory_service, get_default_backend  # noqa: E402
 
@@ -117,32 +121,47 @@ def _dedup_threshold() -> float:
 def _pg_url() -> str | None:
     """Return PostgreSQL connection URL from environment, or None.
 
-    Prefers CONTINUOUS_CLAUDE_DB_URL (canonical) over DATABASE_URL (fallback)
-    to match the resolution order used by recall_learnings and memory_daemon.
-    OPC_POSTGRES_URL is intentionally NOT included here — adding it would
-    create split-brain behavior with consumers that don't check it yet.
-    TODO: Unify all backend/URL resolution behind a shared function.
+    Delegates to the shared resolver (issue #71): CONTINUOUS_CLAUDE_DB_URL >
+    DATABASE_URL > OPC_POSTGRES_URL.
     """
-    return os.environ.get("CONTINUOUS_CLAUDE_DB_URL") or os.environ.get("DATABASE_URL") or None
+    return get_connection_url()
+
+
+def _pg_telemetry_url() -> str | None:
+    """Return the postgres URL for rejection telemetry, or None when disabled.
+
+    Rejection rows live in a postgres-only table, so we only touch postgres when
+    a URL is configured AND the unified backend resolves to postgres. An explicit
+    AGENTICA_MEMORY_BACKEND=sqlite override therefore disables this side channel,
+    keeping it on the same backend as the main learning write (issue #71
+    split-brain fix). The resolved URL is fed back into resolve_backend so the
+    decision depends only on the override and the URL we actually have — not on a
+    separate read of the URL env vars.
+    """
+    url = _pg_url()
+    if not url:
+        return None
+    backend = resolve_backend(
+        {
+            "AGENTICA_MEMORY_BACKEND": os.environ.get("AGENTICA_MEMORY_BACKEND", ""),
+            "DATABASE_URL": url,
+        }
+    )
+    return url if backend == "postgres" else None
 
 
 def detect_backend(env: dict[str, str], fallback: str | None = None) -> str:
     """Determine storage backend from environment variables.
 
-    Takes an env dict and returns a backend name string. When no URL is found
-    and no fallback is provided, delegates to get_default_backend() which
-    reads os.environ and may raise.
-
-    Matches the precedence used by recall_learnings.get_backend():
-    CONTINUOUS_CLAUDE_DB_URL > DATABASE_URL > fallback.
-
-    NOTE: AGENTICA_MEMORY_BACKEND and OPC_POSTGRES_URL are intentionally
-    NOT checked here -- recall_learnings, memory_daemon, and confidence_calibrator
-    don't all honor them yet, so adding them here would create split-brain.
-    TODO: Unify all backend/URL resolution behind a shared function.
+    Delegates to the shared resolver (issue #71): an explicit
+    AGENTICA_MEMORY_BACKEND wins, otherwise the presence of any connection URL
+    (CONTINUOUS_CLAUDE_DB_URL, DATABASE_URL, OPC_POSTGRES_URL) implies postgres.
+    When nothing is determinable, falls back to ``fallback`` if given, else to
+    get_default_backend() (which reads os.environ, validates deps, and may raise).
     """
-    if env.get("CONTINUOUS_CLAUDE_DB_URL") or env.get("DATABASE_URL"):
-        return "postgres"
+    backend = resolve_backend(env, default=None)
+    if backend is not None:
+        return backend
     if fallback is not None:
         return fallback
     return get_default_backend()
@@ -444,13 +463,19 @@ def _record_rejection(
     rejection counts and details after extraction completes.
     Non-fatal -- failures are logged and swallowed.
     """
-    url = _pg_url()
+    url = _pg_telemetry_url()
     if not url:
         return
     try:
         import psycopg2
 
         conn = psycopg2.connect(url)
+    except Exception as e:
+        logger.debug("Failed to record rejection: %s", e)
+        return
+    # Connection acquired: close it in a finally so a failure in table
+    # creation / insert cannot leak it (this function swallows errors).
+    try:
         cur = conn.cursor()
         _ensure_learning_rejections_table(cur)
         cur.execute(
@@ -473,9 +498,10 @@ def _record_rejection(
             ),
         )
         conn.commit()
-        conn.close()
     except Exception as e:
         logger.debug("Failed to record rejection: %s", e)
+    finally:
+        conn.close()
 
 
 def _query_rejection_count(session_id: str) -> int:
@@ -486,7 +512,7 @@ def _query_rejection_count(session_id: str) -> int:
     connection, schema drift) propagates so callers can distinguish an
     unavailable count from a genuine zero (Issue #98).
     """
-    url = _pg_url()
+    url = _pg_telemetry_url()
     if not url:
         return 0
     import psycopg2

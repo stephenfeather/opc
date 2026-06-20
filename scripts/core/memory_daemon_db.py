@@ -8,7 +8,6 @@ Logging via logging.getLogger (D4).
 from __future__ import annotations
 
 import logging
-import os
 import time
 from pathlib import Path
 
@@ -23,12 +22,27 @@ logger = logging.getLogger("memory-daemon")
 
 
 def get_postgres_url() -> str | None:
-    """Get PostgreSQL URL from environment (canonical first)."""
-    return os.environ.get("CONTINUOUS_CLAUDE_DB_URL") or os.environ.get("DATABASE_URL")
+    """Get PostgreSQL URL from environment via the shared resolver (issue #71).
+
+    Precedence: CONTINUOUS_CLAUDE_DB_URL > DATABASE_URL > OPC_POSTGRES_URL.
+    """
+    from scripts.core.db.backend_resolution import get_connection_url
+
+    return get_connection_url()
 
 
 def use_postgres() -> bool:
-    """Check if PostgreSQL is available."""
+    """Check if PostgreSQL is the active backend and usable.
+
+    Honors the unified backend decision (issue #71): an explicit
+    AGENTICA_MEMORY_BACKEND=sqlite override keeps the daemon on sqlite even when
+    a PostgreSQL URL is configured, so the daemon stays on the same backend as
+    store/recall (no split-brain). Requires a URL and an importable psycopg2.
+    """
+    from scripts.core.db.backend_resolution import get_active_backend
+
+    if get_active_backend() != "postgres":
+        return False
     url = get_postgres_url()
     if not url:
         return False

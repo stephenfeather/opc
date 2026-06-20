@@ -253,16 +253,32 @@ def _confidence_patch(change: dict) -> str:
 
 
 def _pg_connect():
-    """Get a PostgreSQL connection."""
-    import psycopg2
+    """Get a PostgreSQL connection.
 
-    db_url = os.environ.get("CONTINUOUS_CLAUDE_DB_URL") or os.environ.get(
-        "DATABASE_URL"
-    )
+    Confidence calibration is postgres-only. Honors the unified backend decision
+    (issue #71): if the active backend is not postgres — e.g. an explicit
+    AGENTICA_MEMORY_BACKEND=sqlite override — refuse rather than mutate
+    archival_memory while store/recall operate on sqlite (no split-brain).
+    """
+    from scripts.core.db.backend_resolution import get_active_backend, get_connection_url
+
+    # Gate before importing psycopg2 so a non-postgres backend yields the clear
+    # RuntimeError below even when the postgres driver is not installed.
+    if get_active_backend() != "postgres":
+        raise RuntimeError(
+            "Confidence calibration requires the postgres backend, but the active "
+            "backend is not postgres. Configure a connection URL "
+            "(CONTINUOUS_CLAUDE_DB_URL, DATABASE_URL, or OPC_POSTGRES_URL) and "
+            "ensure AGENTICA_MEMORY_BACKEND is not pinned to sqlite."
+        )
+    db_url = get_connection_url()
     if not db_url:
         raise RuntimeError(
-            "No database URL configured; set CONTINUOUS_CLAUDE_DB_URL or DATABASE_URL"
+            "No database URL configured; set CONTINUOUS_CLAUDE_DB_URL, "
+            "DATABASE_URL, or OPC_POSTGRES_URL"
         )
+    import psycopg2
+
     return psycopg2.connect(db_url)
 
 

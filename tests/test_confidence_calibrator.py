@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts.core.confidence_calibrator import (  # noqa: E402
     WEIGHTS,
+    _pg_connect,
     backfill_calibration,
     backfill_calibration_sync,
     calibrate_confidence,
@@ -33,6 +34,49 @@ from scripts.core.confidence_calibrator import (  # noqa: E402
     score_scope,
     score_specificity,
 )
+
+
+class TestPgConnectBackendGating:
+    """Issue #71: confidence calibration is postgres-only, so _pg_connect must
+    refuse to open Postgres when the unified active backend is not postgres
+    (e.g. an explicit AGENTICA_MEMORY_BACKEND=sqlite override), rather than
+    mutating archival_memory behind store/recall's back."""
+
+    def test_refuses_when_sqlite_override_with_url(self, monkeypatch):
+        monkeypatch.setenv("AGENTICA_MEMORY_BACKEND", "sqlite")
+        monkeypatch.setenv("CONTINUOUS_CLAUDE_DB_URL", "postgresql://test")
+        with patch("psycopg2.connect") as mock_connect:
+            with pytest.raises(RuntimeError, match="postgres"):
+                _pg_connect()
+            mock_connect.assert_not_called()
+
+    def test_refuses_with_runtimeerror_when_psycopg2_absent(self, monkeypatch):
+        # The backend gate must run before importing psycopg2, so a non-postgres
+        # backend raises the clear RuntimeError even if the driver is missing.
+        monkeypatch.setenv("AGENTICA_MEMORY_BACKEND", "sqlite")
+        monkeypatch.setenv("CONTINUOUS_CLAUDE_DB_URL", "postgresql://test")
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "psycopg2":
+                raise ImportError("no psycopg2")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        with pytest.raises(RuntimeError, match="postgres"):
+            _pg_connect()
+
+    def test_connects_when_backend_is_postgres(self, monkeypatch):
+        monkeypatch.delenv("AGENTICA_MEMORY_BACKEND", raising=False)
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        monkeypatch.delenv("OPC_POSTGRES_URL", raising=False)
+        monkeypatch.setenv("CONTINUOUS_CLAUDE_DB_URL", "postgresql://test")
+        with patch("psycopg2.connect") as mock_connect:
+            _pg_connect()
+            mock_connect.assert_called_once_with("postgresql://test")
+
 
 # ---------------------------------------------------------------------------
 # Specificity scoring

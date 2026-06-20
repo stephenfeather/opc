@@ -1000,19 +1000,17 @@ class TestPruneRecallLog:
 
     @patch("scripts.core.memory_daemon_db.use_postgres", return_value=True)
     @patch("scripts.core.memory_daemon_db.pg_connect", side_effect=Exception("db down"))
-    def test_swallows_connect_error_and_warns(self, mock_pg, mock_use, caplog):
+    def test_raises_on_connect_error(self, mock_pg, mock_use):
+        # Failures propagate (not swallowed) so the scheduler can tell a real
+        # failure from an empty prune and retry promptly (issue #146 review).
         from scripts.core.memory_daemon_db import prune_recall_log
 
-        with caplog.at_level(logging.WARNING, logger="memory-daemon"):
-            assert prune_recall_log(90) == 0
-
-        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert warnings, "expected a WARNING record for swallowed DB error"
-        assert "prune_recall_log failed" in warnings[0].getMessage()
+        with pytest.raises(Exception, match="db down"):
+            prune_recall_log(90)
 
     @patch("scripts.core.memory_daemon_db.use_postgres", return_value=True)
     @patch("scripts.core.memory_daemon_db.pg_connect")
-    def test_returns_partial_count_and_closes_on_midloop_error(self, mock_pg, mock_use):
+    def test_raises_on_midloop_error_and_closes(self, mock_pg, mock_use):
         conn = MagicMock()
         cur = _RowcountCursor([10], error_after=1)  # batch 1 ok, batch 2 raises
         conn.cursor.return_value = cur
@@ -1020,6 +1018,9 @@ class TestPruneRecallLog:
 
         from scripts.core.memory_daemon_db import prune_recall_log
 
-        assert prune_recall_log(90, batch_size=10) == 10
-        # Connection must always be closed even when a batch raises.
+        with pytest.raises(RuntimeError, match="boom mid-loop"):
+            prune_recall_log(90, batch_size=10)
+        # Batch 1 committed before the failure (committed batches persist)...
+        assert conn.commit.call_count == 1
+        # ...and the connection is always closed, even when a batch raises.
         conn.close.assert_called_once()

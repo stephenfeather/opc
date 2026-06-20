@@ -275,6 +275,28 @@ class TestMaybePruneRecallLog:
         mock_prune.assert_called_once_with(90)
         assert self.state.last_recall_prune > 0.0
 
+    @patch(
+        "scripts.core.memory_daemon._prune_recall_log_db",
+        side_effect=Exception("db down"),
+    )
+    @patch("scripts.core.memory_daemon._recall_log_prune_interval", return_value=86400)
+    @patch("scripts.core.memory_daemon._recall_log_retention_days", return_value=90)
+    @patch("scripts.core.memory_daemon.use_postgres", return_value=True)
+    def test_failure_schedules_short_backoff_retry(
+        self, mock_pg, mock_ret, mock_interval, mock_prune
+    ):
+        # On failure the next attempt must be one backoff out (~300s), NOT a
+        # full 24h interval — otherwise a transient outage silently retains rows
+        # for another whole window (issue #146 review).
+        self.state.last_recall_prune = 0.0  # far in the past -> due
+        now = time.time()
+        self.mod._maybe_prune_recall_log()
+        mock_prune.assert_called_once_with(90)
+        backoff = self.mod._RECALL_LOG_PRUNE_RETRY_BACKOFF
+        # Time until next eligible run = interval - (now - last_recall_prune).
+        next_due_in = 86400 - (now - self.state.last_recall_prune)
+        assert abs(next_due_in - backoff) < 5  # within a few seconds of backoff
+
 
 # ---------------------------------------------------------------------------
 # Step 3.3 — daemon_tick uses filter_truly_stale_sessions

@@ -1058,6 +1058,12 @@ def _check_pattern_detection():
         state.pattern_proc = None
 
 
+# On a failed prune, retry after this short backoff instead of waiting a full
+# recall_log_prune_interval_hours -- the retention guarantee recovers promptly
+# once a transient DB outage clears (issue #146 review).
+_RECALL_LOG_PRUNE_RETRY_BACKOFF = 300  # seconds
+
+
 def _maybe_prune_recall_log() -> None:
     """Prune aged recall_log rows when the retention interval has elapsed.
 
@@ -1066,7 +1072,13 @@ def _maybe_prune_recall_log() -> None:
     retention must be enabled (``recall_log_retention_days > 0``), and at least
     ``recall_log_prune_interval_hours`` must have passed since the last run.
     The DELETE itself is batched in prune_recall_log so it never blocks the
-    hot-path INSERT. Errors are swallowed inside prune_recall_log.
+    hot-path INSERT.
+
+    The last-run clock advances to "now" only on a successful prune. If the
+    prune raises (DB outage, lock timeout, schema drift), the clock is set so
+    the next attempt happens after _RECALL_LOG_PRUNE_RETRY_BACKOFF rather than a
+    full interval, so a transient failure does not silently retain rows for
+    another whole window.
     """
     if not use_postgres():
         return
@@ -1077,8 +1089,18 @@ def _maybe_prune_recall_log() -> None:
     elapsed = time.time() - state.last_recall_prune
     if elapsed < _recall_log_prune_interval():
         return
+    try:
+        deleted = _prune_recall_log_db(retention)
+    except Exception as e:
+        # Schedule the next attempt one backoff out (last_recall_prune is the
+        # last *attempt* time the gate measures from), not a full interval.
+        state.last_recall_prune = (
+            time.time() + _RECALL_LOG_PRUNE_RETRY_BACKOFF - _recall_log_prune_interval()
+        )
+        log(f"recall_log prune failed, retrying in "
+            f"{_RECALL_LOG_PRUNE_RETRY_BACKOFF}s: {safe_exception(e)}")
+        return
     state.last_recall_prune = time.time()
-    deleted = _prune_recall_log_db(retention)
     if deleted:
         log(f"Pruned {safe(deleted)} recall_log rows older than "
             f"{safe(retention)} days")

@@ -661,8 +661,14 @@ def prune_recall_log(
     No-op (returns 0) on SQLite or when ``retention_days <= 0`` (pruning
     disabled). The interval is passed as a bind parameter via make_interval()
     -- never string-formatted into the SQL -- so no value reaches the query
-    text. Errors are swallowed with a warning (best-effort background task);
-    the count of rows deleted before the failure is still returned.
+    text.
+
+    Raises on a DB failure (connection, query, or commit) rather than swallowing
+    it, so the scheduler can tell a real failure apart from an empty prune and
+    retry promptly instead of waiting a full interval (issue #146 review).
+    Each batch commits independently, so batches deleted before a later failure
+    stay deleted; the next successful run clears the remainder. The connection
+    is always closed.
     """
     if not use_postgres():
         return 0
@@ -670,30 +676,27 @@ def prune_recall_log(
         return 0
 
     total = 0
+    conn = pg_connect()
     try:
-        conn = pg_connect()
-        try:
-            cur = conn.cursor()
-            for _ in range(max_batches):
-                cur.execute(
-                    """
-                    DELETE FROM recall_log
-                    WHERE id IN (
-                        SELECT id FROM recall_log
-                        WHERE created_at < NOW() - make_interval(days => %s)
-                        ORDER BY created_at
-                        LIMIT %s
-                    )
-                    """,
-                    (retention_days, batch_size),
+        cur = conn.cursor()
+        for _ in range(max_batches):
+            cur.execute(
+                """
+                DELETE FROM recall_log
+                WHERE id IN (
+                    SELECT id FROM recall_log
+                    WHERE created_at < NOW() - make_interval(days => %s)
+                    ORDER BY created_at
+                    LIMIT %s
                 )
-                deleted = cur.rowcount or 0
-                conn.commit()
-                total += deleted
-                if deleted < batch_size:
-                    break
-        finally:
-            conn.close()
-    except Exception as e:
-        logger.warning("prune_recall_log failed: %s", safe_exception(e))
+                """,
+                (retention_days, batch_size),
+            )
+            deleted = cur.rowcount or 0
+            conn.commit()
+            total += deleted
+            if deleted < batch_size:
+                break
+    finally:
+        conn.close()
     return total

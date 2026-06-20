@@ -268,11 +268,11 @@ def _pattern_detection_interval() -> float:
 
 
 def _recall_log_retention_days() -> int:
-    return _daemon_cfg.recall_log_retention_days
+    return _get_config().daemon.recall_log_retention_days
 
 
 def _recall_log_prune_interval() -> float:
-    return _daemon_cfg.recall_log_prune_interval_hours * 3600
+    return _get_config().daemon.recall_log_prune_interval_hours * 3600
 
 
 # ---------------------------------------------------------------------------

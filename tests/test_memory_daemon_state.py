@@ -26,7 +26,7 @@ class TestDaemonState:
             "pending_queue",
             "pattern_proc",
             "last_pattern_run",
-            "last_recall_prune",
+            "recall_prune_due_at",
         }
 
     def test_factory_creates_empty_state(self):
@@ -209,7 +209,8 @@ class TestDaemonTick:
 
 
 class TestMaybePruneRecallLog:
-    """_maybe_prune_recall_log gates pruning on backend, config, and interval."""
+    """_maybe_prune_recall_log gates pruning on backend, config, and a
+    monotonic prune deadline, and reschedules on failure / incomplete drain."""
 
     @pytest.fixture(autouse=True)
     def _setup_state(self):
@@ -236,44 +237,42 @@ class TestMaybePruneRecallLog:
         mock_prune.assert_not_called()
 
     @patch("scripts.core.memory_daemon._prune_recall_log_db")
-    @patch("scripts.core.memory_daemon._recall_log_prune_interval", return_value=86400)
     @patch("scripts.core.memory_daemon._recall_log_retention_days", return_value=90)
     @patch("scripts.core.memory_daemon.use_postgres", return_value=True)
-    def test_skips_when_interval_not_elapsed(
-        self, mock_pg, mock_ret, mock_interval, mock_prune
-    ):
-        # Pruned just now -> not due yet.
-        self.state.last_recall_prune = time.time()
+    def test_skips_when_deadline_not_reached(self, mock_pg, mock_ret, mock_prune):
+        # Deadline is in the (monotonic) future -> not due yet.
+        self.state.recall_prune_due_at = time.monotonic() + 10_000
         self.mod._maybe_prune_recall_log()
         mock_prune.assert_not_called()
 
-    @patch("scripts.core.memory_daemon._prune_recall_log_db", return_value=7)
+    @patch("scripts.core.memory_daemon._prune_recall_log_db", return_value=(7, True))
     @patch("scripts.core.memory_daemon._recall_log_prune_interval", return_value=86400)
     @patch("scripts.core.memory_daemon._recall_log_retention_days", return_value=90)
     @patch("scripts.core.memory_daemon.use_postgres", return_value=True)
-    def test_prunes_and_advances_timestamp_when_due(
+    def test_complete_prune_schedules_full_interval(
         self, mock_pg, mock_ret, mock_interval, mock_prune
     ):
-        self.state.last_recall_prune = 0.0  # far in the past -> due
-        before = time.time()
+        self.state.recall_prune_due_at = 0.0  # due on the first tick
+        before = time.monotonic()
         self.mod._maybe_prune_recall_log()
         mock_prune.assert_called_once_with(90)
-        # Timestamp advanced so the next tick is gated until the interval passes.
-        assert self.state.last_recall_prune >= before
+        # Next deadline is ~one full interval out from now.
+        assert self.state.recall_prune_due_at - before == pytest.approx(86400, abs=5)
 
-    @patch("scripts.core.memory_daemon._prune_recall_log_db", return_value=0)
+    @patch("scripts.core.memory_daemon._prune_recall_log_db", return_value=(0, True))
     @patch("scripts.core.memory_daemon._recall_log_prune_interval", return_value=86400)
     @patch("scripts.core.memory_daemon._recall_log_retention_days", return_value=90)
     @patch("scripts.core.memory_daemon.use_postgres", return_value=True)
-    def test_advances_timestamp_even_when_nothing_deleted(
+    def test_advances_deadline_even_when_nothing_deleted(
         self, mock_pg, mock_ret, mock_interval, mock_prune
     ):
-        # A due run that deletes 0 rows must still reset the clock, otherwise
-        # the daemon would re-query every tick.
-        self.state.last_recall_prune = 0.0
+        # A due run that deletes 0 rows (but drains) must still push the deadline
+        # a full interval, otherwise the daemon would re-query every tick.
+        self.state.recall_prune_due_at = 0.0
+        before = time.monotonic()
         self.mod._maybe_prune_recall_log()
         mock_prune.assert_called_once_with(90)
-        assert self.state.last_recall_prune > 0.0
+        assert self.state.recall_prune_due_at - before == pytest.approx(86400, abs=5)
 
     @patch(
         "scripts.core.memory_daemon._prune_recall_log_db",
@@ -288,14 +287,28 @@ class TestMaybePruneRecallLog:
         # On failure the next attempt must be one backoff out (~300s), NOT a
         # full 24h interval — otherwise a transient outage silently retains rows
         # for another whole window (issue #146 review).
-        self.state.last_recall_prune = 0.0  # far in the past -> due
-        now = time.time()
+        self.state.recall_prune_due_at = 0.0  # due
+        before = time.monotonic()
         self.mod._maybe_prune_recall_log()
         mock_prune.assert_called_once_with(90)
         backoff = self.mod._RECALL_LOG_PRUNE_RETRY_BACKOFF
-        # Time until next eligible run = interval - (now - last_recall_prune).
-        next_due_in = 86400 - (now - self.state.last_recall_prune)
-        assert abs(next_due_in - backoff) < 5  # within a few seconds of backoff
+        assert self.state.recall_prune_due_at - before == pytest.approx(backoff, abs=5)
+
+    @patch("scripts.core.memory_daemon._prune_recall_log_db", return_value=(500, False))
+    @patch("scripts.core.memory_daemon._recall_log_prune_interval", return_value=86400)
+    @patch("scripts.core.memory_daemon._recall_log_retention_days", return_value=90)
+    @patch("scripts.core.memory_daemon.use_postgres", return_value=True)
+    def test_incomplete_drain_schedules_short_backoff(
+        self, mock_pg, mock_ret, mock_interval, mock_prune
+    ):
+        # Backlog remains (cap hit, complete=False) -> continue one backoff out,
+        # NOT a full interval, so the backlog drains across ticks promptly.
+        self.state.recall_prune_due_at = 0.0  # due
+        before = time.monotonic()
+        self.mod._maybe_prune_recall_log()
+        mock_prune.assert_called_once_with(90)
+        backoff = self.mod._RECALL_LOG_PRUNE_RETRY_BACKOFF
+        assert self.state.recall_prune_due_at - before == pytest.approx(backoff, abs=5)
 
 
 # ---------------------------------------------------------------------------

@@ -295,7 +295,10 @@ class DaemonState:
     pending_queue: list = field(default_factory=list)
     pattern_proc: subprocess.Popen | None = None
     last_pattern_run: float = 0.0
-    last_recall_prune: float = 0.0
+    # Monotonic (time.monotonic) deadline for the next recall_log prune; 0.0
+    # means "due on the first tick". Monotonic so wall-clock corrections / VM
+    # resumes cannot silently defer pruning (issue #146 review).
+    recall_prune_due_at: float = 0.0
 
 
 def create_daemon_state() -> DaemonState:
@@ -1058,27 +1061,29 @@ def _check_pattern_detection():
         state.pattern_proc = None
 
 
-# On a failed prune, retry after this short backoff instead of waiting a full
+# When a prune fails, or leaves a backlog (max_batches cap hit with a full
+# final batch), retry after this short backoff instead of waiting a full
 # recall_log_prune_interval_hours -- the retention guarantee recovers promptly
-# once a transient DB outage clears (issue #146 review).
+# once a transient DB outage clears or a backlog drains (issue #146 review).
 _RECALL_LOG_PRUNE_RETRY_BACKOFF = 300  # seconds
 
 
 def _maybe_prune_recall_log() -> None:
-    """Prune aged recall_log rows when the retention interval has elapsed.
+    """Prune aged recall_log rows when the prune deadline has passed.
 
     Issue #146: replaces the previously manual ``DELETE FROM recall_log ...``
     retention step. Gated three ways: PostgreSQL only (the table is PG-only),
-    retention must be enabled (``recall_log_retention_days > 0``), and at least
-    ``recall_log_prune_interval_hours`` must have passed since the last run.
-    The DELETE itself is batched in prune_recall_log so it never blocks the
-    hot-path INSERT.
+    retention must be enabled (``recall_log_retention_days > 0``), and the
+    monotonic prune deadline (``recall_prune_due_at``) must have passed. The
+    DELETE itself is batched in prune_recall_log so it never blocks the hot-path
+    INSERT.
 
-    The last-run clock advances to "now" only on a successful prune. If the
-    prune raises (DB outage, lock timeout, schema drift), the clock is set so
-    the next attempt happens after _RECALL_LOG_PRUNE_RETRY_BACKOFF rather than a
-    full interval, so a transient failure does not silently retain rows for
-    another whole window.
+    Scheduling uses time.monotonic() so a wall-clock correction or VM resume
+    cannot silently defer pruning. The next deadline is a full interval out only
+    when the prune fully drains the expired rows; if the prune fails (DB outage,
+    lock timeout, schema drift) OR leaves a backlog behind the max_batches cap,
+    it reschedules one short backoff out instead, so neither a transient failure
+    nor a large backlog retains rows for another whole window.
     """
     if not use_postgres():
         return
@@ -1086,21 +1091,21 @@ def _maybe_prune_recall_log() -> None:
     if retention <= 0:
         return
     state = _ensure_daemon_state()
-    elapsed = time.time() - state.last_recall_prune
-    if elapsed < _recall_log_prune_interval():
+    now = time.monotonic()
+    if now < state.recall_prune_due_at:
         return
     try:
-        deleted = _prune_recall_log_db(retention)
+        deleted, complete = _prune_recall_log_db(retention)
     except Exception as e:
-        # Schedule the next attempt one backoff out (last_recall_prune is the
-        # last *attempt* time the gate measures from), not a full interval.
-        state.last_recall_prune = (
-            time.time() + _RECALL_LOG_PRUNE_RETRY_BACKOFF - _recall_log_prune_interval()
-        )
+        state.recall_prune_due_at = now + _RECALL_LOG_PRUNE_RETRY_BACKOFF
         log(f"recall_log prune failed, retrying in "
             f"{_RECALL_LOG_PRUNE_RETRY_BACKOFF}s: {safe_exception(e)}")
         return
-    state.last_recall_prune = time.time()
+    if complete:
+        state.recall_prune_due_at = now + _recall_log_prune_interval()
+    else:
+        # Backlog remains behind the batch cap -- continue soon, not next window.
+        state.recall_prune_due_at = now + _RECALL_LOG_PRUNE_RETRY_BACKOFF
     if deleted:
         log(f"Pruned {safe(deleted)} recall_log rows older than "
             f"{safe(retention)} days")

@@ -920,23 +920,23 @@ class TestPruneRecallLog:
     """prune_recall_log: batched retention delete for the recall_log table."""
 
     @patch("scripts.core.memory_daemon_db.use_postgres", return_value=False)
-    def test_returns_zero_without_postgres(self, mock_use):
+    def test_returns_zero_complete_without_postgres(self, mock_use):
         from scripts.core.memory_daemon_db import prune_recall_log
 
-        assert prune_recall_log(90) == 0
+        assert prune_recall_log(90) == (0, True)
 
     @patch("scripts.core.memory_daemon_db.use_postgres", return_value=True)
     @patch("scripts.core.memory_daemon_db.pg_connect")
     def test_disabled_when_retention_non_positive(self, mock_pg, mock_use):
         from scripts.core.memory_daemon_db import prune_recall_log
 
-        assert prune_recall_log(0) == 0
-        assert prune_recall_log(-5) == 0
+        assert prune_recall_log(0) == (0, True)
+        assert prune_recall_log(-5) == (0, True)
         mock_pg.assert_not_called()
 
     @patch("scripts.core.memory_daemon_db.use_postgres", return_value=True)
     @patch("scripts.core.memory_daemon_db.pg_connect")
-    def test_single_partial_batch_returns_rowcount(self, mock_pg, mock_use):
+    def test_single_partial_batch_is_complete(self, mock_pg, mock_use):
         conn = MagicMock()
         cur = _RowcountCursor([3])
         conn.cursor.return_value = cur
@@ -944,7 +944,8 @@ class TestPruneRecallLog:
 
         from scripts.core.memory_daemon_db import prune_recall_log
 
-        assert prune_recall_log(90, batch_size=10) == 3
+        # 3 < batch_size -> drained, so complete is True.
+        assert prune_recall_log(90, batch_size=10) == (3, True)
         assert cur.execute_count == 1
         conn.commit.assert_called_once()
         conn.close.assert_called_once()
@@ -959,7 +960,7 @@ class TestPruneRecallLog:
 
         from scripts.core.memory_daemon_db import prune_recall_log
 
-        assert prune_recall_log(90, batch_size=10) == 24
+        assert prune_recall_log(90, batch_size=10) == (24, True)
         assert cur.execute_count == 3
         # Commit after every batch so locks release between deletes.
         assert conn.commit.call_count == 3
@@ -986,15 +987,17 @@ class TestPruneRecallLog:
 
     @patch("scripts.core.memory_daemon_db.use_postgres", return_value=True)
     @patch("scripts.core.memory_daemon_db.pg_connect")
-    def test_respects_max_batches_cap(self, mock_pg, mock_use):
+    def test_cap_with_full_final_batch_is_incomplete(self, mock_pg, mock_use):
         conn = MagicMock()
-        cur = _RowcountCursor([5] * 10)  # always full
+        cur = _RowcountCursor([5] * 10)  # always full -> never drains
         conn.cursor.return_value = cur
         mock_pg.return_value = conn
 
         from scripts.core.memory_daemon_db import prune_recall_log
 
-        assert prune_recall_log(90, batch_size=5, max_batches=3) == 15
+        # Cap hit with a still-full final batch -> backlog remains -> complete=False
+        # so the scheduler continues promptly instead of waiting a full interval.
+        assert prune_recall_log(90, batch_size=5, max_batches=3) == (15, False)
         assert cur.execute_count == 3
         conn.close.assert_called_once()
 

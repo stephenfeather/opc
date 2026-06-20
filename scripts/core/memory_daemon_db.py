@@ -649,19 +649,25 @@ def prune_recall_log(
     retention_days: int,
     *,
     batch_size: int = 10000,
-    max_batches: int = 1000,
-) -> int:
+    max_batches: int = 50,
+) -> tuple[int, bool]:
     """Delete recall_log rows older than ``retention_days`` (issue #146).
 
     Deletes in bounded batches, committing after each, so the per-statement
     row lock is released promptly and the append-only hot-path INSERT in
-    record_recall is never blocked behind a single large DELETE. Returns the
-    total number of rows deleted.
+    record_recall is never blocked behind a single large DELETE. ``max_batches``
+    caps the synchronous work per call so one tick cannot stall the daemon on a
+    huge backlog.
 
-    No-op (returns 0) on SQLite or when ``retention_days <= 0`` (pruning
-    disabled). The interval is passed as a bind parameter via make_interval()
-    -- never string-formatted into the SQL -- so no value reaches the query
-    text.
+    Returns ``(rows_deleted, complete)``. ``complete`` is True once a short
+    (< batch_size) batch proves the expired rows are drained; it is False if the
+    cap was hit with a still-full final batch, signalling that more expired rows
+    remain so the scheduler can continue promptly instead of waiting a full
+    interval. No-op (returns ``(0, True)``) on SQLite or when
+    ``retention_days <= 0`` (pruning disabled).
+
+    The interval is passed as a bind parameter via make_interval() -- never
+    string-formatted into the SQL -- so no value reaches the query text.
 
     Raises on a DB failure (connection, query, or commit) rather than swallowing
     it, so the scheduler can tell a real failure apart from an empty prune and
@@ -671,11 +677,12 @@ def prune_recall_log(
     is always closed.
     """
     if not use_postgres():
-        return 0
+        return 0, True
     if retention_days <= 0:
-        return 0
+        return 0, True
 
     total = 0
+    complete = False
     conn = pg_connect()
     try:
         cur = conn.cursor()
@@ -696,7 +703,8 @@ def prune_recall_log(
             conn.commit()
             total += deleted
             if deleted < batch_size:
+                complete = True
                 break
     finally:
         conn.close()
-    return total
+    return total, complete

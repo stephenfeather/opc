@@ -101,6 +101,104 @@ function extractKeywords(prompt: string): string {
 }
 
 /**
+ * Normalize an intent string into a Postgres FTS query (issue #213).
+ *
+ * Underscores/slashes become spaces and runs of whitespace collapse, but we
+ * deliberately DO NOT strip short tokens: the previous `\b\w{1,2}\b` removal
+ * discarded bare numbers ("7") and 2-char tech tokens ("os", "pg", "v2", "ci"),
+ * collapsing a specific prompt into a generic phrase that then matched
+ * unrelated cross-project learnings. `plainto_tsquery` already drops English
+ * stopwords downstream, so the blanket strip only destroyed signal.
+ */
+export function sanitizeSearchTerm(intent: string): string {
+  return intent
+    .replace(/[_\/]/g, ' ')           // Convert underscores/slashes to spaces
+    .replace(/\s+/g, ' ')             // Collapse whitespace
+    .trim();
+}
+
+// Lead tokens that mark a conversational reply rather than a knowledge query.
+const CONVERSATIONAL_LEAD = new Set([
+  'no', 'nope', 'nah', 'yes', 'yeah', 'yep', 'yup', 'ok', 'okay', 'sure',
+  'nvm', 'nevermind', 'oops', 'thanks', 'exactly', 'agreed',
+  'cool', 'great', 'awesome', 'perfect'
+]);
+
+// Imperative on a *bare* pronoun that consumes the WHOLE remainder, e.g.
+// "do it", "undo that", "run it again", "extend it another 7 days". The match
+// is anchored to end-of-string: the pronoun may be followed only by meta
+// continuations (again/now/instead/...) or a bounded numeric "another <n>
+// <unit>" quantity ("another 7 days", "another 7 business days"). It is tested
+// against a punctuation-stripped, whitespace-normalized token string, so the
+// `another` branch requires a DIGIT — a generic noun tail like "another auth
+// pattern" does NOT match. This deliberately falls through to recall for real
+// noun phrases: "fix that bug", "change this function", "fix this instead with
+// stored auth pattern", "update this now using the pg v2 note".
+const PRONOUN_IMPERATIVE =
+  /^(?:do|redo|undo|run|rerun|try|retry|repeat|revert|keep|continue|extend|fix|change|update|move|apply|test|save|delete|remove|show|add|create|make|use)\s+(?:it|that|this|them|those|these)(?:\s+(?:again|now|once|more|instead|please|too|another\s+\d+(?:\s+\w+){1,2}))*$/;
+
+// Selection-style meta imperative, e.g. "do the second one", "do the next
+// option", "use the other approach" — issue #213 lists these explicitly. The
+// object is "the <ordinal|next|other|...>" optionally followed by a generic
+// choice noun, anchored to end-of-string. A real noun phrase ("run the second
+// test suite", "do the migration") does NOT match because the trailing words
+// fall outside the bounded choice-noun set.
+const SELECTION_IMPERATIVE =
+  /^(?:do|redo|run|rerun|try|retry|repeat|use|pick|choose|select|take|apply|keep)\s+the\s+(?:first|second|third|fourth|fifth|sixth|last|next|previous|prior|other|another|latter|former|same|top|bottom|\d+(?:st|nd|rd|th)?)(?:\s+(?:one|ones|option|item|choice|approach|suggestion|result|match|idea|fix))?(?:\s+(?:again|now|please|instead|too))*$/;
+
+/**
+ * Decide whether a prompt is a short conversational/meta turn that should NOT
+ * trigger a memory recall (issue #213).
+ *
+ * The always-on hook fired on `"no, extend it another 7 days"` — a meta-command
+ * about the live conversation — and surfaced unrelated cross-project learnings.
+ * The gate is intentionally biased toward LETTING prompts through: a missed
+ * banner is cheap (the user can /recall), but a wrong cross-project banner is
+ * noisy and erodes trust. We therefore strip any leading discourse marker and
+ * classify the REMAINDER, gating only when:
+ *  - the prompt is empty / pure affirmation ("yes", "no thanks", "ok sure");
+ *  - the remainder is a pronoun-imperative consuming the whole tail
+ *    ("do it", "yeah undo that", "no, extend it another 7 days");
+ *  - the remainder is a selection-style imperative ("do the second one").
+ * A real query after a marker ("no, explain pg pool leak") keeps its body and
+ * is NOT gated. Prompts over 8 tokens are treated as substantive outright.
+ */
+export function isConversationalTurn(prompt: string): boolean {
+  const trimmed = prompt.trim();
+  if (!trimmed) return true;
+
+  const lower = trimmed.toLowerCase();
+  // De-glue a leading conversational marker from a punctuation delimiter that
+  // has no following space ("no:do that", "no-do that", "no.do that") so the
+  // marker is recognized regardless of delimiter or spacing. Only the lead
+  // position is rewritten, so internal identifiers ("session-start",
+  // "memory_daemon.py") and decimals elsewhere are left intact.
+  const deglued = lower.replace(
+    /^([a-z]+)\s*[,:;.\-]+\s*/,
+    (match, word) => (CONVERSATIONAL_LEAD.has(word) ? `${word} ` : match)
+  );
+  const tokens = deglued
+    .split(/\s+/)
+    .map(t => t.replace(/^[^\w]+|[^\w]+$/g, ''))
+    .filter(Boolean);
+  if (tokens.length === 0) return true;
+  if (tokens.length > 8) return false;  // substantive turn — let recall run
+
+  // Pure acknowledgement: every token is a conversational lead word
+  // ("yes", "no thanks", "ok sure", "nope nvm").
+  if (tokens.every(t => CONVERSATIONAL_LEAD.has(t))) return true;
+
+  // Drop a single leading discourse marker ("yeah do that" -> "do that";
+  // "no, extend it..." -> "extend it..."), then require the REMAINDER to be a
+  // whole-tail pronoun-imperative. The remainder is rebuilt from the already
+  // punctuation-stripped tokens, so any lead delimiter (comma, colon, dash,
+  // period) is handled uniformly. A substantive body ("no, explain pg pool
+  // leak") survives the drop and is not gated.
+  const body = (CONVERSATIONAL_LEAD.has(tokens[0]) ? tokens.slice(1) : tokens).join(' ');
+  return PRONOUN_IMPERATIVE.test(body) || SELECTION_IMPERATIVE.test(body);
+}
+
+/**
  * Fast memory relevance check using text search.
  * For text-only mode, we search by the most significant keyword
  * (text ILIKE looks for substring match, not multi-word).
@@ -111,13 +209,10 @@ function checkMemoryRelevance(intent: string, projectDir: string): MemoryMatch |
   const opcDir = getOpcDir();
   if (!opcDir) return null;  // Graceful degradation if OPC not available
 
-  // PostgreSQL full-text search handles stopwords automatically via plainto_tsquery
-  // Just clean up the intent: remove paths, underscores, short words
-  const searchTerm = intent
-    .replace(/[_\/]/g, ' ')           // Convert underscores/slashes to spaces
-    .replace(/\b\w{1,2}\b/g, '')      // Remove 1-2 char words
-    .replace(/\s+/g, ' ')             // Collapse whitespace
-    .trim();
+  const searchTerm = sanitizeSearchTerm(intent);
+  // An intent of only stripped chars (e.g. "___") sanitizes to empty — don't
+  // spawn a recall process for a no-op query.
+  if (!searchTerm) return null;
 
   // Derive project tag from CLAUDE_PROJECT_DIR to boost relevance via --tags (not a hard filter)
   const projectTag = projectDir ? projectDir.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? '' : '';
@@ -225,6 +320,13 @@ async function main() {
     return;
   }
 
+  // Skip short conversational/meta turns (issue #213): replies like
+  // "no, extend it another 7 days" carry no archival intent and otherwise
+  // recall unrelated, often cross-project, learnings.
+  if (isConversationalTurn(input.prompt)) {
+    return;
+  }
+
   // Extract intent (semantic query, not just keywords)
   const intent = extractIntent(input.prompt);
 
@@ -253,6 +355,17 @@ async function main() {
   }
 }
 
-main().catch(() => {
-  // Silent fail - don't block user prompts
-});
+// Only run as the hook entry point — guard so the pure helpers above can be
+// imported in unit tests without main() consuming stdin (matches the
+// convention in heartbeat.ts / working-on-sync.ts).
+if (
+  typeof process !== 'undefined' &&
+  process.argv[1] &&
+  (process.argv[1].endsWith('memory-awareness.ts') ||
+    process.argv[1].endsWith('memory-awareness.js') ||
+    process.argv[1].endsWith('memory-awareness.mjs'))
+) {
+  main().catch(() => {
+    // Silent fail - don't block user prompts
+  });
+}

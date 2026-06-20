@@ -32,6 +32,7 @@ This project began as a fork of [Continuous-Claude-v3](https://github.com/parcad
 - **Rerank A/B benchmarking** - Golden-set bootstrap tool and sweep framework for tuning reranker weights with measurable accuracy metrics
 - **TOML-driven configuration** - All daemon, reranker, dedup, recall, embedding, and pattern settings configurable via `opc.toml` with type validation and env overrides
 - **Dedup rejection tracking** - Records rejected (near-duplicate) learnings in `learning_rejections` table with similarity scores, surfaced in daemon extraction logs
+- **Document-collection RAG** - Scope-aware retrieval over folders of born-digital documents (`.pdf` text layer, `.docx`, `.txt`, `.csv`, `.md`, `.html`, `.xml`). A YAML registry tracks folders, each with a `global` or `restricted` scope: default queries search only `global` collections, so `restricted` records (medical/legal/business) are retrievable only when explicitly named. Incremental, idempotent ingestion (sha256 skip-unchanged, deletion reconciliation) into pgvector via the existing embedding service, queryable with an `opc-docs` CLI and a cron rescan wrapper. See [Document-Collection RAG](#document-collection-rag) below.
 
 ## Project Structure
 
@@ -61,6 +62,15 @@ scripts/core/              Core memory system
     memory_protocol.py         Backend protocol definition
     memory_factory.py          Backend factory
     postgres_pool.py           Connection pooling
+  documents/                 Document-collection RAG layer
+    registry.py                YAML registry of tracked folders (scope, extensions)
+    extract.py                 Born-digital text extraction (pdf/docx/txt/csv/md/html/xml)
+    chunk.py                   Page-aware chunking
+    db.py                      Scope-gated pgvector storage and retrieval
+    ingest.py                  Incremental, idempotent ingest pipeline
+    query.py                   Scoped semantic query
+    cli.py                     opc-docs CLI (create/scan/list/query)
+    rescan_cron.sh             Cron wrapper for incremental rescans
 
 src/runtime/               MCP execution runtime
 
@@ -117,7 +127,33 @@ The complete database schema is in [`docker/init-schema.sql`](docker/init-schema
 - **`cross_session_patterns`** — Detected patterns across sessions (recurring errors, tool preferences, decisions)
 - **`continuity`** — Session state snapshots (continuity ledger system)
 - **`plans`** — Indexed implementation plans
+- **`documents`** — One row per ingested file (collection, path, sha256 hash, extraction status), with a unique `(collection_name, file_path)` constraint for idempotent re-ingestion
+- **`document_chunks`** — Embedded text chunks for the RAG layer, carrying the retrieval `scope` (`global`/`restricted`), an HNSW vector index, and a content full-text index; cascades on `documents` delete
 - **`archival_memory` HNSW index** — Approximate nearest-neighbor index on embeddings for fast vector search
+
+## Document-Collection RAG
+
+Ingest folders of born-digital documents into pgvector and query them semantically. The core property is **scope safety**: each collection is `global` or `restricted`, and a default query searches `global` collections only — `restricted` records (medical/legal/business) surface only when a collection is named explicitly.
+
+```bash
+# Register a folder (restricted -> retrievable only by explicit --collection)
+uv run python scripts/core/documents/cli.py create caleb-records \
+    --path "~/Documents/Feather, Caleb" --scope restricted --extensions .pdf,.docx
+
+# Ingest (incremental: unchanged files skipped, deleted files purged)
+uv run python scripts/core/documents/cli.py scan --all
+
+# List collections and ingest stats
+uv run python scripts/core/documents/cli.py list
+
+# Default query: global collections only (restricted never leaks)
+uv run python scripts/core/documents/cli.py query "who flagged home meds"
+
+# Explicit collection: the only way to reach a restricted collection
+uv run python scripts/core/documents/cli.py query "who flagged home meds" --collection caleb-records
+```
+
+Supported formats: `.pdf` (text layer), `.docx`, `.txt`, `.csv`, `.md`, `.html`/`.htm`, `.xml`. Scanned/image-only PDFs are recorded as `skipped_needs_ocr` for a future OCR phase. The registry path defaults to `~/.claude/opc/document_collections.yaml` (override with `OPC_DOC_REGISTRY`); ceilings are tunable via `OPC_DOC_MAX_FILE_MB` and `OPC_DOC_MAX_CHUNKS`. A cron line calling `scripts/core/documents/rescan_cron.sh` keeps collections current.
 
 ## Hook Scripts
 

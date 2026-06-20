@@ -526,7 +526,11 @@ def search_dispatch(
 
 
 def read_text_within_root(
-    root: Path, candidate: str | Path, *, suffixes: tuple[str, ...]
+    root: Path,
+    candidate: str | Path,
+    *,
+    suffixes: tuple[str, ...],
+    anchor: Path | None = None,
 ) -> str | None:
     """Authorize ``candidate`` under ``root`` and read it via an openat walk.
 
@@ -536,15 +540,23 @@ def read_text_within_root(
        requires it to stay inside ``root`` (rejecting ``..`` escapes and symlinks
        that point out of the root) and to carry an allowed suffix.
 
-    2. **No-TOCTOU read** — the authorized path is then read by opening the
-       trusted ``root`` directory once and walking each *lexical* component below
-       it with ``O_NOFOLLOW`` *relative to the previously-opened parent dirfd*
-       (``openat``-style). ``read_text_nofollow``'s single final-component
-       ``O_NOFOLLOW`` left every *intermediate* directory exposed: an attacker
-       who won a race on one between the resolve check and the open could
-       redirect the read (issue #166). Anchoring each open at its validated
-       parent fd means no component — intermediate or final — can be a symlink
-       (or be swapped for one) after the root boundary is established.
+    2. **No-TOCTOU read** — the authorized path is then read by opening a single
+       pathname-resolved trust ``anchor`` directory and walking *every lexical
+       component* from the anchor down to the leaf with ``O_NOFOLLOW`` *relative
+       to the previously-opened parent dirfd* (``openat``-style).
+       ``read_text_nofollow``'s single final-component ``O_NOFOLLOW`` left every
+       *intermediate* directory exposed: an attacker who won a race on one between
+       the resolve check and the open could redirect the read (issue #166).
+
+    ``anchor`` is the irreducible, pathname-resolved trust root the fd-relative
+    walk starts from; it defaults to ``root``. Callers whose ``root`` is itself a
+    nested directory (e.g. ``thoughts/shared/handoffs``) should pass a higher
+    ``anchor`` (e.g. the repo root) so that ``root``'s *own* parent components are
+    traversed under ``O_NOFOLLOW`` too — otherwise a parent of ``root`` could be
+    swapped for a symlink after validation and the walk would anchor inside the
+    attacker's tree. Only the anchor open follows the pathname; once its fd is
+    held, no component below it — including ``root`` and the leaf — can be a
+    symlink (or be swapped for one).
 
     The walk uses the un-resolved (lexical) component names on purpose: a symlink
     present at open time is refused by ``O_NOFOLLOW`` rather than silently
@@ -557,24 +569,27 @@ def read_text_within_root(
     if safe_artifact_read_path(candidate, root, suffixes=suffixes) is None:
         return None
 
-    # Lexical (un-resolved) components of the candidate below the trusted root.
+    walk_anchor = anchor if anchor is not None else root
+
+    # Lexical (un-resolved) components of the candidate below the trust anchor.
     # Path.resolve() in the policy layer follows symlinks; here we deliberately
     # keep the on-disk component names so the O_NOFOLLOW walk inspects reality.
     cand_abs = Path(candidate)
     if not cand_abs.is_absolute():
         cand_abs = Path.cwd() / cand_abs
     try:
-        rel_parts = cand_abs.relative_to(root.absolute()).parts
+        rel_parts = cand_abs.relative_to(walk_anchor.absolute()).parts
     except ValueError:
         return None
     if not rel_parts or any(part in ("..", ".") for part in rel_parts):
-        # No component below root, or a traversal component the openat walk
+        # No component below the anchor, or a traversal component the openat walk
         # would let escape the boundary — fail closed.
         return None
 
-    # Open the established trust boundary; components below it are O_NOFOLLOW.
+    # Open the irreducible trust anchor by pathname; every component below it
+    # (root's own parents, root, intermediates, and the leaf) is O_NOFOLLOW.
     try:
-        dir_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        dir_fd = os.open(walk_anchor, os.O_RDONLY | os.O_DIRECTORY)
     except OSError:
         return None
 
@@ -638,8 +653,15 @@ def handle_span_id_lookup(
 
         # Fail closed if the trusted handoffs root is itself reached via a symlink.
         if is_safe_dir_root(handoffs_root, allowed_root):
+            # Anchor the openat walk at the repo root (allowed_root) so that the
+            # handoffs root's own parents (thoughts/shared/handoffs) are traversed
+            # under O_NOFOLLOW too — closing the residual TOCTOU between the
+            # is_safe_dir_root check above and the directory open.
             content = read_text_within_root(
-                handoffs_root, handoff["file_path"], suffixes=(".md", ".yaml", ".yml")
+                handoffs_root,
+                handoff["file_path"],
+                suffixes=(".md", ".yaml", ".yml"),
+                anchor=allowed_root,
             )
             if content is not None:
                 handoff["content"] = content

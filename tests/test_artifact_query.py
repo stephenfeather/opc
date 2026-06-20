@@ -963,6 +963,37 @@ class TestReadTextWithinRoot:
         candidate = tmp_path / "sub" / ".." / "file.md"
         assert read_text_within_root(tmp_path, candidate, suffixes=self._SUFFIXES) is None
 
+    def test_reads_with_explicit_anchor_above_root(self, tmp_path):
+        """With an anchor above root, a clean (no-symlink) path still reads."""
+        root = tmp_path / "thoughts" / "shared" / "handoffs"
+        root.mkdir(parents=True)
+        target = root / "x.md"
+        target.write_text("legit")
+        result = read_text_within_root(root, target, suffixes=self._SUFFIXES, anchor=tmp_path)
+        assert result == "legit"
+
+    def test_symlinked_parent_of_root_returns_none(self, tmp_path):
+        """A symlinked component in root's OWN path is refused via a higher anchor.
+
+        Mirrors ``handle_span_id_lookup`` passing ``anchor=repo_root``: ``shared``
+        is a symlink along the containment root's path, so even though the
+        candidate resolves inside ``root.resolve()`` (policy passes), the
+        fd-relative walk from the anchor traverses ``thoughts/shared`` under
+        ``O_NOFOLLOW`` and refuses the swapped parent — closing the TOCTOU the
+        plain pathname open of ``root`` would otherwise leave (review #166).
+        """
+        real_shared = tmp_path / "realshared"
+        (real_shared / "handoffs").mkdir(parents=True)
+        (real_shared / "handoffs" / "x.md").write_text("SECRET")
+        thoughts = tmp_path / "thoughts"
+        thoughts.mkdir()
+        (thoughts / "shared").symlink_to(real_shared, target_is_directory=True)
+        root = tmp_path / "thoughts" / "shared" / "handoffs"
+        candidate = root / "x.md"
+        assert (
+            read_text_within_root(root, candidate, suffixes=self._SUFFIXES, anchor=tmp_path) is None
+        )
+
 
 class TestIsSafeDirRoot:
     """Tests for is_safe_dir_root — fail-closed trust-root validation."""

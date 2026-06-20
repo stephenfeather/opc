@@ -118,6 +118,8 @@ print(json.dumps(output))
             timeout: 5000,
             cwd: projectDir,
             stdio: ['pipe', 'pipe', 'pipe'],
+            // Never rewrite the project's uv.lock from a hook-triggered uv run (issue #71).
+            env: { ...process.env, UV_FROZEN: '1' },
         });
 
         if (result.status !== 0 || !result.stdout) {

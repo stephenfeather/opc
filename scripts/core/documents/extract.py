@@ -29,6 +29,10 @@ SUPPORTED_EXTENSIONS = (
     ".xml",
 )
 
+# Formats where "no extractable text" means a scanned image needing OCR (phase 2),
+# as opposed to a born-digital file that is simply empty. Only PDFs are scans.
+_OCR_ELIGIBLE_EXTENSIONS = (".pdf",)
+
 # Page ceiling for PDFs. The on-disk size guard (ingest) checks the *compressed*
 # file; a small but heavily-compressed or many-page PDF can still expand to far
 # more text/objects in memory. Refusing absurd page counts bounds extraction
@@ -89,12 +93,12 @@ class _HTMLTextExtractor(HTMLParser):
 
 
 def _extract_txt(path: Path) -> list[ExtractedPage]:
-    return [ExtractedPage(page_number=1, text=path.read_text(errors="replace"))]
+    return [ExtractedPage(page_number=1, text=path.read_text(encoding="utf-8", errors="replace"))]
 
 
 def _extract_csv(path: Path) -> list[ExtractedPage]:
     rows = []
-    with path.open(newline="") as fh:
+    with path.open(newline="", encoding="utf-8", errors="replace") as fh:
         for row in csv.reader(fh):
             rows.append(" ".join(row))
     return [ExtractedPage(page_number=1, text="\n".join(rows))]
@@ -126,15 +130,17 @@ def _extract_pdf(path: Path) -> list[ExtractedPage]:
 
 def _extract_html(path: Path) -> list[ExtractedPage]:
     parser = _HTMLTextExtractor()
-    parser.feed(path.read_text(errors="replace"))
+    parser.feed(path.read_text(encoding="utf-8", errors="replace"))
     text = parser.get_text()
     return [ExtractedPage(page_number=1, text=text)] if text.strip() else []
 
 
 def _extract_xml(path: Path) -> list[ExtractedPage]:
     # defusedxml raises (EntitiesForbidden / DTDForbidden / etc.) on hostile
-    # XML; the caller's try/except turns that into status='error'.
-    root = _xml_fromstring(path.read_text(errors="replace"))
+    # XML; the caller's try/except turns that into status='error'. Read raw
+    # bytes so the parser honours the document's own <?xml encoding=...?>
+    # declaration instead of forcing UTF-8.
+    root = _xml_fromstring(path.read_bytes())
     text = " ".join(t.strip() for t in root.itertext() if t.strip()).strip()
     return [ExtractedPage(page_number=1, text=text)] if text.strip() else []
 
@@ -164,7 +170,11 @@ def extract_text(path: Path) -> ExtractionResult:
         return ExtractionResult(pages=[], status="error", error=str(exc), page_count=0)
 
     if not pages or not any(p.text.strip() for p in pages):
-        # Supported type but nothing extractable -> a scan; defer to phase-2 OCR.
-        return ExtractionResult(pages=[], status="skipped_needs_ocr", error=None, page_count=0)
+        if ext in _OCR_ELIGIBLE_EXTENSIONS:
+            # An image-only PDF: no text layer -> a scan; defer to phase-2 OCR.
+            return ExtractionResult(pages=[], status="skipped_needs_ocr", error=None, page_count=0)
+        # A born-digital format that is simply empty (blank .txt/.md/.html/.xml/
+        # .docx). OCR cannot help it; record it as an extracted, contentless doc.
+        return ExtractionResult(pages=[], status="extracted", error=None, page_count=0)
 
     return ExtractionResult(pages=pages, status="extracted", error=None, page_count=len(pages))

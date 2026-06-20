@@ -9,7 +9,7 @@ phase-2 feature; the flag is stored but born-digital v1 ignores it).
 from __future__ import annotations
 
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 import yaml
@@ -53,6 +53,16 @@ def validate_collection(collection: Collection) -> Collection:
         raise RegistryError("collection must declare at least one extension")
     if not collection.path.strip():
         raise RegistryError("collection path must not be empty")
+    # Normalize extensions to include a leading dot so a registry entry written
+    # as `pdf,docx` matches `Path.suffix` (always dotted) instead of silently
+    # matching nothing.
+    normalized = [
+        e.strip() if e.strip().startswith(".") else f".{e.strip()}"
+        for e in collection.extensions
+        if e.strip()
+    ]
+    if normalized != collection.extensions:
+        return replace(collection, extensions=normalized)
     return collection
 
 
@@ -68,9 +78,11 @@ def load_registry(path: Path | None = None) -> list[Collection]:
     if not target.exists():
         return []
     try:
-        raw = yaml.safe_load(target.read_text()) or {}
+        raw = yaml.safe_load(target.read_text(encoding="utf-8")) or {}
     except yaml.YAMLError as exc:
         raise RegistryError(f"registry file is not valid YAML: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise RegistryError(f"registry file must be a mapping, got {type(raw).__name__}")
     entries = raw.get("collections", [])
     collections = []
     for entry in entries:
@@ -100,11 +112,11 @@ def append_collection(path: Path | None, collection: Collection) -> None:
         RegistryError: if the collection is invalid or its name already exists.
     """
     target = path or registry_path()
-    validate_collection(collection)
+    collection = validate_collection(collection)  # capture normalized extensions
     existing = load_registry(target)
     if any(c.name == collection.name for c in existing):
         raise RegistryError(f"collection {collection.name!r} already exists")
     existing.append(collection)
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = {"collections": [asdict(c) for c in existing]}
-    target.write_text(yaml.safe_dump(payload, sort_keys=False))
+    target.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")

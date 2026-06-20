@@ -127,6 +127,15 @@ def test_run_scan_all_scans_every_collection(tmp_path: Path, monkeypatch) -> Non
     assert scanned == {"a", "b"}
 
 
+def test_run_scan_malformed_registry_returns_error(tmp_path: Path, monkeypatch) -> None:
+    # A malformed registry must yield a clean non-zero exit, not a traceback.
+    reg = tmp_path / "reg.yaml"
+    reg.write_text("- not\n- a mapping\n")
+    monkeypatch.setenv("OPC_DOC_REGISTRY", str(reg))
+    assert run(["scan", "--all"]) == 1
+    assert run(["list"]) == 1
+
+
 def test_run_scan_unknown_collection_returns_error(tmp_path: Path, monkeypatch) -> None:
     reg = tmp_path / "reg.yaml"
     monkeypatch.setenv("OPC_DOC_REGISTRY", str(reg))

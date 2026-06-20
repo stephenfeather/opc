@@ -105,7 +105,10 @@ def _collection(tmp_path: Path, scope: str = "global", exts=(".txt",)) -> Collec
 async def test_ingest_collection_skips_unchanged_files(tmp_path: Path, db) -> None:
     doc = tmp_path / "note.txt"
     doc.write_text("hello there")
-    db.get_doc.return_value = {"file_hash": compute_file_hash(doc)}
+    db.get_doc.return_value = {
+        "file_hash": compute_file_hash(doc),
+        "extraction_status": "extracted",
+    }
     db.reconcile.return_value = 2  # the bulk per-collection reconcile rescoped 2
 
     report = await ingest_collection(_collection(tmp_path, scope="restricted"), _FakeEmbedder())
@@ -181,6 +184,37 @@ async def test_ingest_isolates_per_file_failure(tmp_path: Path, db) -> None:
     statuses = [c.kwargs["extraction_status"] for c in db.upsert.await_args_list]
     assert "error" in statuses
     assert "extracted" in statuses
+
+
+async def test_ingest_retries_error_rows(tmp_path: Path, db) -> None:
+    # A row from a prior transient failure (status='error') with a matching hash
+    # must NOT be treated as unchanged — it is reprocessed so a fixed provider
+    # gets a chance to embed it instead of leaving it empty forever.
+    doc = tmp_path / "note.txt"
+    doc.write_text("hello there")
+    db.get_doc.return_value = {
+        "file_hash": compute_file_hash(doc),
+        "extraction_status": "error",
+    }
+
+    report = await ingest_collection(_collection(tmp_path), _FakeEmbedder())
+
+    db.upsert.assert_awaited_once()  # reprocessed, not skipped
+    assert report.ingested == 1
+    assert report.skipped_unchanged == 0
+
+
+async def test_ingest_unsupported_fails_closed(tmp_path: Path, db) -> None:
+    # A tracked file whose type the extractor does not support must not keep
+    # any previously-ingested chunks queryable.
+    doc = tmp_path / "data.xyz"
+    doc.write_text("whatever")
+    collection = _collection(tmp_path, exts=(".xyz",))
+
+    report = await ingest_collection(collection, _FakeEmbedder())
+
+    db.del_one.assert_awaited_once_with("c", str(doc))
+    assert report.skipped_unsupported == 1
 
 
 async def test_ingest_purges_deleted_files(tmp_path: Path, db) -> None:

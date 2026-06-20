@@ -133,7 +133,11 @@ async def _scan_all(targets: list[Collection]) -> None:
 
 
 def _cmd_scan(args: argparse.Namespace) -> int:
-    collections = load_registry(None)
+    try:
+        collections = load_registry(None)
+    except RegistryError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     if args.all:
         targets = collections
     else:
@@ -144,7 +148,11 @@ def _cmd_scan(args: argparse.Namespace) -> int:
         if not targets:
             print(f"error: unknown collection '{args.name}'", file=sys.stderr)
             return 1
-    asyncio.run(_scan_all(targets))
+    try:
+        asyncio.run(_scan_all(targets))
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -160,7 +168,11 @@ async def _list_all(collections: list[Collection]) -> None:
 
 
 def _cmd_list(_args: argparse.Namespace) -> int:
-    collections = load_registry(None)
+    try:
+        collections = load_registry(None)
+    except RegistryError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     if not collections:
         print("no collections registered")
         return 0

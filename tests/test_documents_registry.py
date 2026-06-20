@@ -36,6 +36,21 @@ def test_load_registry_non_mapping_entry_raises_registry_error(tmp_path: Path) -
         load_registry(reg)
 
 
+def test_load_registry_top_level_non_mapping_raises_registry_error(tmp_path: Path) -> None:
+    # A YAML file that is valid but not a mapping (top-level list) must raise
+    # RegistryError, not an AttributeError from raw.get(...).
+    reg = tmp_path / "reg.yaml"
+    reg.write_text("- a\n- b\n")
+    with pytest.raises(RegistryError, match="must be a mapping"):
+        load_registry(reg)
+
+
+def test_validate_normalizes_extensions_without_leading_dot() -> None:
+    col = Collection(name="x", path="/tmp/x", scope="global", extensions=["pdf", ".docx"])
+    normalized = validate_collection(col)
+    assert normalized.extensions == [".pdf", ".docx"]
+
+
 def test_append_then_load_roundtrip(tmp_path: Path) -> None:
     reg = tmp_path / "reg.yaml"
     col = Collection(

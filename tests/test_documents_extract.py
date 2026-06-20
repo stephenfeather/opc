@@ -93,6 +93,16 @@ def test_extract_xml_rejects_entity_expansion(tmp_path: Path) -> None:
     assert result.pages == []
 
 
+def test_extract_empty_txt_is_extracted_not_needs_ocr(tmp_path: Path) -> None:
+    # A blank born-digital file is simply empty; OCR cannot help it, so it must
+    # NOT be misclassified as skipped_needs_ocr (which is for image-only PDFs).
+    f = tmp_path / "blank.txt"
+    f.write_text("   \n  ")
+    result = extract_text(f)
+    assert result.status == "extracted"
+    assert result.pages == []
+
+
 def test_extract_pdf_rejects_excessive_page_count(tmp_path: Path, monkeypatch) -> None:
     # DoS guard: a PDF over the page ceiling is refused before extraction so a
     # decompression-bomb / huge PDF cannot exhaust memory during a cron scan.

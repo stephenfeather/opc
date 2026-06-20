@@ -147,16 +147,26 @@ async def _process_file(
 
     file_hash = compute_file_hash(file_path)
     existing = await get_document_by_path(collection.name, str(file_path))
-    if existing is not None and existing["file_hash"] == file_hash:
-        # Bytes unchanged -> nothing to do here. Scope reconciliation is handled
-        # once per collection in ingest_collection (one bulk UPDATE), not per
-        # file, so an all-unchanged cron scan does no per-file writes.
+    if (
+        existing is not None
+        and existing["file_hash"] == file_hash
+        and existing["extraction_status"] != "error"
+    ):
+        # Bytes unchanged AND last attempt was not an error -> nothing to do.
+        # An 'error' row (e.g. a transient embedding-provider timeout) is NOT
+        # treated as unchanged, so a later scan after the problem clears will
+        # re-extract/re-embed it instead of leaving it empty forever. Scope
+        # reconciliation is handled once per collection in ingest_collection.
         report.skipped_unchanged += 1
         return
 
     result = extract_text(file_path)
 
     if result.status == "skipped_unsupported":
+        # Fail closed: a path that is no longer a supported type (extension
+        # dropped, or support removed) must not keep previously-ingested chunks
+        # queryable. Remove any existing row for it.
+        await delete_document_by_path(collection.name, str(file_path))
         report.skipped_unsupported += 1
         return
 
@@ -172,7 +182,7 @@ async def _process_file(
                 file_path=str(file_path),
                 file_hash=file_hash,
                 file_size_bytes=size,
-                page_count=0,
+                page_count=result.page_count,
                 extraction_status="error",
                 error=f"too many chunks ({len(chunks)} > {max_chunks}); raise OPC_DOC_MAX_CHUNKS",
                 chunks=[],

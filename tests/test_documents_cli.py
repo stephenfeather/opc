@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from scripts.core.documents.cli import build_parser, run
+from scripts.core.documents.ingest import IngestReport
+from scripts.core.documents.query import QueryResult
 
 
 def test_cli_runs_as_script_without_pythonpath(tmp_path: Path) -> None:
@@ -154,3 +160,318 @@ def test_run_query_calls_query_documents(tmp_path: Path, monkeypatch) -> None:
         exit_code = run(["query", "find the nurse"])
     assert exit_code == 0
     mock_query.assert_awaited_once()
+
+
+# --- --json output -----------------------------------------------------------
+
+
+def test_parser_json_flag_on_every_subcommand() -> None:
+    parser = build_parser()
+    # default off
+    assert parser.parse_args(["list"]).json is False
+    # present and parseable on each subcommand
+    assert parser.parse_args(["list", "--json"]).json is True
+    assert parser.parse_args(["query", "q", "--json"]).json is True
+    assert parser.parse_args(["scan", "--all", "--json"]).json is True
+    assert (
+        parser.parse_args(["create", "c", "--path", "/tmp/c", "--scope", "global", "--json"]).json
+        is True
+    )
+
+
+def test_parser_json_flag_accepted_before_subcommand() -> None:
+    # A machine wrapper may put a shared --json before the subcommand. Both
+    # placements (and the absence of the flag) must resolve to the right value.
+    parser = build_parser()
+    assert parser.parse_args(["--json", "list"]).json is True
+    assert parser.parse_args(["--json", "query", "q"]).json is True
+    assert parser.parse_args(["query", "q"]).json is False
+
+
+def test_run_query_json_emits_full_content(capsys) -> None:
+    results = [
+        QueryResult(
+            content="full chunk text that must not be truncated " * 10,
+            file_path="/docs/a.pdf",
+            page_number=3,
+            collection="caleb",
+            similarity=0.91,
+        )
+    ]
+    with (
+        patch(
+            "scripts.core.documents.cli.query_documents",
+            new=AsyncMock(return_value=results),
+        ),
+        patch("scripts.core.documents.cli._build_embedder", return_value=object()),
+    ):
+        exit_code = run(["query", "meds", "--json"])
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == [
+        {
+            "content": results[0].content,
+            "file_path": "/docs/a.pdf",
+            "page_number": 3,
+            "collection": "caleb",
+            "similarity": 0.91,
+        }
+    ]
+
+
+def test_run_query_json_empty_is_empty_array(capsys) -> None:
+    with (
+        patch(
+            "scripts.core.documents.cli.query_documents",
+            new=AsyncMock(return_value=[]),
+        ),
+        patch("scripts.core.documents.cli._build_embedder", return_value=object()),
+    ):
+        exit_code = run(["query", "nothing", "--json"])
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out) == []
+
+
+def test_run_list_json_output(tmp_path: Path, monkeypatch, capsys) -> None:
+    reg = tmp_path / "reg.yaml"
+    monkeypatch.setenv("OPC_DOC_REGISTRY", str(reg))
+    run(
+        ["create", "caleb", "--path", "/tmp/caleb", "--scope", "restricted", "--extensions", ".pdf"]
+    )
+    capsys.readouterr()  # discard setup output so only the --json line is captured
+    scanned = datetime(2026, 6, 20, 12, 0, tzinfo=UTC)
+    stats = {"document_count": 4, "chunk_count": 42, "last_scanned_at": scanned}
+    with patch(
+        "scripts.core.documents.cli.collection_stats",
+        new=AsyncMock(return_value=stats),
+    ):
+        exit_code = run(["list", "--json"])
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == [
+        {
+            "name": "caleb",
+            "scope": "restricted",
+            "path": "/tmp/caleb",
+            "document_count": 4,
+            "chunk_count": 42,
+            "last_scanned_at": scanned.isoformat(),
+        }
+    ]
+
+
+def test_run_list_json_empty_registry(tmp_path: Path, monkeypatch, capsys) -> None:
+    reg = tmp_path / "reg.yaml"
+    monkeypatch.setenv("OPC_DOC_REGISTRY", str(reg))
+    assert run(["list", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == []
+
+
+def test_run_list_json_null_last_scan(tmp_path: Path, monkeypatch, capsys) -> None:
+    reg = tmp_path / "reg.yaml"
+    monkeypatch.setenv("OPC_DOC_REGISTRY", str(reg))
+    run(["create", "c", "--path", "/tmp/c", "--scope", "global", "--extensions", ".txt"])
+    capsys.readouterr()  # discard setup output so only the --json line is captured
+    stats = {"document_count": 0, "chunk_count": 0, "last_scanned_at": None}
+    with patch(
+        "scripts.core.documents.cli.collection_stats",
+        new=AsyncMock(return_value=stats),
+    ):
+        assert run(["list", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload[0]["last_scanned_at"] is None
+
+
+def test_run_scan_json_output(tmp_path: Path, monkeypatch, capsys) -> None:
+    reg = tmp_path / "reg.yaml"
+    monkeypatch.setenv("OPC_DOC_REGISTRY", str(reg))
+    run(["create", "c", "--path", str(tmp_path), "--scope", "global", "--extensions", ".txt"])
+    capsys.readouterr()  # discard setup output so only the --json line is captured
+    report = IngestReport(collection="c", ingested=2, skipped_unchanged=1, purged=3)
+    with (
+        patch(
+            "scripts.core.documents.cli.ingest_collection",
+            new=AsyncMock(return_value=report),
+        ),
+        patch("scripts.core.documents.cli._build_embedder", return_value=object()),
+    ):
+        exit_code = run(["scan", "c", "--json"])
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == [
+        {
+            "collection": "c",
+            "ingested": 2,
+            "skipped_unchanged": 1,
+            "skipped_unsupported": 0,
+            "skipped_too_large": 0,
+            "needs_ocr": 0,
+            "errors": 0,
+            "rescoped": 0,
+            "purged": 3,
+        }
+    ]
+
+
+def test_run_scan_all_json_partial_success_keeps_completed_observable(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    # Regression: when a later collection fails (missing folder), the earlier
+    # completed collection's result must still be reported, and the failure must
+    # appear structurally — not swallow the whole batch behind a bare error line.
+    reg = tmp_path / "reg.yaml"
+    monkeypatch.setenv("OPC_DOC_REGISTRY", str(reg))
+    run(["create", "ok", "--path", str(tmp_path), "--scope", "global", "--extensions", ".txt"])
+    run(["create", "bad", "--path", "/tmp/bad", "--scope", "global", "--extensions", ".txt"])
+    capsys.readouterr()  # discard setup output
+
+    async def fake_ingest(collection, _embedder):
+        if collection.name == "bad":
+            raise FileNotFoundError("collection folder not found: /tmp/bad")
+        return IngestReport(collection="ok", ingested=5)
+
+    with (
+        patch("scripts.core.documents.cli.ingest_collection", new=fake_ingest),
+        patch("scripts.core.documents.cli._build_embedder", return_value=object()),
+    ):
+        exit_code = run(["scan", "--all", "--json"])
+    # Nonzero because one collection failed...
+    assert exit_code == 1
+    payload = json.loads(capsys.readouterr().out)
+    # ...but the completed collection's report is still present, and the failure
+    # is represented structurally.
+    by_name = {entry["collection"]: entry for entry in payload}
+    assert by_name["ok"]["ingested"] == 5
+    assert "error" in by_name["bad"]
+    assert "ingested" not in by_name["bad"]
+
+
+def test_run_scan_all_text_partial_success_reports_completed(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    reg = tmp_path / "reg.yaml"
+    monkeypatch.setenv("OPC_DOC_REGISTRY", str(reg))
+    run(["create", "ok", "--path", str(tmp_path), "--scope", "global", "--extensions", ".txt"])
+    run(["create", "bad", "--path", "/tmp/bad", "--scope", "global", "--extensions", ".txt"])
+    capsys.readouterr()
+
+    async def fake_ingest(collection, _embedder):
+        if collection.name == "bad":
+            raise FileNotFoundError("missing")
+        return IngestReport(collection="ok", ingested=5)
+
+    with (
+        patch("scripts.core.documents.cli.ingest_collection", new=fake_ingest),
+        patch("scripts.core.documents.cli._build_embedder", return_value=object()),
+    ):
+        exit_code = run(["scan", "--all"])
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert "[ok] ingested=5" in captured.out  # completed work on stdout
+    assert "bad" in captured.err  # failure on stderr
+
+
+def test_run_create_json_output(tmp_path: Path, monkeypatch, capsys) -> None:
+    reg = tmp_path / "reg.yaml"
+    monkeypatch.setenv("OPC_DOC_REGISTRY", str(reg))
+    exit_code = run(
+        [
+            "create",
+            "caleb",
+            "--path",
+            "/tmp/caleb",
+            "--scope",
+            "restricted",
+            "--extensions",
+            ".pdf,.docx",
+            "--json",
+        ]
+    )
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "name": "caleb",
+        "scope": "restricted",
+        "path": "/tmp/caleb",
+        "extensions": [".pdf", ".docx"],
+        "ocr": False,
+        "status": "registered",
+    }
+
+
+def test_run_create_json_emits_normalized_extensions(tmp_path: Path, monkeypatch, capsys) -> None:
+    # Regression: create --json must emit the canonical collection that is
+    # actually written to the registry (extensions normalized to leading-dot),
+    # not the raw argparse values. Otherwise an MCP consumer that trusts the
+    # JSON sees "pdf" while the registry holds ".pdf".
+    reg = tmp_path / "reg.yaml"
+    monkeypatch.setenv("OPC_DOC_REGISTRY", str(reg))
+    exit_code = run(
+        [
+            "create",
+            "c",
+            "--path",
+            "/tmp/c",
+            "--scope",
+            "global",
+            "--extensions",
+            "pdf,docx",
+            "--json",
+        ]
+    )
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["extensions"] == [".pdf", ".docx"]
+    # The JSON contract must match what the registry actually stored.
+    assert ".pdf" in reg.read_text()
+    assert "\n- pdf\n" not in reg.read_text()
+
+
+def test_run_scan_all_streams_completed_before_nonfnf_failure(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    # A failure other than FileNotFoundError (DB error, SIGTERM) deep in
+    # scan --all must not erase the cron log of collections already completed:
+    # each completed report is flushed the instant it finishes, before the
+    # later collection raises.
+    reg = tmp_path / "reg.yaml"
+    monkeypatch.setenv("OPC_DOC_REGISTRY", str(reg))
+    run(["create", "ok", "--path", str(tmp_path), "--scope", "global", "--extensions", ".txt"])
+    run(["create", "boom", "--path", str(tmp_path), "--scope", "global", "--extensions", ".txt"])
+    capsys.readouterr()
+
+    async def fake_ingest(collection, _embedder):
+        if collection.name == "boom":
+            raise RuntimeError("db exploded mid-scan")
+        return IngestReport(collection="ok", ingested=7)
+
+    with (
+        patch("scripts.core.documents.cli.ingest_collection", new=fake_ingest),
+        patch("scripts.core.documents.cli._build_embedder", return_value=object()),
+    ):
+        with pytest.raises(RuntimeError):
+            run(["scan", "--all"])
+    # The completed collection was reported before the crash propagated.
+    assert "[ok] ingested=7" in capsys.readouterr().out
+
+
+def test_run_query_rejects_over_limit() -> None:
+    # An MCP caller must not be able to request an unbounded full-content payload.
+    assert run(["query", "x", "--limit", "100000"]) == 1
+
+
+def test_run_query_rejects_nonpositive_limit() -> None:
+    assert run(["query", "x", "--limit", "0"]) == 1
+
+
+def test_run_query_allows_max_limit(capsys) -> None:
+    with (
+        patch(
+            "scripts.core.documents.cli.query_documents",
+            new=AsyncMock(return_value=[]),
+        ) as mock_query,
+        patch("scripts.core.documents.cli._build_embedder", return_value=object()),
+    ):
+        assert run(["query", "x", "--limit", "100", "--json"]) == 0
+    mock_query.assert_awaited_once()
+    assert json.loads(capsys.readouterr().out) == []

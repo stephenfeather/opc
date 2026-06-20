@@ -504,6 +504,13 @@ class TestArgValidation:
         assert ns.merge_timeout == 0.5
         assert ns.min_recall == 0
 
+    def test_promote_only_and_cleanup_only_are_mutually_exclusive(self):
+        # Passing both would disable promote AND cleanup → an empty report.
+        from scripts.core.memory_review import _parse_args
+
+        with pytest.raises(SystemExit):
+            _parse_args(["opc", "--promote-only", "--cleanup-only"])
+
 
 class TestMergeGuardClamps:
     # Defense-in-depth for programmatic callers that bypass argparse.
@@ -535,6 +542,18 @@ class TestMainDbErrorHandling:
 
         monkeypatch.setattr(mr, "_default_project", lambda: "opc")
         monkeypatch.setattr(mr, "get_pool", _boom)
+        rc = await mr.main(["opc"])
+        assert rc == 1
+
+    async def test_config_error_returns_clean_exit_code(self, monkeypatch):
+        # Missing DATABASE_URL surfaces as ValueError from get_pool — must exit clean.
+        import scripts.core.memory_review as mr
+
+        async def _no_url():
+            raise ValueError("Database URL not set (environment='<unset>').")
+
+        monkeypatch.setattr(mr, "_default_project", lambda: "opc")
+        monkeypatch.setattr(mr, "get_pool", _no_url)
         rc = await mr.main(["opc"])
         assert rc == 1
 

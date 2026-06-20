@@ -514,7 +514,13 @@ def _default_project() -> str | None:
     """Worktree-aware default project: resolves .claude/worktrees/<branch> to the
     real repo (issue #130), so a worktree session reviews the right corpus rather
     than the branch name. Honors CLAUDE_PROJECT_DIR when set."""
-    return project_from_path(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        # cwd can be gone (deleted out from under us) — fall back to env/None rather
+        # than crashing default resolution.
+        cwd = None
+    return project_from_path(os.environ.get("CLAUDE_PROJECT_DIR") or cwd)
 
 
 def _positive_int(raw: str) -> int:
@@ -568,8 +574,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_MERGE_TIMEOUT_S,
         help="Seconds before the merge scan degrades gracefully (> 0; pool cap is 60s)",
     )
-    p.add_argument("--promote-only", action="store_true", help="Skip cleanup detectors")
-    p.add_argument("--cleanup-only", action="store_true", help="Skip promotion detector")
+    # Mutually exclusive: passing both would disable promote AND cleanup → empty report.
+    only = p.add_mutually_exclusive_group()
+    only.add_argument("--promote-only", action="store_true", help="Skip cleanup detectors")
+    only.add_argument("--cleanup-only", action="store_true", help="Skip promotion detector")
     return p.parse_args(argv)
 
 
@@ -600,6 +608,11 @@ async def main(argv: list[str] | None = None) -> int:
             promote=promote,
             cleanup=cleanup,
         )
+    except ValueError as exc:
+        # Missing/invalid DB config (get_pool raises ValueError when no DATABASE_URL).
+        # The message is our own config text, not a DSN, so it is safe to surface.
+        print(f"memory-review: configuration error: {exc}", file=sys.stderr)
+        return 1
     except (OSError, PostgresError) as exc:
         # Connection/DB failures (DB down, bad DSN, refused) should fail cleanly with
         # a concise message — never dump a traceback that could echo the DSN/host.

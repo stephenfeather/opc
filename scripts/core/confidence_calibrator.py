@@ -260,10 +260,10 @@ def _pg_connect():
     AGENTICA_MEMORY_BACKEND=sqlite override — refuse rather than mutate
     archival_memory while store/recall operate on sqlite (no split-brain).
     """
-    import psycopg2
-
     from scripts.core.db.backend_resolution import get_active_backend, get_connection_url
 
+    # Gate before importing psycopg2 so a non-postgres backend yields the clear
+    # RuntimeError below even when the postgres driver is not installed.
     if get_active_backend() != "postgres":
         raise RuntimeError(
             "Confidence calibration requires the postgres backend, but the active "
@@ -277,6 +277,8 @@ def _pg_connect():
             "No database URL configured; set CONTINUOUS_CLAUDE_DB_URL, "
             "DATABASE_URL, or OPC_POSTGRES_URL"
         )
+    import psycopg2
+
     return psycopg2.connect(db_url)
 
 

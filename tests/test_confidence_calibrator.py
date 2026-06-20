@@ -50,6 +50,24 @@ class TestPgConnectBackendGating:
                 _pg_connect()
             mock_connect.assert_not_called()
 
+    def test_refuses_with_runtimeerror_when_psycopg2_absent(self, monkeypatch):
+        # The backend gate must run before importing psycopg2, so a non-postgres
+        # backend raises the clear RuntimeError even if the driver is missing.
+        monkeypatch.setenv("AGENTICA_MEMORY_BACKEND", "sqlite")
+        monkeypatch.setenv("CONTINUOUS_CLAUDE_DB_URL", "postgresql://test")
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "psycopg2":
+                raise ImportError("no psycopg2")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        with pytest.raises(RuntimeError, match="postgres"):
+            _pg_connect()
+
     def test_connects_when_backend_is_postgres(self, monkeypatch):
         monkeypatch.delenv("AGENTICA_MEMORY_BACKEND", raising=False)
         monkeypatch.delenv("DATABASE_URL", raising=False)

@@ -470,6 +470,12 @@ def _record_rejection(
         import psycopg2
 
         conn = psycopg2.connect(url)
+    except Exception as e:
+        logger.debug("Failed to record rejection: %s", e)
+        return
+    # Connection acquired: close it in a finally so a failure in table
+    # creation / insert cannot leak it (this function swallows errors).
+    try:
         cur = conn.cursor()
         _ensure_learning_rejections_table(cur)
         cur.execute(
@@ -492,9 +498,10 @@ def _record_rejection(
             ),
         )
         conn.commit()
-        conn.close()
     except Exception as e:
         logger.debug("Failed to record rejection: %s", e)
+    finally:
+        conn.close()
 
 
 def _query_rejection_count(session_id: str) -> int:

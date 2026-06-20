@@ -673,6 +673,27 @@ class TestRejectionBackendGating:
             assert _query_rejection_count("s1") == 0
             mock_connect.assert_not_called()
 
+    def test_record_rejection_closes_conn_on_query_error(self) -> None:
+        # Connection must be closed even if table-creation/insert raises, so the
+        # silently-swallowed error path cannot leak connections.
+        from scripts.core.store_learning import _record_rejection
+
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_cur.execute.side_effect = Exception("boom")
+        mock_conn.cursor.return_value = mock_cur
+
+        with (
+            patch(
+                "scripts.core.store_learning._pg_telemetry_url",
+                return_value="postgresql://test",
+            ),
+            patch("psycopg2.connect", return_value=mock_conn),
+        ):
+            _record_rejection("s1", similarity=0.99, threshold=0.9)  # must not raise
+
+        mock_conn.close.assert_called_once()
+
     def test_rejection_still_uses_pg_without_override(self) -> None:
         # No explicit override + URL present → telemetry still hits postgres.
         mock_conn = MagicMock()

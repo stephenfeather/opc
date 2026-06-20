@@ -219,11 +219,48 @@ function extractKeywords(prompt) {
   const words = prompt.toLowerCase().replace(/[^\w\s-]/g, " ").split(/\s+/).filter((w) => w.length > 2 && !stopWords.has(w));
   return [...new Set(words)].slice(0, 5).join(" ");
 }
+function sanitizeSearchTerm(intent) {
+  return intent.replace(/[_\/]/g, " ").replace(/\s+/g, " ").trim();
+}
+var CONVERSATIONAL_LEAD = /* @__PURE__ */ new Set([
+  "no",
+  "nope",
+  "nah",
+  "yes",
+  "yeah",
+  "yep",
+  "yup",
+  "ok",
+  "okay",
+  "sure",
+  "nvm",
+  "nevermind",
+  "oops",
+  "thanks",
+  "exactly",
+  "agreed"
+]);
+var PRONOUN_IMPERATIVE = /^(do|redo|undo|run|rerun|try|retry|repeat|revert|keep|continue|extend|fix|change|update|move)\s+(it|that|this|them|those|these)(\s+(again|now|another|once|more|instead|please)\b|\s*[.!?,]*\s*$)/;
+function isConversationalTurn(prompt) {
+  const trimmed = prompt.trim();
+  if (!trimmed) return true;
+  const lower = trimmed.toLowerCase();
+  const tokens = lower.split(/\s+/).map((t) => t.replace(/^[^\w]+|[^\w]+$/g, "")).filter(Boolean);
+  if (tokens.length === 0) return true;
+  if (tokens.length > 8) return false;
+  const lead = tokens[0];
+  const hasLeadComma = /^[a-z]+\s*,/.test(lower);
+  if (CONVERSATIONAL_LEAD.has(lead) && (tokens.length <= 2 || hasLeadComma)) {
+    return true;
+  }
+  const rest = CONVERSATIONAL_LEAD.has(lead) ? lower.replace(/^[a-z]+\s*,?\s*/, "") : lower;
+  return PRONOUN_IMPERATIVE.test(rest);
+}
 function checkMemoryRelevance(intent, projectDir) {
   if (!intent || intent.length < 3) return null;
   const opcDir = getOpcDir();
   if (!opcDir) return null;
-  const searchTerm = intent.replace(/[_\/]/g, " ").replace(/\b\w{1,2}\b/g, "").replace(/\s+/g, " ").trim();
+  const searchTerm = sanitizeSearchTerm(intent);
   const projectTag = projectDir ? projectDir.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? "" : "";
   const safeProjectTag = projectTag && !projectTag.startsWith("-") ? projectTag : "";
   const tagArgs = safeProjectTag ? ["--tags", safeProjectTag] : [];
@@ -291,6 +328,9 @@ async function main() {
   if (input.prompt.trim().startsWith("/")) {
     return;
   }
+  if (isConversationalTurn(input.prompt)) {
+    return;
+  }
   const intent = extractIntent(input.prompt);
   if (intent.length < 3) {
     return;
@@ -311,5 +351,11 @@ Use /recall "${intent}" for full content. Disclose if helpful.`;
     }));
   }
 }
-main().catch(() => {
-});
+if (typeof process !== "undefined" && process.argv[1] && (process.argv[1].endsWith("memory-awareness.ts") || process.argv[1].endsWith("memory-awareness.js") || process.argv[1].endsWith("memory-awareness.mjs"))) {
+  main().catch(() => {
+  });
+}
+export {
+  isConversationalTurn,
+  sanitizeSearchTerm
+};

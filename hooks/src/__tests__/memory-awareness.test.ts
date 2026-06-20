@@ -1,0 +1,90 @@
+/**
+ * Unit tests for the pure helpers in memory-awareness.ts (issue #213).
+ *
+ * Two defects are covered:
+ *  1. `sanitizeSearchTerm` must NOT discard discriminating short tokens —
+ *     bare numbers ("7") and 2-char tech tokens ("os", "pg", "v2") were being
+ *     stripped by a blanket `\b\w{1,2}\b` removal, collapsing a specific prompt
+ *     into a generic phrase that matched unrelated cross-project learnings.
+ *  2. `isConversationalTurn` must suppress recall on short imperative/meta
+ *     replies (e.g. "no, extend it another 7 days") that carry no archival
+ *     intent, while letting genuine knowledge queries through.
+ */
+
+import { describe, it, expect } from 'vitest';
+import { sanitizeSearchTerm, isConversationalTurn } from '../memory-awareness.js';
+
+describe('sanitizeSearchTerm', () => {
+  it('preserves bare numbers (regression: "7" was stripped)', () => {
+    expect(sanitizeSearchTerm('extend another 7 days')).toBe('extend another 7 days');
+  });
+
+  it('preserves 2-char tech tokens like os / pg / v2', () => {
+    expect(sanitizeSearchTerm('os import bug')).toBe('os import bug');
+    expect(sanitizeSearchTerm('pg pool leak')).toBe('pg pool leak');
+    expect(sanitizeSearchTerm('migrate to v2 api')).toBe('migrate to v2 api');
+  });
+
+  it('converts underscores and slashes to spaces', () => {
+    expect(sanitizeSearchTerm('memory_daemon/db pool')).toBe('memory daemon db pool');
+  });
+
+  it('collapses repeated whitespace and trims', () => {
+    expect(sanitizeSearchTerm('  multiple   spaces  ')).toBe('multiple spaces');
+  });
+
+  it('returns empty string for whitespace-only input', () => {
+    expect(sanitizeSearchTerm('   ')).toBe('');
+  });
+});
+
+describe('isConversationalTurn', () => {
+  it('gates the reported prompt: "no, extend it another 7 days"', () => {
+    expect(isConversationalTurn('no, extend it another 7 days')).toBe(true);
+  });
+
+  it('gates bare affirmations and negations', () => {
+    for (const p of ['yes', 'no', 'nope', 'sure', 'ok', 'okay', 'yeah', 'nvm', 'no thanks']) {
+      expect(isConversationalTurn(p)).toBe(true);
+    }
+  });
+
+  it('gates comma-led discourse markers', () => {
+    expect(isConversationalTurn('yes, do that one')).toBe(true);
+    expect(isConversationalTurn('ok, try the other approach')).toBe(true);
+  });
+
+  it('gates affirmation followed by a pronoun-imperative', () => {
+    expect(isConversationalTurn('yeah do that')).toBe(true);
+  });
+
+  it('gates short pronoun-led imperatives', () => {
+    for (const p of ['do it', 'run it', 'try that', 'undo that', 'redo it', 'extend it another 7 days', 'run it again']) {
+      expect(isConversationalTurn(p)).toBe(true);
+    }
+  });
+
+  it('lets genuine knowledge queries through', () => {
+    expect(isConversationalTurn('how does the reranker compute project_match weight')).toBe(false);
+    expect(isConversationalTurn('fix the auth bug in session-start')).toBe(false);
+    expect(isConversationalTurn('implement the backend resolver for store_learning')).toBe(false);
+  });
+
+  it('does NOT gate verb + determiner + noun (not a bare pronoun)', () => {
+    expect(isConversationalTurn('fix that bug in the parser')).toBe(false);
+    expect(isConversationalTurn('change this function to async')).toBe(false);
+    expect(isConversationalTurn('delete that migration file')).toBe(false);
+  });
+
+  it('lets substantive corrections through even when they start with "no,"', () => {
+    expect(
+      isConversationalTurn(
+        'no, I actually want to understand how the memory daemon extracts thinking blocks across sessions'
+      )
+    ).toBe(false);
+  });
+
+  it('treats empty/whitespace input as conversational (nothing to recall)', () => {
+    expect(isConversationalTurn('   ')).toBe(true);
+  });
+});

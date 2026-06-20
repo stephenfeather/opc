@@ -101,6 +101,77 @@ function extractKeywords(prompt: string): string {
 }
 
 /**
+ * Normalize an intent string into a Postgres FTS query (issue #213).
+ *
+ * Underscores/slashes become spaces and runs of whitespace collapse, but we
+ * deliberately DO NOT strip short tokens: the previous `\b\w{1,2}\b` removal
+ * discarded bare numbers ("7") and 2-char tech tokens ("os", "pg", "v2", "ci"),
+ * collapsing a specific prompt into a generic phrase that then matched
+ * unrelated cross-project learnings. `plainto_tsquery` already drops English
+ * stopwords downstream, so the blanket strip only destroyed signal.
+ */
+export function sanitizeSearchTerm(intent: string): string {
+  return intent
+    .replace(/[_\/]/g, ' ')           // Convert underscores/slashes to spaces
+    .replace(/\s+/g, ' ')             // Collapse whitespace
+    .trim();
+}
+
+// Lead tokens that mark a conversational reply rather than a knowledge query.
+const CONVERSATIONAL_LEAD = new Set([
+  'no', 'nope', 'nah', 'yes', 'yeah', 'yep', 'yup', 'ok', 'okay', 'sure',
+  'nvm', 'nevermind', 'oops', 'thanks', 'exactly', 'agreed'
+]);
+
+// Imperative-on-a-bare-pronoun, e.g. "do it", "undo that", "extend it another".
+// The pronoun must end the prompt or be followed by a non-noun continuation
+// (again/now/another/...) so "fix that bug" / "change this function" are NOT
+// matched — there the pronoun is a determiner introducing a real noun.
+const PRONOUN_IMPERATIVE =
+  /^(do|redo|undo|run|rerun|try|retry|repeat|revert|keep|continue|extend|fix|change|update|move)\s+(it|that|this|them|those|these)(\s+(again|now|another|once|more|instead|please)\b|\s*[.!?,]*\s*$)/;
+
+/**
+ * Decide whether a prompt is a short conversational/meta turn that should NOT
+ * trigger a memory recall (issue #213).
+ *
+ * The always-on hook fired on `"no, extend it another 7 days"` — a meta-command
+ * about the live conversation — and surfaced unrelated cross-project learnings.
+ * We gate such turns while letting genuine knowledge queries through:
+ *  - more than 8 word-tokens -> treat as substantive, never gate;
+ *  - a bare affirmation/negation, optionally with a trailing clause introduced
+ *    by a comma ("no, ...", "yes, do that one");
+ *  - an affirmation followed by a pronoun-imperative ("yeah do that");
+ *  - a short pronoun-led imperative ("do it", "extend it another 7 days").
+ */
+export function isConversationalTurn(prompt: string): boolean {
+  const trimmed = prompt.trim();
+  if (!trimmed) return true;
+
+  const lower = trimmed.toLowerCase();
+  const tokens = lower
+    .split(/\s+/)
+    .map(t => t.replace(/^[^\w]+|[^\w]+$/g, ''))
+    .filter(Boolean);
+  if (tokens.length === 0) return true;
+  if (tokens.length > 8) return false;  // substantive turn — let recall run
+
+  const lead = tokens[0];
+  const hasLeadComma = /^[a-z]+\s*,/.test(lower);
+
+  // Bare affirmation/negation, or one used as a comma-led discourse marker.
+  if (CONVERSATIONAL_LEAD.has(lead) && (tokens.length <= 2 || hasLeadComma)) {
+    return true;
+  }
+
+  // Strip a leading discourse marker ("yeah do that" -> "do that") then test
+  // the pronoun-imperative pattern.
+  const rest = CONVERSATIONAL_LEAD.has(lead)
+    ? lower.replace(/^[a-z]+\s*,?\s*/, '')
+    : lower;
+  return PRONOUN_IMPERATIVE.test(rest);
+}
+
+/**
  * Fast memory relevance check using text search.
  * For text-only mode, we search by the most significant keyword
  * (text ILIKE looks for substring match, not multi-word).
@@ -111,13 +182,7 @@ function checkMemoryRelevance(intent: string, projectDir: string): MemoryMatch |
   const opcDir = getOpcDir();
   if (!opcDir) return null;  // Graceful degradation if OPC not available
 
-  // PostgreSQL full-text search handles stopwords automatically via plainto_tsquery
-  // Just clean up the intent: remove paths, underscores, short words
-  const searchTerm = intent
-    .replace(/[_\/]/g, ' ')           // Convert underscores/slashes to spaces
-    .replace(/\b\w{1,2}\b/g, '')      // Remove 1-2 char words
-    .replace(/\s+/g, ' ')             // Collapse whitespace
-    .trim();
+  const searchTerm = sanitizeSearchTerm(intent);
 
   // Derive project tag from CLAUDE_PROJECT_DIR to boost relevance via --tags (not a hard filter)
   const projectTag = projectDir ? projectDir.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? '' : '';
@@ -225,6 +290,13 @@ async function main() {
     return;
   }
 
+  // Skip short conversational/meta turns (issue #213): replies like
+  // "no, extend it another 7 days" carry no archival intent and otherwise
+  // recall unrelated, often cross-project, learnings.
+  if (isConversationalTurn(input.prompt)) {
+    return;
+  }
+
   // Extract intent (semantic query, not just keywords)
   const intent = extractIntent(input.prompt);
 
@@ -253,6 +325,17 @@ async function main() {
   }
 }
 
-main().catch(() => {
-  // Silent fail - don't block user prompts
-});
+// Only run as the hook entry point — guard so the pure helpers above can be
+// imported in unit tests without main() consuming stdin (matches the
+// convention in heartbeat.ts / working-on-sync.ts).
+if (
+  typeof process !== 'undefined' &&
+  process.argv[1] &&
+  (process.argv[1].endsWith('memory-awareness.ts') ||
+    process.argv[1].endsWith('memory-awareness.js') ||
+    process.argv[1].endsWith('memory-awareness.mjs'))
+) {
+  main().catch(() => {
+    // Silent fail - don't block user prompts
+  });
+}

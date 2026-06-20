@@ -74,13 +74,19 @@ def load_registry(path: Path | None = None) -> list[Collection]:
     entries = raw.get("collections", [])
     collections = []
     for entry in entries:
-        col = Collection(
-            name=entry["name"],
-            path=entry["path"],
-            scope=entry["scope"],
-            extensions=list(entry.get("extensions", [])),
-            ocr=bool(entry.get("ocr", False)),
-        )
+        # The registry is hand-edited YAML; a missing key or a non-mapping entry
+        # must surface as RegistryError (which callers handle), not an unhandled
+        # KeyError/TypeError traceback out of the CLI.
+        try:
+            col = Collection(
+                name=entry["name"],
+                path=entry["path"],
+                scope=entry["scope"],
+                extensions=list(entry.get("extensions", [])),
+                ocr=bool(entry.get("ocr", False)),
+            )
+        except (KeyError, TypeError) as exc:
+            raise RegistryError(f"malformed registry entry {entry!r}: {exc}") from exc
         collections.append(validate_collection(col))
     return collections
 

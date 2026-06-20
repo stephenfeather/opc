@@ -35,9 +35,15 @@ _ERROR_MSG_MAX = 500
 
 def _max_file_bytes() -> int:
     """Per-file size ceiling; larger files are skipped (not embedded), bounding
-    memory and embedding-request size. Override with OPC_DOC_MAX_FILE_MB."""
+    memory and embedding-request size. Override with OPC_DOC_MAX_FILE_MB.
+
+    A negative value would make the size check always true and skip every file,
+    so negatives fall back to the default.
+    """
     try:
         mb = float(os.getenv("OPC_DOC_MAX_FILE_MB", str(_DEFAULT_MAX_FILE_MB)))
+        if mb < 0:
+            raise ValueError
     except (TypeError, ValueError):
         mb = _DEFAULT_MAX_FILE_MB
     return int(mb * 1024 * 1024)
@@ -46,9 +52,15 @@ def _max_file_bytes() -> int:
 def _max_chunks_per_file() -> int:
     """Cap on chunks embedded from one file, bounding a single embed_batch /
     insert payload even for an allowed-size but chunk-dense file. Override with
-    OPC_DOC_MAX_CHUNKS."""
+    OPC_DOC_MAX_CHUNKS.
+
+    A negative value would reject every file, so negatives fall back to default.
+    """
     try:
-        return int(os.getenv("OPC_DOC_MAX_CHUNKS", str(_DEFAULT_MAX_CHUNKS)))
+        n = int(os.getenv("OPC_DOC_MAX_CHUNKS", str(_DEFAULT_MAX_CHUNKS)))
+        if n < 0:
+            raise ValueError
+        return n
     except (TypeError, ValueError):
         return _DEFAULT_MAX_CHUNKS
 

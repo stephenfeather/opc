@@ -20,6 +20,22 @@ def test_load_registry_missing_file_returns_empty(tmp_path: Path) -> None:
     assert result == []
 
 
+def test_load_registry_missing_key_raises_registry_error(tmp_path: Path) -> None:
+    # A hand-edited entry missing a required key must raise RegistryError (which
+    # callers handle), not an unhandled KeyError traceback out of the CLI.
+    reg = tmp_path / "reg.yaml"
+    reg.write_text("collections:\n  - name: x\n    path: /tmp/x\n")  # no 'scope'
+    with pytest.raises(RegistryError, match="malformed registry entry"):
+        load_registry(reg)
+
+
+def test_load_registry_non_mapping_entry_raises_registry_error(tmp_path: Path) -> None:
+    reg = tmp_path / "reg.yaml"
+    reg.write_text("collections:\n  - just-a-string\n")
+    with pytest.raises(RegistryError, match="malformed registry entry"):
+        load_registry(reg)
+
+
 def test_append_then_load_roundtrip(tmp_path: Path) -> None:
     reg = tmp_path / "reg.yaml"
     col = Collection(

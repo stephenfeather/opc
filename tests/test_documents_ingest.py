@@ -8,8 +8,30 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from scripts.core.documents.ingest import compute_file_hash, ingest_collection
+from scripts.core.documents.ingest import (
+    _DEFAULT_MAX_CHUNKS,
+    _DEFAULT_MAX_FILE_MB,
+    _max_chunks_per_file,
+    _max_file_bytes,
+    compute_file_hash,
+    ingest_collection,
+)
 from scripts.core.documents.registry import Collection
+
+
+def test_max_file_bytes_rejects_negative_env(monkeypatch) -> None:
+    monkeypatch.setenv("OPC_DOC_MAX_FILE_MB", "-5")
+    assert _max_file_bytes() == int(_DEFAULT_MAX_FILE_MB * 1024 * 1024)
+
+
+def test_max_file_bytes_rejects_garbage_env(monkeypatch) -> None:
+    monkeypatch.setenv("OPC_DOC_MAX_FILE_MB", "not-a-number")
+    assert _max_file_bytes() == int(_DEFAULT_MAX_FILE_MB * 1024 * 1024)
+
+
+def test_max_chunks_rejects_negative_env(monkeypatch) -> None:
+    monkeypatch.setenv("OPC_DOC_MAX_CHUNKS", "-1")
+    assert _max_chunks_per_file() == _DEFAULT_MAX_CHUNKS
 
 
 def test_compute_file_hash_is_stable(tmp_path: Path) -> None:

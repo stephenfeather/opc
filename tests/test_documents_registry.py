@@ -1,0 +1,94 @@
+"""Tests for the document-collection registry."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from scripts.core.documents.registry import (
+    Collection,
+    RegistryError,
+    append_collection,
+    load_registry,
+    validate_collection,
+)
+
+
+def test_load_registry_missing_file_returns_empty(tmp_path: Path) -> None:
+    result = load_registry(tmp_path / "nonexistent.yaml")
+    assert result == []
+
+
+def test_load_registry_missing_key_raises_registry_error(tmp_path: Path) -> None:
+    # A hand-edited entry missing a required key must raise RegistryError (which
+    # callers handle), not an unhandled KeyError traceback out of the CLI.
+    reg = tmp_path / "reg.yaml"
+    reg.write_text("collections:\n  - name: x\n    path: /tmp/x\n")  # no 'scope'
+    with pytest.raises(RegistryError, match="malformed registry entry"):
+        load_registry(reg)
+
+
+def test_load_registry_non_mapping_entry_raises_registry_error(tmp_path: Path) -> None:
+    reg = tmp_path / "reg.yaml"
+    reg.write_text("collections:\n  - just-a-string\n")
+    with pytest.raises(RegistryError, match="malformed registry entry"):
+        load_registry(reg)
+
+
+def test_load_registry_top_level_non_mapping_raises_registry_error(tmp_path: Path) -> None:
+    # A YAML file that is valid but not a mapping (top-level list) must raise
+    # RegistryError, not an AttributeError from raw.get(...).
+    reg = tmp_path / "reg.yaml"
+    reg.write_text("- a\n- b\n")
+    with pytest.raises(RegistryError, match="must be a mapping"):
+        load_registry(reg)
+
+
+def test_validate_normalizes_extensions_without_leading_dot() -> None:
+    col = Collection(name="x", path="/tmp/x", scope="global", extensions=["pdf", ".docx"])
+    normalized = validate_collection(col)
+    assert normalized.extensions == [".pdf", ".docx"]
+
+
+def test_append_then_load_roundtrip(tmp_path: Path) -> None:
+    reg = tmp_path / "reg.yaml"
+    col = Collection(
+        name="caleb-records",
+        path="~/Documents/Feather, Caleb",
+        scope="restricted",
+        extensions=[".pdf", ".docx"],
+        ocr=False,
+    )
+    append_collection(reg, col)
+    loaded = load_registry(reg)
+    assert loaded == [col]
+
+
+def test_append_rejects_duplicate_name(tmp_path: Path) -> None:
+    reg = tmp_path / "reg.yaml"
+    col = Collection(name="x", path="/tmp/x", scope="global", extensions=[".txt"], ocr=False)
+    append_collection(reg, col)
+    with pytest.raises(RegistryError, match="already exists"):
+        append_collection(reg, col)
+
+
+def test_validate_rejects_bad_scope() -> None:
+    with pytest.raises(RegistryError, match="scope"):
+        validate_collection(
+            Collection(name="x", path="/tmp/x", scope="public", extensions=[".txt"], ocr=False)
+        )
+
+
+def test_validate_rejects_empty_name() -> None:
+    with pytest.raises(RegistryError, match="name"):
+        validate_collection(
+            Collection(name="", path="/tmp/x", scope="global", extensions=[".txt"], ocr=False)
+        )
+
+
+def test_validate_rejects_empty_extensions() -> None:
+    with pytest.raises(RegistryError, match="extension"):
+        validate_collection(
+            Collection(name="x", path="/tmp/x", scope="global", extensions=[], ocr=False)
+        )

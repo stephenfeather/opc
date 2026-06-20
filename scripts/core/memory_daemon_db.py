@@ -650,6 +650,8 @@ def prune_recall_log(
     *,
     batch_size: int = 10000,
     max_batches: int = 50,
+    lock_timeout_ms: int = 3000,
+    statement_timeout_ms: int = 15000,
 ) -> tuple[int, bool]:
     """Delete recall_log rows older than ``retention_days`` (issue #146).
 
@@ -658,6 +660,13 @@ def prune_recall_log(
     record_recall is never blocked behind a single large DELETE. ``max_batches``
     caps the synchronous work per call so one tick cannot stall the daemon on a
     huge backlog.
+
+    The prune is also latency-bounded, not just batch-count-bounded (issue #146
+    review round 3): the session sets ``lock_timeout`` so a batch blocked behind
+    a conflicting lock aborts quickly instead of stalling the synchronous daemon
+    loop, and ``statement_timeout`` so a pathological plan on a large/bloated
+    table cannot run unbounded. On either timeout psycopg2 raises, which
+    propagates so the scheduler reschedules with a short backoff.
 
     Returns ``(rows_deleted, complete)``. ``complete`` is True once a short
     (< batch_size) batch proves the expired rows are drained; it is False if the
@@ -669,12 +678,12 @@ def prune_recall_log(
     The interval is passed as a bind parameter via make_interval() -- never
     string-formatted into the SQL -- so no value reaches the query text.
 
-    Raises on a DB failure (connection, query, or commit) rather than swallowing
-    it, so the scheduler can tell a real failure apart from an empty prune and
-    retry promptly instead of waiting a full interval (issue #146 review).
-    Each batch commits independently, so batches deleted before a later failure
-    stay deleted; the next successful run clears the remainder. The connection
-    is always closed.
+    Raises on a DB failure (connection, query, commit, or timeout) rather than
+    swallowing it, so the scheduler can tell a real failure apart from an empty
+    prune and retry promptly instead of waiting a full interval (issue #146
+    review). Each batch commits independently, so batches deleted before a later
+    failure stay deleted; the next successful run clears the remainder. The
+    connection is always closed.
     """
     if not use_postgres():
         return 0, True
@@ -686,6 +695,18 @@ def prune_recall_log(
     conn = pg_connect()
     try:
         cur = conn.cursor()
+        # Latency guards for the synchronous daemon loop. set_config() is used
+        # (not SET) so the millisecond values bind as parameters rather than
+        # being interpolated into SQL. is_local=false keeps them for the whole
+        # short-lived prune connection, across the per-batch COMMITs.
+        cur.execute(
+            "SELECT set_config('lock_timeout', %s, false)",
+            (str(lock_timeout_ms),),
+        )
+        cur.execute(
+            "SELECT set_config('statement_timeout', %s, false)",
+            (str(statement_timeout_ms),),
+        )
         for _ in range(max_batches):
             cur.execute(
                 """

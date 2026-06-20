@@ -893,26 +893,35 @@ class TestSeedLastPatternRunDb:
 
 
 class _RowcountCursor:
-    """Fake DB cursor whose ``rowcount`` follows a scripted per-execute sequence.
+    """Fake DB cursor that scripts ``rowcount`` per DELETE batch.
 
-    Each ``execute()`` pops the next value from ``rowcounts`` and exposes it as
-    ``rowcount`` (psycopg2 semantics: rows affected by the last statement). When
-    ``error_after`` is set, the (error_after+1)-th execute raises, simulating a
-    mid-loop DB failure.
+    Non-DELETE statements (the set_config latency-guard calls prune_recall_log
+    issues before the loop) are recorded in ``execute_calls`` but do not consume
+    the scripted rowcounts or count as batches, so tests assert on batch
+    behaviour via ``delete_count`` / ``delete_calls`` independent of the guards.
+    Each DELETE pops the next value from ``rowcounts`` and exposes it as
+    ``rowcount`` (psycopg2 semantics). When ``error_after`` is set, the
+    (error_after+1)-th DELETE raises, simulating a mid-loop DB failure.
     """
 
     def __init__(self, rowcounts, *, error_after=None):
         self._rowcounts = list(rowcounts)
         self._error_after = error_after
         self.execute_count = 0
+        self.delete_count = 0
         self.rowcount = 0
         self.execute_calls: list[tuple] = []
+        self.delete_calls: list[tuple] = []
 
     def execute(self, sql, params=None):
         self.execute_count += 1
-        if self._error_after is not None and self.execute_count > self._error_after:
-            raise RuntimeError("boom mid-loop")
         self.execute_calls.append((sql, params))
+        if "DELETE" not in sql:
+            return  # set_config / SET guard — not a batch
+        self.delete_count += 1
+        if self._error_after is not None and self.delete_count > self._error_after:
+            raise RuntimeError("boom mid-loop")
+        self.delete_calls.append((sql, params))
         self.rowcount = self._rowcounts.pop(0) if self._rowcounts else 0
 
 
@@ -946,7 +955,7 @@ class TestPruneRecallLog:
 
         # 3 < batch_size -> drained, so complete is True.
         assert prune_recall_log(90, batch_size=10) == (3, True)
-        assert cur.execute_count == 1
+        assert cur.delete_count == 1
         conn.commit.assert_called_once()
         conn.close.assert_called_once()
 
@@ -961,7 +970,7 @@ class TestPruneRecallLog:
         from scripts.core.memory_daemon_db import prune_recall_log
 
         assert prune_recall_log(90, batch_size=10) == (24, True)
-        assert cur.execute_count == 3
+        assert cur.delete_count == 3
         # Commit after every batch so locks release between deletes.
         assert conn.commit.call_count == 3
         conn.close.assert_called_once()
@@ -977,7 +986,7 @@ class TestPruneRecallLog:
         from scripts.core.memory_daemon_db import prune_recall_log
 
         prune_recall_log(90, batch_size=500)
-        sql, params = cur.execute_calls[0]
+        sql, params = cur.delete_calls[0]
         assert "recall_log" in sql
         assert "make_interval" in sql
         assert params == (90, 500)
@@ -998,8 +1007,28 @@ class TestPruneRecallLog:
         # Cap hit with a still-full final batch -> backlog remains -> complete=False
         # so the scheduler continues promptly instead of waiting a full interval.
         assert prune_recall_log(90, batch_size=5, max_batches=3) == (15, False)
-        assert cur.execute_count == 3
+        assert cur.delete_count == 3
         conn.close.assert_called_once()
+
+    @patch("scripts.core.memory_daemon_db.use_postgres", return_value=True)
+    @patch("scripts.core.memory_daemon_db.pg_connect")
+    def test_sets_lock_and_statement_timeouts(self, mock_pg, mock_use):
+        conn = MagicMock()
+        cur = _RowcountCursor([0])
+        conn.cursor.return_value = cur
+        mock_pg.return_value = conn
+
+        from scripts.core.memory_daemon_db import prune_recall_log
+
+        prune_recall_log(90, lock_timeout_ms=2000, statement_timeout_ms=9000)
+        # The two non-DELETE guard statements run before any batch, binding the
+        # millisecond values as parameters (never interpolated into SQL).
+        guards = [c for c in cur.execute_calls if "DELETE" not in c[0]]
+        assert ("SELECT set_config('lock_timeout', %s, false)", ("2000",)) in guards
+        assert (
+            "SELECT set_config('statement_timeout', %s, false)",
+            ("9000",),
+        ) in guards
 
     @patch("scripts.core.memory_daemon_db.use_postgres", return_value=True)
     @patch("scripts.core.memory_daemon_db.pg_connect", side_effect=Exception("db down"))

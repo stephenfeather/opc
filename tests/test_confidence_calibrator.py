@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts.core.confidence_calibrator import (  # noqa: E402
     WEIGHTS,
+    _pg_connect,
     backfill_calibration,
     backfill_calibration_sync,
     calibrate_confidence,
@@ -33,6 +34,31 @@ from scripts.core.confidence_calibrator import (  # noqa: E402
     score_scope,
     score_specificity,
 )
+
+
+class TestPgConnectBackendGating:
+    """Issue #71: confidence calibration is postgres-only, so _pg_connect must
+    refuse to open Postgres when the unified active backend is not postgres
+    (e.g. an explicit AGENTICA_MEMORY_BACKEND=sqlite override), rather than
+    mutating archival_memory behind store/recall's back."""
+
+    def test_refuses_when_sqlite_override_with_url(self, monkeypatch):
+        monkeypatch.setenv("AGENTICA_MEMORY_BACKEND", "sqlite")
+        monkeypatch.setenv("CONTINUOUS_CLAUDE_DB_URL", "postgresql://test")
+        with patch("psycopg2.connect") as mock_connect:
+            with pytest.raises(RuntimeError, match="postgres"):
+                _pg_connect()
+            mock_connect.assert_not_called()
+
+    def test_connects_when_backend_is_postgres(self, monkeypatch):
+        monkeypatch.delenv("AGENTICA_MEMORY_BACKEND", raising=False)
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        monkeypatch.delenv("OPC_POSTGRES_URL", raising=False)
+        monkeypatch.setenv("CONTINUOUS_CLAUDE_DB_URL", "postgresql://test")
+        with patch("psycopg2.connect") as mock_connect:
+            _pg_connect()
+            mock_connect.assert_called_once_with("postgresql://test")
+
 
 # ---------------------------------------------------------------------------
 # Specificity scoring

@@ -206,6 +206,9 @@ from scripts.core.memory_daemon_db import (
     pg_mark_extraction_failed as _pg_mark_extraction_failed_impl,
 )
 from scripts.core.memory_daemon_db import (
+    prune_recall_log as _prune_recall_log_db,
+)
+from scripts.core.memory_daemon_db import (
     seed_last_pattern_run as _seed_last_pattern_run_db,
 )
 from scripts.core.memory_daemon_db import (
@@ -264,6 +267,14 @@ def _pattern_detection_interval() -> float:
     return _daemon_cfg.pattern_detection_interval_hours * 3600
 
 
+def _recall_log_retention_days() -> int:
+    return _daemon_cfg.recall_log_retention_days
+
+
+def _recall_log_prune_interval() -> float:
+    return _daemon_cfg.recall_log_prune_interval_hours * 3600
+
+
 # ---------------------------------------------------------------------------
 # DaemonState (D14: single source of truth for mutable daemon state)
 # ---------------------------------------------------------------------------
@@ -284,6 +295,7 @@ class DaemonState:
     pending_queue: list = field(default_factory=list)
     pattern_proc: subprocess.Popen | None = None
     last_pattern_run: float = 0.0
+    last_recall_prune: float = 0.0
 
 
 def create_daemon_state() -> DaemonState:
@@ -1046,6 +1058,32 @@ def _check_pattern_detection():
         state.pattern_proc = None
 
 
+def _maybe_prune_recall_log() -> None:
+    """Prune aged recall_log rows when the retention interval has elapsed.
+
+    Issue #146: replaces the previously manual ``DELETE FROM recall_log ...``
+    retention step. Gated three ways: PostgreSQL only (the table is PG-only),
+    retention must be enabled (``recall_log_retention_days > 0``), and at least
+    ``recall_log_prune_interval_hours`` must have passed since the last run.
+    The DELETE itself is batched in prune_recall_log so it never blocks the
+    hot-path INSERT. Errors are swallowed inside prune_recall_log.
+    """
+    if not use_postgres():
+        return
+    retention = _recall_log_retention_days()
+    if retention <= 0:
+        return
+    state = _ensure_daemon_state()
+    elapsed = time.time() - state.last_recall_prune
+    if elapsed < _recall_log_prune_interval():
+        return
+    state.last_recall_prune = time.time()
+    deleted = _prune_recall_log_db(retention)
+    if deleted:
+        log(f"Pruned {safe(deleted)} recall_log rows older than "
+            f"{safe(retention)} days")
+
+
 def daemon_tick() -> None:
     """Execute one iteration of the daemon loop.
 
@@ -1107,6 +1145,9 @@ def daemon_tick() -> None:
         elapsed = time.time() - _ensure_daemon_state().last_pattern_run
         if elapsed > _pattern_detection_interval():
             _run_pattern_detection_batch()
+
+    # recall_log retention pruning (issue #146): interval-gated inside helper
+    _maybe_prune_recall_log()
 
 
 def daemon_loop():

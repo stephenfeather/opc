@@ -46,6 +46,9 @@ class TestDaemonConfig:
         assert cfg.extraction_max_turns == 15
         assert cfg.log_rotation_days == 7
         assert cfg.log_backup_count == 4
+        # Issue #146: automated recall_log retention pruning.
+        assert cfg.recall_log_retention_days == 90
+        assert cfg.recall_log_prune_interval_hours == 24
 
 
 class TestRerankerConfig:

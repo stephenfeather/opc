@@ -885,3 +885,141 @@ class TestSeedLastPatternRunDb:
         assert "seed_last_pattern_run failed" in msg
         # Exception rendered via safe_exception(): "ClassName: message".
         assert "Exception: db down" in msg
+
+
+# ---------------------------------------------------------------------------
+# Step 2.x — recall_log retention pruning (issue #146)
+# ---------------------------------------------------------------------------
+
+
+class _RowcountCursor:
+    """Fake DB cursor whose ``rowcount`` follows a scripted per-execute sequence.
+
+    Each ``execute()`` pops the next value from ``rowcounts`` and exposes it as
+    ``rowcount`` (psycopg2 semantics: rows affected by the last statement). When
+    ``error_after`` is set, the (error_after+1)-th execute raises, simulating a
+    mid-loop DB failure.
+    """
+
+    def __init__(self, rowcounts, *, error_after=None):
+        self._rowcounts = list(rowcounts)
+        self._error_after = error_after
+        self.execute_count = 0
+        self.rowcount = 0
+        self.execute_calls: list[tuple] = []
+
+    def execute(self, sql, params=None):
+        self.execute_count += 1
+        if self._error_after is not None and self.execute_count > self._error_after:
+            raise RuntimeError("boom mid-loop")
+        self.execute_calls.append((sql, params))
+        self.rowcount = self._rowcounts.pop(0) if self._rowcounts else 0
+
+
+class TestPruneRecallLog:
+    """prune_recall_log: batched retention delete for the recall_log table."""
+
+    @patch("scripts.core.memory_daemon_db.use_postgres", return_value=False)
+    def test_returns_zero_without_postgres(self, mock_use):
+        from scripts.core.memory_daemon_db import prune_recall_log
+
+        assert prune_recall_log(90) == 0
+
+    @patch("scripts.core.memory_daemon_db.use_postgres", return_value=True)
+    @patch("scripts.core.memory_daemon_db.pg_connect")
+    def test_disabled_when_retention_non_positive(self, mock_pg, mock_use):
+        from scripts.core.memory_daemon_db import prune_recall_log
+
+        assert prune_recall_log(0) == 0
+        assert prune_recall_log(-5) == 0
+        mock_pg.assert_not_called()
+
+    @patch("scripts.core.memory_daemon_db.use_postgres", return_value=True)
+    @patch("scripts.core.memory_daemon_db.pg_connect")
+    def test_single_partial_batch_returns_rowcount(self, mock_pg, mock_use):
+        conn = MagicMock()
+        cur = _RowcountCursor([3])
+        conn.cursor.return_value = cur
+        mock_pg.return_value = conn
+
+        from scripts.core.memory_daemon_db import prune_recall_log
+
+        assert prune_recall_log(90, batch_size=10) == 3
+        assert cur.execute_count == 1
+        conn.commit.assert_called_once()
+        conn.close.assert_called_once()
+
+    @patch("scripts.core.memory_daemon_db.use_postgres", return_value=True)
+    @patch("scripts.core.memory_daemon_db.pg_connect")
+    def test_loops_until_batch_not_full(self, mock_pg, mock_use):
+        conn = MagicMock()
+        cur = _RowcountCursor([10, 10, 4])  # full, full, partial -> stop
+        conn.cursor.return_value = cur
+        mock_pg.return_value = conn
+
+        from scripts.core.memory_daemon_db import prune_recall_log
+
+        assert prune_recall_log(90, batch_size=10) == 24
+        assert cur.execute_count == 3
+        # Commit after every batch so locks release between deletes.
+        assert conn.commit.call_count == 3
+        conn.close.assert_called_once()
+
+    @patch("scripts.core.memory_daemon_db.use_postgres", return_value=True)
+    @patch("scripts.core.memory_daemon_db.pg_connect")
+    def test_interval_is_parameterized_not_interpolated(self, mock_pg, mock_use):
+        conn = MagicMock()
+        cur = _RowcountCursor([0])
+        conn.cursor.return_value = cur
+        mock_pg.return_value = conn
+
+        from scripts.core.memory_daemon_db import prune_recall_log
+
+        prune_recall_log(90, batch_size=500)
+        sql, params = cur.execute_calls[0]
+        assert "recall_log" in sql
+        assert "make_interval" in sql
+        assert params == (90, 500)
+        # Retention/limit must never be string-formatted into the SQL text.
+        assert "90" not in sql
+        assert "500" not in sql
+
+    @patch("scripts.core.memory_daemon_db.use_postgres", return_value=True)
+    @patch("scripts.core.memory_daemon_db.pg_connect")
+    def test_respects_max_batches_cap(self, mock_pg, mock_use):
+        conn = MagicMock()
+        cur = _RowcountCursor([5] * 10)  # always full
+        conn.cursor.return_value = cur
+        mock_pg.return_value = conn
+
+        from scripts.core.memory_daemon_db import prune_recall_log
+
+        assert prune_recall_log(90, batch_size=5, max_batches=3) == 15
+        assert cur.execute_count == 3
+        conn.close.assert_called_once()
+
+    @patch("scripts.core.memory_daemon_db.use_postgres", return_value=True)
+    @patch("scripts.core.memory_daemon_db.pg_connect", side_effect=Exception("db down"))
+    def test_swallows_connect_error_and_warns(self, mock_pg, mock_use, caplog):
+        from scripts.core.memory_daemon_db import prune_recall_log
+
+        with caplog.at_level(logging.WARNING, logger="memory-daemon"):
+            assert prune_recall_log(90) == 0
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings, "expected a WARNING record for swallowed DB error"
+        assert "prune_recall_log failed" in warnings[0].getMessage()
+
+    @patch("scripts.core.memory_daemon_db.use_postgres", return_value=True)
+    @patch("scripts.core.memory_daemon_db.pg_connect")
+    def test_returns_partial_count_and_closes_on_midloop_error(self, mock_pg, mock_use):
+        conn = MagicMock()
+        cur = _RowcountCursor([10], error_after=1)  # batch 1 ok, batch 2 raises
+        conn.cursor.return_value = cur
+        mock_pg.return_value = conn
+
+        from scripts.core.memory_daemon_db import prune_recall_log
+
+        assert prune_recall_log(90, batch_size=10) == 10
+        # Connection must always be closed even when a batch raises.
+        conn.close.assert_called_once()

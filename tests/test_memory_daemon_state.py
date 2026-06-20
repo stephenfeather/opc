@@ -6,6 +6,7 @@ Phase 3 of S30 TDD+FP refactor.
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import fields
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -25,6 +26,7 @@ class TestDaemonState:
             "pending_queue",
             "pattern_proc",
             "last_pattern_run",
+            "last_recall_prune",
         }
 
     def test_factory_creates_empty_state(self):
@@ -181,6 +183,97 @@ class TestDaemonTick:
         self.state.last_pattern_run = 0
         daemon_tick()
         mock_run.assert_called_once()
+
+    @patch("scripts.core.memory_daemon._maybe_prune_recall_log")
+    @patch("scripts.core.memory_daemon._run_pattern_detection_batch")
+    @patch("scripts.core.memory_daemon._check_pattern_detection")
+    @patch("scripts.core.memory_daemon.get_stale_sessions", return_value=[])
+    @patch("scripts.core.memory_daemon.process_pending_queue")
+    @patch("scripts.core.memory_daemon.watchdog_stuck_extractions")
+    @patch("scripts.core.memory_daemon.reap_completed_extractions")
+    def test_invokes_recall_log_prune_each_tick(
+        self, mock_reap, mock_watchdog, mock_queue, mock_stale,
+        mock_check, mock_run, mock_prune
+    ):
+        from scripts.core.memory_daemon import daemon_tick
+
+        daemon_tick()
+        # The interval gate lives inside _maybe_prune_recall_log; daemon_tick
+        # always delegates the decision to it.
+        mock_prune.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Step 3.x — recall_log retention pruning gate (issue #146)
+# ---------------------------------------------------------------------------
+
+
+class TestMaybePruneRecallLog:
+    """_maybe_prune_recall_log gates pruning on backend, config, and interval."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_state(self):
+        import scripts.core.memory_daemon as mod
+
+        self.mod = mod
+        self.state = mod.create_daemon_state()
+        self.original = mod._daemon_state
+        mod._daemon_state = self.state
+        yield
+        mod._daemon_state = self.original
+
+    @patch("scripts.core.memory_daemon._prune_recall_log_db")
+    @patch("scripts.core.memory_daemon.use_postgres", return_value=False)
+    def test_skips_without_postgres(self, mock_pg, mock_prune):
+        self.mod._maybe_prune_recall_log()
+        mock_prune.assert_not_called()
+
+    @patch("scripts.core.memory_daemon._prune_recall_log_db")
+    @patch("scripts.core.memory_daemon._recall_log_retention_days", return_value=0)
+    @patch("scripts.core.memory_daemon.use_postgres", return_value=True)
+    def test_skips_when_retention_disabled(self, mock_pg, mock_ret, mock_prune):
+        self.mod._maybe_prune_recall_log()
+        mock_prune.assert_not_called()
+
+    @patch("scripts.core.memory_daemon._prune_recall_log_db")
+    @patch("scripts.core.memory_daemon._recall_log_prune_interval", return_value=86400)
+    @patch("scripts.core.memory_daemon._recall_log_retention_days", return_value=90)
+    @patch("scripts.core.memory_daemon.use_postgres", return_value=True)
+    def test_skips_when_interval_not_elapsed(
+        self, mock_pg, mock_ret, mock_interval, mock_prune
+    ):
+        # Pruned just now -> not due yet.
+        self.state.last_recall_prune = time.time()
+        self.mod._maybe_prune_recall_log()
+        mock_prune.assert_not_called()
+
+    @patch("scripts.core.memory_daemon._prune_recall_log_db", return_value=7)
+    @patch("scripts.core.memory_daemon._recall_log_prune_interval", return_value=86400)
+    @patch("scripts.core.memory_daemon._recall_log_retention_days", return_value=90)
+    @patch("scripts.core.memory_daemon.use_postgres", return_value=True)
+    def test_prunes_and_advances_timestamp_when_due(
+        self, mock_pg, mock_ret, mock_interval, mock_prune
+    ):
+        self.state.last_recall_prune = 0.0  # far in the past -> due
+        before = time.time()
+        self.mod._maybe_prune_recall_log()
+        mock_prune.assert_called_once_with(90)
+        # Timestamp advanced so the next tick is gated until the interval passes.
+        assert self.state.last_recall_prune >= before
+
+    @patch("scripts.core.memory_daemon._prune_recall_log_db", return_value=0)
+    @patch("scripts.core.memory_daemon._recall_log_prune_interval", return_value=86400)
+    @patch("scripts.core.memory_daemon._recall_log_retention_days", return_value=90)
+    @patch("scripts.core.memory_daemon.use_postgres", return_value=True)
+    def test_advances_timestamp_even_when_nothing_deleted(
+        self, mock_pg, mock_ret, mock_interval, mock_prune
+    ):
+        # A due run that deletes 0 rows must still reset the clock, otherwise
+        # the daemon would re-query every tick.
+        self.state.last_recall_prune = 0.0
+        self.mod._maybe_prune_recall_log()
+        mock_prune.assert_called_once_with(90)
+        assert self.state.last_recall_prune > 0.0
 
 
 # ---------------------------------------------------------------------------

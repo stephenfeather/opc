@@ -643,3 +643,57 @@ def seed_last_pattern_run() -> float:
     except Exception as e:
         logger.warning("seed_last_pattern_run failed: %s", safe_exception(e))
     return 0
+
+
+def prune_recall_log(
+    retention_days: int,
+    *,
+    batch_size: int = 10000,
+    max_batches: int = 1000,
+) -> int:
+    """Delete recall_log rows older than ``retention_days`` (issue #146).
+
+    Deletes in bounded batches, committing after each, so the per-statement
+    row lock is released promptly and the append-only hot-path INSERT in
+    record_recall is never blocked behind a single large DELETE. Returns the
+    total number of rows deleted.
+
+    No-op (returns 0) on SQLite or when ``retention_days <= 0`` (pruning
+    disabled). The interval is passed as a bind parameter via make_interval()
+    -- never string-formatted into the SQL -- so no value reaches the query
+    text. Errors are swallowed with a warning (best-effort background task);
+    the count of rows deleted before the failure is still returned.
+    """
+    if not use_postgres():
+        return 0
+    if retention_days <= 0:
+        return 0
+
+    total = 0
+    try:
+        conn = pg_connect()
+        try:
+            cur = conn.cursor()
+            for _ in range(max_batches):
+                cur.execute(
+                    """
+                    DELETE FROM recall_log
+                    WHERE id IN (
+                        SELECT id FROM recall_log
+                        WHERE created_at < NOW() - make_interval(days => %s)
+                        ORDER BY created_at
+                        LIMIT %s
+                    )
+                    """,
+                    (retention_days, batch_size),
+                )
+                deleted = cur.rowcount or 0
+                conn.commit()
+                total += deleted
+                if deleted < batch_size:
+                    break
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("prune_recall_log failed: %s", safe_exception(e))
+    return total

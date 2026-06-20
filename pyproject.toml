@@ -96,6 +96,23 @@ packages = ["src/runtime"]
 [tool.black]
 line-length = 100
 target-version = ["py313"]
+# Pre-existing files that predate black formatting and carry many unrelated
+# long-line / style deviations. Excluded for now (issue #146) so formatting a
+# small nearby change does not rewrite hundreds of untouched lines and bloat the
+# diff. force-exclude (not exclude) so the skip also applies when black is given
+# these paths explicitly. Drop an entry once its file is reformatted in a
+# dedicated cleanup PR.
+force-exclude = '''
+(
+    scripts/core/memory_daemon\.py
+  | scripts/core/memory_daemon_db\.py
+  | scripts/core/config/handlers\.py
+  | scripts/core/config/core\.py
+  | tests/test_memory_daemon_db\.py
+  | tests/test_memory_daemon_state\.py
+  | tests/test_config_models\.py
+)
+'''
 
 [tool.mypy]
 python_version = "3.13"

@@ -53,6 +53,9 @@ _RANGE_RULES: dict[tuple[str, str], tuple[float | None, float | None]] = {
     ("daemon", "harvest_grace_period"): (0, None),
     ("daemon", "pattern_detection_interval_hours"): (1, None),
     ("daemon", "extraction_max_turns"): (1, None),
+    # 0 disables recall_log pruning; negative is invalid.
+    ("daemon", "recall_log_retention_days"): (0, None),
+    ("daemon", "recall_log_prune_interval_hours"): (1, None),
     ("reranker", "recency_half_life_days"): (0.1, None),
     ("reranker", "recall_log2_normalizer"): (1, None),
     ("reranker", "rrf_scale_factor"): (0.1, None),

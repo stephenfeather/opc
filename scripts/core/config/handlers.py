@@ -22,6 +22,8 @@ from scripts.core.config.models import OPCConfig
 _ENV_OVERRIDES: list[tuple[str, str, str, type]] = [
     # (env_var, section, key, cast_type)
     ("PATTERN_DETECTION_INTERVAL_HOURS", "daemon", "pattern_detection_interval_hours", int),
+    ("RECALL_LOG_RETENTION_DAYS", "daemon", "recall_log_retention_days", int),
+    ("RECALL_LOG_PRUNE_INTERVAL_HOURS", "daemon", "recall_log_prune_interval_hours", int),
     ("OLLAMA_EMBED_MODEL", "embedding", "ollama_model", str),
     ("OLLAMA_HOST", "embedding", "ollama_host", str),
     ("VOYAGE_EMBEDDING_MODEL", "embedding", "voyage_model", str),

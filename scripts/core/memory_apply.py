@@ -54,6 +54,10 @@ _APPLY_ROUTING: dict[str, str] = {
 _SLUG_MAXLEN = 60
 _SLUG_FALLBACK = "promoted-learning"
 
+# Frontmatter key that records the source learning id in a promoted memory file. Used as
+# the authoritative provenance marker for same-candidate vs slug-collision detection.
+SOURCE_MARKER_KEY = "source_learning_id"
+
 
 # --- Data structures -------------------------------------------------------
 
@@ -147,17 +151,27 @@ def render_plan(plan: ApplyPlan) -> str:
     return "\n".join(lines)
 
 
-def memory_entry(candidate: PromotionCandidate) -> tuple[str, str]:
-    """Build (filename, file_body) for a MEMORY.md promotion as a Claude-memory file."""
-    slug = slugify(candidate.content)
-    filename = f"promoted-{slug}.md"
+def _memory_name(candidate: PromotionCandidate) -> str:
+    """Base Claude-memory file stem for a candidate (no extension)."""
+    return f"promoted-{slugify(candidate.content)}"
+
+
+def memory_entry(candidate: PromotionCandidate, name: str | None = None) -> tuple[str, str]:
+    """Build (filename, file_body) for a MEMORY.md promotion as a Claude-memory file.
+
+    ``name`` overrides the file stem (used to dodge slug collisions). The full source id is
+    embedded in frontmatter as the authoritative provenance marker — apply uses it to tell a
+    same-candidate re-apply from a different-candidate slug collision.
+    """
+    stem = name or _memory_name(candidate)
+    filename = f"{stem}.md"
     body = (
         "---\n"
-        f"name: promoted-{slug}\n"
+        f"name: {stem}\n"
         f"description: Promoted from archival_memory (recalled {candidate.recall_count}×)\n"
         "metadata:\n"
         "  type: reference\n"
-        f"  source_learning_id: {candidate.id}\n"
+        f"  {SOURCE_MARKER_KEY}: {candidate.id}\n"
         "---\n\n"
         f"{candidate.content.strip()}\n"
     )
@@ -170,11 +184,17 @@ def memory_index_line(candidate: PromotionCandidate, filename: str) -> str:
     return f"- [{title}]({filename}) — promoted, recalled {candidate.recall_count}×"
 
 
+def claude_md_marker(candidate: PromotionCandidate) -> str:
+    """Exact, structured idempotency marker carrying the FULL learning id (no substring traps)."""
+    return f"<!-- promoted_from_archival_memory: {candidate.id} -->"
+
+
 def claude_md_block(candidate: PromotionCandidate) -> str:
     """Markdown block appended to CLAUDE.md for an ARCHITECTURAL_DECISION promotion."""
     return (
         f"- {candidate.content.strip()} "
-        f"_(promoted from archival_memory {candidate.id[:8]}, recalled {candidate.recall_count}×)_"
+        f"_(promoted from archival_memory {candidate.id[:8]}, recalled {candidate.recall_count}×)_ "
+        f"{claude_md_marker(candidate)}"
     )
 
 
@@ -297,26 +317,42 @@ def backup_database(dest: Path, *, run=subprocess.run) -> Path:
     return dest
 
 
-def apply_memory_file(memory_dir: Path, candidate: PromotionCandidate) -> Path | None:
-    """Create the promoted Claude-memory file + index pointer. Idempotent (None if present)."""
-    filename, body = memory_entry(candidate)
-    path = memory_dir / filename
-    if path.exists():
-        return None
-    _atomic_write(path, body)
+def apply_memory_file(memory_dir: Path, candidate: PromotionCandidate) -> bool:
+    """Ensure the promoted Claude-memory file AND its MEMORY.md pointer exist.
+
+    Returns True once both artifacts are present (the caller tags provenance only then).
+    Reconciles a partial prior apply: if the file already exists but the index pointer is
+    missing, the pointer is still appended. Slug collisions with a *different* source id
+    get a collision-free filename (so one candidate never silently shadows another).
+    Raises on I/O failure — the row is then left untagged and a re-run resumes safely.
+    """
+    base = _memory_name(candidate)
+    path = memory_dir / f"{base}.md"
+    if path.exists() and f"{SOURCE_MARKER_KEY}: {candidate.id}" not in path.read_text():
+        # Same slug, different learning — disambiguate with the id so neither is shadowed.
+        base = f"{base}-{candidate.id[:8]}"
+        path = memory_dir / f"{base}.md"
+    filename, body = memory_entry(candidate, name=base)
+    if not path.exists():
+        _atomic_write(path, body)
+    # Always reconcile the index pointer (idempotent), even if the file pre-existed.
     _append_line_if_absent(memory_dir / "MEMORY.md", memory_index_line(candidate, filename))
-    return path
+    return True
 
 
 _CLAUDE_SECTION = "## Promoted Decisions"
 
 
 def append_claude_md(path: Path, candidate: PromotionCandidate) -> bool:
-    """Append a decision block to CLAUDE.md under a Promoted section. Idempotent by id."""
+    """Ensure the decision block is present in CLAUDE.md under the Promoted section.
+
+    Idempotency uses the EXACT structured marker carrying the full learning id (not an
+    8-char substring), so unrelated text can never falsely suppress a promotion. Returns
+    True once the block is present (caller tags provenance only then).
+    """
     text = path.read_text() if path.exists() else ""
-    marker = candidate.id[:8]
-    if marker in text:
-        return False
+    if claude_md_marker(candidate) in text:
+        return True  # already promoted (exact full-id marker) — present, nothing to do
     if _CLAUDE_SECTION not in text:
         text = (
             (text.rstrip() + "\n\n" + _CLAUDE_SECTION + "\n")
@@ -371,10 +407,18 @@ async def run_apply(
         tier = action.target
         if tier is None:  # unreachable for applicable actions; satisfies the type + defensive
             continue
+        # File-first, tag-only-on-confirmed-success: the writer returns True only once the
+        # artifact (file + index pointer, or CLAUDE.md block) is actually present, so a
+        # skipped/partial write can never leave the row tagged-but-unwritten. A write that
+        # raises propagates out untagged, and the item is idempotent on the next run.
         if tier == "MEMORY.md":
-            apply_memory_file(memory_dir, c)
+            ok = apply_memory_file(memory_dir, c)
         elif tier == "CLAUDE.md":
-            append_claude_md(claude_md_path, c)
+            ok = append_claude_md(claude_md_path, c)
+        else:
+            ok = False
+        if not ok:
+            continue
         await write_provenance(pool, c.id, tier)
         applied.append(c.id)
     return ApplyResult(plan=plan, applied=applied, backup_path=backup_path)

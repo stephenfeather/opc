@@ -335,40 +335,86 @@ class TestApplyMemoryFile:
         memory_dir = tmp_path
         (memory_dir / "MEMORY.md").write_text("# Memory Index\n")
         c = _cand(content="Recall scoping is a soft boost")
-        path = apply_memory_file(memory_dir, c)
-        assert path is not None and path.exists()
-        assert "Recall scoping" in path.read_text()
+        ok = apply_memory_file(memory_dir, c)
+        assert ok is True
+        created = list(memory_dir.glob("promoted-*.md"))
+        assert len(created) == 1
+        assert "Recall scoping" in created[0].read_text()
         assert "promoted-recall" in (memory_dir / "MEMORY.md").read_text()
 
-    def test_idempotent_skip_when_file_exists(self, tmp_path):
+    def test_idempotent_no_duplicate_when_reapplied(self, tmp_path):
         memory_dir = tmp_path
         (memory_dir / "MEMORY.md").write_text("# Memory Index\n")
         c = _cand(content="Same content here")
-        first = apply_memory_file(memory_dir, c)
-        assert first is not None
-        second = apply_memory_file(memory_dir, c)
-        assert second is None  # already present → no duplicate
+        assert apply_memory_file(memory_dir, c) is True
+        assert apply_memory_file(memory_dir, c) is True  # present → no error
         assert (memory_dir / "MEMORY.md").read_text().count("promoted-same-content-here") == 1
+        assert len(list(memory_dir.glob("promoted-*.md"))) == 1
+
+    def test_reconciles_missing_index_pointer(self, tmp_path):
+        # Regression (round 1): a prior partial apply left the file but no index pointer.
+        memory_dir = tmp_path
+        (memory_dir / "MEMORY.md").write_text("# Memory Index\n")
+        c = _cand(content="Partial apply learning")
+        # simulate: file exists (for this candidate) but pointer was never written
+        fname, body = memory_entry(c)
+        (memory_dir / fname).write_text(body)
+        assert "promoted-partial" not in (memory_dir / "MEMORY.md").read_text()
+        ok = apply_memory_file(memory_dir, c)
+        assert ok is True
+        assert "promoted-partial-apply-learning" in (memory_dir / "MEMORY.md").read_text()
+
+    def test_slug_collision_uses_distinct_filename(self, tmp_path):
+        # Regression (round 1): two different learnings with the same slug must not shadow.
+        memory_dir = tmp_path
+        (memory_dir / "MEMORY.md").write_text("# Memory Index\n")
+        c1 = _cand(id="11111111-aaaa", content="Same Slug Text")
+        c2 = _cand(id="22222222-bbbb", content="Same Slug Text")
+        assert apply_memory_file(memory_dir, c1) is True
+        assert apply_memory_file(memory_dir, c2) is True
+        files = sorted(f.name for f in memory_dir.glob("promoted-*.md"))
+        assert len(files) == 2  # neither candidate shadowed the other
+        # both source ids preserved across the two files
+        blob = "".join((memory_dir / f).read_text() for f in files)
+        assert "11111111-aaaa" in blob and "22222222-bbbb" in blob
 
 
 class TestAppendClaudeMd:
     def test_appends_under_section(self, tmp_path):
         path = tmp_path / "CLAUDE.md"
         path.write_text("# Project\n\nSome content.\n")
-        c = _cand(id="dec12345", lt="ARCHITECTURAL_DECISION", dest="CLAUDE.md", content="Chose X")
-        wrote = append_claude_md(path, c)
-        assert wrote is True
+        c = _cand(
+            id="dec12345-0000", lt="ARCHITECTURAL_DECISION", dest="CLAUDE.md", content="Chose X"
+        )
+        assert append_claude_md(path, c) is True
         text = path.read_text()
         assert "Promoted Decisions" in text
         assert "Chose X" in text
 
-    def test_idempotent_on_same_id(self, tmp_path):
+    def test_idempotent_on_exact_marker(self, tmp_path):
         path = tmp_path / "CLAUDE.md"
         path.write_text("# Project\n")
-        c = _cand(id="dec12345", lt="ARCHITECTURAL_DECISION", dest="CLAUDE.md", content="Chose X")
+        c = _cand(
+            id="dec12345-0000", lt="ARCHITECTURAL_DECISION", dest="CLAUDE.md", content="Chose X"
+        )
         assert append_claude_md(path, c) is True
-        assert append_claude_md(path, c) is False  # same provenance id → skip
+        assert append_claude_md(path, c) is True  # present (exact marker) → no duplicate
         assert path.read_text().count("Chose X") == 1
+
+    def test_substring_id_does_not_false_suppress(self, tmp_path):
+        # Regression (round 1): an 8-char prefix appearing in unrelated text must NOT be
+        # treated as "already promoted" — only the exact full-id marker counts.
+        path = tmp_path / "CLAUDE.md"
+        c = _cand(
+            id="dec12345-9999",
+            lt="ARCHITECTURAL_DECISION",
+            dest="CLAUDE.md",
+            content="Real decision",
+        )
+        path.write_text(f"# Project\n\nUnrelated mention of {c.id[:8]} in prose.\n")
+        wrote = append_claude_md(path, c)
+        assert wrote is True
+        assert "Real decision" in path.read_text()
 
 
 class TestRunApply:
@@ -462,3 +508,33 @@ class TestRunApply:
         # backup happens before the provenance write
         assert order[0] == "backup"
         assert "provenance" in order
+
+    async def test_provenance_not_written_when_writer_reports_failure(self, tmp_path, monkeypatch):
+        # Regression (round 1): tag the row only after the artifact is confirmed present.
+        import scripts.core.memory_apply as ma
+
+        memory_dir, claude_md, backup_dir = self._setup(tmp_path)
+        rows = [
+            {"id": "a", "content": "P", "recall_count": 11, "learning_type": "CODEBASE_PATTERN"}
+        ]
+        pool, conn = _pool()
+        conn.fetch.side_effect = [rows, []]
+
+        def _run(cmd, **kw):
+            Path(kw["stdout"].name).write_text("-- dump")
+            return MagicMock(returncode=0)
+
+        monkeypatch.setattr(ma, "apply_memory_file", lambda *a, **k: False)
+        result = await run_apply(
+            pool,
+            "opc",
+            ["a"],
+            execute=True,
+            memory_dir=memory_dir,
+            claude_md_path=claude_md,
+            backup_dir=backup_dir,
+            timestamp="20260101-000000",
+            run=_run,
+        )
+        assert result.applied == []
+        conn.execute.assert_not_called()  # no provenance tag without a confirmed write

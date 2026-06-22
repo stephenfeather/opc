@@ -170,7 +170,7 @@ class TestClaudeMdBlock:
 def _pool(rows=None):
     conn = MagicMock()
     conn.fetch = AsyncMock(return_value=rows or [])
-    conn.execute = AsyncMock()
+    conn.execute = AsyncMock(return_value="UPDATE 1")  # asyncpg status string
     ctx = MagicMock()
     ctx.__aenter__ = AsyncMock(return_value=conn)
     ctx.__aexit__ = AsyncMock(return_value=False)
@@ -197,17 +197,33 @@ class TestWriteProvenance:
     async def test_stores_structured_provenance(self):
         pool, conn = _pool()
         await write_provenance(
-            pool, "abc", tier="MEMORY.md", target="/m/promoted-x.md", at="20260101-000000"
+            pool,
+            "abc",
+            project="opc",
+            tier="MEMORY.md",
+            target="/m/promoted-x.md",
+            at="20260101-000000",
         )
         args = conn.execute.call_args.args
         sql = args[0]
         assert "UPDATE archival_memory" in sql
         assert "promoted_to" in sql
-        # structured object: tier + exact target path + timestamp all bound (not interpolated)
+        assert "superseded_by IS NULL" in sql  # only tags a current row
+        # structured object: tier + exact target path + timestamp + project all bound
         assert "abc" in args
         assert "MEMORY.md" in args
         assert "/m/promoted-x.md" in args
         assert "20260101-000000" in args
+        assert "opc" in args
+
+    async def test_raises_when_no_row_updated(self):
+        # Round 3: a superseded/removed row -> UPDATE 0 must raise, not silently succeed.
+        pool, conn = _pool()
+        conn.execute = AsyncMock(return_value="UPDATE 0")
+        with pytest.raises(RuntimeError, match="exactly one row"):
+            await write_provenance(
+                pool, "gone", project="opc", tier="MEMORY.md", target="/m/x.md", at="t"
+            )
 
 
 def test_apply_action_dataclass_shape():
@@ -327,10 +343,23 @@ class TestBackupDatabase:
 
     def test_raises_when_pg_dump_fails(self, tmp_path):
         def _run(cmd, **kw):
-            return MagicMock(returncode=1)
+            return MagicMock(returncode=1, stderr=b"could not connect")
 
+        dest = tmp_path / "b.sql"
         with pytest.raises(RuntimeError, match="backup"):
-            backup_database(tmp_path / "b.sql", run=_run)
+            backup_database(dest, run=_run)
+        assert not dest.exists()  # no misleading partial backup left behind
+
+    def test_spawn_failure_leaves_no_backup_file(self, tmp_path):
+        # Round 3: docker missing -> subprocess raises before returncode; dest must not exist.
+        def _run(cmd, **kw):
+            raise FileNotFoundError("docker not found")
+
+        dest = tmp_path / "b.sql"
+        with pytest.raises(FileNotFoundError):
+            backup_database(dest, run=_run)
+        assert not dest.exists()
+        assert list(tmp_path.glob("*.tmp")) == []  # temp file cleaned up
 
 
 class TestApplyMemoryFile:
@@ -541,6 +570,36 @@ class TestRunApply:
         )
         assert result.applied == []
         conn.execute.assert_not_called()  # no provenance tag without a confirmed write
+
+    async def test_provenance_update_zero_goes_to_failed_not_applied(self, tmp_path):
+        # Round 3: file written but UPDATE 0 (row superseded) -> item is reported failed,
+        # not applied, and the run returns the reason.
+        memory_dir, claude_md, backup_dir = self._setup(tmp_path)
+        rows = [
+            {"id": "a", "content": "Pat", "recall_count": 11, "learning_type": "CODEBASE_PATTERN"}
+        ]
+        pool, conn = _pool()
+        conn.fetch.side_effect = [rows, []]
+        conn.execute = AsyncMock(return_value="UPDATE 0")  # provenance tags nothing
+
+        def _run(cmd, **kw):
+            Path(kw["stdout"].name).write_text("-- dump")
+            return MagicMock(returncode=0)
+
+        result = await run_apply(
+            pool,
+            "opc",
+            ["a"],
+            execute=True,
+            memory_dir=memory_dir,
+            claude_md_path=claude_md,
+            backup_dir=backup_dir,
+            timestamp="20260101-000000",
+            run=_run,
+        )
+        assert result.applied == []
+        assert len(result.failed) == 1
+        assert result.failed[0][0] == "a"
 
     async def test_execute_snapshots_files_before_writing(self, tmp_path):
         # Round 2: the file side must be recoverable too — MEMORY.md/CLAUDE.md are copied

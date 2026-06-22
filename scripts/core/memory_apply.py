@@ -220,12 +220,18 @@ _PROMOTED_IDS_SQL = """
 # Merge a STRUCTURED provenance object into metadata (not a bare string) so a future
 # repair/unpromote pass can find exactly what was written where. tier/target/timestamp are
 # bound params ($2..$4) — jsonb_build_object never lets them carry SQL.
+# Scoped to the SAME predicates the candidate was fetched under (project + not superseded)
+# so the tag can only land on a current row. asyncpg returns "UPDATE <n>" — write_provenance
+# verifies n == 1 so a row that was superseded/removed between fetch and write surfaces as an
+# error instead of silently leaving the file promoted but the row untagged.
 _PROVENANCE_SQL = """
     UPDATE archival_memory
     SET metadata = metadata || jsonb_build_object(
         'promoted_to', jsonb_build_object('tier', $2::text, 'target', $3::text, 'at', $4::text)
     )
     WHERE id = $1::uuid
+      AND LOWER(project) = LOWER($5)
+      AND superseded_by IS NULL
 """
 
 
@@ -236,14 +242,23 @@ async def fetch_promoted_ids(pool, project: str) -> set[str]:
     return {r["id"] for r in rows}
 
 
-async def write_provenance(pool, learning_id: str, *, tier: str, target: str, at: str) -> None:
+async def write_provenance(
+    pool, learning_id: str, *, project: str, tier: str, target: str, at: str
+) -> None:
     """Tag a source row with structured promotion provenance (tier, exact target, timestamp).
 
-    Reversible (clear the key) and never deletes the row. Storing the exact target path +
-    timestamp is what a Phase-2b unpromote/repair pass needs to undo precisely this write.
+    Reversible (clear the key) and never deletes the row. Verifies exactly one current row
+    was tagged — a stale id, or a row superseded/removed between fetch and write, raises
+    rather than silently reporting a promotion whose DB side never landed. Storing the exact
+    target path + timestamp is what a Phase-2b unpromote/repair pass needs to undo this write.
     """
     async with pool.acquire() as conn:
-        await conn.execute(_PROVENANCE_SQL, learning_id, tier, target, at)
+        status = await conn.execute(_PROVENANCE_SQL, learning_id, tier, target, at, project)
+    if status != "UPDATE 1":
+        raise RuntimeError(
+            f"provenance tag did not update exactly one row (status={status!r}) for "
+            f"{learning_id} in project {project!r}: the row may have been superseded or removed"
+        )
 
 
 _CANDIDATES_BY_IDS_SQL = """
@@ -323,14 +338,26 @@ def backup_database(dest: Path, *, run=subprocess.run) -> Path:
         "-t",
         "archival_memory",
     ]
-    with open(dest, "w") as fh:
-        result = run(cmd, stdout=fh, stderr=subprocess.PIPE)
-    if getattr(result, "returncode", 1) != 0:
-        dest.unlink(missing_ok=True)
-        raise RuntimeError(
-            f"database backup failed (pg_dump returncode={getattr(result, 'returncode', None)}); "
-            "aborting apply"
-        )
+    # Dump to a temp file and rename only on success, so a spawn failure (docker missing)
+    # or a non-zero pg_dump never leaves a misleading empty/partial backup at `dest`.
+    fd, tmp_name = tempfile.mkstemp(dir=str(dest.parent), suffix=".sql.tmp")
+    os.close(fd)  # reopen by path so the file handle carries a real path name
+    tmp = Path(tmp_name)
+    try:
+        with open(tmp, "w") as fh:
+            result = run(cmd, stdout=fh, stderr=subprocess.PIPE)
+        rc = getattr(result, "returncode", 1)
+        if rc != 0:
+            stderr = getattr(result, "stderr", b"") or b""
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode("utf-8", "replace")
+            raise RuntimeError(
+                f"database backup failed (pg_dump returncode={rc}): {stderr[:500]}; aborting apply"
+            )
+        tmp.replace(dest)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     return dest
 
 
@@ -422,6 +449,7 @@ class ApplyResult:
     plan: ApplyPlan
     applied: list[str] = field(default_factory=list)
     backup_path: Path | None = None
+    failed: list[tuple[str, str]] = field(default_factory=list)
 
 
 async def run_apply(
@@ -457,6 +485,7 @@ async def run_apply(
         backup_path = backup_database(backup_dir / f"memory-apply-{timestamp}.sql", run=run)
         backup_files(backup_dir, timestamp, [memory_dir / "MEMORY.md", claude_md_path])
         applied: list[str] = []
+        failed: list[tuple[str, str]] = []
         for action in plan.applicable:
             c = action.candidate
             tier = action.target
@@ -474,9 +503,18 @@ async def run_apply(
                 artifact = None
             if artifact is None:
                 continue
-            await write_provenance(pool, c.id, tier=tier, target=str(artifact), at=timestamp)
+            try:
+                await write_provenance(
+                    pool, c.id, project=project, tier=tier, target=str(artifact), at=timestamp
+                )
+            except RuntimeError as exc:
+                # Row vanished/superseded between fetch and tag: the file is written (and
+                # idempotent), but we could not record provenance. Don't claim it applied;
+                # surface it and keep going so one bad row doesn't block the rest.
+                failed.append((c.id, str(exc)))
+                continue
             applied.append(c.id)
-    return ApplyResult(plan=plan, applied=applied, backup_path=backup_path)
+    return ApplyResult(plan=plan, applied=applied, backup_path=backup_path, failed=failed)
 
 
 # --- CLI -------------------------------------------------------------------
@@ -597,6 +635,10 @@ async def main(argv: list[str] | None = None) -> int:
         print(f"Applied {len(result.applied)} promotion(s).")
         if result.backup_path:
             print(f"DB backup: {result.backup_path}")
+        if result.failed:
+            for fid, reason in result.failed:
+                print(f"  ⚠️ not tagged [{fid[:8]}]: {reason}", file=sys.stderr)
+            return 1
     return 0
 
 

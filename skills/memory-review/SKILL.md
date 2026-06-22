@@ -70,12 +70,37 @@ Output the detector's report, refined by your judgment, grouped by action:
 4. **Ambiguous** — entries needing the user's call on destination
 5. **No action** — brief note on what stays on-demand and why
 
-### 4. Apply only on approval
+### 4. Apply promotions on approval (Phase 2a)
 
-Phase 1 is **read-only**: stop after presenting. Applying promotions/merges/archival is a
-later phase. If the user approves changes now, anything touching tracked files (`rules/`,
-committed docs) goes through the worktree + PR workflow; never hard-delete an
-`archival_memory` row (supersede/flag only — recall must keep working).
+Detection (steps 1–3) is read-only. **Applying** approved promotions is a separate,
+explicitly-gated step via `scripts/core/memory_apply.py` (`opc memory-apply`). It is
+**dry-run by default** and writes nothing without `--execute`.
+
+After the user approves specific promotion items, apply them by their learning ids:
+
+1. **Dry-run first (always).** Show exactly what would be written:
+   ```bash
+   uv run python scripts/core/memory_apply.py <project> --ids <id1,id2,...>
+   ```
+   This prints the resolved write targets (`MEMORY.md` dir, `CLAUDE.md` path) and a plan
+   grouped by target, with skips for already-promoted or unsupported (e.g. `rules/`) items.
+   **Verify the resolved paths** before going further.
+2. **Confirm with the user**, then execute. A `pg_dump` DB backup runs first; the apply
+   aborts if the backup fails:
+   ```bash
+   uv run python scripts/core/memory_apply.py <project> --ids <id1,id2,...> --execute
+   ```
+
+What apply does (Phase 2a):
+- `CODEBASE_PATTERN` → a new `promoted-<slug>.md` Claude-memory file + a `MEMORY.md` pointer.
+- `ARCHITECTURAL_DECISION` → appended to the project `CLAUDE.md` under `## Promoted Decisions`.
+- Tags the source `archival_memory` row's metadata with `promoted_to` (idempotent: a
+  re-apply is skipped; the row is **never** deleted — promotion is additive and reversible).
+
+**Deferred (not yet in apply):** `USER_PREFERENCE` → `rules/` (separate repo), and
+merge-supersede / stale-archive cleanup. Those still stop at the read-only report.
+
+Never hard-delete an `archival_memory` row (provenance-tag only — recall must keep working).
 
 ## Rules
 

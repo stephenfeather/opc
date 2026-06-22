@@ -5,7 +5,7 @@
 -- Idempotent: ON CONFLICT DO NOTHING skips already-backfilled rows.
 --
 -- Usage:
---   docker exec continuous-claude-postgres psql -U claude -d continuous_claude \
+--   docker exec opc-postgres psql -U claude -d continuous_claude \
 --     -f /path/to/backfill_memory_tags.sql
 
 INSERT INTO memory_tags (memory_id, tag, session_id, created_at)

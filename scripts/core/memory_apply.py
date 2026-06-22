@@ -47,10 +47,9 @@ from scripts.core.db.postgres_pool import close_pool, get_pool  # noqa: E402
 from scripts.core.memory_review import PromotionCandidate, route_destination  # noqa: E402
 from scripts.core.project_naming import canonicalize_project, project_from_path  # noqa: E402
 
-# pg_dump backup target. The running container is `continuous-claude-postgres` (per the
-# project CLAUDE.md and the live setup), which differs from the stale `container_name` in
-# docker/docker-compose.yml — so the name is env-overridable to stay portable.
-_BACKUP_CONTAINER = os.environ.get("OPC_PG_CONTAINER", "continuous-claude-postgres")
+# pg_dump backup target. The container is `opc-postgres` (matches docker-compose.yml's
+# container_name and the running container; issue #233). Still env-overridable for portability.
+_BACKUP_CONTAINER = os.environ.get("OPC_PG_CONTAINER", "opc-postgres")
 _BACKUP_USER = os.environ.get("OPC_PG_USER", "claude")
 _BACKUP_DB = os.environ.get("OPC_PG_DB", "continuous_claude")
 

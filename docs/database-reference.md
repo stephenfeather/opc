@@ -6,7 +6,7 @@ Complete reference for all database tables, their schemas, and the scripts/hooks
 
 OPC uses **two database systems**:
 
-1. **PostgreSQL** (primary) — Long-term memory, session coordination, feedback, patterns. Connection via `CONTINUOUS_CLAUDE_DB_URL` or `DATABASE_URL` env var. Runs in Docker (`continuous-claude-postgres`).
+1. **PostgreSQL** (primary) — Long-term memory, session coordination, feedback, patterns. Connection via `CONTINUOUS_CLAUDE_DB_URL` or `DATABASE_URL` env var. Runs in Docker (`opc-postgres`).
 2. **SQLite** (artifact index) — Context Graph for handoffs, plans, continuity ledgers, and queries. Located at `.claude/cache/artifact-index/context.db`. Used for FTS5-powered search.
 
 Some tables exist in **both** databases with slightly different schemas (handoffs, plans, continuity). The PostgreSQL versions are the authoritative store; the SQLite versions are a search-optimized index.

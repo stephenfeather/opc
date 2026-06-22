@@ -142,10 +142,10 @@ def format_report(report: ReviewReport) -> str:
             group = sorted(by_dest[dest], key=lambda c: c.recall_count, reverse=True)
             lines.append(f"  → {dest}  ({len(group)})")
             for c in group:
-                lines.append(
-                    f"      • [{c.learning_type}, recalled {c.recall_count}×] "
-                    f"{_truncate(c.content)}"
-                )
+                # Full id is shown so an approved promotion can be applied directly:
+                # `opc memory-apply <project> --ids <id>` (Phase 2a).
+                lines.append(f"      • [{c.learning_type}, recalled {c.recall_count}×] id={c.id}")
+                lines.append(f"          {_truncate(c.content)}")
     else:
         lines.append("  (none)")
     lines.append("")

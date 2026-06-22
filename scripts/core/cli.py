@@ -95,6 +95,11 @@ COMMANDS: dict[CommandKey, Command] = {
         "Detect memory promotion/merge/stale candidates (read-only)",
         "Patterns & Metrics",
     ),
+    ("memory-apply",): Command(
+        "memory_apply.py",
+        "Apply approved memory promotions (dry-run by default)",
+        "Patterns & Metrics",
+    ),
     ("confidence", "calibrate"): Command(
         "confidence_calibrator.py",
         "Calibrate learning confidence scores",

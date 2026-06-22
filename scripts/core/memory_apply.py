@@ -134,6 +134,13 @@ def _short(text: str, width: int = 80) -> str:
     return text if len(text) <= width else text[: width - 1] + "…"
 
 
+def _sanitize_content(text: str) -> str:
+    """Neutralize a learning body that tries to forge an idempotency marker — defang the
+    exact ``promoted_from_archival_memory`` token so stored content can't fake a promotion
+    marker (or an HTML comment) and cause a different promotion to be wrongly skipped."""
+    return text.replace("promoted_from_archival_memory", "promoted-from-archival-memory")
+
+
 def render_plan(plan: ApplyPlan) -> str:
     """Render the apply plan as a readable preview. Pure — writes nothing."""
     lines: list[str] = []
@@ -183,7 +190,7 @@ def memory_entry(candidate: PromotionCandidate, name: str | None = None) -> tupl
         "  type: reference\n"
         f'  {SOURCE_MARKER_KEY}: "{candidate.id}"\n'
         "---\n\n"
-        f"{candidate.content.strip()}\n"
+        f"{_sanitize_content(candidate.content.strip())}\n"
     )
     return filename, body
 
@@ -202,7 +209,7 @@ def claude_md_marker(candidate: PromotionCandidate) -> str:
 def claude_md_block(candidate: PromotionCandidate) -> str:
     """Markdown block appended to CLAUDE.md for an ARCHITECTURAL_DECISION promotion."""
     return (
-        f"- {candidate.content.strip()} "
+        f"- {_sanitize_content(candidate.content.strip())} "
         f"_(promoted from archival_memory {candidate.id[:8]}, recalled {candidate.recall_count}×)_ "
         f"{claude_md_marker(candidate)}"
     )
@@ -355,6 +362,7 @@ def backup_database(dest: Path, *, run=subprocess.run) -> Path:
                 f"database backup failed (pg_dump returncode={rc}): {stderr[:500]}; aborting apply"
             )
         tmp.replace(dest)
+        os.chmod(dest, 0o600)  # the dump carries all archival_memory content — owner-only
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
@@ -380,11 +388,15 @@ def backup_files(backup_dir: Path, timestamp: str, files: list[Path]) -> list[Pa
 
 
 @contextmanager
-def _apply_lock(lock_dir: Path):
+def _apply_lock(lock_dir: Path, project: str):
     """Serialize apply per project: an flock so two concurrent applies can't clobber each
-    other's MEMORY.md/CLAUDE.md edits or both pass the DB idempotency check (round 2)."""
+    other's MEMORY.md/CLAUDE.md edits or both pass the DB idempotency check.
+
+    The lock is keyed to the (stable) memory dir + project, NOT the overridable backup dir,
+    so two applies to the same memory tree serialize even with different --backup-dir."""
     lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = lock_dir / ".memory-apply.lock"
+    safe = re.sub(r"[^a-z0-9_-]+", "-", project.lower()) or "project"
+    lock_path = lock_dir / f".memory-apply-{safe}.lock"
     with open(lock_path, "w") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
         try:
@@ -481,7 +493,7 @@ async def run_apply(
     if not execute or not plan.applicable:
         return ApplyResult(plan=plan, applied=[], backup_path=None)
 
-    with _apply_lock(backup_dir):
+    with _apply_lock(memory_dir, project):
         backup_path = backup_database(backup_dir / f"memory-apply-{timestamp}.sql", run=run)
         backup_files(backup_dir, timestamp, [memory_dir / "MEMORY.md", claude_md_path])
         applied: list[str] = []
@@ -531,19 +543,51 @@ def default_memory_dir(project_dir: str) -> Path:
     return Path.home() / ".claude" / "projects" / flattened / "memory"
 
 
+def default_backup_dir() -> Path:
+    """Backups live OUTSIDE any git working tree (a pg_dump of the whole archival_memory
+    table can carry secrets; in-repo it risks accidental commit + cross-project leakage)."""
+    return Path.home() / ".claude" / "opc-backups"
+
+
+_MANIFEST_MAX_BYTES = 256 * 1024
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
 def parse_ids(raw_ids: str | None, manifest: str | None) -> list[str]:
-    """Approved ids from a comma list and/or a manifest file (one id per line)."""
+    """Approved ids from a comma list and/or a manifest file (one id per line).
+
+    The manifest read is bounded (a huge/binary file is rejected rather than slurped).
+    """
     ids: list[str] = []
     if raw_ids:
         ids.extend(part.strip() for part in raw_ids.split(",") if part.strip())
     if manifest:
-        for line in Path(manifest).read_text().splitlines():
+        mpath = Path(manifest)
+        if mpath.stat().st_size > _MANIFEST_MAX_BYTES:
+            raise ValueError(
+                f"--manifest file is too large ({mpath.stat().st_size} bytes > "
+                f"{_MANIFEST_MAX_BYTES}); pass a list of ids, not arbitrary data"
+            )
+        for line in mpath.read_text().splitlines():
             line = line.strip()
             if line and not line.startswith("#"):
                 ids.append(line)
     # de-dup, preserve order
     seen: set[str] = set()
     return [i for i in ids if not (i in seen or seen.add(i))]
+
+
+def validate_ids(ids: list[str]) -> tuple[list[str], list[str]]:
+    """Split ids into (valid uuids, malformed). Malformed ids never reach SQL/filenames."""
+    valid: list[str] = []
+    invalid: list[str] = []
+    for i in ids:
+        # Canonicalize to lowercase: archival_memory.id::text is lowercase, so an uppercase
+        # CLI uuid would otherwise silently match no candidate.
+        (valid.append(i.lower()) if _UUID_RE.match(i) else invalid.append(i))
+    return valid, invalid
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -575,9 +619,19 @@ async def main(argv: list[str] | None = None) -> int:
         print("memory-apply: could not resolve a project. Pass one explicitly.", file=sys.stderr)
         return 2
 
-    ids = parse_ids(args.ids, args.manifest)
+    try:
+        ids = parse_ids(args.ids, args.manifest)
+    except (OSError, ValueError) as exc:
+        print(f"memory-apply: could not read ids: {exc}", file=sys.stderr)
+        return 2
+    ids, invalid = validate_ids(ids)
+    for bad in invalid:
+        print(f"memory-apply: ignoring malformed id (not a uuid): {bad!r}", file=sys.stderr)
     if not ids:
-        print("memory-apply: no approved ids given (use --ids or --manifest).", file=sys.stderr)
+        print(
+            "memory-apply: no valid approved ids given (use --ids or --manifest).",
+            file=sys.stderr,
+        )
         return 2
 
     project_dir = _project_dir()
@@ -598,7 +652,7 @@ async def main(argv: list[str] | None = None) -> int:
 
     memory_dir = Path(args.memory_dir) if args.memory_dir else default_memory_dir(project_dir)
     claude_md = Path(args.claude_md) if args.claude_md else Path(project_dir) / "CLAUDE.md"
-    backup_dir = Path(args.backup_dir) if args.backup_dir else Path(project_dir) / "backups"
+    backup_dir = Path(args.backup_dir) if args.backup_dir else default_backup_dir()
     timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
 
     # Echo resolved write targets so a wrong default is caught in dry-run before --execute.
@@ -628,6 +682,10 @@ async def main(argv: list[str] | None = None) -> int:
         # RuntimeError covers a failed pg_dump backup (apply aborts before any mutation).
         print(f"memory-apply: aborted ({type(exc).__name__}): {exc}", file=sys.stderr)
         return 1
+
+    resolved = {a.candidate.id for a in result.plan.actions}
+    for missing in [i for i in ids if i not in resolved]:
+        print(f"memory-apply: id not found / not a current learning: {missing}", file=sys.stderr)
 
     print(render_plan(result.plan))
     if args.execute:

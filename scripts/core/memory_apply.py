@@ -5,14 +5,19 @@ Applies APPROVED promotion candidates from the read-only detector
 (``scripts/core/memory_review.py``) to the always-loaded memory tiers. Safety rails:
 
 * **Dry-run is the default.** Nothing is written unless ``execute=True``.
-* **DB backup before any mutation.** ``backup_database`` runs ``pg_dump`` to a
-  timestamped file; apply aborts if it fails.
-* **Reversible & idempotent.** Promotion appends to the target file and tags the source
-  ``archival_memory`` row's metadata with ``promoted_to`` — it never deletes the row, and
-  re-applying an already-tagged learning is skipped.
+* **Backups before any mutation.** A ``pg_dump`` of ``archival_memory`` AND a snapshot of
+  the files about to change (``MEMORY.md``, ``CLAUDE.md``) are written first; apply aborts
+  if the DB dump fails. Newly-created ``promoted-*.md`` files need no backup (undo = delete).
+* **Serialized.** The execute phase holds a per-project flock so concurrent applies can't
+  clobber each other's file edits.
+* **Reversible & idempotent.** Promotion appends to the target file and tags the source row
+  with STRUCTURED provenance (tier, exact target path, timestamp) — it never deletes the
+  row, and re-applying an already-tagged learning is skipped.
 
 Targets in Phase 2a: ``MEMORY.md`` (Claude auto-memory) and ``CLAUDE.md`` (opc-local).
-``rules/`` (a separate repo) and merge/archive cleanup-apply are deferred to later phases.
+``rules/`` (a separate repo), merge/archive cleanup-apply, and a one-shot operation-level
+``unpromote``/``repair`` command are deferred to later phases — the structured provenance
+written here is the enabler for that undo path.
 
 The read-only detector is intentionally untouched: all write logic lives here.
 """
@@ -21,11 +26,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import os
 import re
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -165,13 +172,16 @@ def memory_entry(candidate: PromotionCandidate, name: str | None = None) -> tupl
     """
     stem = name or _memory_name(candidate)
     filename = f"{stem}.md"
+    # Frontmatter values are double-quoted so dynamic text (the recall count's ×, etc.)
+    # is always a valid YAML scalar; the learning body lives below the frontmatter where
+    # it cannot affect the block. stem/id are slug/uuid (no quote chars) by construction.
     body = (
         "---\n"
-        f"name: {stem}\n"
-        f"description: Promoted from archival_memory (recalled {candidate.recall_count}×)\n"
+        f'name: "{stem}"\n'
+        f'description: "Promoted from archival_memory (recalled {candidate.recall_count}×)"\n'
         "metadata:\n"
         "  type: reference\n"
-        f"  {SOURCE_MARKER_KEY}: {candidate.id}\n"
+        f'  {SOURCE_MARKER_KEY}: "{candidate.id}"\n'
         "---\n\n"
         f"{candidate.content.strip()}\n"
     )
@@ -207,11 +217,14 @@ _PROMOTED_IDS_SQL = """
       AND metadata ? 'promoted_to'
 """
 
-# Merge a provenance object into metadata without clobbering existing keys. The tier is
-# bound as $2 (jsonb-encoded by asyncpg) so it can never carry SQL.
+# Merge a STRUCTURED provenance object into metadata (not a bare string) so a future
+# repair/unpromote pass can find exactly what was written where. tier/target/timestamp are
+# bound params ($2..$4) — jsonb_build_object never lets them carry SQL.
 _PROVENANCE_SQL = """
     UPDATE archival_memory
-    SET metadata = metadata || jsonb_build_object('promoted_to', $2::text)
+    SET metadata = metadata || jsonb_build_object(
+        'promoted_to', jsonb_build_object('tier', $2::text, 'target', $3::text, 'at', $4::text)
+    )
     WHERE id = $1::uuid
 """
 
@@ -223,10 +236,14 @@ async def fetch_promoted_ids(pool, project: str) -> set[str]:
     return {r["id"] for r in rows}
 
 
-async def write_provenance(pool, learning_id: str, tier: str) -> None:
-    """Tag a source row as promoted. Reversible (clear the key); never deletes the row."""
+async def write_provenance(pool, learning_id: str, *, tier: str, target: str, at: str) -> None:
+    """Tag a source row with structured promotion provenance (tier, exact target, timestamp).
+
+    Reversible (clear the key) and never deletes the row. Storing the exact target path +
+    timestamp is what a Phase-2b unpromote/repair pass needs to undo precisely this write.
+    """
     async with pool.acquire() as conn:
-        await conn.execute(_PROVENANCE_SQL, learning_id, tier)
+        await conn.execute(_PROVENANCE_SQL, learning_id, tier, target, at)
 
 
 _CANDIDATES_BY_IDS_SQL = """
@@ -317,18 +334,51 @@ def backup_database(dest: Path, *, run=subprocess.run) -> Path:
     return dest
 
 
-def apply_memory_file(memory_dir: Path, candidate: PromotionCandidate) -> bool:
+def backup_files(backup_dir: Path, timestamp: str, files: list[Path]) -> list[Path]:
+    """Snapshot the files an apply will MUTATE (MEMORY.md, CLAUDE.md) before --execute.
+
+    The pg_dump only covers the DB table; these copies make the FILE side recoverable too.
+    Newly-created promoted-*.md files need no backup (undo = delete them). Missing files are
+    skipped (nothing to restore). Returns the list of backup copies written.
+    """
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    copies: list[Path] = []
+    for src in files:
+        if not src.exists():
+            continue
+        dest = backup_dir / f"memory-apply-{timestamp}-{src.name}.bak"
+        _atomic_write(dest, src.read_text())
+        copies.append(dest)
+    return copies
+
+
+@contextmanager
+def _apply_lock(lock_dir: Path):
+    """Serialize apply per project: an flock so two concurrent applies can't clobber each
+    other's MEMORY.md/CLAUDE.md edits or both pass the DB idempotency check (round 2)."""
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / ".memory-apply.lock"
+    with open(lock_path, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+def apply_memory_file(memory_dir: Path, candidate: PromotionCandidate) -> Path | None:
     """Ensure the promoted Claude-memory file AND its MEMORY.md pointer exist.
 
-    Returns True once both artifacts are present (the caller tags provenance only then).
-    Reconciles a partial prior apply: if the file already exists but the index pointer is
-    missing, the pointer is still appended. Slug collisions with a *different* source id
-    get a collision-free filename (so one candidate never silently shadows another).
-    Raises on I/O failure — the row is then left untagged and a re-run resumes safely.
+    Returns the file Path once both artifacts are present (the caller tags provenance with
+    that exact path only then), or None on a no-op failure. Reconciles a partial prior
+    apply: if the file already exists but the index pointer is missing, the pointer is still
+    appended. Slug collisions with a *different* source id get a collision-free filename (so
+    one candidate never silently shadows another). Raises on I/O failure — the row is then
+    left untagged and a re-run resumes safely.
     """
     base = _memory_name(candidate)
     path = memory_dir / f"{base}.md"
-    if path.exists() and f"{SOURCE_MARKER_KEY}: {candidate.id}" not in path.read_text():
+    if path.exists() and f'{SOURCE_MARKER_KEY}: "{candidate.id}"' not in path.read_text():
         # Same slug, different learning — disambiguate with the id so neither is shadowed.
         base = f"{base}-{candidate.id[:8]}"
         path = memory_dir / f"{base}.md"
@@ -337,22 +387,22 @@ def apply_memory_file(memory_dir: Path, candidate: PromotionCandidate) -> bool:
         _atomic_write(path, body)
     # Always reconcile the index pointer (idempotent), even if the file pre-existed.
     _append_line_if_absent(memory_dir / "MEMORY.md", memory_index_line(candidate, filename))
-    return True
+    return path
 
 
 _CLAUDE_SECTION = "## Promoted Decisions"
 
 
-def append_claude_md(path: Path, candidate: PromotionCandidate) -> bool:
+def append_claude_md(path: Path, candidate: PromotionCandidate) -> Path | None:
     """Ensure the decision block is present in CLAUDE.md under the Promoted section.
 
     Idempotency uses the EXACT structured marker carrying the full learning id (not an
-    8-char substring), so unrelated text can never falsely suppress a promotion. Returns
-    True once the block is present (caller tags provenance only then).
+    8-char substring), so unrelated text can never falsely suppress a promotion. Returns the
+    CLAUDE.md Path once the block is present (caller tags provenance only then).
     """
     text = path.read_text() if path.exists() else ""
     if claude_md_marker(candidate) in text:
-        return True  # already promoted (exact full-id marker) — present, nothing to do
+        return path  # already promoted (exact full-id marker) — present, nothing to do
     if _CLAUDE_SECTION not in text:
         text = (
             (text.rstrip() + "\n\n" + _CLAUDE_SECTION + "\n")
@@ -361,7 +411,7 @@ def append_claude_md(path: Path, candidate: PromotionCandidate) -> bool:
         )
     text = text.rstrip() + "\n" + claude_md_block(candidate) + "\n"
     _atomic_write(path, text)
-    return True
+    return path
 
 
 # --- Orchestrator ----------------------------------------------------------
@@ -388,10 +438,13 @@ async def run_apply(
 ) -> ApplyResult:
     """Resolve approved ids, plan, and (only if execute) back up then write + tag.
 
-    Dry-run (execute=False) performs ZERO writes and takes NO backup. Under execute, the
-    DB backup runs before the first mutation; each item writes its file then tags the
-    source row (file-first so a tag never outlives a failed write). Items are independent
-    and idempotent, so a partial failure is safe to re-run.
+    Dry-run (execute=False) performs ZERO writes and takes NO backup. Under execute the
+    whole mutation phase is serialized by a per-project flock (concurrent applies can't
+    clobber each other's file edits); a DB-table dump AND a snapshot of the files about to
+    be mutated are taken before the first write; each item writes its file then tags the
+    source row with structured provenance (file-first, so a tag never outlives a failed
+    write — and only the exact written path is recorded). Items are independent and
+    idempotent, so a partial failure is safe to re-run.
     """
     candidates = await fetch_candidates_by_ids(pool, project, approved_ids)
     already = await fetch_promoted_ids(pool, project)
@@ -400,27 +453,29 @@ async def run_apply(
     if not execute or not plan.applicable:
         return ApplyResult(plan=plan, applied=[], backup_path=None)
 
-    backup_path = backup_database(backup_dir / f"memory-apply-{timestamp}.sql", run=run)
-    applied: list[str] = []
-    for action in plan.applicable:
-        c = action.candidate
-        tier = action.target
-        if tier is None:  # unreachable for applicable actions; satisfies the type + defensive
-            continue
-        # File-first, tag-only-on-confirmed-success: the writer returns True only once the
-        # artifact (file + index pointer, or CLAUDE.md block) is actually present, so a
-        # skipped/partial write can never leave the row tagged-but-unwritten. A write that
-        # raises propagates out untagged, and the item is idempotent on the next run.
-        if tier == "MEMORY.md":
-            ok = apply_memory_file(memory_dir, c)
-        elif tier == "CLAUDE.md":
-            ok = append_claude_md(claude_md_path, c)
-        else:
-            ok = False
-        if not ok:
-            continue
-        await write_provenance(pool, c.id, tier)
-        applied.append(c.id)
+    with _apply_lock(backup_dir):
+        backup_path = backup_database(backup_dir / f"memory-apply-{timestamp}.sql", run=run)
+        backup_files(backup_dir, timestamp, [memory_dir / "MEMORY.md", claude_md_path])
+        applied: list[str] = []
+        for action in plan.applicable:
+            c = action.candidate
+            tier = action.target
+            if tier is None:  # unreachable for applicable actions; satisfies type + defensive
+                continue
+            # File-first, tag-only-on-confirmed-success: the writer returns the exact target
+            # path only once the artifact (file + index pointer, or CLAUDE.md block) is
+            # present, so a skipped/partial write can never leave the row tagged-but-unwritten.
+            # A write that raises propagates out untagged; the item is idempotent on re-run.
+            if tier == "MEMORY.md":
+                artifact = apply_memory_file(memory_dir, c)
+            elif tier == "CLAUDE.md":
+                artifact = append_claude_md(claude_md_path, c)
+            else:
+                artifact = None
+            if artifact is None:
+                continue
+            await write_provenance(pool, c.id, tier=tier, target=str(artifact), at=timestamp)
+            applied.append(c.id)
     return ApplyResult(plan=plan, applied=applied, backup_path=backup_path)
 
 
@@ -488,6 +543,21 @@ async def main(argv: list[str] | None = None) -> int:
         return 2
 
     project_dir = _project_dir()
+    # Fail-closed guard (round 2): the DB project comes from the explicit arg, but the file
+    # write roots derive from the working tree. If they disagree (e.g. `memory-apply other`
+    # from the opc tree, or a stale CLAUDE_PROJECT_DIR), --execute would fetch one project's
+    # candidates and write another's files. Require explicit --memory-dir AND --claude-md to
+    # proceed in that case, so a mismatch can never silently target the wrong tree.
+    cwd_project = project_from_path(project_dir)
+    if args.execute and project != cwd_project and not (args.memory_dir and args.claude_md):
+        print(
+            f"memory-apply: refusing to --execute: requested project '{project}' differs from "
+            f"the working tree's project '{cwd_project}'. Pass explicit --memory-dir and "
+            "--claude-md so the write target is unambiguous.",
+            file=sys.stderr,
+        )
+        return 2
+
     memory_dir = Path(args.memory_dir) if args.memory_dir else default_memory_dir(project_dir)
     claude_md = Path(args.claude_md) if args.claude_md else Path(project_dir) / "CLAUDE.md"
     backup_dir = Path(args.backup_dir) if args.backup_dir else Path(project_dir) / "backups"

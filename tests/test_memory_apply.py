@@ -194,17 +194,20 @@ class TestFetchPromotedIds:
 
 
 class TestWriteProvenance:
-    async def test_updates_metadata_with_tier_and_id(self):
+    async def test_stores_structured_provenance(self):
         pool, conn = _pool()
-        await write_provenance(pool, "abc", "MEMORY.md")
+        await write_provenance(
+            pool, "abc", tier="MEMORY.md", target="/m/promoted-x.md", at="20260101-000000"
+        )
         args = conn.execute.call_args.args
         sql = args[0]
         assert "UPDATE archival_memory" in sql
-        assert "metadata" in sql
         assert "promoted_to" in sql
-        assert "abc" in args  # bound id
-        # tier carried in the jsonb payload (bound, not interpolated)
-        assert any("MEMORY.md" in str(a) for a in args)
+        # structured object: tier + exact target path + timestamp all bound (not interpolated)
+        assert "abc" in args
+        assert "MEMORY.md" in args
+        assert "/m/promoted-x.md" in args
+        assert "20260101-000000" in args
 
 
 def test_apply_action_dataclass_shape():
@@ -336,7 +339,7 @@ class TestApplyMemoryFile:
         (memory_dir / "MEMORY.md").write_text("# Memory Index\n")
         c = _cand(content="Recall scoping is a soft boost")
         ok = apply_memory_file(memory_dir, c)
-        assert ok is True
+        assert ok
         created = list(memory_dir.glob("promoted-*.md"))
         assert len(created) == 1
         assert "Recall scoping" in created[0].read_text()
@@ -346,8 +349,8 @@ class TestApplyMemoryFile:
         memory_dir = tmp_path
         (memory_dir / "MEMORY.md").write_text("# Memory Index\n")
         c = _cand(content="Same content here")
-        assert apply_memory_file(memory_dir, c) is True
-        assert apply_memory_file(memory_dir, c) is True  # present → no error
+        assert apply_memory_file(memory_dir, c)
+        assert apply_memory_file(memory_dir, c)  # present → no error
         assert (memory_dir / "MEMORY.md").read_text().count("promoted-same-content-here") == 1
         assert len(list(memory_dir.glob("promoted-*.md"))) == 1
 
@@ -361,7 +364,7 @@ class TestApplyMemoryFile:
         (memory_dir / fname).write_text(body)
         assert "promoted-partial" not in (memory_dir / "MEMORY.md").read_text()
         ok = apply_memory_file(memory_dir, c)
-        assert ok is True
+        assert ok
         assert "promoted-partial-apply-learning" in (memory_dir / "MEMORY.md").read_text()
 
     def test_slug_collision_uses_distinct_filename(self, tmp_path):
@@ -370,8 +373,8 @@ class TestApplyMemoryFile:
         (memory_dir / "MEMORY.md").write_text("# Memory Index\n")
         c1 = _cand(id="11111111-aaaa", content="Same Slug Text")
         c2 = _cand(id="22222222-bbbb", content="Same Slug Text")
-        assert apply_memory_file(memory_dir, c1) is True
-        assert apply_memory_file(memory_dir, c2) is True
+        assert apply_memory_file(memory_dir, c1) is not None
+        assert apply_memory_file(memory_dir, c2) is not None
         files = sorted(f.name for f in memory_dir.glob("promoted-*.md"))
         assert len(files) == 2  # neither candidate shadowed the other
         # both source ids preserved across the two files
@@ -386,7 +389,7 @@ class TestAppendClaudeMd:
         c = _cand(
             id="dec12345-0000", lt="ARCHITECTURAL_DECISION", dest="CLAUDE.md", content="Chose X"
         )
-        assert append_claude_md(path, c) is True
+        assert append_claude_md(path, c)
         text = path.read_text()
         assert "Promoted Decisions" in text
         assert "Chose X" in text
@@ -397,8 +400,8 @@ class TestAppendClaudeMd:
         c = _cand(
             id="dec12345-0000", lt="ARCHITECTURAL_DECISION", dest="CLAUDE.md", content="Chose X"
         )
-        assert append_claude_md(path, c) is True
-        assert append_claude_md(path, c) is True  # present (exact marker) → no duplicate
+        assert append_claude_md(path, c)
+        assert append_claude_md(path, c)  # present (exact marker) → no duplicate
         assert path.read_text().count("Chose X") == 1
 
     def test_substring_id_does_not_false_suppress(self, tmp_path):
@@ -413,7 +416,7 @@ class TestAppendClaudeMd:
         )
         path.write_text(f"# Project\n\nUnrelated mention of {c.id[:8]} in prose.\n")
         wrote = append_claude_md(path, c)
-        assert wrote is True
+        assert wrote
         assert "Real decision" in path.read_text()
 
 
@@ -524,7 +527,7 @@ class TestRunApply:
             Path(kw["stdout"].name).write_text("-- dump")
             return MagicMock(returncode=0)
 
-        monkeypatch.setattr(ma, "apply_memory_file", lambda *a, **k: False)
+        monkeypatch.setattr(ma, "apply_memory_file", lambda *a, **k: None)
         result = await run_apply(
             pool,
             "opc",
@@ -538,3 +541,94 @@ class TestRunApply:
         )
         assert result.applied == []
         conn.execute.assert_not_called()  # no provenance tag without a confirmed write
+
+    async def test_execute_snapshots_files_before_writing(self, tmp_path):
+        # Round 2: the file side must be recoverable too — MEMORY.md/CLAUDE.md are copied
+        # to the backup dir before any mutation.
+        memory_dir, claude_md, backup_dir = self._setup(tmp_path)
+        rows = [
+            {"id": "a", "content": "Pat", "recall_count": 11, "learning_type": "CODEBASE_PATTERN"}
+        ]
+        pool, conn = _pool()
+        conn.fetch.side_effect = [rows, []]
+
+        def _run(cmd, **kw):
+            Path(kw["stdout"].name).write_text("-- dump")
+            return MagicMock(returncode=0)
+
+        await run_apply(
+            pool,
+            "opc",
+            ["a"],
+            execute=True,
+            memory_dir=memory_dir,
+            claude_md_path=claude_md,
+            backup_dir=backup_dir,
+            timestamp="20260101-000000",
+            run=_run,
+        )
+        backups = {p.name for p in backup_dir.glob("*.bak")}
+        assert any("MEMORY.md" in n for n in backups)
+        assert any("CLAUDE.md" in n for n in backups)
+
+
+class TestBackupFiles:
+    def test_copies_existing_skips_missing(self, tmp_path):
+        from scripts.core.memory_apply import backup_files
+
+        present = tmp_path / "MEMORY.md"
+        present.write_text("hello")
+        missing = tmp_path / "CLAUDE.md"  # not created
+        out = backup_files(tmp_path / "bk", "20260101-000000", [present, missing])
+        assert len(out) == 1
+        assert out[0].read_text() == "hello"
+
+
+class TestExecutePathGuard:
+    async def test_refuses_execute_on_project_path_mismatch(self, monkeypatch):
+        # Round 2: requested project differs from the working tree -> fail closed unless
+        # explicit write paths are given.
+        import scripts.core.memory_apply as ma
+
+        monkeypatch.setattr(ma, "canonicalize_project", lambda p: "other-project")
+        monkeypatch.setattr(ma, "project_from_path", lambda p: "opc")
+        called = False
+
+        async def _get_pool():
+            nonlocal called
+            called = True
+            return MagicMock()
+
+        monkeypatch.setattr(ma, "get_pool", _get_pool)
+        rc = await ma.main(["other-project", "--ids", "a", "--execute"])
+        assert rc == 2
+        assert called is False  # bailed before touching the DB
+
+    async def test_mismatch_allowed_with_explicit_paths(self, tmp_path, monkeypatch):
+        import scripts.core.memory_apply as ma
+
+        monkeypatch.setattr(ma, "canonicalize_project", lambda p: "other-project")
+        monkeypatch.setattr(ma, "project_from_path", lambda p: "opc")
+        memory_dir = tmp_path / "mem"
+        memory_dir.mkdir()
+        (memory_dir / "MEMORY.md").write_text("# Index\n")
+        pool, conn = _pool()
+        conn.fetch.side_effect = [[], []]  # no candidates -> dry plan, no writes
+
+        async def _get_pool():
+            return pool
+
+        monkeypatch.setattr(ma, "get_pool", _get_pool)
+        # explicit paths provided -> guard passes; dry-run (no --execute on the write side)
+        rc = await ma.main(
+            [
+                "other-project",
+                "--ids",
+                "a",
+                "--memory-dir",
+                str(memory_dir),
+                "--claude-md",
+                str(tmp_path / "C.md"),
+            ]
+        )
+        assert rc == 0

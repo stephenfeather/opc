@@ -41,14 +41,18 @@ _repo_root = str(Path(__file__).resolve().parent.parent.parent)
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
+from asyncpg.exceptions import PostgresError  # noqa: E402
+
 from scripts.core.db.postgres_pool import close_pool, get_pool  # noqa: E402
 from scripts.core.memory_review import PromotionCandidate, route_destination  # noqa: E402
 from scripts.core.project_naming import canonicalize_project, project_from_path  # noqa: E402
 
-# pg_dump backup target (the Dockerized PostgreSQL from docker/docker-compose.yml).
-_BACKUP_CONTAINER = "continuous-claude-postgres"
-_BACKUP_USER = "claude"
-_BACKUP_DB = "continuous_claude"
+# pg_dump backup target. The running container is `continuous-claude-postgres` (per the
+# project CLAUDE.md and the live setup), which differs from the stale `container_name` in
+# docker/docker-compose.yml — so the name is env-overridable to stay portable.
+_BACKUP_CONTAINER = os.environ.get("OPC_PG_CONTAINER", "continuous-claude-postgres")
+_BACKUP_USER = os.environ.get("OPC_PG_USER", "claude")
+_BACKUP_DB = os.environ.get("OPC_PG_DB", "continuous_claude")
 
 # learning_type -> apply target (subset of memory_review routing supported in Phase 2a).
 # The detector may route a candidate to "rules/" (USER_PREFERENCE) — that target is deferred
@@ -309,7 +313,12 @@ def _atomic_write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
     try:
-        with os.fdopen(fd, "w") as f:
+        try:
+            f = os.fdopen(fd, "w")
+        except (OSError, ValueError):
+            os.close(fd)  # fdopen failed without taking ownership of fd — close it ourselves
+            raise
+        with f:
             f.write(content)
         Path(tmp).replace(path)
     except BaseException:
@@ -442,13 +451,16 @@ def append_claude_md(path: Path, candidate: PromotionCandidate) -> Path | None:
     text = path.read_text() if path.exists() else ""
     if claude_md_marker(candidate) in text:
         return path  # already promoted (exact full-id marker) — present, nothing to do
-    if _CLAUDE_SECTION not in text:
-        text = (
-            (text.rstrip() + "\n\n" + _CLAUDE_SECTION + "\n")
-            if text.strip()
-            else (_CLAUDE_SECTION + "\n")
-        )
-    text = text.rstrip() + "\n" + claude_md_block(candidate) + "\n"
+    block = claude_md_block(candidate)
+    if _CLAUDE_SECTION in text:
+        # Insert directly under the section header so the block lands in the right section
+        # even when other sections follow it (appending to EOF would misfile it).
+        head, rest = text.split(_CLAUDE_SECTION, 1)
+        sep = "" if rest.startswith("\n") else "\n"
+        text = head + _CLAUDE_SECTION + "\n" + block + sep + rest
+    else:
+        prefix = (text.rstrip() + "\n\n") if text.strip() else ""
+        text = prefix + _CLAUDE_SECTION + "\n" + block + "\n"
     _atomic_write(path, text)
     return path
 
@@ -586,7 +598,10 @@ def validate_ids(ids: list[str]) -> tuple[list[str], list[str]]:
     for i in ids:
         # Canonicalize to lowercase: archival_memory.id::text is lowercase, so an uppercase
         # CLI uuid would otherwise silently match no candidate.
-        (valid.append(i.lower()) if _UUID_RE.match(i) else invalid.append(i))
+        if _UUID_RE.match(i):
+            valid.append(i.lower())
+        else:
+            invalid.append(i)
     return valid, invalid
 
 
@@ -678,8 +693,9 @@ async def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"memory-apply: configuration error: {exc}", file=sys.stderr)
         return 1
-    except (OSError, RuntimeError) as exc:
-        # RuntimeError covers a failed pg_dump backup (apply aborts before any mutation).
+    except (OSError, RuntimeError, PostgresError) as exc:
+        # RuntimeError covers a failed pg_dump backup (apply aborts before any mutation);
+        # PostgresError is caught so a DB failure can't dump a traceback that echoes the DSN.
         print(f"memory-apply: aborted ({type(exc).__name__}): {exc}", file=sys.stderr)
         return 1
 

@@ -118,6 +118,11 @@ class TestFormatReport:
         assert "rules/" in out
         assert "34" in out
 
+    def test_promotion_shows_full_id_for_apply(self):
+        # The apply step needs the full uuid; the report must expose it (not just type/recall).
+        out = format_report(self._report())
+        assert "id=a1" in out  # full id surfaced for `memory-apply --ids`
+
     def test_merge_shows_similarity(self):
         out = format_report(self._report())
         assert "0.99" in out

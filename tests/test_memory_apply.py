@@ -436,6 +436,22 @@ class TestAppendClaudeMd:
         assert append_claude_md(path, c)  # present (exact marker) → no duplicate
         assert path.read_text().count("Chose X") == 1
 
+    def test_inserts_under_section_when_other_sections_follow(self, tmp_path):
+        # Review finding: with a section after Promoted Decisions, the block must land
+        # under the right header, not at EOF.
+        path = tmp_path / "CLAUDE.md"
+        path.write_text("# P\n\n## Promoted Decisions\n\n## Later Section\nstuff\n")
+        c = _cand(
+            id="cccccccc-0000",
+            lt="ARCHITECTURAL_DECISION",
+            dest="CLAUDE.md",
+            content="New decision",
+        )
+        append_claude_md(path, c)
+        text = path.read_text()
+        # the new block appears before the later section, i.e. under Promoted Decisions
+        assert text.index("New decision") < text.index("## Later Section")
+
     def test_substring_id_does_not_false_suppress(self, tmp_path):
         # Regression (round 1): an 8-char prefix appearing in unrelated text must NOT be
         # treated as "already promoted" — only the exact full-id marker counts.

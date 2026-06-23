@@ -256,7 +256,7 @@ async def test_supersede_target_does_not_block_replacement(
     """
     mock_memory_service.search_vector_global.return_value = [
         {
-            "id": "bad-row-uuid",
+            "id": "11111111-1111-1111-1111-111111111111",
             "session_id": "old-session",
             "content": "The wrong learning being corrected",
             "similarity": 0.97,
@@ -270,17 +270,17 @@ async def test_supersede_target_does_not_block_replacement(
         result = await store_learning_v2(
             session_id="my-session",
             content="The corrected learning",
-            supersedes="bad-row-uuid",
+            supersedes="11111111-1111-1111-1111-111111111111",
         )
 
     assert result["success"] is True
     assert "skipped" not in result
     assert result["memory_id"] == "new-uuid-123"
-    assert result.get("superseded") == "bad-row-uuid"
+    assert result.get("superseded") == "11111111-1111-1111-1111-111111111111"
     mock_memory_service.store.assert_called_once()
     # The supersede target id is passed through to the store layer.
     _, store_kwargs = mock_memory_service.store.call_args
-    assert store_kwargs.get("supersedes") == "bad-row-uuid"
+    assert store_kwargs.get("supersedes") == "11111111-1111-1111-1111-111111111111"
     # The dedup probe fetched an extra neighbor so a *different* dup can still surface.
     _, probe_kwargs = mock_memory_service.search_vector_global.call_args
     assert probe_kwargs.get("limit") == 2
@@ -293,13 +293,13 @@ async def test_supersede_still_rejects_a_different_duplicate(
     """Superseding row X must still reject when a DIFFERENT row Y is a near-dup."""
     mock_memory_service.search_vector_global.return_value = [
         {
-            "id": "other-dup-uuid",
+            "id": "22222222-2222-2222-2222-222222222222",
             "session_id": "other-session",
             "content": "An unrelated near-duplicate",
             "similarity": 0.96,
         },
         {
-            "id": "bad-row-uuid",
+            "id": "11111111-1111-1111-1111-111111111111",
             "session_id": "old-session",
             "content": "The wrong learning being corrected",
             "similarity": 0.95,
@@ -313,13 +313,13 @@ async def test_supersede_still_rejects_a_different_duplicate(
         result = await store_learning_v2(
             session_id="my-session",
             content="The corrected learning",
-            supersedes="bad-row-uuid",
+            supersedes="11111111-1111-1111-1111-111111111111",
         )
 
     assert result["success"] is True
     assert result["skipped"] is True
     assert "duplicate" in result["reason"]
-    assert result["existing_id"] == "other-dup-uuid"
+    assert result["existing_id"] == "22222222-2222-2222-2222-222222222222"
     mock_memory_service.store.assert_not_called()
 
 
@@ -335,7 +335,7 @@ async def test_supersede_on_sqlite_still_blocks_duplicate(mock_embedder):
     memory.search_vector_global = AsyncMock(
         return_value=[
             {
-                "id": "bad-row-uuid",
+                "id": "11111111-1111-1111-1111-111111111111",
                 "session_id": "old-session",
                 "content": "The wrong learning being corrected",
                 "similarity": 0.97,
@@ -357,13 +357,13 @@ async def test_supersede_on_sqlite_still_blocks_duplicate(mock_embedder):
         result = await store_learning_v2(
             session_id="my-session",
             content="The corrected learning",
-            supersedes="bad-row-uuid",
+            supersedes="11111111-1111-1111-1111-111111111111",
         )
 
     assert result["success"] is True
     assert result["skipped"] is True
     assert "duplicate" in result["reason"]
-    assert result["existing_id"] == "bad-row-uuid"
+    assert result["existing_id"] == "11111111-1111-1111-1111-111111111111"
     memory.store.assert_not_called()
 
 
@@ -383,7 +383,7 @@ async def test_supersede_on_pre_migration_postgres_still_blocks_duplicate(
     memory.search_vector_global = AsyncMock(
         return_value=[
             {
-                "id": "bad-row-uuid",
+                "id": "11111111-1111-1111-1111-111111111111",
                 "session_id": "old-session",
                 "content": "The wrong learning being corrected",
                 "similarity": 0.97,
@@ -406,11 +406,85 @@ async def test_supersede_on_pre_migration_postgres_still_blocks_duplicate(
         result = await store_learning_v2(
             session_id="my-session",
             content="The corrected learning",
-            supersedes="bad-row-uuid",
+            supersedes="11111111-1111-1111-1111-111111111111",
         )
 
     assert result["success"] is True
     assert result["skipped"] is True
     assert "duplicate" in result["reason"]
-    assert result["existing_id"] == "bad-row-uuid"
+    assert result["existing_id"] == "11111111-1111-1111-1111-111111111111"
     memory.store.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_supersede_uppercase_uuid_still_excludes_target(
+    mock_memory_service, mock_embedder
+):
+    """An uppercase --supersedes UUID must still exclude the target (issue #235).
+
+    asyncpg returns row ids in canonical lowercase; comparing the raw uppercase
+    operator input would fail to match and silently re-break the replace. The
+    id must be canonicalized before the dedup-exclusion filter and the store.
+    """
+    mock_memory_service.search_vector_global.return_value = [
+        {
+            "id": "33333333-3333-3333-3333-333333333333",  # asyncpg: lowercase
+            "session_id": "old-session",
+            "content": "The wrong learning being corrected",
+            "similarity": 0.97,
+        }
+    ]
+
+    p1, p2, p3 = _patches(mock_memory_service, mock_embedder)
+    with p1, p2, p3, patch(
+        f"{STORE_MOD}.detect_backend", MagicMock(return_value="postgres")
+    ):
+        result = await store_learning_v2(
+            session_id="my-session",
+            content="The corrected learning",
+            supersedes="33333333-3333-3333-3333-333333333333".upper(),
+        )
+
+    assert result["success"] is True
+    assert "skipped" not in result
+    assert result["memory_id"] == "new-uuid-123"
+    # Reported and persisted in canonical lowercase, not the raw uppercase input.
+    assert result.get("superseded") == "33333333-3333-3333-3333-333333333333"
+    _, store_kwargs = mock_memory_service.store.call_args
+    assert store_kwargs.get("supersedes") == "33333333-3333-3333-3333-333333333333"
+
+
+@pytest.mark.asyncio
+async def test_supersede_invalid_uuid_falls_back_to_plain_dedup(
+    mock_memory_service, mock_embedder
+):
+    """A non-UUID --supersedes must not reach the DB; fall back to plain dedup.
+
+    Previously the bad value hit the $2::uuid cast and raised
+    InvalidTextRepresentationError. Now it is ignored: no exclusion, so a
+    matching row still blocks (and no DB error escapes).
+    """
+    mock_memory_service.search_vector_global.return_value = [
+        {
+            "id": "44444444-4444-4444-4444-444444444444",
+            "session_id": "other-session",
+            "content": "A near-duplicate",
+            "similarity": 0.96,
+        }
+    ]
+
+    p1, p2, p3 = _patches(mock_memory_service, mock_embedder)
+    with p1, p2, p3, patch(
+        f"{STORE_MOD}.detect_backend", MagicMock(return_value="postgres")
+    ):
+        result = await store_learning_v2(
+            session_id="my-session",
+            content="The corrected learning",
+            supersedes="not-a-valid-uuid",
+        )
+
+    assert result["success"] is True
+    assert result["skipped"] is True
+    assert "duplicate" in result["reason"]
+    assert result["existing_id"] == "44444444-4444-4444-4444-444444444444"
+    mock_memory_service.store.assert_not_called()

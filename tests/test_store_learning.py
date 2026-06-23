@@ -504,10 +504,10 @@ class TestStoreLearningV2:
         ):
             result = await store_learning_v2(
                 session_id="s1", content="New version",
-                supersedes="old-uuid",
+                supersedes="55555555-5555-5555-5555-555555555555",
             )
 
-        assert result["superseded"] == "old-uuid"
+        assert result["superseded"] == "55555555-5555-5555-5555-555555555555"
 
 
 class TestStoreLearningLegacy:

@@ -45,6 +45,7 @@ import json
 import logging
 import os
 import sys
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -266,6 +267,29 @@ def check_dedup_result(
             "existing_id": str(top_match.get("id", "")),
         }
     return None
+
+
+def _canonical_supersedes(supersedes: str | None) -> str | None:
+    """Canonicalize a supersedes id to a lowercase UUID string.
+
+    asyncpg returns row ids in canonical lowercase, so the dedup-exclusion
+    filter must compare against the same form — an uppercase or otherwise
+    non-canonical operator input would fail to match and silently re-break the
+    replace (issue #235). A value that is not a valid UUID is not a real row id;
+    return None so the caller falls back to plain dedup instead of passing the
+    bad value to the DB's ``$2::uuid`` cast (which raises
+    ``InvalidTextRepresentationError``). Pure function.
+    """
+    if not supersedes:
+        return None
+    try:
+        return str(uuid.UUID(str(supersedes)))
+    except (ValueError, TypeError, AttributeError):
+        logger.warning(
+            "Invalid supersedes id %r (not a UUID); ignoring and falling back "
+            "to plain dedup", supersedes,
+        )
+        return None
 
 
 async def _supersede_persists(memory: Any, backend: str) -> bool:
@@ -776,7 +800,16 @@ async def store_learning_v2(
         # — the same regression the backend gate closes for sqlite, via schema
         # drift instead of backend type. When capability is absent we fall back
         # to plain dedup (active_supersedes=None), which still protects the row.
-        active_supersedes = supersedes if await _supersede_persists(memory, backend) else None
+        #
+        # Canonicalize the id to a lowercase UUID string: asyncpg returns row
+        # ids in canonical lowercase, so comparing the raw operator input (which
+        # may be uppercase or otherwise non-canonical) would fail to exclude the
+        # target — silently re-breaking the replace for uppercase UUIDs. An
+        # unparseable id is not a real row, so fall back to plain dedup rather
+        # than letting the bad value reach the DB's $2::uuid cast and raise.
+        active_supersedes = _canonical_supersedes(supersedes)
+        if active_supersedes and not await _supersede_persists(memory, backend):
+            active_supersedes = None
         dedup_limit = 2 if active_supersedes else 1
         try:
             if hasattr(memory, "search_vector_global"):

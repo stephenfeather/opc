@@ -516,6 +516,15 @@ class MemoryServicePG:
                     )
 
             if supersedes:
+                # Intentionally NOT scoped by session_id/agent_id (unlike
+                # delete_archival). Supersede is a curation operation: a
+                # correction stored in the current session must be able to
+                # retire a bad/stale row created in ANY prior session. Adding a
+                # session/agent scope here would silently no-op cross-session
+                # corrections (the primary use case) and defeat the feature.
+                # The link is non-destructive and reversible, and the store is a
+                # local single-operator tool. Do not "harden" this to match the
+                # DELETE scoping without removing cross-session curation.
                 try:
                     status = await conn.execute(
                         """

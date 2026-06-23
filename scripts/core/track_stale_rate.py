@@ -46,7 +46,8 @@ async def fetch_stale_counts(pool) -> tuple[int, int]:
             "SELECT"
             " COUNT(*) AS total,"
             " COUNT(*) FILTER (WHERE recall_count = 0) AS stale"
-            " FROM archival_memory WHERE superseded_by IS NULL"
+            " FROM archival_memory"
+            " WHERE superseded_by IS NULL AND archived_at IS NULL"
         )
     return int(row["total"]), int(row["stale"])
 

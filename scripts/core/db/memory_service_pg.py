@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     from .memory_block import Block
 
 from .memory_service_queries import (
-    ACTIVE_ROW_FILTER,
+    active_row_conditions,
     build_hybrid_search_sql,
     build_text_search_sql,
     build_vector_search_sql,
@@ -187,6 +187,12 @@ class MemoryServicePG:
 
     # Module-level cache: None = not checked, True/False = result
     _has_superseded_column: bool | None = None
+    # Issue #63 Phase 2b (SF-1): a SEPARATE probe for archived_at. A DB may have
+    # superseded_by but NOT archived_at (superseded migration ran, stale-archive
+    # migration did not). Caching the two independently is what stops the active
+    # filter from emitting `archived_at IS NULL` against a column that doesn't
+    # exist and crashing every recall.
+    _has_archived_at_column: bool | None = None
 
     def __init__(
         self,
@@ -219,6 +225,46 @@ class MemoryServicePG:
             logger.debug("superseded_by column not found, disabling active-row filter")
             MemoryServicePG._has_superseded_column = False
         return MemoryServicePG._has_superseded_column
+
+    async def _check_archived_at_column(self) -> bool:
+        """Check if the archived_at column exists (issue #63 Phase 2b, SF-1).
+
+        Independent of ``_check_superseded_column``: the stale-archive migration
+        (add_archived_at.sql) may not have run even when superseded_by exists.
+        Caches at the class level so the probe runs at most once per process.
+        """
+        if MemoryServicePG._has_archived_at_column is not None:
+            return MemoryServicePG._has_archived_at_column
+        try:
+            async with get_connection() as conn:
+                await conn.fetchval(
+                    "SELECT 1 FROM archival_memory WHERE archived_at IS NULL LIMIT 1"
+                )
+            MemoryServicePG._has_archived_at_column = True
+        except (asyncpg.UndefinedColumnError, asyncpg.UndefinedTableError):
+            logger.debug("archived_at column not found, disabling archived-row filter")
+            MemoryServicePG._has_archived_at_column = False
+        return MemoryServicePG._has_archived_at_column
+
+    async def _lifecycle_filter_clause(self, *, alias: str = "") -> str:
+        """Build the inline `AND <predicates>` lifecycle filter for raw-SQL methods.
+
+        Runs both capability probes and emits only the predicates whose column
+        exists: `superseded_by IS NULL` (superseded probe) and/or
+        `archived_at IS NULL` (archived probe, SF-1). Returns "" when neither
+        column exists. ``alias`` prefixes each predicate (e.g. "a.") for joined
+        queries. Builder-based methods use ``active_row_conditions`` directly.
+        """
+        has_superseded = await self._check_superseded_column()
+        has_archived = await self._check_archived_at_column()
+        conds = active_row_conditions(
+            include_active_filter=has_superseded,
+            include_archived_filter=has_archived,
+        )
+        if not conds:
+            return ""
+        prefix = f"{alias}." if alias else ""
+        return "AND " + " AND ".join(f"{prefix}{c}" for c in conds)
 
     async def close(self) -> None:
         """Release connection (pool stays open for other services)."""
@@ -626,10 +672,12 @@ class MemoryServicePG:
         """Search archival memory with full-text search."""
         resolved_limit = _search_limit(limit)
         has_col = await self._check_superseded_column()
+        has_archived = await self._check_archived_at_column()
         sql, params = build_text_search_sql(
             self.session_id, self.agent_id, query, resolved_limit,
             start_date=start_date, end_date=end_date,
             include_active_filter=has_col,
+            include_archived_filter=has_archived,
         )
         async with get_connection() as conn:
             rows = await conn.fetch(sql, *params)
@@ -651,6 +699,7 @@ class MemoryServicePG:
         """
         resolved_limit = _search_limit(limit)
         has_col = await self._check_superseded_column()
+        has_archived = await self._check_archived_at_column()
         padded_query = pad_embedding(query_embedding)
         async with get_connection() as conn:
             await init_pgvector(conn)
@@ -662,6 +711,7 @@ class MemoryServicePG:
                 start_date=start_date, end_date=end_date,
                 include_active_filter=has_col,
                 embedding_model=model_label,
+                include_archived_filter=has_archived,
             )
             rows = await conn.fetch(sql, *params)
             return format_rows(rows, extra_fields=["similarity"])
@@ -678,8 +728,7 @@ class MemoryServicePG:
     ) -> list[dict[str, Any]]:
         """Search archival memory with vector similarity and threshold filter."""
         resolved_limit = _search_limit(limit)
-        has_col = await self._check_superseded_column()
-        active_filter = f"AND {ACTIVE_ROW_FILTER}" if has_col else ""
+        active_filter = await self._lifecycle_filter_clause()
         padded_query = pad_embedding(query_embedding)
         async with get_connection() as conn:
             await init_pgvector(conn)
@@ -708,8 +757,7 @@ class MemoryServicePG:
     ) -> list[dict[str, Any]]:
         """Search archival memory with vector similarity and metadata filter."""
         resolved_limit = _search_limit(limit)
-        has_col = await self._check_superseded_column()
-        active_filter = f"AND {ACTIVE_ROW_FILTER}" if has_col else ""
+        active_filter = await self._lifecycle_filter_clause()
         padded_query = pad_embedding(query_embedding)
         async with get_connection() as conn:
             await init_pgvector(conn)
@@ -748,8 +796,7 @@ class MemoryServicePG:
         $4, after the existing $1/$2/$3. The capability probe drops the filter
         on a pre-migration DB so the SQL stays byte-identical to pre-#151.
         """
-        has_col = await self._check_superseded_column()
-        active_filter = f"AND {ACTIVE_ROW_FILTER}" if has_col else ""
+        active_filter = await self._lifecycle_filter_clause()
         padded_query = pad_embedding(query_embedding)
         params: list[Any] = [padded_query, threshold, limit]
         async with get_connection() as conn:
@@ -789,12 +836,14 @@ class MemoryServicePG:
         """Hybrid search combining full-text search and vector similarity."""
         resolved_limit = _search_limit(limit)
         has_col = await self._check_superseded_column()
+        has_archived = await self._check_archived_at_column()
         padded_query = pad_embedding(query_embedding)
         sql, params = build_hybrid_search_sql(
             self.session_id, self.agent_id, text_query, padded_query, resolved_limit,
             text_weight=text_weight, vector_weight=vector_weight,
             start_date=start_date, end_date=end_date,
             include_active_filter=has_col,
+            include_archived_filter=has_archived,
         )
         async with get_connection() as conn:
             await init_pgvector(conn)
@@ -814,8 +863,7 @@ class MemoryServicePG:
         """Hybrid search using Reciprocal Rank Fusion."""
         resolved_limit = _search_limit(limit)
         resolved_k = _rrf_k(k)
-        has_col = await self._check_superseded_column()
-        active_filter = f"AND {ACTIVE_ROW_FILTER}" if has_col else ""
+        active_filter = await self._lifecycle_filter_clause()
         padded_query = pad_embedding(query_embedding)
         async with get_connection() as conn:
             await init_pgvector(conn)
@@ -948,8 +996,7 @@ class MemoryServicePG:
     ) -> list[dict[str, Any]]:
         """Search archival memory with optional tag filtering."""
         resolved_limit = _search_limit(limit)
-        has_col = await self._check_superseded_column()
-        active_filter = f"AND a.{ACTIVE_ROW_FILTER}" if has_col else ""
+        active_filter = await self._lifecycle_filter_clause(alias="a")
         async with get_connection() as conn:
             if not tags:
                 rows = await conn.fetch(
@@ -1047,8 +1094,7 @@ class MemoryServicePG:
         """Generate context string for prompt injection."""
         resolved_max_archival = _max_archival(max_archival)
         core = await self.get_all_core()
-        has_col = await self._check_superseded_column()
-        active_filter = f"AND {ACTIVE_ROW_FILTER}" if has_col else ""
+        active_filter = await self._lifecycle_filter_clause()
 
         async with get_connection() as conn:
             rows = await conn.fetch(

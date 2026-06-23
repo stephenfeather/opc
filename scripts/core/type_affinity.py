@@ -115,13 +115,20 @@ WHERE embedding IS NOT NULL
 GROUP BY 1
 """
 
-# The full-predicate aggregate (mirrors recall's chain=True CTE).
+# The full-predicate aggregate (mirrors recall's chain=True CTE). Issue #63
+# Phase 2b: also drop stale-archived rows so centroids train on exactly the
+# corpus recall can return.
 _CENTROID_SQL = _CENTROID_SQL_TEMPLATE.format(
+    chain_filter="\n    AND superseded_by IS NULL\n    AND archived_at IS NULL"
+)
+# Middle tier (issue #63 Phase 2b, W-1): a DB that has superseded_by but NOT
+# archived_at keeps the superseded filter rather than degrading to all rows.
+_CENTROID_SQL_NO_ARCHIVE = _CENTROID_SQL_TEMPLATE.format(
     chain_filter="\n    AND superseded_by IS NULL"
 )
 # Degraded aggregate for a pre-migration DB without the superseded_by column,
 # mirroring recall's chain=False fallback. Only used after the full query
-# raises UndefinedColumnError.
+# raises UndefinedColumnError for superseded_by.
 _CENTROID_SQL_NO_CHAIN = _CENTROID_SQL_TEMPLATE.format(chain_filter="")
 
 
@@ -429,10 +436,22 @@ async def fetch_type_centroids(model_label: str) -> dict[str, list[float]] | Non
                     if not _is_missing_column_error(exc):
                         raise
                     logger.debug(
-                        "centroid aggregate: superseded_by absent, degrading",
+                        "centroid aggregate: archived_at/superseded_by absent, degrading",
                         exc_info=True,
                     )
-                    rows = await conn.fetch(_CENTROID_SQL_NO_CHAIN, model_label)
+                    # Issue #63 Phase 2b (W-1): step down one clause at a time so a
+                    # missing archived_at keeps the superseded filter; only a missing
+                    # superseded_by drops to the no-chain aggregate.
+                    try:
+                        rows = await conn.fetch(_CENTROID_SQL_NO_ARCHIVE, model_label)
+                    except Exception as exc2:  # noqa: BLE001 - only column case retries
+                        if not _is_missing_column_error(exc2):
+                            raise
+                        logger.debug(
+                            "centroid aggregate: superseded_by absent, degrading to no-chain",
+                            exc_info=True,
+                        )
+                        rows = await conn.fetch(_CENTROID_SQL_NO_CHAIN, model_label)
     except Exception:  # noqa: BLE001 - degrade, never crash recall
         logger.debug("type-centroid aggregate failed", exc_info=True)
         return None

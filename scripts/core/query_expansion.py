@@ -284,6 +284,7 @@ async def build_idf_index(path: Path | None = None) -> IDFIndex:
                 SELECT content FROM archival_memory
                 WHERE metadata->>'type' = 'session_learning'
                 AND superseded_by IS NULL
+                AND archived_at IS NULL
                 """
             ):
                 word_df, doc_count = _fold_document(word_df, doc_count, row["content"])
@@ -325,6 +326,7 @@ async def get_idf_index(
                         SELECT COUNT(*) as cnt FROM archival_memory
                         WHERE metadata->>'type' = 'session_learning'
                         AND superseded_by IS NULL
+                        AND archived_at IS NULL
                         """
                     )
                 current_count = row["cnt"] if row else 0
@@ -394,6 +396,7 @@ async def expand_query(
             SELECT content FROM archival_memory
             WHERE metadata->>'type' = 'session_learning'
             AND superseded_by IS NULL
+            AND archived_at IS NULL
             AND embedding IS NOT NULL
             {model_clause}
             ORDER BY embedding <=> $1::vector

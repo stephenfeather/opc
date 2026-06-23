@@ -36,6 +36,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 _repo_root = str(Path(__file__).resolve().parent.parent.parent)
 if _repo_root not in sys.path:
@@ -340,6 +341,7 @@ _PROVENANCE_SQL = """
     WHERE id = $1::uuid
       AND LOWER(project) = LOWER($5)
       AND superseded_by IS NULL
+      AND archived_at IS NULL
 """
 
 
@@ -377,8 +379,53 @@ _CANDIDATES_BY_IDS_SQL = """
     FROM archival_memory
     WHERE LOWER(project) = LOWER($1)
       AND superseded_by IS NULL
+      AND archived_at IS NULL
       AND id::text = ANY($2::text[])
 """
+
+
+# Stale-archive UPDATE (issue #63 Phase 2b Step 3). ONE statement (mirrors
+# supersede_row's single-statement discipline): the COLUMN archived_at drives
+# query exclusion; the superseded_via MARKER drives provenance/undo symmetry.
+# Unlike a merge, a stale row has no survivor, so by=null and reason="stale".
+# Guarded by `archived_at IS NULL` so a concurrent archive collapses to a 0-row
+# no-op rather than re-stamping. `at` reuses the same NOW() as archived_at.
+_ARCHIVE_ROW_SQL = """
+    UPDATE archival_memory
+    SET archived_at = NOW(),
+        metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+            'superseded_via',
+            jsonb_build_object(
+                'by', NULL,
+                'reason', 'stale',
+                'at', NOW()
+            )
+        )
+    WHERE id = $1::uuid AND archived_at IS NULL
+"""
+
+
+def _parse_archive_count(status: str) -> int:
+    """Parse asyncpg's ``"UPDATE N"`` command tag into the row count (0 on any
+    unparseable tag), mirroring memory_service_pg._parse_update_count."""
+    try:
+        return int(status.split()[-1])
+    except (ValueError, IndexError, AttributeError):
+        return 0
+
+
+async def archive_row(conn: Any, *, learning_id: str) -> int:
+    """Stale-archive ``learning_id`` in one guarded UPDATE. Returns the row count.
+
+    Sets ``archived_at = NOW()`` and stamps the ``superseded_via`` marker
+    ``{"by": null, "reason": "stale", "at": <ts>}`` for audit/undo symmetry. The
+    column drives recall exclusion; the marker drives provenance. Guarded by
+    ``archived_at IS NULL`` so re-archiving an already-archived row is a 0-row
+    no-op (idempotent), never a raise. Does NOT catch UndefinedColumnError — on a
+    pre-migration schema it propagates so the caller owns the compat policy.
+    """
+    status = await conn.execute(_ARCHIVE_ROW_SQL, learning_id)
+    return _parse_archive_count(status)
 
 
 async def fetch_candidates_by_ids(pool, project: str, ids: list[str]) -> list[PromotionCandidate]:
@@ -702,6 +749,60 @@ async def run_merge_apply(
     return MergeApplyResult(plan=plan, applied=applied, skipped=skipped, backup_path=backup_path)
 
 
+@dataclass(frozen=True)
+class StaleArchiveResult:
+    applied: list[str] = field(default_factory=list)  # ids actually archived
+    skipped: list[tuple[str, str]] = field(default_factory=list)  # (id, reason)
+    backup_path: Path | None = None
+    dry_run: bool = True
+
+
+async def run_stale_archive(
+    pool,
+    project: str,
+    ids: list[str],
+    *,
+    execute: bool,
+    backup_dir: Path,
+    timestamp: str,
+    lock_dir: Path | None = None,
+    run=subprocess.run,
+) -> StaleArchiveResult:
+    """Stale-archive approved ids; (only if execute) back up then archive each.
+
+    Same safety envelope as ``run_merge_apply``: dry-run (execute=False) performs
+    ZERO writes and takes NO backup; under execute a per-project flock serializes
+    the run, a DB-table dump is taken before the first write, and each id is
+    retired through the shared ``archive_row`` helper (archived_at = NOW() + a
+    {by:null, reason:"stale"} marker).
+
+    Idempotent: a 0-row archive (the row was already archived) is reported as a
+    skip, NOT an error — a stale-archive that finds the work already done is a
+    success-shaped no-op (mirrors run_merge_apply's 0-row handling).
+    """
+    if not execute or not ids:
+        skipped = [(i, "dry-run") for i in ids] if not execute else []
+        return StaleArchiveResult(applied=[], skipped=skipped, backup_path=None, dry_run=True)
+
+    lock_root = lock_dir if lock_dir is not None else backup_dir
+    with _apply_lock(lock_root, project):
+        backup_path = backup_database(backup_dir / f"memory-archive-{timestamp}.sql", run=run)
+        applied: list[str] = []
+        skipped: list[tuple[str, str]] = []
+        async with pool.acquire() as conn:
+            for learning_id in ids:
+                count = await archive_row(conn, learning_id=learning_id)
+                if count == 0:
+                    # Already archived (idempotent / concurrent archive): the guarded
+                    # UPDATE matched nothing. Skip + report, never raise.
+                    skipped.append((learning_id, "already archived (0-row update)"))
+                    continue
+                applied.append(learning_id)
+    return StaleArchiveResult(
+        applied=applied, skipped=skipped, backup_path=backup_path, dry_run=False
+    )
+
+
 # --- CLI -------------------------------------------------------------------
 
 
@@ -824,6 +925,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="ID_A:ID_B",
         help="A merge pair '<uuid>:<uuid>' (repeatable). Used only with --merge.",
     )
+    p.add_argument(
+        "--archive",
+        action="store_true",
+        help="Stale-archive mode: set archived_at on each --ids/--manifest learning "
+        "(dry-run by default; --execute backs up then writes).",
+    )
     return p.parse_args(argv)
 
 
@@ -892,6 +999,73 @@ async def _merge_main(args: argparse.Namespace, project: str) -> int:
     return 0
 
 
+def render_archive_plan(ids: list[str], *, dry_run: bool) -> str:
+    """Render the stale-archive plan as a readable preview. Pure — writes nothing."""
+    lines: list[str] = []
+    banner = "DRY RUN — no changes written" if dry_run else "EXECUTE — writing changes"
+    lines.append(f"## Stale-Archive Plan ({banner})")
+    lines.append(f"{len(ids)} to archive")
+    lines.append("")
+    for i in ids:
+        lines.append(f"  → archive [{i[:8]}]")
+    if dry_run and ids:
+        lines.append("")
+        lines.append("_Re-run with --execute to apply (a DB backup is taken first)._")
+    return "\n".join(lines)
+
+
+async def _archive_main(args: argparse.Namespace, project: str) -> int:
+    """Stale-archive CLI path. Dry-run by default; --execute backs up then writes."""
+    try:
+        ids = parse_ids(args.ids, args.manifest)
+    except (OSError, ValueError) as exc:
+        print(f"memory-apply: could not read ids: {exc}", file=sys.stderr)
+        return 2
+    ids, invalid = validate_ids(ids)
+    for bad in invalid:
+        print(f"memory-apply: ignoring malformed id (not a uuid): {bad!r}", file=sys.stderr)
+    if not ids:
+        print(
+            "memory-apply: --archive needs at least one valid id (use --ids or --manifest).",
+            file=sys.stderr,
+        )
+        return 2
+
+    backup_dir = Path(args.backup_dir) if args.backup_dir else default_backup_dir()
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+
+    print(f"memory-apply: project={project} (stale-archive)")
+    if args.execute:
+        print(f"  backup dir : {backup_dir}")
+    print("")
+
+    try:
+        pool = await get_pool()
+        result = await run_stale_archive(
+            pool,
+            project,
+            ids,
+            execute=args.execute,
+            backup_dir=backup_dir,
+            timestamp=timestamp,
+        )
+    except (OSError, RuntimeError, PostgresError) as exc:
+        # RuntimeError covers a failed pg_dump backup (apply aborts before any write);
+        # PostgresError is caught so a DB failure can't echo the DSN in a traceback.
+        print(f"memory-apply: aborted ({type(exc).__name__}): {exc}", file=sys.stderr)
+        return 1
+
+    print(render_archive_plan(ids, dry_run=result.dry_run))
+    if args.execute:
+        print("")
+        print(f"Archived {len(result.applied)} learning(s).")
+        if result.backup_path:
+            print(f"DB backup: {result.backup_path}")
+        for sid, reason in result.skipped:
+            print(f"  skip [{sid[:8]}]: {reason}", file=sys.stderr)
+    return 0
+
+
 async def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     project = (
@@ -901,8 +1075,15 @@ async def main(argv: list[str] | None = None) -> int:
         print("memory-apply: could not resolve a project. Pass one explicitly.", file=sys.stderr)
         return 2
 
+    if args.merge and args.archive:
+        print(
+            "memory-apply: --merge and --archive are mutually exclusive.", file=sys.stderr
+        )
+        return 2
     if args.merge:
         return await _merge_main(args, project)
+    if args.archive:
+        return await _archive_main(args, project)
 
     try:
         ids = parse_ids(args.ids, args.manifest)

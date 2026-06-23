@@ -21,6 +21,31 @@ import numpy as np
 # indicates the column is absent.
 ACTIVE_ROW_FILTER = "superseded_by IS NULL"
 
+# Stale-archive predicate (issue #63 Phase 2b): excludes stale-archived rows.
+# archived_at is its own lifecycle column (a stale row has no survivor, so
+# superseded_by cannot mark it). It may not exist on a DB that has superseded_by
+# but has NOT run the add_archived_at migration — callers MUST gate this on the
+# archived_at capability probe (SF-1), independently of the superseded probe.
+ARCHIVED_ROW_FILTER = "archived_at IS NULL"
+
+
+def active_row_conditions(
+    *, include_active_filter: bool, include_archived_filter: bool
+) -> list[str]:
+    """Return the lifecycle predicates to AND into a recall WHERE clause.
+
+    ``include_active_filter`` -> superseded_by IS NULL (gated on the superseded probe).
+    ``include_archived_filter`` -> archived_at IS NULL (gated on the SEPARATE archived
+    probe). The two are independent: a pre-migration DB may have superseded_by but not
+    archived_at, in which case only the first predicate is emitted (SF-1).
+    """
+    conds: list[str] = []
+    if include_active_filter:
+        conds.append(ACTIVE_ROW_FILTER)
+    if include_archived_filter:
+        conds.append(ARCHIVED_ROW_FILTER)
+    return conds
+
 # ==================== ID Generation ====================
 
 
@@ -157,6 +182,7 @@ def build_text_search_sql(
     start_date: datetime | None = None,
     end_date: datetime | None = None,
     include_active_filter: bool = True,
+    include_archived_filter: bool = False,
 ) -> tuple[str, list[Any]]:
     """Build SQL for full-text search on archival memory.
 
@@ -169,6 +195,9 @@ def build_text_search_sql(
         end_date: Optional end date filter.
         include_active_filter: Whether to add superseded_by IS NULL filter.
             Set False when the column doesn't exist (pre-migration).
+        include_archived_filter: Whether to add archived_at IS NULL filter
+            (issue #63 Phase 2b). Gate on the SEPARATE archived_at probe; leave
+            False when that column is absent so a pre-migration DB never crashes.
 
     Returns:
         Tuple of (sql_string, params_list).
@@ -178,8 +207,12 @@ def build_text_search_sql(
         "agent_id IS NOT DISTINCT FROM $2",
         "to_tsvector('english', content) @@ plainto_tsquery('english', $3)",
     ]
-    if include_active_filter:
-        conditions.append(ACTIVE_ROW_FILTER)
+    conditions.extend(
+        active_row_conditions(
+            include_active_filter=include_active_filter,
+            include_archived_filter=include_archived_filter,
+        )
+    )
     params: list[Any] = [session_id, agent_id, query]
 
     date_conds, date_params, next_idx = build_date_conditions(
@@ -214,6 +247,7 @@ def build_vector_search_sql(
     end_date: datetime | None = None,
     include_active_filter: bool = True,
     embedding_model: str | None = None,
+    include_archived_filter: bool = False,
 ) -> tuple[str, list[Any]]:
     """Build SQL for vector similarity search on archival memory.
 
@@ -239,8 +273,12 @@ def build_vector_search_sql(
         "agent_id IS NOT DISTINCT FROM $2",
         "embedding IS NOT NULL",
     ]
-    if include_active_filter:
-        conditions.append(ACTIVE_ROW_FILTER)
+    conditions.extend(
+        active_row_conditions(
+            include_active_filter=include_active_filter,
+            include_archived_filter=include_archived_filter,
+        )
+    )
     params: list[Any] = [session_id, agent_id, query_embedding]
 
     date_conds, date_params, next_idx = build_date_conditions(
@@ -278,6 +316,7 @@ def build_hybrid_search_sql(
     start_date: datetime | None = None,
     end_date: datetime | None = None,
     include_active_filter: bool = True,
+    include_archived_filter: bool = False,
 ) -> tuple[str, list[Any]]:
     """Build SQL for hybrid (text + vector) search.
 
@@ -304,8 +343,12 @@ def build_hybrid_search_sql(
             " OR embedding IS NOT NULL)"
         ),
     ]
-    if include_active_filter:
-        conditions.append(ACTIVE_ROW_FILTER)
+    conditions.extend(
+        active_row_conditions(
+            include_active_filter=include_active_filter,
+            include_archived_filter=include_archived_filter,
+        )
+    )
     params: list[Any] = [
         session_id, agent_id, text_query, query_embedding,
         text_weight, vector_weight,

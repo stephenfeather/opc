@@ -461,6 +461,7 @@ def build_rrf_cte(
     project_filter: str | None = None,
     model_filter: str | None = None,
     candidate_param: int | None = None,
+    archived_filter: bool = False,
 ) -> str:
     """Build the SQL CTE for RRF (Reciprocal Rank Fusion) queries.
 
@@ -487,8 +488,15 @@ def build_rrf_cte(
     the LIMIT. ``None`` preserves the legacy unbounded leg byte-identically
     for callers/tests that don't pass it.
     """
+    # Issue #63 Phase 2b: the archived clause rides on the chain clause so the
+    # existing graceful chain-fallback (drop the clause on a capability error)
+    # covers a pre-migration archived_at too. archived_filter is only set when
+    # chain_filter is, so a no-chain (degraded) attempt never references either.
     chain_clause = (
-        "\n                AND superseded_by IS NULL" if chain_filter else ""
+        "\n                AND superseded_by IS NULL"
+        + ("\n                AND archived_at IS NULL" if archived_filter else "")
+        if chain_filter
+        else ""
     )
     project_clause = (
         f"\n                {project_filter}" if project_filter else ""
@@ -601,6 +609,24 @@ _TEXT_ONLY_FTS_SQL = """
     FROM archival_memory
     WHERE metadata->>'type' = 'session_learning'
         AND superseded_by IS NULL
+        AND archived_at IS NULL
+        AND to_tsvector('english', content) @@ to_tsquery('english', $1)
+        {project_filter}
+    ORDER BY similarity DESC, created_at DESC
+    LIMIT $2
+    """
+
+# Superseded-only middle tier (issue #63 Phase 2b): used when the chain+archive
+# attempt fails because archived_at is absent, so a pre-stale-migration DB keeps
+# the superseded filter rather than degrading straight to all rows.
+_TEXT_ONLY_FTS_NO_ARCHIVE_SQL = """
+    SELECT
+        id, session_id, content, metadata, created_at{project_col},
+        ts_rank(to_tsvector('english', content),
+                to_tsquery('english', $1)) as similarity
+    FROM archival_memory
+    WHERE metadata->>'type' = 'session_learning'
+        AND superseded_by IS NULL
         AND to_tsvector('english', content) @@ to_tsquery('english', $1)
         {project_filter}
     ORDER BY similarity DESC, created_at DESC
@@ -621,6 +647,21 @@ _TEXT_ONLY_FTS_NO_CHAIN_SQL = """
     """
 
 _TEXT_ONLY_ILIKE_SQL = """
+    SELECT
+        id, session_id, content, metadata, created_at{project_col},
+        0.1 as similarity
+    FROM archival_memory
+    WHERE metadata->>'type' = 'session_learning'
+        AND superseded_by IS NULL
+        AND archived_at IS NULL
+        AND content ILIKE '%' || $1 || '%'
+        {project_filter}
+    ORDER BY created_at DESC
+    LIMIT $2
+    """
+
+# Superseded-only middle tier (issue #63 Phase 2b) — see _TEXT_ONLY_FTS_NO_ARCHIVE_SQL.
+_TEXT_ONLY_ILIKE_NO_ARCHIVE_SQL = """
     SELECT
         id, session_id, content, metadata, created_at{project_col},
         0.1 as similarity
@@ -1094,10 +1135,18 @@ async def search_learnings_text_only_postgres(
             except Exception as exc:
                 if _is_project_capability_error(exc):
                     raise
-                logger.debug("Chain filter fallback in text_only_postgres FTS", exc_info=True)
-                rows = await conn.fetch(
-                    _r(_TEXT_ONLY_FTS_NO_CHAIN_SQL), or_query, k, *extra,
-                )
+                logger.debug("Chain+archive fallback in text_only_postgres FTS", exc_info=True)
+                try:
+                    rows = await conn.fetch(
+                        _r(_TEXT_ONLY_FTS_NO_ARCHIVE_SQL), or_query, k, *extra,
+                    )
+                except Exception as exc:
+                    if _is_project_capability_error(exc):
+                        raise
+                    logger.debug("Chain fallback in text_only_postgres FTS", exc_info=True)
+                    rows = await conn.fetch(
+                        _r(_TEXT_ONLY_FTS_NO_CHAIN_SQL), or_query, k, *extra,
+                    )
 
         if not rows:
             first_word = query.split()[0] if query.split() else query
@@ -1108,10 +1157,18 @@ async def search_learnings_text_only_postgres(
             except Exception as exc:
                 if _is_project_capability_error(exc):
                     raise
-                logger.debug("Chain filter fallback in text_only_postgres ILIKE", exc_info=True)
-                rows = await conn.fetch(
-                    _r(_TEXT_ONLY_ILIKE_NO_CHAIN_SQL), first_word, k, *extra,
-                )
+                logger.debug("Chain+archive fallback in text_only_postgres ILIKE", exc_info=True)
+                try:
+                    rows = await conn.fetch(
+                        _r(_TEXT_ONLY_ILIKE_NO_ARCHIVE_SQL), first_word, k, *extra,
+                    )
+                except Exception as exc:
+                    if _is_project_capability_error(exc):
+                        raise
+                    logger.debug("Chain fallback in text_only_postgres ILIKE", exc_info=True)
+                    rows = await conn.fetch(
+                        _r(_TEXT_ONLY_ILIKE_NO_CHAIN_SQL), first_word, k, *extra,
+                    )
         return rows
 
     pool = await get_pool()
@@ -1417,11 +1474,13 @@ async def search_learnings_hybrid_rrf(
 
         def _cte(
             *, chain: bool, ts: bool, pf: str, mf: str, candidate_param: int,
+            archived: bool = False,
         ) -> str:
             return build_rrf_cte(
                 chain_filter=chain, use_tsquery=ts,
                 project_filter=pf, model_filter=mf,
                 candidate_param=candidate_param,
+                archived_filter=archived,
             )
 
         # Append project then model values, matching the param ordering above,
@@ -1445,11 +1504,18 @@ async def search_learnings_hybrid_rrf(
 
         cte_boosted = _cte(
             chain=True, ts=use_tsquery, pf=boosted_pf, mf=boosted_mf,
-            candidate_param=boosted_candidate_idx,
+            candidate_param=boosted_candidate_idx, archived=True,
         )
         cte_plain_args = _cte(
             chain=True, ts=use_tsquery, pf=plain_pf, mf=plain_mf,
-            candidate_param=plain_candidate_idx,
+            candidate_param=plain_candidate_idx, archived=True,
+        )
+        # Issue #63 Phase 2b: a chain-on attempt that DROPS only the archived
+        # clause, for a DB that has superseded_by but not archived_at — so a
+        # missing archived_at degrades to superseded-only recall, not all-rows.
+        cte_plain_noarchive = _cte(
+            chain=True, ts=use_tsquery, pf=plain_pf, mf=plain_mf,
+            candidate_param=plain_candidate_idx, archived=False,
         )
         cte_plain_nochain = _cte(
             chain=False, ts=use_tsquery, pf=plain_pf, mf=plain_mf,
@@ -1475,9 +1541,19 @@ async def search_learnings_hybrid_rrf(
                 if _is_project_capability_error(exc):
                     raise
                 logger.debug("RRF plain+chain fallback", exc_info=True)
-                rows = await conn.fetch(
-                    cte_plain_nochain + plain_tail, *plain_args,
-                )
+                try:
+                    # Issue #63 Phase 2b: drop only the archived clause first, so a
+                    # superseded-but-not-archived DB keeps the superseded filter.
+                    rows = await conn.fetch(
+                        cte_plain_noarchive + plain_tail, *plain_args,
+                    )
+                except Exception as exc:
+                    if _is_project_capability_error(exc):
+                        raise
+                    logger.debug("RRF plain+chain(no-archive) fallback", exc_info=True)
+                    rows = await conn.fetch(
+                        cte_plain_nochain + plain_tail, *plain_args,
+                    )
 
         if not rows and use_tsquery:
             logger.debug(
@@ -1700,13 +1776,24 @@ async def search_learnings_postgres(
                 project_filter=pf,
                 model_filter=mf,
             )
+        # Issue #63 Phase 2b: filter active (not superseded) AND not stale-archived.
+        # A capability error degrades in stages so a missing archived_at keeps the
+        # superseded filter (superseded-only), and only a missing superseded_by
+        # drops to no chain filter at all.
+        full_chain = "AND superseded_by IS NULL\n        AND archived_at IS NULL"
         try:
-            return await conn.fetch(_sql("AND superseded_by IS NULL"), *scoped_args)
+            return await conn.fetch(_sql(full_chain), *scoped_args)
         except Exception as exc:
             if _is_project_capability_error(exc):
                 raise
-            logger.debug("Chain filter fallback in postgres %s", label, exc_info=True)
-            return await conn.fetch(_sql(""), *scoped_args)
+            logger.debug("Chain+archive filter fallback in postgres %s", label, exc_info=True)
+            try:
+                return await conn.fetch(_sql("AND superseded_by IS NULL"), *scoped_args)
+            except Exception as exc:
+                if _is_project_capability_error(exc):
+                    raise
+                logger.debug("Chain filter fallback in postgres %s", label, exc_info=True)
+                return await conn.fetch(_sql(""), *scoped_args)
 
     async def _fetch_branch(
         conn: Any, template: str, has_project: bool,

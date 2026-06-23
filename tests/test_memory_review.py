@@ -358,6 +358,53 @@ class TestFetchActiveTotal:
         assert total == 6400
 
 
+class TestFetchStaleIds:
+    """fetch_stale_ids (issue #63 Phase 2b Step 3): read-only — returns the ids
+    eligible for stale archival, mirroring the StaleBucket >60d predicate."""
+
+    _A = "11111111-1111-1111-1111-111111111111"
+    _B = "22222222-2222-2222-2222-222222222222"
+
+    async def test_returns_ids_for_eligible_rows(self):
+        from scripts.core.memory_review import fetch_stale_ids
+
+        pool, conn = _pool_returning([{"id": self._A}, {"id": self._B}])
+        out = await fetch_stale_ids(pool, "opc")
+        assert out == [self._A, self._B]
+
+    async def test_predicate_matches_stale_bucket(self):
+        """Same predicate the >60d stale bucket uses: recall_count = 0,
+        created_at older than 60 days, AND active (not superseded, not archived)."""
+        from scripts.core.memory_review import fetch_stale_ids
+
+        pool, conn = _pool_returning([])
+        await fetch_stale_ids(pool, "opc")
+        sql = conn.fetch.await_args.args[0]
+        assert "recall_count = 0" in sql
+        assert "60 days" in sql or "make_interval" in sql
+        assert "superseded_by IS NULL" in sql
+        assert "archived_at IS NULL" in sql
+
+    async def test_scoped_by_project(self):
+        from scripts.core.memory_review import fetch_stale_ids
+
+        pool, conn = _pool_returning([])
+        await fetch_stale_ids(pool, "binbrain")
+        args = conn.fetch.await_args.args
+        assert "LOWER(project)" in args[0]
+        assert "binbrain" in args  # bound, not interpolated
+
+    async def test_read_only_no_writes(self):
+        from scripts.core.memory_review import fetch_stale_ids
+
+        pool, conn = _pool_returning([])
+        await fetch_stale_ids(pool, "opc")
+        # Read-only: no UPDATE/DELETE/INSERT/execute.
+        conn.execute.assert_not_called()
+        sql = conn.fetch.await_args.args[0].upper()
+        assert "UPDATE" not in sql and "DELETE" not in sql and "INSERT" not in sql
+
+
 class TestBuildReview:
     async def test_assembles_full_report(self):
         pool, conn = _pool_returning([])

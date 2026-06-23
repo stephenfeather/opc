@@ -1115,3 +1115,168 @@ class TestSecurityHardening:
         assert append_claude_md(path, evil)
         # the forged marker for bbbb... must NOT appear verbatim (was defanged)
         assert "promoted_from_archival_memory: bbbbbbbb-1111" not in path.read_text()
+
+
+# ---------------------------------------------------------------------------
+# Stale-archive apply (issue #63 Phase 2b Step 3)
+# ---------------------------------------------------------------------------
+
+
+class TestArchiveRow:
+    """archive_row: ONE guarded UPDATE that sets archived_at = NOW() AND stamps a
+    superseded_via marker {by: null, reason: "stale", at}. Mirrors supersede_row's
+    single-statement discipline; idempotent (already-archived -> 0-row, no raise)."""
+
+    async def test_single_update_sets_archived_at_and_marker(self):
+        from scripts.core.memory_apply import archive_row
+
+        pool, conn = _pool()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+        count = await archive_row(conn, learning_id=_UUID)
+        assert count == 1
+        conn.execute.assert_awaited_once()  # ONE statement
+        sql = conn.execute.await_args.args[0]
+        assert "archived_at = NOW()" in sql
+        assert "superseded_via" in sql
+        assert "stale" in sql  # the reason marker
+        # Guarded so a concurrent archive collapses to a 0-row no-op.
+        assert "archived_at IS NULL" in sql
+
+    async def test_already_archived_returns_zero_not_raise(self):
+        from scripts.core.memory_apply import archive_row
+
+        pool, conn = _pool()
+        conn.execute = AsyncMock(return_value="UPDATE 0")
+        count = await archive_row(conn, learning_id=_UUID)
+        assert count == 0  # idempotent: never raises on a no-op
+
+
+class TestRunStaleArchive:
+    async def test_dry_run_writes_nothing_no_backup(self, tmp_path):
+        from scripts.core.memory_apply import run_stale_archive
+
+        pool, conn = _pool()
+        backup_called = False
+
+        def _run(*a, **k):
+            nonlocal backup_called
+            backup_called = True
+            return MagicMock(returncode=0)
+
+        result = await run_stale_archive(
+            pool, "opc", [_UUID, _UUID2],
+            execute=False, backup_dir=tmp_path, timestamp="ts", run=_run,
+        )
+        assert backup_called is False
+        conn.execute.assert_not_called()
+        assert result.applied == []
+
+    async def test_execute_backs_up_before_any_write(self, tmp_path, monkeypatch):
+        import scripts.core.memory_apply as ma
+
+        pool, conn = _pool()
+        order = []
+
+        def _backup(dest, **kw):
+            order.append("backup")
+            Path(dest).parent.mkdir(parents=True, exist_ok=True)
+            Path(dest).write_text("-- dump")
+            return Path(dest)
+
+        async def _exec(*a, **k):
+            order.append("archive")
+            return "UPDATE 1"
+
+        conn.execute = _exec
+        monkeypatch.setattr(ma, "backup_database", _backup)
+        result = await ma.run_stale_archive(
+            pool, "opc", [_UUID, _UUID2],
+            execute=True, backup_dir=tmp_path, timestamp="ts", lock_dir=tmp_path,
+        )
+        # Backup happens FIRST, before any archive write.
+        assert order and order[0] == "backup"
+        assert "archive" in order
+        assert result.applied == [_UUID, _UUID2]
+        assert result.backup_path is not None
+
+    async def test_idempotent_already_archived_skipped(self, tmp_path, monkeypatch):
+        import scripts.core.memory_apply as ma
+
+        pool, conn = _pool()
+
+        def _backup(dest, **kw):
+            Path(dest).parent.mkdir(parents=True, exist_ok=True)
+            Path(dest).write_text("-- dump")
+            return Path(dest)
+
+        async def _exec(*a, **k):
+            return "UPDATE 0"  # every row already archived
+
+        conn.execute = _exec
+        monkeypatch.setattr(ma, "backup_database", _backup)
+        result = await ma.run_stale_archive(
+            pool, "opc", [_UUID],
+            execute=True, backup_dir=tmp_path, timestamp="ts", lock_dir=tmp_path,
+        )
+        assert result.applied == []  # nothing newly archived
+        assert _UUID in [s[0] for s in result.skipped]  # reported as skipped, not raised
+
+
+class TestArchiveCliMain:
+    async def test_archive_dry_run_writes_nothing(self, tmp_path, monkeypatch):
+        import scripts.core.memory_apply as ma
+
+        pool, conn = _pool()
+        backup_called = False
+
+        def _run(*a, **k):
+            nonlocal backup_called
+            backup_called = True
+            return MagicMock(returncode=0)
+
+        async def _get_pool():
+            return pool
+
+        monkeypatch.setattr(ma, "get_pool", _get_pool)
+        monkeypatch.setattr(ma, "project_from_path", lambda _p: "opc")
+        rc = await ma.main(
+            ["opc", "--archive", "--ids", _UUID, "--backup-dir", str(tmp_path)]
+        )
+        assert rc == 0
+        assert backup_called is False
+        conn.execute.assert_not_called()
+
+    async def test_archive_execute_backs_up_first(self, tmp_path, monkeypatch):
+        import scripts.core.memory_apply as ma
+
+        pool, conn = _pool()
+        order = []
+
+        def _backup(dest, **kw):
+            order.append("backup")
+            Path(dest).parent.mkdir(parents=True, exist_ok=True)
+            Path(dest).write_text("-- dump")
+            return Path(dest)
+
+        async def _exec(*a, **k):
+            order.append("archive")
+            return "UPDATE 1"
+
+        conn.execute = _exec
+
+        async def _get_pool():
+            return pool
+
+        monkeypatch.setattr(ma, "get_pool", _get_pool)
+        monkeypatch.setattr(ma, "project_from_path", lambda _p: "opc")
+        monkeypatch.setattr(ma, "backup_database", _backup)
+        rc = await ma.main(
+            ["opc", "--archive", "--ids", _UUID, "--execute", "--backup-dir", str(tmp_path)]
+        )
+        assert rc == 0
+        assert order and order[0] == "backup"
+        assert "archive" in order
+
+    def test_archive_flag_parses(self):
+        args = parse_apply_args(["opc", "--archive", "--ids", _UUID])
+        assert args.archive is True

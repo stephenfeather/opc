@@ -80,6 +80,11 @@ CREATE TABLE IF NOT EXISTS archival_memory (
     superseded_by UUID REFERENCES archival_memory(id),
     superseded_at TIMESTAMPTZ,
 
+    -- OPC: Stale lifecycle (issue #63 Phase 2b). NULL = active; a timestamp =
+    -- archived (stale-retired, no survivor). Recall/active surfaces filter
+    -- `AND archived_at IS NULL` in addition to `superseded_by IS NULL`.
+    archived_at TIMESTAMPTZ,
+
     -- OPC: Project relevance for contextual reranking
     project TEXT
 );
@@ -94,6 +99,9 @@ CREATE INDEX IF NOT EXISTS idx_archival_host ON archival_memory(host_id);
 CREATE INDEX IF NOT EXISTS idx_archival_last_recalled ON archival_memory(last_recalled DESC NULLS LAST);
 CREATE INDEX IF NOT EXISTS idx_archival_superseded ON archival_memory(superseded_by) WHERE superseded_by IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_archival_active ON archival_memory(superseded_by) WHERE superseded_by IS NULL;
+-- Stale lifecycle (issue #63 Phase 2b): partial index on the active (not archived)
+-- rows so the `AND archived_at IS NULL` recall filter stays index-backed.
+CREATE INDEX IF NOT EXISTS idx_archival_not_archived ON archival_memory(archived_at) WHERE archived_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_archival_project ON archival_memory(project) WHERE project IS NOT NULL;
 -- Functional index for the case-insensitive --project-first scoped pass
 -- (issue #139): recall filters on LOWER(project) = $N, which only uses an

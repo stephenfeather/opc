@@ -221,9 +221,11 @@ class TestRecallChainFilter:
             results = await search_learnings_hybrid_rrf("test query", k=5, expand=False)
 
         assert len(results) == 1
-        # Exactly the cascade ran: boosted+chain, plain+chain, plain (no chain).
-        # Probe fetches are excluded because the caches are pinned above.
-        assert call_count == 3
+        # Exactly the cascade ran (issue #63 Phase 2b adds a superseded-only middle
+        # tier): boosted+chain(+archived), plain+chain(+archived), plain+chain
+        # (no archived — still references superseded_by, so it also raises here),
+        # then plain (no chain). Probe fetches are excluded (caches pinned above).
+        assert call_count == 4
 
 
 # ---------------------------------------------------------------------------

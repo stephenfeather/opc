@@ -224,6 +224,7 @@ _PROMOTION_SQL = """
     FROM archival_memory
     WHERE LOWER(project) = LOWER($1)
       AND superseded_by IS NULL
+      AND archived_at IS NULL
       AND recall_count >= $2
       AND metadata->>'learning_type' = ANY($3::text[])
     ORDER BY recall_count DESC
@@ -252,6 +253,7 @@ _MERGE_SQL = """
         FROM archival_memory
         WHERE LOWER(project) = LOWER($1)
           AND superseded_by IS NULL
+          AND archived_at IS NULL
           AND embedding IS NOT NULL
           AND embedding_model = $5
     ),
@@ -272,6 +274,7 @@ _MERGE_SQL = """
             FROM archival_memory b
             WHERE LOWER(b.project) = LOWER($1)
               AND b.superseded_by IS NULL
+              AND b.archived_at IS NULL
               AND b.embedding IS NOT NULL
               AND b.embedding_model = $5
               AND b.id <> a.id
@@ -305,6 +308,7 @@ _MERGE_COVERAGE_SQL = """
         FROM archival_memory
         WHERE LOWER(project) = LOWER($1)
           AND superseded_by IS NULL
+          AND archived_at IS NULL
           AND embedding IS NOT NULL
     ),
     ranked AS (
@@ -323,7 +327,9 @@ _STALE_SQL = """
     WITH scoped AS (
         SELECT recall_count, created_at
         FROM archival_memory
-        WHERE LOWER(project) = LOWER($1) AND superseded_by IS NULL
+        WHERE LOWER(project) = LOWER($1)
+          AND superseded_by IS NULL
+          AND archived_at IS NULL
     )
     SELECT bucket AS staleness_bucket, COUNT(*) AS learnings
     FROM (
@@ -347,6 +353,7 @@ _STALE_OPEN_THREAD_SQL = """
     FROM archival_memory
     WHERE LOWER(project) = LOWER($1)
       AND superseded_by IS NULL
+      AND archived_at IS NULL
       AND metadata->>'learning_type' = 'OPEN_THREAD'
       AND recall_count = 0
       AND created_at < NOW() - make_interval(days => $2)
@@ -355,7 +362,9 @@ _STALE_OPEN_THREAD_SQL = """
 _ACTIVE_TOTAL_SQL = """
     SELECT COUNT(*)
     FROM archival_memory
-    WHERE LOWER(project) = LOWER($1) AND superseded_by IS NULL
+    WHERE LOWER(project) = LOWER($1)
+      AND superseded_by IS NULL
+      AND archived_at IS NULL
 """
 
 # Resolve both ids of a merge pair in ONE round-trip (plan note N-1: never per-id fetches).
@@ -374,9 +383,39 @@ _MERGE_PAIR_DETAILS_SQL = """
 """
 
 
+# Stale-archive eligibility (issue #63 Phase 2b Step 3): the ids the >60d stale
+# bucket counts — never recalled, older than 60 days, AND active (not superseded,
+# not already archived). Same predicate as the '>60d old' arm of _STALE_SQL so
+# the archive apply retires exactly the rows the review reported as stale. READ-ONLY.
+_STALE_IDS_SQL = """
+    SELECT id::text AS id
+    FROM archival_memory
+    WHERE LOWER(project) = LOWER($1)
+      AND superseded_by IS NULL
+      AND archived_at IS NULL
+      AND recall_count = 0
+      AND created_at < NOW() - INTERVAL '60 days'
+    ORDER BY created_at ASC
+"""
+
+
 async def fetch_active_total(pool, project: str) -> int:
     async with pool.acquire() as conn:
         return int(await conn.fetchval(_ACTIVE_TOTAL_SQL, project) or 0)
+
+
+async def fetch_stale_ids(pool, project: str) -> list[str]:
+    """Return the ids eligible for stale archival (READ-ONLY).
+
+    Mirrors the '>60d old, never recalled' stale bucket predicate exactly: active
+    (``superseded_by IS NULL AND archived_at IS NULL``), ``recall_count = 0``, and
+    ``created_at`` older than 60 days. This module never writes — the archive apply
+    (memory_apply.run_stale_archive) consumes these ids behind the dry-run/backup
+    safety envelope.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(_STALE_IDS_SQL, project)
+    return [r["id"] for r in rows]
 
 
 async def fetch_merge_pair_details(pool, project: str, id_a: str, id_b: str) -> dict[str, MergeRow]:

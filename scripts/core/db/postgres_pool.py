@@ -320,12 +320,27 @@ def _reset_schema_capability_caches() -> None:
     may point the process at a DB with a different migration state, so the cached
     probe results must be invalidated. Imported lazily here to avoid a circular
     import (memory_service_pg imports from this module at module load).
+
+    Round-3 finding 1 (issue #63 Phase 2b): the recall path also keeps its own
+    module-level archived_at capability cache (and the sibling project /
+    embedding_model probes). Those probe the SAME schema and outlive the pool the
+    same way, so reset them here too — a re-probe must run after a pool
+    generation flip. Lazy import for the same circular-import reason.
     """
     try:
         from scripts.core.db.memory_service_pg import MemoryServicePG
     except ImportError:  # pragma: no cover - defensive; module should import
+        pass
+    else:
+        MemoryServicePG.reset_capability_caches()
+
+    try:
+        from scripts.core import recall_backends
+    except ImportError:  # pragma: no cover - defensive; module should import
         return
-    MemoryServicePG.reset_capability_caches()
+    recall_backends.reset_archived_at_column_cache()
+    recall_backends.reset_project_column_cache()
+    recall_backends.reset_embedding_model_column_cache()
 
 
 async def close_pool() -> None:

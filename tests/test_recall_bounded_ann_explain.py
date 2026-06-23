@@ -134,6 +134,69 @@ class TestRrfVectorLegHnswServable:
         finally:
             await conn.close()
 
+    async def test_archived_filter_leg_plans_hnsw_index_scan(self):
+        """Issue #63 Phase 2b round-3 finding 2: the SHIPPED full-lifecycle leg
+        (``archived_filter=True`` -> ``superseded_by IS NULL AND archived_at IS
+        NULL``) must still plan the bounded HNSW index walk. The single-column
+        partial btree on archived_at cannot *back* the vector walk (the order is
+        by ``embedding <=> $q``), so the archived predicate is applied as a cheap
+        POST-SCAN filter on the HNSW candidate walk — exactly like the
+        pre-existing superseded_by predicate. This proves the shipped plan does
+        NOT introduce a Seq Scan / regress versus the chain-only plan, so the
+        deferred partial-HNSW index is not needed for Phase 2b."""
+        conn, embedding = await self._setup()
+        try:
+            from scripts.core.recall_backends import (
+                _RRF_PLAIN_TAIL_SQL,
+                build_rrf_cte,
+                render_recall_sql,
+            )
+
+            tail = render_recall_sql(
+                _RRF_PLAIN_TAIL_SQL,
+                include_project=True,
+                project_expr=", a.project",
+            )
+
+            chain_only = build_rrf_cte(
+                chain_filter=True, candidate_param=5, archived_filter=False,
+            )
+            shipped = build_rrf_cte(
+                chain_filter=True, candidate_param=5, archived_filter=True,
+            )
+            # $1 text, $2 embedding, $3 rrf_k, $4 tail LIMIT, $5 candidates.
+            args = ("memory recall", embedding, 60, 10, 40)
+            chain_plan = await _explain(conn, chain_only + tail, *args)
+            shipped_plan = await _explain(conn, shipped + tail, *args)
+
+            # The shipped (archived) leg still plans the HNSW index walk.
+            assert "idx_archival_embedding_hnsw" in shipped_plan, (
+                "archived_filter=True leg did not plan the HNSW index scan; "
+                "plan was:\n" + shipped_plan
+            )
+            # archived_at rides as a post-scan Filter, not a Seq Scan: the
+            # shipped plan must not introduce a sequential scan the chain-only
+            # plan lacked.
+            assert "Seq Scan on archival_memory" not in shipped_plan, (
+                "archived_filter=True regressed the vector leg to a Seq Scan; "
+                "plan was:\n" + shipped_plan
+            )
+            # The archived predicate is applied (post-scan filter), proving the
+            # lifecycle filter is actually enforced on the bounded walk.
+            assert "archived_at IS NULL" in shipped_plan, (
+                "expected the archived_at predicate in the plan; plan was:\n"
+                + shipped_plan
+            )
+            # Parity with the chain-only plan: both use the same index walk.
+            assert ("idx_archival_embedding_hnsw" in chain_plan) == (
+                "idx_archival_embedding_hnsw" in shipped_plan
+            ), (
+                "archived_filter changed the index strategy vs chain-only;\n"
+                "chain-only:\n" + chain_plan + "\nshipped:\n" + shipped_plan
+            )
+        finally:
+            await conn.close()
+
     async def test_legacy_unbounded_leg_has_no_bounded_index_walk(self):
         """Negative control: the legacy unbounded leg, even when steered onto
         the HNSW index, must walk it unbounded (no inner Limit) — it ranks

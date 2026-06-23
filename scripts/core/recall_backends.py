@@ -1110,6 +1110,77 @@ async def embedding_model_column_available(conn: Any) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# archived_at column capability probe (issue #63 Phase 2b, round 3 finding 1)
+#
+# The lifecycle filter ``AND archived_at IS NULL`` rides on the chain clause.
+# On a partial-migration DB (superseded_by present, add_archived_at.sql NOT
+# applied) the previous code ALWAYS built the boosted+plain CTEs with
+# archived_at and only fell back AFTER catching the UndefinedColumnError — so
+# EVERY hybrid recall ran the full archived query, failed, ran the plain
+# archived query, failed, before using the no-archive CTE: repeated FAILED SQL
+# on the hot path during schema skew. Mirror the #139 project-column and #151
+# embedding_model probes: probe once, cache only definitive answers, and when
+# the column is absent build the CTE WITHOUT archived_at FROM THE START (no
+# failed SQL). The existing _is_missing_archived_at_error exception fallback is
+# KEPT as a stale-cache safety net (cache True but column dropped mid-process).
+# Apply scripts/migrations/add_archived_at.sql to add the column.
+# ---------------------------------------------------------------------------
+
+_archived_at_column_cache: bool | None = None
+
+# Probe the exact relation recall hits (same search_path), LIMIT 0 -> free.
+_ARCHIVED_AT_COLUMN_PROBE_SQL = "SELECT archived_at FROM archival_memory LIMIT 0"
+
+
+def reset_archived_at_column_cache() -> None:
+    """Clear the cached archived_at capability probe (test isolation, and pool
+    teardown so a re-probe runs against a possibly-different DB)."""
+    global _archived_at_column_cache
+    _archived_at_column_cache = None
+
+
+def _set_archived_at_column_cache_for_tests(value: bool | None) -> None:
+    """Force the archived_at probe cache to a value (test-only)."""
+    global _archived_at_column_cache
+    _archived_at_column_cache = value
+
+
+async def archived_at_column_available(conn: Any) -> bool:
+    """Check (once per process) whether archival_memory.archived_at exists.
+
+    Only definitive answers are cached. A transient probe failure degrades THIS
+    call to superseded-only recall (lifecycle filter without archived_at) but
+    leaves the cache unset so the next recall retries — one hiccup must not
+    silently weaken the lifecycle filter for the process lifetime. When the
+    column is provably absent the boosted/plain CTEs are built with
+    archived=False from the start, so NO failed archived_at SQL runs on the hot
+    path during schema skew.
+    """
+    global _archived_at_column_cache
+    if _archived_at_column_cache is not None:
+        return _archived_at_column_cache
+    try:
+        await conn.fetch(_ARCHIVED_AT_COLUMN_PROBE_SQL)
+    except _missing_relation_errors():
+        logger.warning(
+            "archival_memory.archived_at column missing — recall running in "
+            "superseded-only lifecycle mode (archived rows not excluded, "
+            "issue #63). Apply scripts/migrations/add_archived_at.sql to enable."
+        )
+        _archived_at_column_cache = False
+        return False
+    except Exception as exc:
+        logger.warning(
+            "archived_at column probe failed transiently; degrading this recall "
+            "to superseded-only SQL and retrying the probe on the next call (%s)",
+            type(exc).__name__,
+        )
+        return False
+    _archived_at_column_cache = True
+    return True
+
+
 async def search_learnings_text_only_postgres(
     query: str, k: int = _recall_cfg.default_k, *, project: str | None = None,
 ) -> list[dict[str, Any]]:
@@ -1409,6 +1480,16 @@ async def search_learnings_hybrid_rrf(
             if not await embedding_model_column_available(probe_conn):
                 model_label = None
 
+    # Round-3 finding 1 (issue #63 Phase 2b): probe the archived_at column ONCE
+    # up front (cached). On a partial-migration DB (superseded_by present,
+    # archived_at absent) build the lifecycle CTEs WITHOUT archived_at from the
+    # start so NO failed archived_at SQL runs on the hot path. The probe result
+    # is cached, so the later pool.acquire() reuses it for free. The exception
+    # fallback below stays as a stale-cache safety net (column dropped after a
+    # True probe).
+    async with pool.acquire() as probe_conn:
+        has_archived_at = await archived_at_column_available(probe_conn)
+
     # Issue #54: surface the embedding (and its now-resolved model-space label)
     # for the type-affinity reranker signal. Only reached after a successful
     # embed — the degraded text-only return above never gets here, so a
@@ -1524,13 +1605,19 @@ async def search_learnings_hybrid_rrf(
             *plain_extra, candidate_count,
         )
 
+        # Round-3 finding 1: build with archived_at ONLY when the up-front probe
+        # confirmed the column exists. On a column-absent DB has_archived_at is
+        # False, so the FIRST executed CTE already omits archived_at — no failed
+        # archived_at SQL on the hot path. The _is_missing_archived_at_error
+        # fallback below remains as a stale-cache safety net (probe cached True
+        # but the column was dropped mid-process).
         cte_boosted = _cte(
             chain=True, ts=use_tsquery, pf=boosted_pf, mf=boosted_mf,
-            candidate_param=boosted_candidate_idx, archived=True,
+            candidate_param=boosted_candidate_idx, archived=has_archived_at,
         )
         cte_plain_args = _cte(
             chain=True, ts=use_tsquery, pf=plain_pf, mf=plain_mf,
-            candidate_param=plain_candidate_idx, archived=True,
+            candidate_param=plain_candidate_idx, archived=has_archived_at,
         )
         # Issue #63 Phase 2b: a chain-on attempt that DROPS only the archived
         # clause, for a DB that has superseded_by but not archived_at — so a
@@ -1611,16 +1698,17 @@ async def search_learnings_hybrid_rrf(
             )
             # Issue #63 Phase 2b round-2 finding 1: the plainto no-results
             # fallback MUST carry the full lifecycle filter (superseded_by AND
-            # archived_at). Omitting archived=True here recalled archived rows
-            # as active whenever the expanded query missed and the plain query
-            # matched on a migrated DB.
+            # archived_at) whenever the column exists. Round-3 finding 1: gate
+            # archived on the same up-front probe so a column-absent DB issues no
+            # failed archived_at SQL here either; the missing-archived_at error
+            # fallback below remains the stale-cache safety net.
             fb_cte_boosted = _cte(
                 chain=True, ts=False, pf=boosted_pf, mf=boosted_mf,
-                candidate_param=boosted_candidate_idx, archived=True,
+                candidate_param=boosted_candidate_idx, archived=has_archived_at,
             )
             fb_cte_plain = _cte(
                 chain=True, ts=False, pf=plain_pf, mf=plain_mf,
-                candidate_param=plain_candidate_idx, archived=True,
+                candidate_param=plain_candidate_idx, archived=has_archived_at,
             )
             # Superseded-only middle tier (drops ONLY archived_at) for a DB that
             # has superseded_by but not archived_at — used only on a provable
@@ -1867,15 +1955,26 @@ async def search_learnings_postgres(
         # A capability error degrades in stages so a missing archived_at keeps the
         # superseded filter (superseded-only), and only a missing superseded_by
         # drops to no chain filter at all.
-        full_chain = "AND superseded_by IS NULL\n        AND archived_at IS NULL"
+        #
+        # Round-3 finding 1: gate archived_at on the cached up-front probe so a
+        # partial-migration DB (superseded_by present, archived_at absent) builds
+        # the superseded-only chain FROM THE START — no failed archived_at SQL on
+        # the hot path. The _is_missing_archived_at_error fallback below remains a
+        # stale-cache safety net (column dropped after a True probe).
+        superseded_only = "AND superseded_by IS NULL"
+        full_chain = f"{superseded_only}\n        AND archived_at IS NULL"
+        if await archived_at_column_available(conn):
+            initial_chain = full_chain
+        else:
+            initial_chain = superseded_only
         try:
-            return await conn.fetch(_sql(full_chain), *scoped_args)
+            return await conn.fetch(_sql(initial_chain), *scoped_args)
         except Exception as exc:
             if _is_project_capability_error(exc):
                 raise
             logger.debug("Chain+archive filter fallback in postgres %s", label, exc_info=True)
             try:
-                return await conn.fetch(_sql("AND superseded_by IS NULL"), *scoped_args)
+                return await conn.fetch(_sql(superseded_only), *scoped_args)
             except Exception as exc:
                 if _is_project_capability_error(exc):
                     raise

@@ -413,6 +413,72 @@ class TestResetPool:
         reset_pool()
 
 
+class TestCapabilityCacheReset:
+    """Issue #63 Phase 2b round-2 finding 4: closing/resetting the pool must
+    invalidate MemoryServicePG's process-wide schema capability caches so the
+    next probe re-runs against the live DB (which may have a different migration
+    state).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset(self):
+        reset_pool()
+        yield
+        reset_pool()
+
+    async def test_close_pool_resets_capability_caches(self):
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        MemoryServicePG._has_superseded_column = True
+        MemoryServicePG._has_archived_at_column = False
+
+        mock_pool = AsyncMock()
+        with patch(
+            "scripts.core.db.postgres_pool.asyncpg.create_pool",
+            new_callable=AsyncMock,
+            return_value=mock_pool,
+        ):
+            await get_pool()
+            await close_pool()
+
+        assert MemoryServicePG._has_superseded_column is None
+        assert MemoryServicePG._has_archived_at_column is None
+
+    async def test_close_pool_resets_caches_even_without_pool(self):
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        MemoryServicePG._has_superseded_column = True
+        MemoryServicePG._has_archived_at_column = True
+
+        # No pool created — close_pool must still reset the caches.
+        await close_pool()
+
+        assert MemoryServicePG._has_superseded_column is None
+        assert MemoryServicePG._has_archived_at_column is None
+
+    def test_reset_pool_resets_capability_caches(self):
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        MemoryServicePG._has_superseded_column = False
+        MemoryServicePG._has_archived_at_column = True
+
+        reset_pool()
+
+        assert MemoryServicePG._has_superseded_column is None
+        assert MemoryServicePG._has_archived_at_column is None
+
+    def test_reset_capability_caches_classmethod(self):
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        MemoryServicePG._has_superseded_column = True
+        MemoryServicePG._has_archived_at_column = False
+
+        MemoryServicePG.reset_capability_caches()
+
+        assert MemoryServicePG._has_superseded_column is None
+        assert MemoryServicePG._has_archived_at_column is None
+
+
 # ---------------------------------------------------------------------------
 # I/O handlers: get_connection, get_transaction
 # ---------------------------------------------------------------------------

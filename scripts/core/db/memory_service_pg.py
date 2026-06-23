@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     from .memory_block import Block
 
 from .memory_service_queries import (
-    ACTIVE_ROW_FILTER,
+    active_row_conditions,
     build_hybrid_search_sql,
     build_text_search_sql,
     build_vector_search_sql,
@@ -98,6 +98,114 @@ async def embedding_model_column_available(conn: Any) -> bool:
     return await probe(conn)
 
 
+def _parse_update_count(status: str) -> int:
+    """Parse asyncpg's ``"UPDATE N"`` command tag into the row count.
+
+    asyncpg returns a command-status string (e.g. ``"UPDATE 1"``); a zero-row
+    UPDATE returns ``"UPDATE 0"`` and does NOT raise. Returns 0 for any
+    unparseable tag so callers can treat it as a no-op.
+    """
+    try:
+        return int(status.split()[-1])
+    except (ValueError, IndexError, AttributeError):
+        return 0
+
+
+# Base supersede UPDATE (W-3): superseded_by, superseded_at, and the superseded_via
+# marker in ONE statement, guarded by the loser's `superseded_by IS NULL` so a
+# concurrent supersede collapses to a 0-row no-op. The trailing WHERE term is
+# appended per call (string concat, NOT str.format — the body contains literal
+# `{}` jsonb): empty on the store-time hot path (the just-inserted keeper is
+# trivially active), or a same-statement keeper-liveness guard on the merge path.
+_SUPERSEDE_ROW_SQL = """
+        UPDATE archival_memory
+        SET superseded_by = $1::uuid,
+            superseded_at = NOW(),
+            metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+                'superseded_via',
+                jsonb_build_object(
+                    'by', $1::text,
+                    'reason', $2::text,
+                    'at', NOW()
+                )
+            )
+        WHERE id = $3::uuid AND superseded_by IS NULL"""
+
+# Same-statement keeper-liveness term (merge path only): the loser is only retired
+# if the chosen keeper is still active. Reuses $1 (the keeper id) — no extra param.
+_KEEPER_ACTIVE_GUARD = (
+    "\n          AND EXISTS (SELECT 1 FROM archival_memory k"
+    " WHERE k.id = $1::uuid AND k.superseded_by IS NULL)"
+)
+
+# Optional same-statement project guard (defense-in-depth): the loser is retired only
+# if it lives in the bound project. The base UPDATE matches the loser by GLOBAL uuid
+# with NO project predicate — safe today only because callers pre-filter ids through a
+# project-scoped fetch. This term lets a caller make the statement self-enforcing so a
+# future code path that skips that pre-fetch can't supersede a row in ANOTHER project.
+# Binds $4 — the next free positional after keeper($1), reason($2), loser($3); the
+# keeper guard reuses $1, so $4 is correct whether or not that guard is present.
+_PROJECT_GUARD = "\n          AND LOWER(project) = LOWER($4::text)"
+
+
+async def supersede_row(
+    conn: Any,
+    *,
+    loser_id: str,
+    keeper_id: str,
+    reason: str,
+    require_active_keeper: bool = False,
+    project: str | None = None,
+) -> int:
+    """Mark ``loser_id`` as superseded by ``keeper_id`` in one guarded UPDATE.
+
+    The single owner of the ``superseded_by`` write invariant (Issue #63 D1).
+    Policy-neutral: it sets ``superseded_by``, ``superseded_at``, and the
+    ``superseded_via`` provenance marker (D2) in a single statement (W-3),
+    guarded by ``superseded_by IS NULL`` so a concurrent supersede between a
+    caller's fetch and apply collapses to a zero-row no-op rather than a clobber.
+
+    The marker records ``{"by": keeper_id, "reason": reason, "at": <ts>}`` where
+    ``reason`` is one of ``merge`` | ``stale`` | ``store`` and ``at`` reuses the
+    same ``NOW()`` as ``superseded_at`` (no clock skew).
+
+    When ``require_active_keeper`` is True (the merge path), the SAME statement
+    gains a keeper-liveness guard: the loser is retired only if the keeper is
+    itself still active (``superseded_by IS NULL``). This closes the race where a
+    keeper chosen at plan time is superseded by a concurrent store/merge before
+    this UPDATE — without it the loser would be pointed at a dead keeper,
+    violating ``select_merge_keeper``'s "a dead side is unsafe" invariant. Default
+    False keeps the store-time hot path byte-for-byte unchanged (the just-inserted
+    keeper is trivially active, and the extra subquery is not worth paying on every
+    store) and is still a SINGLE UPDATE in both modes.
+
+    When ``project`` is provided (defense-in-depth), the SAME statement gains a
+    project guard: the loser is retired only if it lives in ``project`` (matched
+    case-insensitively). The base UPDATE selects the loser by GLOBAL uuid with NO
+    project predicate, so it is safe today only because callers pre-filter ids
+    through a project-scoped fetch; passing ``project`` makes the statement
+    self-enforcing so a future caller that drops that pre-fetch can't supersede a
+    row in ANOTHER project. The bound value uses ``$4`` — the next free positional
+    after keeper/reason/loser; the keeper guard reuses ``$1`` so ``$4`` is correct
+    whether or not that guard is present. Default None keeps the store-time hot path
+    byte-for-byte unchanged (no project predicate, exactly three bound params).
+
+    Returns the number of rows updated (0 = already superseded, missing, a stale
+    id, a cross-project loser when ``project`` is set, or — with
+    ``require_active_keeper`` — a keeper that died after planning).
+    Does NOT decide what a zero-row result means — each caller owns that policy.
+    Does NOT catch ``asyncpg.UndefinedColumnError``: on a pre-migration schema it
+    propagates so callers own the compat policy.
+    """
+    sql = _SUPERSEDE_ROW_SQL + (_KEEPER_ACTIVE_GUARD if require_active_keeper else "")
+    if project is not None:
+        sql += _PROJECT_GUARD
+        status = await conn.execute(sql, keeper_id, reason, loser_id, project)
+    else:
+        status = await conn.execute(sql, keeper_id, reason, loser_id)
+    return _parse_update_count(status)
+
+
 class EmbeddingProvider(Protocol):
     """Protocol for embedding providers."""
 
@@ -130,6 +238,28 @@ class MemoryServicePG:
 
     # Module-level cache: None = not checked, True/False = result
     _has_superseded_column: bool | None = None
+    # Issue #63 Phase 2b (SF-1): a SEPARATE probe for archived_at. A DB may have
+    # superseded_by but NOT archived_at (superseded migration ran, stale-archive
+    # migration did not). Caching the two independently is what stops the active
+    # filter from emitting `archived_at IS NULL` against a column that doesn't
+    # exist and crashing every recall.
+    _has_archived_at_column: bool | None = None
+
+    @classmethod
+    def reset_capability_caches(cls) -> None:
+        """Reset both class-level schema capability caches to ``None``.
+
+        Issue #63 Phase 2b round-2 finding 4: ``_has_superseded_column`` and
+        ``_has_archived_at_column`` are cached on the CLASS, so they are
+        process-wide rather than scoped to a specific DB/pool. When the postgres
+        pool is closed/reset (e.g. the process repoints at a DB with a different
+        migration state, or a test swaps pools), the cached probe results no
+        longer describe the live DB. Clearing both caches forces the next probe
+        to re-run against the current connection. ``close_pool``/``reset_pool``
+        call this via a lazy import to avoid a circular import.
+        """
+        cls._has_superseded_column = None
+        cls._has_archived_at_column = None
 
     def __init__(
         self,
@@ -162,6 +292,46 @@ class MemoryServicePG:
             logger.debug("superseded_by column not found, disabling active-row filter")
             MemoryServicePG._has_superseded_column = False
         return MemoryServicePG._has_superseded_column
+
+    async def _check_archived_at_column(self) -> bool:
+        """Check if the archived_at column exists (issue #63 Phase 2b, SF-1).
+
+        Independent of ``_check_superseded_column``: the stale-archive migration
+        (add_archived_at.sql) may not have run even when superseded_by exists.
+        Caches at the class level so the probe runs at most once per process.
+        """
+        if MemoryServicePG._has_archived_at_column is not None:
+            return MemoryServicePG._has_archived_at_column
+        try:
+            async with get_connection() as conn:
+                await conn.fetchval(
+                    "SELECT 1 FROM archival_memory WHERE archived_at IS NULL LIMIT 1"
+                )
+            MemoryServicePG._has_archived_at_column = True
+        except (asyncpg.UndefinedColumnError, asyncpg.UndefinedTableError):
+            logger.debug("archived_at column not found, disabling archived-row filter")
+            MemoryServicePG._has_archived_at_column = False
+        return MemoryServicePG._has_archived_at_column
+
+    async def _lifecycle_filter_clause(self, *, alias: str = "") -> str:
+        """Build the inline `AND <predicates>` lifecycle filter for raw-SQL methods.
+
+        Runs both capability probes and emits only the predicates whose column
+        exists: `superseded_by IS NULL` (superseded probe) and/or
+        `archived_at IS NULL` (archived probe, SF-1). Returns "" when neither
+        column exists. ``alias`` prefixes each predicate (e.g. "a.") for joined
+        queries. Builder-based methods use ``active_row_conditions`` directly.
+        """
+        has_superseded = await self._check_superseded_column()
+        has_archived = await self._check_archived_at_column()
+        conds = active_row_conditions(
+            include_active_filter=has_superseded,
+            include_archived_filter=has_archived,
+        )
+        if not conds:
+            return ""
+        prefix = f"{alias}." if alias else ""
+        return "AND " + " AND ".join(f"{prefix}{c}" for c in conds)
 
     async def close(self) -> None:
         """Release connection (pool stays open for other services)."""
@@ -516,6 +686,11 @@ class MemoryServicePG:
                     )
 
             if supersedes:
+                # Route through the shared supersede_row helper (Issue #63 D1):
+                # one owner of the superseded_by write invariant, shared with the
+                # Phase 2b curation apply path. The helper stamps the
+                # superseded_via marker with reason="store" (D2).
+                #
                 # Intentionally NOT scoped by session_id/agent_id (unlike
                 # delete_archival). Supersede is a curation operation: a
                 # correction stored in the current session must be able to
@@ -526,30 +701,29 @@ class MemoryServicePG:
                 # local single-operator tool. Do not "harden" this to match the
                 # DELETE scoping without removing cross-session curation.
                 try:
-                    status = await conn.execute(
-                        """
-                        UPDATE archival_memory
-                        SET superseded_by = $1::uuid, superseded_at = NOW()
-                        WHERE id = $2::uuid AND superseded_by IS NULL
-                        """,
-                        memory_id, supersedes,
+                    rows = await supersede_row(
+                        conn,
+                        loser_id=supersedes,
+                        keeper_id=memory_id,
+                        reason="store",
                     )
-                    # A zero-row UPDATE means the target was not superseded: it is
+                    # store() owns the 0-row policy: best-effort warning. A
+                    # zero-row UPDATE means the target was not superseded — it is
                     # already superseded (e.g. a concurrent writer claimed it
                     # between the caller's dedup probe and now), missing, or a
                     # stale id. asyncpg does NOT raise on zero matches, so surface
                     # it instead of silently leaving an unlinked active row.
                     # Full transactional abort-and-retry is tracked separately;
                     # this at least makes the lost supersede observable.
-                    if status == "UPDATE 0":
+                    if rows == 0:
                         logger.warning(
-                            "Supersede UPDATE matched 0 rows: target %s not "
+                            "Supersede matched 0 rows: target %s not "
                             "superseded by %s (already superseded, missing, or "
                             "stale id)", supersedes, memory_id,
                         )
                 except asyncpg.UndefinedColumnError:
                     logger.debug(
-                        "Supersede UPDATE failed (column missing) for %s -> %s",
+                        "Supersede failed (column missing) for %s -> %s",
                         supersedes, memory_id, exc_info=True,
                     )
 
@@ -565,10 +739,12 @@ class MemoryServicePG:
         """Search archival memory with full-text search."""
         resolved_limit = _search_limit(limit)
         has_col = await self._check_superseded_column()
+        has_archived = await self._check_archived_at_column()
         sql, params = build_text_search_sql(
             self.session_id, self.agent_id, query, resolved_limit,
             start_date=start_date, end_date=end_date,
             include_active_filter=has_col,
+            include_archived_filter=has_archived,
         )
         async with get_connection() as conn:
             rows = await conn.fetch(sql, *params)
@@ -590,6 +766,7 @@ class MemoryServicePG:
         """
         resolved_limit = _search_limit(limit)
         has_col = await self._check_superseded_column()
+        has_archived = await self._check_archived_at_column()
         padded_query = pad_embedding(query_embedding)
         async with get_connection() as conn:
             await init_pgvector(conn)
@@ -601,6 +778,7 @@ class MemoryServicePG:
                 start_date=start_date, end_date=end_date,
                 include_active_filter=has_col,
                 embedding_model=model_label,
+                include_archived_filter=has_archived,
             )
             rows = await conn.fetch(sql, *params)
             return format_rows(rows, extra_fields=["similarity"])
@@ -617,8 +795,7 @@ class MemoryServicePG:
     ) -> list[dict[str, Any]]:
         """Search archival memory with vector similarity and threshold filter."""
         resolved_limit = _search_limit(limit)
-        has_col = await self._check_superseded_column()
-        active_filter = f"AND {ACTIVE_ROW_FILTER}" if has_col else ""
+        active_filter = await self._lifecycle_filter_clause()
         padded_query = pad_embedding(query_embedding)
         async with get_connection() as conn:
             await init_pgvector(conn)
@@ -647,8 +824,7 @@ class MemoryServicePG:
     ) -> list[dict[str, Any]]:
         """Search archival memory with vector similarity and metadata filter."""
         resolved_limit = _search_limit(limit)
-        has_col = await self._check_superseded_column()
-        active_filter = f"AND {ACTIVE_ROW_FILTER}" if has_col else ""
+        active_filter = await self._lifecycle_filter_clause()
         padded_query = pad_embedding(query_embedding)
         async with get_connection() as conn:
             await init_pgvector(conn)
@@ -687,8 +863,7 @@ class MemoryServicePG:
         $4, after the existing $1/$2/$3. The capability probe drops the filter
         on a pre-migration DB so the SQL stays byte-identical to pre-#151.
         """
-        has_col = await self._check_superseded_column()
-        active_filter = f"AND {ACTIVE_ROW_FILTER}" if has_col else ""
+        active_filter = await self._lifecycle_filter_clause()
         padded_query = pad_embedding(query_embedding)
         params: list[Any] = [padded_query, threshold, limit]
         async with get_connection() as conn:
@@ -728,12 +903,14 @@ class MemoryServicePG:
         """Hybrid search combining full-text search and vector similarity."""
         resolved_limit = _search_limit(limit)
         has_col = await self._check_superseded_column()
+        has_archived = await self._check_archived_at_column()
         padded_query = pad_embedding(query_embedding)
         sql, params = build_hybrid_search_sql(
             self.session_id, self.agent_id, text_query, padded_query, resolved_limit,
             text_weight=text_weight, vector_weight=vector_weight,
             start_date=start_date, end_date=end_date,
             include_active_filter=has_col,
+            include_archived_filter=has_archived,
         )
         async with get_connection() as conn:
             await init_pgvector(conn)
@@ -753,8 +930,7 @@ class MemoryServicePG:
         """Hybrid search using Reciprocal Rank Fusion."""
         resolved_limit = _search_limit(limit)
         resolved_k = _rrf_k(k)
-        has_col = await self._check_superseded_column()
-        active_filter = f"AND {ACTIVE_ROW_FILTER}" if has_col else ""
+        active_filter = await self._lifecycle_filter_clause()
         padded_query = pad_embedding(query_embedding)
         async with get_connection() as conn:
             await init_pgvector(conn)
@@ -887,8 +1063,7 @@ class MemoryServicePG:
     ) -> list[dict[str, Any]]:
         """Search archival memory with optional tag filtering."""
         resolved_limit = _search_limit(limit)
-        has_col = await self._check_superseded_column()
-        active_filter = f"AND a.{ACTIVE_ROW_FILTER}" if has_col else ""
+        active_filter = await self._lifecycle_filter_clause(alias="a")
         async with get_connection() as conn:
             if not tags:
                 rows = await conn.fetch(
@@ -986,8 +1161,7 @@ class MemoryServicePG:
         """Generate context string for prompt injection."""
         resolved_max_archival = _max_archival(max_archival)
         core = await self.get_all_core()
-        has_col = await self._check_superseded_column()
-        active_filter = f"AND {ACTIVE_ROW_FILTER}" if has_col else ""
+        active_filter = await self._lifecycle_filter_clause()
 
         async with get_connection() as conn:
             rows = await conn.fetch(

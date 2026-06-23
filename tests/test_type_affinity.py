@@ -328,9 +328,52 @@ class TestFetchCentroids:
         # Recall's authoritative predicates (recall_backends.py CTEs / tails).
         assert "session_learning" in sql
         assert "superseded_by IS NULL" in sql
+        # Issue #63 Phase 2b: also excludes stale-archived rows.
+        assert "archived_at IS NULL" in sql
         # Null learning_type rows are excluded server-side, not just in parsing.
         assert "learning_type" in sql
         assert "IS NOT NULL" in sql
+
+    async def test_missing_archived_column_keeps_superseded_filter(self, monkeypatch):
+        """Issue #63 Phase 2b (W-1): a DB with superseded_by but NOT archived_at
+        must degrade to the superseded-only aggregate (middle tier), NOT all rows."""
+        from asyncpg.exceptions import UndefinedColumnError
+
+        from scripts.core import type_affinity as ta
+
+        class _ArchivedMissingConn:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def transaction(self) -> _FakeTransaction:
+                return _FakeTransaction()
+
+            async def execute(self, sql: str, *_args: Any) -> str:
+                return "SET"
+
+            async def fetch(self, sql: str, *args: Any) -> list[Any]:
+                self.calls.append(sql)
+                # Only the archived_at clause is missing; superseded_by exists.
+                if "archived_at" in sql:
+                    raise UndefinedColumnError("column archived_at does not exist")
+                return [{"ltype": "ERROR_FIX", "centroid": "[0.5, 0.6]"}]
+
+        conn = _ArchivedMissingConn()
+
+        async def fake_get_pool():
+            return _FakePool(conn)
+
+        monkeypatch.setattr("scripts.core.db.postgres_pool.get_pool", fake_get_pool)
+
+        centroids = await ta.fetch_type_centroids("voyage-code-3")
+
+        assert centroids == {"ERROR_FIX": [0.5, 0.6]}
+        # Two attempts: full (raises on archived_at) then no-archive (succeeds,
+        # keeps superseded_by). It never reaches the no-chain (all-rows) SQL.
+        assert len(conn.calls) == 2
+        assert "archived_at" in conn.calls[0]
+        assert "superseded_by IS NULL" in conn.calls[1]
+        assert "archived_at" not in conn.calls[1]
 
     async def test_missing_superseded_column_degrades(self, monkeypatch):
         """Finding 1: a pre-migration DB without superseded_by must not crash
@@ -369,10 +412,16 @@ class TestFetchCentroids:
         centroids = await ta.fetch_type_centroids("voyage-code-3")
 
         assert centroids == {"ERROR_FIX": [0.5, 0.6]}
-        # It tried the full-predicate SQL first, then the degraded one.
-        assert len(conn.calls) == 2
+        # Issue #63 Phase 2b: 3-tier cascade when superseded_by is wholly absent —
+        # full (superseded+archived) and no-archive (superseded only) both
+        # reference superseded_by and raise; only the no-chain SQL succeeds.
+        assert len(conn.calls) == 3
         assert "superseded_by" in conn.calls[0]
-        assert "superseded_by" not in conn.calls[1]
+        assert "archived_at" in conn.calls[0]
+        assert "superseded_by" in conn.calls[1]
+        assert "archived_at" not in conn.calls[1]
+        assert "superseded_by" not in conn.calls[2]
+        assert "archived_at" not in conn.calls[2]
 
     async def test_db_failure_returns_none(self, monkeypatch):
         from scripts.core import type_affinity as ta

@@ -39,6 +39,40 @@ from scripts.core.memory_metrics import (  # noqa: E402
 )
 
 
+class _FakeTotalsConn:
+    """Captures the get_totals SQL and returns a fixed lifecycle-count row."""
+
+    def __init__(self, row: dict[str, int]) -> None:
+        self.row = row
+        self.sql: str | None = None
+
+    async def fetchrow(self, sql: str, *args):
+        self.sql = sql
+        return self.row
+
+
+class TestGetTotalsArchived:
+    """Issue #63 Phase 2b (SF-2): get_totals reports a DISTINCT archived counter
+    and counts active as truly-active (not superseded AND not archived)."""
+
+    @pytest.mark.asyncio
+    async def test_emits_archived_counter_without_dropping_rows(self):
+        from scripts.core.memory_metrics import get_totals
+
+        conn = _FakeTotalsConn(
+            {"active": 70, "superseded": 20, "archived": 10, "total": 100}
+        )
+        result = await get_totals(conn, None, None)
+
+        assert result["active_learnings"] == 70
+        assert result["superseded_learnings"] == 20
+        assert result["archived_learnings"] == 10
+        assert result["total_learnings"] == 100  # total counts ALL rows, none dropped
+        # active filter must exclude archived rows; the SQL must reference archived_at.
+        assert "archived_at IS NULL" in conn.sql
+        assert "archived_at IS NOT NULL" in conn.sql
+
+
 # ---------------------------------------------------------------------------
 # calculate_pct
 # ---------------------------------------------------------------------------
@@ -785,8 +819,15 @@ class TestCollectMetrics:
         t = metrics["totals"]
         assert isinstance(t["active_learnings"], int)
         assert isinstance(t["superseded_learnings"], int)
+        assert isinstance(t["archived_learnings"], int)
         assert isinstance(t["total_learnings"], int)
-        assert t["total_learnings"] == t["active_learnings"] + t["superseded_learnings"]
+        # Issue #63 Phase 2b (SF-2): active, superseded, and archived are mutually
+        # exclusive lifecycle states (archived counts only non-superseded rows), so
+        # the three buckets sum to total.
+        assert (
+            t["total_learnings"]
+            == t["active_learnings"] + t["superseded_learnings"] + t["archived_learnings"]
+        )
 
     @pytest.mark.asyncio
     async def test_period_is_none_by_default(self):

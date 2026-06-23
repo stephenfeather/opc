@@ -12,6 +12,25 @@ import sys
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _reset_capability_caches():
+    """Isolate the class-level capability probes between tests (issue #63 Phase 2b).
+
+    Both ``_has_superseded_column`` and ``_has_archived_at_column`` are process-wide
+    caches; leaking one test's value into the next makes filter-wiring assertions
+    order-dependent. Reset to None before and after each test.
+    """
+    from scripts.core.db.memory_service_pg import MemoryServicePG
+
+    MemoryServicePG._has_superseded_column = None
+    MemoryServicePG._has_archived_at_column = None
+    yield
+    MemoryServicePG._has_superseded_column = None
+    MemoryServicePG._has_archived_at_column = None
+
 
 class FakeTransaction:
     """Async context manager that yields a mock connection."""
@@ -274,6 +293,167 @@ class TestSupersededColumnWiring:
         assert "superseded_by IS NULL" in sql
 
 
+class TestCheckArchivedAtColumn:
+    """Issue #63 Phase 2b (SF-1): a SECOND capability probe for archived_at.
+
+    The active-row filter gains `AND archived_at IS NULL`, but a DB that has
+    superseded_by yet has NOT run the add_archived_at migration would pass the
+    superseded probe and then crash on every recall. The archived_at probe must
+    independently gate the new clause.
+    """
+
+    async def test_returns_true_when_column_exists(self):
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        MemoryServicePG._has_archived_at_column = None  # reset cache
+        conn = AsyncMock()
+        conn.fetchval = AsyncMock(return_value=1)
+        svc = MemoryServicePG(session_id="s1")
+
+        with patch(
+            "scripts.core.db.memory_service_pg.get_connection",
+            return_value=FakeConnection(conn),
+        ):
+            result = await svc._check_archived_at_column()
+
+        assert result is True
+        assert MemoryServicePG._has_archived_at_column is True
+        # The probe must check archived_at, not superseded_by.
+        sql = conn.fetchval.call_args[0][0]
+        assert "archived_at" in sql
+
+    async def test_returns_false_when_column_missing(self):
+        import asyncpg
+
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        MemoryServicePG._has_archived_at_column = None  # reset cache
+        conn = AsyncMock()
+        conn.fetchval = AsyncMock(
+            side_effect=asyncpg.UndefinedColumnError("column does not exist")
+        )
+        svc = MemoryServicePG(session_id="s1")
+
+        with patch(
+            "scripts.core.db.memory_service_pg.get_connection",
+            return_value=FakeConnection(conn),
+        ):
+            result = await svc._check_archived_at_column()
+
+        assert result is False
+        assert MemoryServicePG._has_archived_at_column is False
+
+    async def test_uses_cached_result_on_subsequent_calls(self):
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        MemoryServicePG._has_archived_at_column = True  # pre-cached
+        svc = MemoryServicePG(session_id="s1")
+
+        with patch(
+            "scripts.core.db.memory_service_pg.get_connection",
+        ) as mock_conn:
+            result = await svc._check_archived_at_column()
+
+        assert result is True
+        mock_conn.assert_not_called()
+
+    async def test_archived_probe_is_independent_of_superseded_probe(self):
+        """The two probes cache independently — superseded True must NOT imply
+        archived True (the exact pre-migration crash SF-1 guards)."""
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        MemoryServicePG._has_superseded_column = True  # pre-cached True
+        MemoryServicePG._has_archived_at_column = False  # pre-cached False
+        svc = MemoryServicePG(session_id="s1")
+        with patch("scripts.core.db.memory_service_pg.get_connection") as mock_conn:
+            assert await svc._check_superseded_column() is True
+            assert await svc._check_archived_at_column() is False
+            mock_conn.assert_not_called()
+
+
+class TestArchivedAtFilterWiring:
+    """The `archived_at IS NULL` clause is injected ONLY when the archived probe
+    passes; on a pre-migration DB (archived absent) recall does NOT crash and the
+    clause is omitted."""
+
+    async def test_search_text_no_archived_clause_when_column_absent(self):
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        MemoryServicePG._has_superseded_column = True  # superseded present
+        MemoryServicePG._has_archived_at_column = False  # archived ABSENT (pre-migration)
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[])
+        svc = MemoryServicePG(session_id="s1")
+
+        with patch(
+            "scripts.core.db.memory_service_pg.get_connection",
+            return_value=FakeConnection(conn),
+        ):
+            # Must NOT raise — the archived clause is omitted when the column is absent.
+            await svc.search_text("test")
+
+        sql = conn.fetch.call_args[0][0]
+        assert "superseded_by IS NULL" in sql  # superseded still filtered
+        assert "archived_at" not in sql  # but NOT archived (column absent)
+
+    async def test_search_text_adds_archived_clause_when_column_present(self):
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        MemoryServicePG._has_superseded_column = True
+        MemoryServicePG._has_archived_at_column = True
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[])
+        svc = MemoryServicePG(session_id="s1")
+
+        with patch(
+            "scripts.core.db.memory_service_pg.get_connection",
+            return_value=FakeConnection(conn),
+        ):
+            await svc.search_text("test")
+
+        sql = conn.fetch.call_args[0][0]
+        assert "archived_at IS NULL" in sql
+
+    async def test_search_with_tags_adds_archived_clause_when_present(self):
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        MemoryServicePG._has_superseded_column = True
+        MemoryServicePG._has_archived_at_column = True
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[])
+        svc = MemoryServicePG(session_id="s1")
+
+        with patch(
+            "scripts.core.db.memory_service_pg.get_connection",
+            return_value=FakeConnection(conn),
+        ):
+            await svc.search_with_tags("test")
+
+        sql = conn.fetch.call_args[0][0]
+        assert "archived_at IS NULL" in sql
+
+    async def test_search_vector_global_adds_archived_clause_when_present(self):
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        MemoryServicePG._has_superseded_column = True
+        MemoryServicePG._has_archived_at_column = True
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[])
+        svc = MemoryServicePG(session_id="s1")
+
+        with patch(
+            "scripts.core.db.memory_service_pg.get_connection",
+            return_value=FakeConnection(conn),
+        ), patch(
+            "scripts.core.db.memory_service_pg.init_pgvector",
+            AsyncMock(),
+        ):
+            await svc.search_vector_global([0.1] * 1024)
+
+        sql = conn.fetch.call_args[0][0]
+        assert "archived_at IS NULL" in sql
+
+
 # ==================== Core Memory ====================
 
 
@@ -490,6 +670,53 @@ class TestStore:
             c for c in conn.execute.call_args_list if "superseded_by" in str(c)
         ]
         assert len(supersede_calls) == 1
+
+    async def test_store_supersede_uses_helper_with_reason_store(self):
+        """D1/D2: store() routes through supersede_row with reason='store'."""
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        conn = AsyncMock()
+        conn.execute = AsyncMock(return_value="INSERT 0 1")
+        svc = MemoryServicePG(session_id="s1")
+
+        with patch(
+            "scripts.core.db.memory_service_pg.get_transaction",
+            return_value=FakeTransaction(conn),
+        ), patch(
+            "scripts.core.db.memory_service_pg.supersede_row",
+            new=AsyncMock(return_value=1),
+        ) as mock_helper:
+            await svc.store("new fact", supersedes="old-uuid")
+
+        mock_helper.assert_awaited_once()
+        kwargs = mock_helper.await_args.kwargs
+        assert kwargs["loser_id"] == "old-uuid"
+        assert kwargs["reason"] == "store"
+        # keeper is the freshly generated memory id (non-empty)
+        assert kwargs["keeper_id"]
+
+    async def test_store_supersede_zero_rows_warns(self, caplog):
+        """store() owns the 0-row policy: best-effort warning, no raise."""
+        import logging
+
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        conn = AsyncMock()
+        conn.execute = AsyncMock(return_value="INSERT 0 1")
+        svc = MemoryServicePG(session_id="s1")
+
+        with patch(
+            "scripts.core.db.memory_service_pg.get_transaction",
+            return_value=FakeTransaction(conn),
+        ), patch(
+            "scripts.core.db.memory_service_pg.supersede_row",
+            new=AsyncMock(return_value=0),
+        ), caplog.at_level(
+            logging.WARNING, logger="scripts.core.db.memory_service_pg"
+        ):
+            await svc.store("new fact", supersedes="old-uuid")
+
+        assert any("0 row" in r.getMessage() for r in caplog.records)
 
 
 # ==================== Search methods delegate to query builders ====================

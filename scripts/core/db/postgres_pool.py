@@ -311,6 +311,38 @@ async def get_pool() -> Pool:
     return _pool
 
 
+def _reset_schema_capability_caches() -> None:
+    """Clear MemoryServicePG's process-wide schema probe caches (issue #63
+    Phase 2b round-2 finding 4).
+
+    The capability caches (`_has_superseded_column`, `_has_archived_at_column`)
+    are class-level, so they outlive any single pool. Closing/resetting the pool
+    may point the process at a DB with a different migration state, so the cached
+    probe results must be invalidated. Imported lazily here to avoid a circular
+    import (memory_service_pg imports from this module at module load).
+
+    Round-3 finding 1 (issue #63 Phase 2b): the recall path also keeps its own
+    module-level archived_at capability cache (and the sibling project /
+    embedding_model probes). Those probe the SAME schema and outlive the pool the
+    same way, so reset them here too — a re-probe must run after a pool
+    generation flip. Lazy import for the same circular-import reason.
+    """
+    try:
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+    except ImportError:  # pragma: no cover - defensive; module should import
+        pass
+    else:
+        MemoryServicePG.reset_capability_caches()
+
+    try:
+        from scripts.core import recall_backends
+    except ImportError:  # pragma: no cover - defensive; module should import
+        return
+    recall_backends.reset_archived_at_column_cache()
+    recall_backends.reset_project_column_cache()
+    recall_backends.reset_embedding_model_column_cache()
+
+
 async def close_pool() -> None:
     """Close the connection pool gracefully."""
     global _pool
@@ -319,6 +351,7 @@ async def close_pool() -> None:
         if _pool is not None:
             await _pool.close()
             _pool = None
+        _reset_schema_capability_caches()
 
 
 def reset_pool() -> None:
@@ -329,6 +362,7 @@ def reset_pool() -> None:
     global _pool, _pool_lock
     _pool = None
     _pool_lock = asyncio.Lock()
+    _reset_schema_capability_caches()
 
 
 @asynccontextmanager

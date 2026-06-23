@@ -5,14 +5,19 @@ backup. The read-only detector (memory_review.py) is untouched; all write logic 
 here. Pure planning/rendering is unit-tested; I/O handlers use tmp dirs + mocked pools.
 """
 
+import datetime as _dt
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+_DT_A = _dt.datetime(2026, 1, 1, tzinfo=_dt.UTC)
+_DT_B = _dt.datetime(2026, 2, 1, tzinfo=_dt.UTC)
+
 from scripts.core.memory_apply import (
     ApplyAction,
     ApplyPlan,
+    UnpromoteAction,
     append_claude_md,
     apply_memory_file,
     backup_database,
@@ -34,6 +39,7 @@ from scripts.core.memory_apply import _parse_args as parse_apply_args
 from scripts.core.memory_review import PromotionCandidate
 
 _UUID = "11111111-1111-1111-1111-111111111111"
+_UUID2 = "22222222-2222-2222-2222-222222222222"
 
 
 def _cand(id="a1", lt="CODEBASE_PATTERN", dest="MEMORY.md", recall=12, content="A useful pattern"):
@@ -43,6 +49,75 @@ def _cand(id="a1", lt="CODEBASE_PATTERN", dest="MEMORY.md", recall=12, content="
 
 
 # --- route_apply_target (pure) ---
+
+
+def _mrow(id="a", recall=0, created="2026-01-01", superseded_by=None):
+    import datetime as _dt
+
+    from scripts.core.memory_review import MergeRow
+
+    y, m, d = (int(x) for x in created.split("-"))
+    return MergeRow(
+        id=id,
+        recall_count=recall,
+        created_at=_dt.datetime(y, m, d, tzinfo=_dt.UTC),
+        superseded_by=superseded_by,
+    )
+
+
+class TestSelectMergeKeeper:
+    """Pure keeper selection: higher recall, then older created_at, then smaller id."""
+
+    def test_higher_recall_wins(self):
+        from scripts.core.memory_apply import select_merge_keeper
+
+        a = _mrow(id="aaaa", recall=3)
+        b = _mrow(id="bbbb", recall=9)
+        keeper, loser = select_merge_keeper(a, b)
+        assert keeper.id == "bbbb"
+        assert loser.id == "aaaa"
+
+    def test_recall_tie_older_created_at_wins(self):
+        from scripts.core.memory_apply import select_merge_keeper
+
+        older = _mrow(id="zzzz", recall=5, created="2026-01-01")
+        newer = _mrow(id="aaaa", recall=5, created="2026-06-01")
+        keeper, loser = select_merge_keeper(newer, older)
+        assert keeper.id == "zzzz"  # older keeper despite larger id
+        assert loser.id == "aaaa"
+
+    def test_full_tie_smaller_id_wins(self):
+        from scripts.core.memory_apply import select_merge_keeper
+
+        a = _mrow(id="aaaa", recall=5, created="2026-01-01")
+        b = _mrow(id="bbbb", recall=5, created="2026-01-01")
+        keeper, loser = select_merge_keeper(b, a)  # order-independent
+        assert keeper.id == "aaaa"
+        assert loser.id == "bbbb"
+
+    def test_pure_does_not_mutate_inputs(self):
+        from scripts.core.memory_apply import select_merge_keeper
+
+        a = _mrow(id="aaaa", recall=3)
+        b = _mrow(id="bbbb", recall=9)
+        select_merge_keeper(a, b)
+        assert a.recall_count == 3 and b.recall_count == 9  # frozen, untouched
+
+    def test_raises_when_keeper_side_already_superseded(self):
+        from scripts.core.memory_apply import MergeKeeperError, select_merge_keeper
+
+        a = _mrow(id="aaaa", recall=9, superseded_by="cccc")  # would-be keeper, dead
+        b = _mrow(id="bbbb", recall=3)
+        with pytest.raises(MergeKeeperError):
+            select_merge_keeper(a, b)
+
+    def test_raises_when_loser_side_already_superseded(self):
+        from scripts.core.memory_apply import MergeKeeperError, select_merge_keeper
+
+        a = _mrow(id="aaaa", recall=9)
+        b = _mrow(id="bbbb", recall=3, superseded_by="cccc")
+        with pytest.raises(MergeKeeperError):
+            select_merge_keeper(a, b)
 
 
 class TestRouteApplyTarget:
@@ -261,6 +336,113 @@ class TestCliParsing:
         d = default_memory_dir("/Users/x/opc")
         assert d.name == "memory"
         assert "-Users-x-opc" in str(d)
+
+
+class TestMergeCliParsing:
+    def test_merge_flag_defaults_false(self):
+        ns = parse_apply_args(["opc", "--ids", "a"])
+        assert ns.merge is False
+
+    def test_merge_flag_set(self):
+        ns = parse_apply_args(["opc", "--merge", "--pair", f"{_UUID}:{_UUID2}"])
+        assert ns.merge is True
+
+    def test_pair_is_repeatable(self):
+        ns = parse_apply_args(
+            ["opc", "--merge", "--pair", f"{_UUID}:{_UUID2}", "--pair", f"{_UUID2}:{_UUID}"]
+        )
+        assert ns.pair == [f"{_UUID}:{_UUID2}", f"{_UUID2}:{_UUID}"]
+
+    def test_parse_pairs_splits_on_colon(self):
+        from scripts.core.memory_apply import parse_pairs
+
+        assert parse_pairs([f"{_UUID}:{_UUID2}"]) == [(_UUID, _UUID2)]
+
+    def test_parse_pairs_rejects_malformed(self):
+        from scripts.core.memory_apply import parse_pairs
+
+        with pytest.raises(ValueError, match="pair"):
+            parse_pairs(["only-one-id"])
+
+    def test_parse_pairs_validates_uuids(self):
+        from scripts.core.memory_apply import parse_pairs
+
+        with pytest.raises(ValueError):
+            parse_pairs(["not-a-uuid:also-bad"])
+
+
+class TestMergeCliMain:
+    async def test_merge_dry_run_writes_nothing(self, tmp_path, monkeypatch):
+        import scripts.core.memory_apply as ma
+
+        rows = [
+            {"id": _UUID, "recall_count": 3, "created_at": _DT_A, "superseded_by": None},
+            {"id": _UUID2, "recall_count": 9, "created_at": _DT_B, "superseded_by": None},
+        ]
+        pool, conn = _pool()
+        conn.fetch.side_effect = [rows]
+        backup_called = False
+
+        def _run(*a, **k):
+            nonlocal backup_called
+            backup_called = True
+            return MagicMock(returncode=0)
+
+        async def _get_pool():
+            return pool
+
+        monkeypatch.setattr(ma, "get_pool", _get_pool)
+        monkeypatch.setattr(ma, "project_from_path", lambda _p: "opc")
+        rc = await ma.main(
+            ["opc", "--merge", "--pair", f"{_UUID}:{_UUID2}", "--backup-dir", str(tmp_path)]
+        )
+        assert rc == 0
+        assert backup_called is False
+        conn.execute.assert_not_called()  # no supersede, no backup in dry-run
+
+    async def test_merge_execute_backs_up_then_supersedes(self, tmp_path, monkeypatch):
+        import scripts.core.memory_apply as ma
+
+        rows = [
+            {"id": _UUID, "recall_count": 3, "created_at": _DT_A, "superseded_by": None},
+            {"id": _UUID2, "recall_count": 9, "created_at": _DT_B, "superseded_by": None},
+        ]
+        pool, conn = _pool()
+        conn.fetch.side_effect = [rows]
+        order = []
+
+        def _backup(dest, **kw):
+            order.append("backup")
+            Path(dest).parent.mkdir(parents=True, exist_ok=True)
+            Path(dest).write_text("-- dump")
+            return Path(dest)
+
+        async def _exec(*a, **k):
+            order.append("supersede")
+            return "UPDATE 1"
+
+        conn.execute = _exec
+
+        async def _get_pool():
+            return pool
+
+        monkeypatch.setattr(ma, "get_pool", _get_pool)
+        monkeypatch.setattr(ma, "project_from_path", lambda _p: "opc")
+        monkeypatch.setattr(ma, "backup_database", _backup)
+        rc = await ma.main(
+            [
+                "opc",
+                "--merge",
+                "--pair",
+                f"{_UUID}:{_UUID2}",
+                "--execute",
+                "--backup-dir",
+                str(tmp_path),
+            ]
+        )
+        assert rc == 0
+        assert order and order[0] == "backup"
+        assert "supersede" in order
 
 
 class TestCliMain:
@@ -650,6 +832,277 @@ class TestRunApply:
         assert any("CLAUDE.md" in n for n in backups)
 
 
+class TestRunMergeApply:
+    """Merge-supersede apply path: same safety envelope as promotion, reason='merge'."""
+
+    _A = "11111111-1111-1111-1111-111111111111"
+    _B = "22222222-2222-2222-2222-222222222222"
+
+    def _merge_rows(self, recall_a=3, recall_b=9, sup_a=None, sup_b=None):
+        # row_b wins keeper (higher recall) by default.
+        return [
+            {
+                "id": self._A,
+                "recall_count": recall_a,
+                "created_at": _DT_A,
+                "superseded_by": sup_a,
+            },
+            {
+                "id": self._B,
+                "recall_count": recall_b,
+                "created_at": _DT_B,
+                "superseded_by": sup_b,
+            },
+        ]
+
+    async def test_dry_run_writes_nothing_and_no_backup(self, tmp_path):
+        from scripts.core.memory_apply import run_merge_apply
+
+        pool, conn = _pool(rows=self._merge_rows())
+        backup_dir = tmp_path / "backups"
+        backup_called = False
+
+        def _run(*a, **k):
+            nonlocal backup_called
+            backup_called = True
+            return MagicMock(returncode=0)
+
+        result = await run_merge_apply(
+            pool,
+            "opc",
+            [(self._A, self._B)],
+            execute=False,
+            backup_dir=backup_dir,
+            timestamp="20260101-000000",
+            run=_run,
+        )
+        assert result.plan.dry_run is True
+        assert result.applied == []
+        assert result.backup_path is None
+        assert backup_called is False
+        conn.execute.assert_not_called()  # no supersede UPDATE in dry-run
+
+    async def test_execute_backs_up_then_supersedes_loser_with_merge_reason(self, tmp_path):
+        from scripts.core.memory_apply import run_merge_apply
+
+        pool, conn = _pool()
+        conn.fetch.side_effect = [self._merge_rows()]  # one pair -> one detail fetch
+        order = []
+
+        def _run(cmd, **kw):
+            order.append("backup")
+            Path(kw["stdout"].name).write_text("-- dump")
+            return MagicMock(returncode=0)
+
+        async def _exec(*a, **k):
+            order.append("supersede")
+            return "UPDATE 1"
+
+        conn.execute = _exec
+        backup_dir = tmp_path / "backups"
+
+        result = await run_merge_apply(
+            pool,
+            "opc",
+            [(self._A, self._B)],
+            execute=True,
+            backup_dir=backup_dir,
+            timestamp="20260101-000000",
+            run=_run,
+        )
+        assert result.backup_path is not None and result.backup_path.exists()
+        assert order[0] == "backup"  # backup precedes any write
+        assert "supersede" in order
+        # row_b (recall 9) is keeper, row_a (recall 3) is loser
+        assert result.applied == [self._A]
+
+    async def test_supersede_called_with_keeper_loser_and_merge_reason(self, tmp_path):
+        from scripts.core.memory_apply import run_merge_apply
+
+        pool, conn = _pool()
+        conn.fetch.side_effect = [self._merge_rows()]
+        captured = {}
+
+        async def _exec(sql, *params, **kw):
+            captured["sql"] = sql
+            captured["params"] = params
+            return "UPDATE 1"
+
+        conn.execute = _exec
+
+        def _run(cmd, **kw):
+            Path(kw["stdout"].name).write_text("-- dump")
+            return MagicMock(returncode=0)
+
+        await run_merge_apply(
+            pool,
+            "opc",
+            [(self._A, self._B)],
+            execute=True,
+            backup_dir=tmp_path / "b",
+            timestamp="t",
+            run=_run,
+        )
+        # keeper=_B, loser=_A, reason="merge" all reach supersede_row's UPDATE
+        assert self._A in captured["params"]  # loser
+        assert self._B in captured["params"]  # keeper
+        assert "merge" in captured["params"]
+        assert "superseded_by IS NULL" in captured["sql"]
+
+    async def test_idempotent_zero_row_update_skips_without_raising(self, tmp_path):
+        from scripts.core.memory_apply import run_merge_apply
+
+        pool, conn = _pool()
+        conn.fetch.side_effect = [self._merge_rows()]
+        conn.execute = AsyncMock(return_value="UPDATE 0")  # already superseded concurrently
+
+        def _run(cmd, **kw):
+            Path(kw["stdout"].name).write_text("-- dump")
+            return MagicMock(returncode=0)
+
+        result = await run_merge_apply(
+            pool,
+            "opc",
+            [(self._A, self._B)],
+            execute=True,
+            backup_dir=tmp_path / "b",
+            timestamp="t",
+            run=_run,
+        )
+        assert result.applied == []  # nothing applied
+        assert len(result.skipped) == 1  # reported as a skip, not a failure
+        # no exception raised -> the assertion below proves we returned normally
+
+    async def test_merge_requires_active_keeper(self, tmp_path):
+        # Finding 2: the merge path must guard keeper-liveness in the SAME statement so a
+        # loser is never retired onto a keeper that died after planning. Assert the flag
+        # is threaded through to supersede_row.
+        from scripts.core.memory_apply import run_merge_apply
+
+        pool, conn = _pool()
+        conn.fetch.side_effect = [self._merge_rows()]
+        captured = {}
+
+        async def _exec(sql, *params, **kw):
+            captured["kwargs"] = kw
+            return "UPDATE 1"
+
+        # run_merge_apply calls supersede_row(conn, ..., require_active_keeper=True);
+        # patch supersede_row to capture how it was invoked.
+        import scripts.core.memory_apply as ma
+
+        async def _supersede(conn, **kw):
+            captured["supersede_kwargs"] = kw
+            return 1
+
+        def _run(cmd, **kw):
+            Path(kw["stdout"].name).write_text("-- dump")
+            return MagicMock(returncode=0)
+
+        from unittest.mock import patch
+
+        with patch.object(ma, "supersede_row", _supersede):
+            result = await run_merge_apply(
+                pool, "opc", [(self._A, self._B)],
+                execute=True, backup_dir=tmp_path / "b", timestamp="t", run=_run,
+            )
+        assert captured["supersede_kwargs"].get("require_active_keeper") is True
+        assert captured["supersede_kwargs"].get("reason") == "merge"
+        assert result.applied == [self._A]
+
+    async def test_merge_passes_project_into_supersede_row(self, tmp_path):
+        # Defense-in-depth: run_merge_apply must thread the apply `project` into
+        # supersede_row so the guarded UPDATE is self-enforcing even if a future change
+        # drops the project-scoped fetch_merge_pair_details pre-filter.
+        from scripts.core.memory_apply import run_merge_apply
+
+        pool, conn = _pool()
+        conn.fetch.side_effect = [self._merge_rows()]
+        captured = {}
+
+        import scripts.core.memory_apply as ma
+
+        async def _supersede(conn, **kw):
+            captured["supersede_kwargs"] = kw
+            return 1
+
+        def _run(cmd, **kw):
+            Path(kw["stdout"].name).write_text("-- dump")
+            return MagicMock(returncode=0)
+
+        from unittest.mock import patch
+
+        with patch.object(ma, "supersede_row", _supersede):
+            await run_merge_apply(
+                pool, "opc", [(self._A, self._B)],
+                execute=True, backup_dir=tmp_path / "b", timestamp="t", run=_run,
+            )
+        assert captured["supersede_kwargs"].get("project") == "opc"
+
+    async def test_keeper_died_after_plan_is_skip_not_raise(self, tmp_path):
+        # Finding 2: keeper superseded concurrently after planning -> the keeper-liveness
+        # guard makes the UPDATE match 0 rows. The loser must NOT be applied; reported as a
+        # skip, never raised (idempotent / re-plannable).
+        from scripts.core.memory_apply import run_merge_apply
+
+        pool, conn = _pool()
+        conn.fetch.side_effect = [self._merge_rows()]
+        # 0-row because the keeper died after planning (same-statement liveness guard).
+        conn.execute = AsyncMock(return_value="UPDATE 0")
+
+        def _run(cmd, **kw):
+            Path(kw["stdout"].name).write_text("-- dump")
+            return MagicMock(returncode=0)
+
+        result = await run_merge_apply(
+            pool, "opc", [(self._A, self._B)],
+            execute=True, backup_dir=tmp_path / "b", timestamp="t", run=_run,
+        )
+        assert result.applied == []  # loser NOT retired onto a dead keeper
+        assert len(result.skipped) == 1  # surfaced as a skip, not a raise
+
+    async def test_already_superseded_pair_skips_no_raise(self, tmp_path):
+        from scripts.core.memory_apply import run_merge_apply
+
+        pool, conn = _pool()
+        # row_a already superseded -> select_merge_keeper refuses -> skip, no write
+        conn.fetch.side_effect = [self._merge_rows(sup_a=self._B)]
+
+        def _run(cmd, **kw):
+            Path(kw["stdout"].name).write_text("-- dump")
+            return MagicMock(returncode=0)
+
+        result = await run_merge_apply(
+            pool,
+            "opc",
+            [(self._A, self._B)],
+            execute=True,
+            backup_dir=tmp_path / "b",
+            timestamp="t",
+            run=_run,
+        )
+        assert result.applied == []
+        assert len(result.skipped) == 1
+        conn.execute.assert_not_called()  # no supersede attempted
+
+    async def test_missing_side_skips(self, tmp_path):
+        from scripts.core.memory_apply import run_merge_apply
+
+        pool, conn = _pool()
+        # only one id resolves -> cannot form a pair -> skip
+        conn.fetch.side_effect = [[self._merge_rows()[0]]]
+
+        result = await run_merge_apply(
+            pool,
+            "opc",
+            [(self._A, self._B)],
+            execute=False,
+            backup_dir=tmp_path / "b",
+            timestamp="t",
+        )
+        assert len(result.skipped) == 1
+
+
 class TestBackupFiles:
     def test_copies_existing_skips_missing(self, tmp_path):
         from scripts.core.memory_apply import backup_files
@@ -751,3 +1204,867 @@ class TestSecurityHardening:
         assert append_claude_md(path, evil)
         # the forged marker for bbbb... must NOT appear verbatim (was defanged)
         assert "promoted_from_archival_memory: bbbbbbbb-1111" not in path.read_text()
+
+
+# ---------------------------------------------------------------------------
+# Stale-archive apply (issue #63 Phase 2b Step 3)
+# ---------------------------------------------------------------------------
+
+
+class TestArchiveRow:
+    """archive_row: ONE guarded UPDATE that sets archived_at = NOW() AND stamps a
+    superseded_via marker {by: null, reason: "stale", at}. Mirrors supersede_row's
+    single-statement discipline; idempotent (already-archived -> 0-row, no raise)."""
+
+    async def test_single_update_sets_archived_at_and_marker(self):
+        from scripts.core.memory_apply import archive_row
+
+        pool, conn = _pool()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+        count = await archive_row(conn, learning_id=_UUID, project="opc")
+        assert count == 1
+        conn.execute.assert_awaited_once()  # ONE statement
+        sql = conn.execute.await_args.args[0]
+        assert "archived_at = NOW()" in sql
+        assert "superseded_via" in sql
+        assert "stale" in sql  # the reason marker
+        # Guarded so a concurrent archive collapses to a 0-row no-op.
+        assert "archived_at IS NULL" in sql
+
+    async def test_already_archived_returns_zero_not_raise(self):
+        from scripts.core.memory_apply import archive_row
+
+        pool, conn = _pool()
+        conn.execute = AsyncMock(return_value="UPDATE 0")
+        count = await archive_row(conn, learning_id=_UUID, project="opc")
+        assert count == 0  # idempotent: never raises on a no-op
+
+    async def test_guarded_by_project_and_not_superseded(self):
+        # Finding 1: a global UUID from ANOTHER project, or a row concurrently superseded
+        # (its real provenance must not be clobbered with reason="stale"), must not be
+        # archived. Both guards belong in the SAME UPDATE; project is threaded + bound.
+        from scripts.core.memory_apply import archive_row
+
+        pool, conn = _pool()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+        await archive_row(conn, learning_id=_UUID, project="opc")
+        sql = conn.execute.await_args.args[0]
+        assert "LOWER(project) = LOWER($2)" in sql  # wrong-project id cannot be archived
+        assert "superseded_by IS NULL" in sql  # don't clobber a superseded row's provenance
+        assert "archived_at IS NULL" in sql  # still idempotent on re-archive
+        # project bound as a parameter, not interpolated
+        params = conn.execute.await_args.args[1:]
+        assert "opc" in params
+
+    async def test_wrong_project_zero_row_not_archived(self):
+        # The DB returns UPDATE 0 because the project guard excluded a cross-project id.
+        from scripts.core.memory_apply import archive_row
+
+        pool, conn = _pool()
+        conn.execute = AsyncMock(return_value="UPDATE 0")
+        count = await archive_row(conn, learning_id=_UUID, project="other-project")
+        assert count == 0  # not archived; no raise
+
+
+class TestRunStaleArchive:
+    async def test_dry_run_writes_nothing_no_backup(self, tmp_path):
+        from scripts.core.memory_apply import run_stale_archive
+
+        pool, conn = _pool()
+        backup_called = False
+
+        def _run(*a, **k):
+            nonlocal backup_called
+            backup_called = True
+            return MagicMock(returncode=0)
+
+        result = await run_stale_archive(
+            pool, "opc", [_UUID, _UUID2],
+            execute=False, backup_dir=tmp_path, timestamp="ts", run=_run,
+        )
+        assert backup_called is False
+        conn.execute.assert_not_called()
+        assert result.applied == []
+
+    async def test_execute_backs_up_before_any_write(self, tmp_path, monkeypatch):
+        import scripts.core.memory_apply as ma
+
+        pool, conn = _pool()
+        order = []
+
+        def _backup(dest, **kw):
+            order.append("backup")
+            Path(dest).parent.mkdir(parents=True, exist_ok=True)
+            Path(dest).write_text("-- dump")
+            return Path(dest)
+
+        async def _exec(*a, **k):
+            order.append("archive")
+            return "UPDATE 1"
+
+        conn.execute = _exec
+        monkeypatch.setattr(ma, "backup_database", _backup)
+        result = await ma.run_stale_archive(
+            pool, "opc", [_UUID, _UUID2],
+            execute=True, backup_dir=tmp_path, timestamp="ts", lock_dir=tmp_path,
+        )
+        # Backup happens FIRST, before any archive write.
+        assert order and order[0] == "backup"
+        assert "archive" in order
+        assert result.applied == [_UUID, _UUID2]
+        assert result.backup_path is not None
+
+    async def test_idempotent_already_archived_skipped(self, tmp_path, monkeypatch):
+        import scripts.core.memory_apply as ma
+
+        pool, conn = _pool()
+
+        def _backup(dest, **kw):
+            Path(dest).parent.mkdir(parents=True, exist_ok=True)
+            Path(dest).write_text("-- dump")
+            return Path(dest)
+
+        async def _exec(*a, **k):
+            return "UPDATE 0"  # every row already archived
+
+        conn.execute = _exec
+        monkeypatch.setattr(ma, "backup_database", _backup)
+        result = await ma.run_stale_archive(
+            pool, "opc", [_UUID],
+            execute=True, backup_dir=tmp_path, timestamp="ts", lock_dir=tmp_path,
+        )
+        assert result.applied == []  # nothing newly archived
+        assert _UUID in [s[0] for s in result.skipped]  # reported as skipped, not raised
+
+    async def test_threads_project_into_archive_row(self, tmp_path, monkeypatch):
+        # Finding 1: run_stale_archive must pass its project down to archive_row so the
+        # guarded UPDATE can reject cross-project ids and superseded rows.
+        import scripts.core.memory_apply as ma
+
+        pool, conn = _pool()
+        captured = {}
+
+        def _backup(dest, **kw):
+            Path(dest).parent.mkdir(parents=True, exist_ok=True)
+            Path(dest).write_text("-- dump")
+            return Path(dest)
+
+        async def _archive(conn, **kw):
+            captured["kwargs"] = kw
+            return 1
+
+        monkeypatch.setattr(ma, "backup_database", _backup)
+        monkeypatch.setattr(ma, "archive_row", _archive)
+        result = await ma.run_stale_archive(
+            pool, "opc", [_UUID],
+            execute=True, backup_dir=tmp_path, timestamp="ts", lock_dir=tmp_path,
+        )
+        assert captured["kwargs"].get("project") == "opc"
+        assert captured["kwargs"].get("learning_id") == _UUID
+        assert result.applied == [_UUID]
+
+    async def test_zero_row_skip_reason_covers_wrong_project(self, tmp_path, monkeypatch):
+        # The 0-row skip wording must reflect the new guards (archived/superseded/project),
+        # not just "already archived".
+        import scripts.core.memory_apply as ma
+
+        pool, conn = _pool()
+
+        def _backup(dest, **kw):
+            Path(dest).parent.mkdir(parents=True, exist_ok=True)
+            Path(dest).write_text("-- dump")
+            return Path(dest)
+
+        async def _exec(*a, **k):
+            return "UPDATE 0"  # excluded by project / superseded / archived guard
+
+        conn.execute = _exec
+        monkeypatch.setattr(ma, "backup_database", _backup)
+        result = await ma.run_stale_archive(
+            pool, "opc", [_UUID],
+            execute=True, backup_dir=tmp_path, timestamp="ts", lock_dir=tmp_path,
+        )
+        assert result.applied == []
+        reason = [s[1] for s in result.skipped if s[0] == _UUID][0]
+        assert "not eligible" in reason.lower()
+
+
+class TestArchiveCliMain:
+    async def test_archive_dry_run_writes_nothing(self, tmp_path, monkeypatch):
+        import scripts.core.memory_apply as ma
+
+        pool, conn = _pool()
+        backup_called = False
+
+        def _run(*a, **k):
+            nonlocal backup_called
+            backup_called = True
+            return MagicMock(returncode=0)
+
+        async def _get_pool():
+            return pool
+
+        monkeypatch.setattr(ma, "get_pool", _get_pool)
+        monkeypatch.setattr(ma, "project_from_path", lambda _p: "opc")
+        rc = await ma.main(
+            ["opc", "--archive", "--ids", _UUID, "--backup-dir", str(tmp_path)]
+        )
+        assert rc == 0
+        assert backup_called is False
+        conn.execute.assert_not_called()
+
+    async def test_archive_execute_backs_up_first(self, tmp_path, monkeypatch):
+        import scripts.core.memory_apply as ma
+
+        pool, conn = _pool()
+        order = []
+
+        def _backup(dest, **kw):
+            order.append("backup")
+            Path(dest).parent.mkdir(parents=True, exist_ok=True)
+            Path(dest).write_text("-- dump")
+            return Path(dest)
+
+        async def _exec(*a, **k):
+            order.append("archive")
+            return "UPDATE 1"
+
+        conn.execute = _exec
+
+        async def _get_pool():
+            return pool
+
+        monkeypatch.setattr(ma, "get_pool", _get_pool)
+        monkeypatch.setattr(ma, "project_from_path", lambda _p: "opc")
+        monkeypatch.setattr(ma, "backup_database", _backup)
+        rc = await ma.main(
+            ["opc", "--archive", "--ids", _UUID, "--execute", "--backup-dir", str(tmp_path)]
+        )
+        assert rc == 0
+        assert order and order[0] == "backup"
+        assert "archive" in order
+
+    def test_archive_flag_parses(self):
+        args = parse_apply_args(["opc", "--archive", "--ids", _UUID])
+        assert args.archive is True
+
+
+# --- Unpromote / repair (issue #63 Phase 2b Step 4) ---
+
+
+def _prow(id="a", *, tier="MEMORY.md", target="/m/promoted-x.md", lt="CODEBASE_PATTERN",
+          content="A useful pattern", recall=12):
+    from scripts.core.memory_review import PromotedRow
+
+    return PromotedRow(
+        id=id, content=content, recall_count=recall, learning_type=lt, tier=tier, target=target
+    )
+
+
+class TestBuildUnpromotePlan:
+    """build_unpromote_plan (pure): map promoted rows -> unpromote actions, distinguishing the
+    single-artifact CLAUDE.md block from the two-artifact MEMORY.md (file + index line), and
+    skipping a row whose promoted_to is already absent (tier/target None)."""
+
+    def test_memory_tier_is_two_artifact(self):
+        from scripts.core.memory_apply import build_unpromote_plan
+
+        plan = build_unpromote_plan([_prow("a", tier="MEMORY.md")], dry_run=True)
+        assert len(plan.actions) == 1
+        act = plan.actions[0]
+        assert act.skipped is False
+        assert act.two_artifact is True
+        assert act.tier == "MEMORY.md"
+
+    def test_claude_tier_is_single_artifact(self):
+        from scripts.core.memory_apply import build_unpromote_plan
+
+        plan = build_unpromote_plan(
+            [_prow("a", tier="CLAUDE.md", target="/c/CLAUDE.md", lt="ARCHITECTURAL_DECISION")],
+            dry_run=True,
+        )
+        act = plan.actions[0]
+        assert act.skipped is False
+        assert act.two_artifact is False
+        assert act.tier == "CLAUDE.md"
+
+    def test_skips_row_with_no_promoted_marker(self):
+        from scripts.core.memory_apply import build_unpromote_plan
+
+        plan = build_unpromote_plan([_prow("a", tier=None, target=None)], dry_run=True)
+        act = plan.actions[0]
+        assert act.skipped is True
+        assert "already" in (act.skip_reason or "").lower()
+
+    def test_unknown_tier_skipped(self):
+        from scripts.core.memory_apply import build_unpromote_plan
+
+        plan = build_unpromote_plan([_prow("a", tier="rules/", target="/x")], dry_run=True)
+        assert plan.actions[0].skipped is True
+
+    def test_dry_run_flag_carried(self):
+        from scripts.core.memory_apply import build_unpromote_plan
+
+        assert build_unpromote_plan([_prow()], dry_run=True).dry_run is True
+        assert build_unpromote_plan([_prow()], dry_run=False).dry_run is False
+
+    def test_pure_no_io(self):
+        from scripts.core.memory_apply import build_unpromote_plan
+
+        rows = [_prow("a"), _prow("b", tier="CLAUDE.md", target="/c/CLAUDE.md")]
+        plan = build_unpromote_plan(rows, dry_run=True)
+        assert len(plan.applicable) == 2  # both routable
+
+
+class TestClearPromotedMarker:
+    """clear_promoted_marker: ONE guarded UPDATE that removes ONLY the promoted_to key
+    (metadata - 'promoted_to'), guarded so it matches only a row that still has it.
+    Idempotent: a 0-row clear is a no-op, never a raise. Never touches superseded_via."""
+
+    async def test_single_update_removes_only_promoted_to(self):
+        from scripts.core.memory_apply import clear_promoted_marker
+
+        pool, conn = _pool()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+        count = await clear_promoted_marker(conn, learning_id=_UUID, project="opc")
+        assert count == 1
+        conn.execute.assert_awaited_once()
+        sql = conn.execute.await_args.args[0]
+        assert "promoted_to" in sql
+        assert "- 'promoted_to'" in sql or "- $" in sql  # subtracts the key
+        assert "superseded_via" not in sql  # must not touch other keys
+        assert "metadata ? 'promoted_to'" in sql  # guarded to rows still carrying it
+
+    async def test_already_cleared_returns_zero_not_raise(self):
+        from scripts.core.memory_apply import clear_promoted_marker
+
+        pool, conn = _pool()
+        conn.execute = AsyncMock(return_value="UPDATE 0")
+        count = await clear_promoted_marker(conn, learning_id=_UUID, project="opc")
+        assert count == 0  # idempotent: no raise
+
+
+class TestRemoveLineByMarker:
+    """remove_line_by_marker: splice a single line out of a file by a substring marker,
+    atomically. Absent marker -> no-op (already removed); returns whether a line was removed."""
+
+    def test_removes_matching_line(self, tmp_path):
+        from scripts.core.memory_apply import remove_line_by_marker
+
+        f = tmp_path / "MEMORY.md"
+        f.write_text("# Index\n- [x](promoted-x.md) — promoted\n- [y](other.md)\n")
+        removed = remove_line_by_marker(f, "promoted-x.md")
+        assert removed is True
+        text = f.read_text()
+        assert "promoted-x.md" not in text
+        assert "other.md" in text  # other lines untouched
+
+    def test_absent_marker_is_noop(self, tmp_path):
+        from scripts.core.memory_apply import remove_line_by_marker
+
+        f = tmp_path / "MEMORY.md"
+        f.write_text("# Index\n- [y](other.md)\n")
+        removed = remove_line_by_marker(f, "promoted-x.md")
+        assert removed is False
+        assert f.read_text() == "# Index\n- [y](other.md)\n"
+
+    def test_missing_file_is_noop(self, tmp_path):
+        from scripts.core.memory_apply import remove_line_by_marker
+
+        removed = remove_line_by_marker(tmp_path / "nope.md", "marker")
+        assert removed is False
+
+
+class TestUnpromoteIndexMarkerExactness:
+    """Defense-in-depth (Issue #63 Phase 2b hardening): the MEMORY.md index splice must match
+    the EXACT wrapped ``({filename})`` reference the Phase-2a writer emits, not the bare
+    basename. A bare-basename substring match would splice an unintended line when one promoted
+    filename is a substring of another. The classic trap is a backup/variant filename that
+    CONTAINS the target's basename as a prefix (e.g. the target ``promoted-foo.md`` is a literal
+    substring of a sibling index line referencing ``promoted-foo.md.bak``), so a bare-basename
+    match would splice BOTH lines. Matching ``(promoted-foo.md)`` exactly leaves the other line
+    intact."""
+
+    def test_splices_only_exact_wrapped_filename(self, tmp_path):
+        from scripts.core.memory_apply import _unpromote_one_row
+        from scripts.core.memory_review import PromotedRow
+
+        memory_dir = tmp_path / "mem"
+        memory_dir.mkdir()
+        # The target's basename `promoted-foo.md` is a literal substring of the sibling
+        # filename `promoted-foo.md.bak` — a bare-basename splice would remove BOTH lines.
+        target_file = memory_dir / "promoted-foo.md"
+        target_file.write_text("body")
+        memory_md = memory_dir / "MEMORY.md"
+        memory_md.write_text(
+            "# Index\n"
+            "- [Foo](promoted-foo.md) — promoted, recalled 5×\n"
+            "- [FooBak](promoted-foo.md.bak) — promoted, recalled 7×\n"
+        )
+
+        action = UnpromoteAction(
+            row=PromotedRow(
+                id="a", content="c", recall_count=5, learning_type="CODEBASE_PATTERN",
+                tier="MEMORY.md", target=str(target_file),
+            ),
+            tier="MEMORY.md",
+            target=str(target_file),
+            two_artifact=True,
+            skipped=False,
+            skip_reason=None,
+        )
+
+        _unpromote_one_row(action, memory_dir, tmp_path / "CLAUDE.md")
+
+        text = memory_md.read_text()
+        # The exact (promoted-foo.md) line is gone...
+        assert "(promoted-foo.md)" not in text
+        # ...but the substring-colliding (promoted-foo.md.bak) line survives.
+        assert "(promoted-foo.md.bak)" in text
+        assert not target_file.exists()  # the target file itself was deleted
+
+
+class TestUnpromoteRelativeTarget:
+    """Issue #63 Phase 2b (PR #237 gemini finding): a promotion run with a RELATIVE ``--memory-dir``
+    stores a relative ``promoted_to.target``. The containment check must resolve a relative target
+    against ``memory_dir``, NOT the process CWD — otherwise a legitimate unpromote run from a
+    different working directory (e.g. the repo root) false-positives into ``OSError`` and the action
+    never completes. Resolving relative-to-``memory_dir`` keeps the security property intact: only
+    the basename is ever unlinked, and a relative ``..`` traversal still escapes ``memory_dir`` and
+    raises (covered separately)."""
+
+    def test_relative_target_resolved_against_memory_dir_not_cwd(self, tmp_path):
+        from scripts.core.memory_apply import _unpromote_one_row
+        from scripts.core.memory_review import PromotedRow
+
+        memory_dir = tmp_path / "mem"
+        memory_dir.mkdir()
+        target_file = memory_dir / "promoted-foo.md"
+        target_file.write_text("body")
+        memory_md = memory_dir / "MEMORY.md"
+        memory_md.write_text("# Index\n- [Foo](promoted-foo.md) — promoted, recalled 5×\n")
+
+        # target stored as a BARE RELATIVE basename, as a relative --memory-dir promote writes it.
+        # pytest's CWD is the repo root (!= memory_dir), so the pre-fix CWD-relative resolve
+        # mismatches `resolved` and raises a false-positive OSError.
+        action = UnpromoteAction(
+            row=PromotedRow(
+                id="a", content="c", recall_count=5, learning_type="CODEBASE_PATTERN",
+                tier="MEMORY.md", target="promoted-foo.md",
+            ),
+            tier="MEMORY.md",
+            target="promoted-foo.md",
+            two_artifact=True,
+            skipped=False,
+            skip_reason=None,
+        )
+
+        # Must NOT raise: the relative target is resolved against memory_dir and removed.
+        _unpromote_one_row(action, memory_dir, tmp_path / "CLAUDE.md")
+
+        assert not target_file.exists()
+        assert "(promoted-foo.md)" not in memory_md.read_text()
+
+    def test_relative_traversal_target_still_raises(self, tmp_path):
+        """A RELATIVE target that escapes memory_dir via .. must still be refused (security)."""
+        from scripts.core.memory_apply import _unpromote_one_row
+        from scripts.core.memory_review import PromotedRow
+
+        memory_dir = tmp_path / "mem"
+        memory_dir.mkdir()
+        outside = tmp_path / "evil.md"
+        outside.write_text("secret")
+
+        action = UnpromoteAction(
+            row=PromotedRow(
+                id="a", content="c", recall_count=5, learning_type="CODEBASE_PATTERN",
+                tier="MEMORY.md", target="../evil.md",
+            ),
+            tier="MEMORY.md",
+            target="../evil.md",
+            two_artifact=True,
+            skipped=False,
+            skip_reason=None,
+        )
+
+        with pytest.raises(OSError):
+            _unpromote_one_row(action, memory_dir, tmp_path / "CLAUDE.md")
+        assert outside.exists(), "a relative ..-traversal target must never be unlinked"
+
+
+class TestRunUnpromote:
+    """The W-2 ordering invariant. Two-artifact: delete promoted-<slug>.md FIRST, THEN splice
+    the MEMORY.md index line, THEN clear promoted_to. Single-artifact: remove the CLAUDE.md
+    block FIRST, then clear. A clear is a guarded UPDATE; 0-row -> skip, never raise."""
+
+    def _setup(self, tmp_path):
+        memory_dir = tmp_path / "mem"
+        memory_dir.mkdir()
+        claude_md = tmp_path / "CLAUDE.md"
+        backup_dir = tmp_path / "backups"
+        return memory_dir, claude_md, backup_dir
+
+    async def test_dry_run_writes_nothing_no_backup(self, tmp_path):
+        from scripts.core.memory_apply import run_unpromote
+
+        memory_dir, claude_md, backup_dir = self._setup(tmp_path)
+        slug_file = memory_dir / "promoted-x.md"
+        slug_file.write_text("body")
+        (memory_dir / "MEMORY.md").write_text("- [x](promoted-x.md) — promoted\n")
+        pool, conn = _pool()
+        conn.fetch.side_effect = [
+            [{"id": "a", "content": "c", "recall_count": 12,
+              "learning_type": "CODEBASE_PATTERN",
+              "promoted_tier": "MEMORY.md", "promoted_target": str(slug_file)}]
+        ]
+        backup_called = False
+
+        def _run(*a, **k):
+            nonlocal backup_called
+            backup_called = True
+            return MagicMock(returncode=0)
+
+        result = await run_unpromote(
+            pool, "opc", ["a"], execute=False, memory_dir=memory_dir,
+            claude_md_path=claude_md, backup_dir=backup_dir, timestamp="ts", run=_run,
+        )
+        assert result.plan.dry_run is True
+        assert backup_called is False
+        assert slug_file.exists()  # nothing deleted in dry-run
+        conn.execute.assert_not_called()
+
+    async def test_two_artifact_order_file_then_index_then_clear(self, tmp_path):
+        from scripts.core.memory_apply import run_unpromote
+
+        memory_dir, claude_md, backup_dir = self._setup(tmp_path)
+        slug_file = memory_dir / "promoted-x.md"
+        slug_file.write_text("body")
+        memory_md = memory_dir / "MEMORY.md"
+        memory_md.write_text("# Index\n- [x](promoted-x.md) — promoted\n")
+        pool, conn = _pool()
+        conn.fetch.side_effect = [
+            [{"id": "a", "content": "c", "recall_count": 12,
+              "learning_type": "CODEBASE_PATTERN",
+              "promoted_tier": "MEMORY.md", "promoted_target": str(slug_file)}]
+        ]
+        order = []
+
+        def _run(cmd, **kw):
+            order.append("backup")
+            Path(kw["stdout"].name).write_text("-- dump")
+            return MagicMock(returncode=0)
+
+        async def _exec(*a, **k):
+            # the DB clear must come AFTER the file is gone and the index line spliced
+            order.append("clear")
+            assert not slug_file.exists(), "file must be deleted before DB clear"
+            assert "promoted-x.md" not in memory_md.read_text(), "index spliced before clear"
+            return "UPDATE 1"
+
+        conn.execute = _exec
+        result = await run_unpromote(
+            pool, "opc", ["a"], execute=True, memory_dir=memory_dir,
+            claude_md_path=claude_md, backup_dir=backup_dir, timestamp="ts", run=_run,
+        )
+        assert order[0] == "backup"
+        assert "clear" in order
+        assert not slug_file.exists()
+        assert "promoted-x.md" not in memory_md.read_text()
+        assert result.applied == ["a"]
+
+    async def test_two_artifact_partial_failure_does_not_clear(self, tmp_path, monkeypatch):
+        # W-2: index-line removal fails AFTER the file delete -> promoted_to is NOT cleared,
+        # so the action is re-runnable (the file is gone but the DB still points at it).
+        import scripts.core.memory_apply as ma
+        from scripts.core.memory_apply import run_unpromote
+
+        memory_dir, claude_md, backup_dir = self._setup(tmp_path)
+        slug_file = memory_dir / "promoted-x.md"
+        slug_file.write_text("body")
+        memory_md = memory_dir / "MEMORY.md"
+        memory_md.write_text("# Index\n- [x](promoted-x.md) — promoted\n")
+        pool, conn = _pool()
+        conn.fetch.side_effect = [
+            [{"id": "a", "content": "c", "recall_count": 12,
+              "learning_type": "CODEBASE_PATTERN",
+              "promoted_tier": "MEMORY.md", "promoted_target": str(slug_file)}]
+        ]
+        cleared = False
+
+        async def _exec(*a, **k):
+            nonlocal cleared
+            cleared = True
+            return "UPDATE 1"
+
+        conn.execute = _exec
+
+        def _run(cmd, **kw):
+            Path(kw["stdout"].name).write_text("-- dump")
+            return MagicMock(returncode=0)
+
+        def _boom(*a, **k):
+            raise OSError("disk full splicing index")
+
+        monkeypatch.setattr(ma, "remove_line_by_marker", _boom)
+        result = await run_unpromote(
+            pool, "opc", ["a"], execute=True, memory_dir=memory_dir,
+            claude_md_path=claude_md, backup_dir=backup_dir, timestamp="ts", run=_run,
+        )
+        # The file delete happened (stage 1), but the index splice failed (stage 2),
+        # so the DB clear (stage 3) must NOT have run.
+        assert cleared is False, "promoted_to must not be cleared when index splice fails"
+        assert "a" not in result.applied
+        assert result.failed and result.failed[0][0] == "a"
+
+    async def test_out_of_root_target_not_deleted_and_not_cleared(self, tmp_path):
+        # Finding 3: a stale/corrupt/cross-worktree ABSOLUTE promoted_to.target that
+        # resolves OUTSIDE the active memory_dir must NOT be unlinked. The action lands in
+        # `failed` and promoted_to is NOT cleared, so it stays re-runnable (no data loss).
+        from scripts.core.memory_apply import run_unpromote
+
+        memory_dir, claude_md, backup_dir = self._setup(tmp_path)
+        (memory_dir / "MEMORY.md").write_text("# Index\n")
+        # A file OUTSIDE memory_dir that the DB target points at (e.g. a stale worktree path).
+        outside = tmp_path / "outside-promoted-x.md"
+        outside.write_text("DO NOT DELETE ME")
+        pool, conn = _pool()
+        conn.fetch.side_effect = [
+            [{"id": "a", "content": "c", "recall_count": 12,
+              "learning_type": "CODEBASE_PATTERN",
+              "promoted_tier": "MEMORY.md", "promoted_target": str(outside)}]
+        ]
+        cleared = False
+
+        async def _exec(*a, **k):
+            nonlocal cleared
+            cleared = True
+            return "UPDATE 1"
+
+        conn.execute = _exec
+
+        def _run(cmd, **kw):
+            Path(kw["stdout"].name).write_text("-- dump")
+            return MagicMock(returncode=0)
+
+        result = await run_unpromote(
+            pool, "opc", ["a"], execute=True, memory_dir=memory_dir,
+            claude_md_path=claude_md, backup_dir=backup_dir, timestamp="ts", run=_run,
+        )
+        assert outside.exists(), "an out-of-root target must never be unlinked"
+        assert outside.read_text() == "DO NOT DELETE ME"
+        assert cleared is False, "promoted_to must not be cleared for an out-of-root target"
+        assert "a" not in result.applied
+        assert result.failed and result.failed[0][0] == "a"
+
+    async def test_single_artifact_removes_block_then_clears(self, tmp_path):
+        from scripts.core.memory_apply import claude_md_block, claude_md_marker, run_unpromote
+        from scripts.core.memory_review import PromotionCandidate
+
+        memory_dir, claude_md, backup_dir = self._setup(tmp_path)
+        cand = PromotionCandidate(
+            id="a", content="Decide X", recall_count=12,
+            learning_type="ARCHITECTURAL_DECISION", destination="CLAUDE.md",
+        )
+        marker = claude_md_marker(cand)
+        claude_md.write_text("# Project\n## Promoted Decisions\n" + claude_md_block(cand) + "\n")
+        pool, conn = _pool()
+        conn.fetch.side_effect = [
+            [{"id": "a", "content": "Decide X", "recall_count": 12,
+              "learning_type": "ARCHITECTURAL_DECISION",
+              "promoted_tier": "CLAUDE.md", "promoted_target": str(claude_md)}]
+        ]
+        order = []
+
+        def _run(cmd, **kw):
+            order.append("backup")
+            Path(kw["stdout"].name).write_text("-- dump")
+            return MagicMock(returncode=0)
+
+        async def _exec(*a, **k):
+            order.append("clear")
+            assert marker not in claude_md.read_text(), "block spliced before DB clear"
+            return "UPDATE 1"
+
+        conn.execute = _exec
+        result = await run_unpromote(
+            pool, "opc", ["a"], execute=True, memory_dir=memory_dir,
+            claude_md_path=claude_md, backup_dir=backup_dir, timestamp="ts", run=_run,
+        )
+        assert order[0] == "backup"
+        assert marker not in claude_md.read_text()
+        assert result.applied == ["a"]
+
+    async def test_idempotent_already_unpromoted_no_raise_no_write(self, tmp_path):
+        # No promoted_to row resolves -> plan has nothing applicable; files already absent.
+        from scripts.core.memory_apply import run_unpromote
+
+        memory_dir, claude_md, backup_dir = self._setup(tmp_path)
+        (memory_dir / "MEMORY.md").write_text("# Index\n")
+        pool, conn = _pool()
+        conn.fetch.side_effect = [[]]  # fetch_promoted_rows returns nothing
+        backup_called = False
+
+        def _run(*a, **k):
+            nonlocal backup_called
+            backup_called = True
+            return MagicMock(returncode=0)
+
+        result = await run_unpromote(
+            pool, "opc", ["a"], execute=True, memory_dir=memory_dir,
+            claude_md_path=claude_md, backup_dir=backup_dir, timestamp="ts", run=_run,
+        )
+        assert result.applied == []
+        assert backup_called is False  # nothing applicable -> no backup, no write
+        conn.execute.assert_not_called()
+
+    async def test_clear_zero_row_reports_skip_not_raise(self, tmp_path):
+        # Stages 1-2 succeed but the guarded clear matches 0 rows (concurrent clear) ->
+        # reported as skipped, never raised.
+        from scripts.core.memory_apply import run_unpromote
+
+        memory_dir, claude_md, backup_dir = self._setup(tmp_path)
+        slug_file = memory_dir / "promoted-x.md"
+        slug_file.write_text("body")
+        (memory_dir / "MEMORY.md").write_text("- [x](promoted-x.md) — promoted\n")
+        pool, conn = _pool()
+        conn.fetch.side_effect = [
+            [{"id": "a", "content": "c", "recall_count": 12,
+              "learning_type": "CODEBASE_PATTERN",
+              "promoted_tier": "MEMORY.md", "promoted_target": str(slug_file)}]
+        ]
+        conn.execute = AsyncMock(return_value="UPDATE 0")
+
+        def _run(cmd, **kw):
+            Path(kw["stdout"].name).write_text("-- dump")
+            return MagicMock(returncode=0)
+
+        result = await run_unpromote(
+            pool, "opc", ["a"], execute=True, memory_dir=memory_dir,
+            claude_md_path=claude_md, backup_dir=backup_dir, timestamp="ts", run=_run,
+        )
+        assert result.applied == []
+        assert "a" in [s[0] for s in result.skipped]
+        assert not slug_file.exists()  # stages 1-2 still ran
+
+    async def test_backup_taken_before_any_removal(self, tmp_path, monkeypatch):
+        import scripts.core.memory_apply as ma
+        from scripts.core.memory_apply import run_unpromote
+
+        memory_dir, claude_md, backup_dir = self._setup(tmp_path)
+        slug_file = memory_dir / "promoted-x.md"
+        slug_file.write_text("body")
+        (memory_dir / "MEMORY.md").write_text("- [x](promoted-x.md) — promoted\n")
+        pool, conn = _pool()
+        conn.fetch.side_effect = [
+            [{"id": "a", "content": "c", "recall_count": 12,
+              "learning_type": "CODEBASE_PATTERN",
+              "promoted_tier": "MEMORY.md", "promoted_target": str(slug_file)}]
+        ]
+        order = []
+
+        def _backup(dest, **kw):
+            order.append("backup")
+            assert slug_file.exists(), "backup must precede any file removal"
+            Path(dest).parent.mkdir(parents=True, exist_ok=True)
+            Path(dest).write_text("-- dump")
+            return Path(dest)
+
+        async def _exec(*a, **k):
+            return "UPDATE 1"
+
+        conn.execute = _exec
+        monkeypatch.setattr(ma, "backup_database", _backup)
+        await run_unpromote(
+            pool, "opc", ["a"], execute=True, memory_dir=memory_dir,
+            claude_md_path=claude_md, backup_dir=backup_dir, timestamp="ts", lock_dir=tmp_path,
+        )
+        assert order and order[0] == "backup"
+
+
+class TestUnpromoteCli:
+    def test_unpromote_flag_parses(self):
+        args = parse_apply_args(["opc", "--unpromote", "--ids", _UUID])
+        assert args.unpromote is True
+
+    async def test_mutually_exclusive_with_merge(self, monkeypatch):
+        import scripts.core.memory_apply as ma
+
+        monkeypatch.setattr(ma, "project_from_path", lambda _p: "opc")
+        rc = await ma.main(["opc", "--unpromote", "--merge", "--ids", _UUID])
+        assert rc == 2
+
+    async def test_mutually_exclusive_with_archive(self, monkeypatch):
+        import scripts.core.memory_apply as ma
+
+        monkeypatch.setattr(ma, "project_from_path", lambda _p: "opc")
+        rc = await ma.main(["opc", "--unpromote", "--archive", "--ids", _UUID])
+        assert rc == 2
+
+    async def test_dry_run_writes_nothing(self, tmp_path, monkeypatch):
+        import scripts.core.memory_apply as ma
+
+        pool, conn = _pool()
+        conn.fetch.side_effect = [[]]  # no promoted rows
+        backup_called = False
+
+        def _run(*a, **k):
+            nonlocal backup_called
+            backup_called = True
+            return MagicMock(returncode=0)
+
+        async def _get_pool():
+            return pool
+
+        monkeypatch.setattr(ma, "get_pool", _get_pool)
+        monkeypatch.setattr(ma, "project_from_path", lambda _p: "opc")
+        rc = await ma.main([
+            "opc", "--unpromote", "--ids", _UUID,
+            "--memory-dir", str(tmp_path / "m"), "--claude-md", str(tmp_path / "CLAUDE.md"),
+            "--backup-dir", str(tmp_path / "b"),
+        ])
+        assert rc == 0
+        assert backup_called is False
+        conn.execute.assert_not_called()
+
+    async def test_execute_backs_up_first(self, tmp_path, monkeypatch):
+        import scripts.core.memory_apply as ma
+
+        memory_dir = tmp_path / "m"
+        memory_dir.mkdir()
+        slug_file = memory_dir / "promoted-x.md"
+        slug_file.write_text("body")
+        (memory_dir / "MEMORY.md").write_text("- [x](promoted-x.md) — promoted\n")
+        pool, conn = _pool()
+        conn.fetch.side_effect = [
+            [{"id": _UUID, "content": "c", "recall_count": 12,
+              "learning_type": "CODEBASE_PATTERN",
+              "promoted_tier": "MEMORY.md", "promoted_target": str(slug_file)}]
+        ]
+        order = []
+
+        def _backup(dest, **kw):
+            order.append("backup")
+            Path(dest).parent.mkdir(parents=True, exist_ok=True)
+            Path(dest).write_text("-- dump")
+            return Path(dest)
+
+        async def _exec(*a, **k):
+            order.append("clear")
+            return "UPDATE 1"
+
+        conn.execute = _exec
+
+        async def _get_pool():
+            return pool
+
+        monkeypatch.setattr(ma, "get_pool", _get_pool)
+        monkeypatch.setattr(ma, "project_from_path", lambda _p: "opc")
+        monkeypatch.setattr(ma, "backup_database", _backup)
+        rc = await ma.main([
+            "opc", "--unpromote", "--ids", _UUID, "--execute",
+            "--memory-dir", str(memory_dir), "--claude-md", str(tmp_path / "CLAUDE.md"),
+            "--backup-dir", str(tmp_path / "b"),
+        ])
+        assert rc == 0
+        assert order and order[0] == "backup"
+        assert "clear" in order

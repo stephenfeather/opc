@@ -18,6 +18,7 @@ import asyncio
 import os
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 _repo_root = str(Path(__file__).resolve().parent.parent.parent)
@@ -86,6 +87,40 @@ class MergeCandidate:
     similarity: float
     preview_a: str
     preview_b: str
+
+
+@dataclass(frozen=True)
+class MergeRow:
+    """The keeper-selection signals for one side of a merge pair.
+
+    Distinct from ``MergeCandidate`` (which carries previews for the report): this is the
+    minimal row the apply path needs to pick a keeper — recall_count and created_at for the
+    tie-break, and ``superseded_by`` so an already-superseded side is refused before any write.
+    """
+
+    id: str
+    recall_count: int
+    created_at: datetime
+    superseded_by: str | None
+
+
+@dataclass(frozen=True)
+class PromotedRow:
+    """A row that currently carries a ``metadata.promoted_to`` marker (issue #63 Phase 2b
+    Step 4 — unpromote/repair).
+
+    Carries exactly what the unpromote apply needs to REVERSE a Phase-2a promotion: the
+    ``tier`` (MEMORY.md vs CLAUDE.md, which selects single- vs two-artifact removal) and the
+    exact ``target`` path that was tagged, plus content/recall so the artifact identity (the
+    CLAUDE.md exact-id marker, the MEMORY.md index line) can be reconstructed and spliced out.
+    """
+
+    id: str
+    content: str
+    recall_count: int
+    learning_type: str
+    tier: str | None
+    target: str | None
 
 
 @dataclass(frozen=True)
@@ -208,6 +243,7 @@ _PROMOTION_SQL = """
     FROM archival_memory
     WHERE LOWER(project) = LOWER($1)
       AND superseded_by IS NULL
+      AND archived_at IS NULL
       AND recall_count >= $2
       AND metadata->>'learning_type' = ANY($3::text[])
     ORDER BY recall_count DESC
@@ -236,6 +272,7 @@ _MERGE_SQL = """
         FROM archival_memory
         WHERE LOWER(project) = LOWER($1)
           AND superseded_by IS NULL
+          AND archived_at IS NULL
           AND embedding IS NOT NULL
           AND embedding_model = $5
     ),
@@ -256,6 +293,7 @@ _MERGE_SQL = """
             FROM archival_memory b
             WHERE LOWER(b.project) = LOWER($1)
               AND b.superseded_by IS NULL
+              AND b.archived_at IS NULL
               AND b.embedding IS NOT NULL
               AND b.embedding_model = $5
               AND b.id <> a.id
@@ -289,6 +327,7 @@ _MERGE_COVERAGE_SQL = """
         FROM archival_memory
         WHERE LOWER(project) = LOWER($1)
           AND superseded_by IS NULL
+          AND archived_at IS NULL
           AND embedding IS NOT NULL
     ),
     ranked AS (
@@ -307,7 +346,9 @@ _STALE_SQL = """
     WITH scoped AS (
         SELECT recall_count, created_at
         FROM archival_memory
-        WHERE LOWER(project) = LOWER($1) AND superseded_by IS NULL
+        WHERE LOWER(project) = LOWER($1)
+          AND superseded_by IS NULL
+          AND archived_at IS NULL
     )
     SELECT bucket AS staleness_bucket, COUNT(*) AS learnings
     FROM (
@@ -331,6 +372,7 @@ _STALE_OPEN_THREAD_SQL = """
     FROM archival_memory
     WHERE LOWER(project) = LOWER($1)
       AND superseded_by IS NULL
+      AND archived_at IS NULL
       AND metadata->>'learning_type' = 'OPEN_THREAD'
       AND recall_count = 0
       AND created_at < NOW() - make_interval(days => $2)
@@ -339,13 +381,128 @@ _STALE_OPEN_THREAD_SQL = """
 _ACTIVE_TOTAL_SQL = """
     SELECT COUNT(*)
     FROM archival_memory
-    WHERE LOWER(project) = LOWER($1) AND superseded_by IS NULL
+    WHERE LOWER(project) = LOWER($1)
+      AND superseded_by IS NULL
+      AND archived_at IS NULL
+"""
+
+# Resolve both ids of a merge pair in ONE round-trip (plan note N-1: never per-id fetches).
+# Carries the keeper-selection signals only (recall_count, created_at) plus superseded_by so
+# the apply path can refuse a pair whose side is already superseded. Mirrors
+# _CANDIDATES_BY_IDS_SQL (id = ANY, project-scoped) but does NOT filter superseded_by here —
+# the apply path needs to SEE an already-superseded side to refuse/skip it, not have it hidden.
+_MERGE_PAIR_DETAILS_SQL = """
+    SELECT id::text AS id,
+           recall_count,
+           created_at,
+           superseded_by::text AS superseded_by
+    FROM archival_memory
+    WHERE LOWER(project) = LOWER($1)
+      AND id::text = ANY($2::text[])
+"""
+
+
+# Stale-archive eligibility (issue #63 Phase 2b Step 3): the ids the >60d stale
+# bucket counts — never recalled, older than 60 days, AND active (not superseded,
+# not already archived). Same predicate as the '>60d old' arm of _STALE_SQL so
+# the archive apply retires exactly the rows the review reported as stale. READ-ONLY.
+_STALE_IDS_SQL = """
+    SELECT id::text AS id
+    FROM archival_memory
+    WHERE LOWER(project) = LOWER($1)
+      AND superseded_by IS NULL
+      AND archived_at IS NULL
+      AND recall_count = 0
+      AND created_at < NOW() - INTERVAL '60 days'
+    ORDER BY created_at ASC
+"""
+
+
+# Promoted-row resolution (issue #63 Phase 2b Step 4): resolve approved ids to the rows that
+# STILL carry the metadata.promoted_to marker written by the Phase-2a promote path. The marker
+# is a structured object {tier, target, at}; tier selects single- vs two-artifact removal and
+# target is the exact file path that was tagged. Project- AND id-scoped (mirrors
+# _MERGE_PAIR_DETAILS_SQL's id = ANY); the `metadata ? 'promoted_to'` guard means a row whose
+# tag was already cleared is simply absent (the apply path treats absence as already-undone).
+# Does NOT filter superseded_by/archived_at — an unpromote may need to undo a promotion on a
+# row that was later superseded/archived, so the apply path must still SEE it. READ-ONLY.
+_PROMOTED_ROWS_SQL = """
+    SELECT id::text AS id,
+           content,
+           recall_count,
+           metadata->>'learning_type' AS learning_type,
+           metadata->'promoted_to'->>'tier' AS promoted_tier,
+           metadata->'promoted_to'->>'target' AS promoted_target
+    FROM archival_memory
+    WHERE LOWER(project) = LOWER($1)
+      AND id::text = ANY($2::text[])
+      AND metadata ? 'promoted_to'
 """
 
 
 async def fetch_active_total(pool, project: str) -> int:
     async with pool.acquire() as conn:
         return int(await conn.fetchval(_ACTIVE_TOTAL_SQL, project) or 0)
+
+
+async def fetch_stale_ids(pool, project: str) -> list[str]:
+    """Return the ids eligible for stale archival (READ-ONLY).
+
+    Mirrors the '>60d old, never recalled' stale bucket predicate exactly: active
+    (``superseded_by IS NULL AND archived_at IS NULL``), ``recall_count = 0``, and
+    ``created_at`` older than 60 days. This module never writes — the archive apply
+    (memory_apply.run_stale_archive) consumes these ids behind the dry-run/backup
+    safety envelope.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(_STALE_IDS_SQL, project)
+    return [r["id"] for r in rows]
+
+
+async def fetch_promoted_rows(pool, project: str, ids: list[str]) -> list[PromotedRow]:
+    """Resolve approved ids to the rows that STILL carry ``metadata.promoted_to`` (READ-ONLY).
+
+    Returns only rows whose Phase-2a promotion tag is present, so the unpromote apply
+    (memory_apply.run_unpromote) knows the exact tier/target it must reverse. An id whose tag
+    was already cleared (re-run / concurrent unpromote) is simply absent — the apply path
+    treats absence as already-undone. This module never writes.
+    """
+    if not ids:
+        return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(_PROMOTED_ROWS_SQL, project, list(ids))
+    return [
+        PromotedRow(
+            id=r["id"],
+            content=r["content"],
+            recall_count=int(r["recall_count"]),
+            learning_type=r["learning_type"],
+            tier=r["promoted_tier"],
+            target=r["promoted_target"],
+        )
+        for r in rows
+    ]
+
+
+async def fetch_merge_pair_details(pool, project: str, id_a: str, id_b: str) -> dict[str, MergeRow]:
+    """Resolve a merge pair's two ids to ``MergeRow``s in one batched, project-scoped query.
+
+    Returns a dict keyed by id::text so a caller can index either side; an id that does not
+    resolve (hard-deleted / wrong project) is simply absent from the dict. Read-only — this
+    module never writes. The apply path consumes these rows to pick a keeper and to refuse a
+    pair whose side is already superseded.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(_MERGE_PAIR_DETAILS_SQL, project, [id_a, id_b])
+    return {
+        r["id"]: MergeRow(
+            id=r["id"],
+            recall_count=int(r["recall_count"]),
+            created_at=r["created_at"],
+            superseded_by=r["superseded_by"],
+        )
+        for r in rows
+    }
 
 
 async def fetch_promotion_candidates(

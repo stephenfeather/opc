@@ -36,6 +36,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 _repo_root = str(Path(__file__).resolve().parent.parent.parent)
 if _repo_root not in sys.path:
@@ -43,8 +44,16 @@ if _repo_root not in sys.path:
 
 from asyncpg.exceptions import PostgresError  # noqa: E402
 
+from scripts.core.db.memory_service_pg import supersede_row  # noqa: E402
 from scripts.core.db.postgres_pool import close_pool, get_pool  # noqa: E402
-from scripts.core.memory_review import PromotionCandidate, route_destination  # noqa: E402
+from scripts.core.memory_review import (  # noqa: E402
+    MergeRow,
+    PromotedRow,
+    PromotionCandidate,
+    fetch_merge_pair_details,
+    fetch_promoted_rows,
+    route_destination,
+)
 from scripts.core.project_naming import canonicalize_project, project_from_path  # noqa: E402
 
 # pg_dump backup target. The container is `opc-postgres` (matches docker-compose.yml's
@@ -90,6 +99,65 @@ class ApplyPlan:
         return [a for a in self.actions if not a.skipped]
 
 
+@dataclass(frozen=True)
+class MergeAction:
+    """One planned merge-supersede: keeper_id supersedes loser_id, or a skip with a reason."""
+
+    id_a: str
+    id_b: str
+    keeper_id: str | None
+    loser_id: str | None
+    skipped: bool
+    skip_reason: str | None
+
+
+@dataclass(frozen=True)
+class MergeApplyPlan:
+    actions: list[MergeAction] = field(default_factory=list)
+    dry_run: bool = True
+
+    @property
+    def applicable(self) -> list[MergeAction]:
+        return [a for a in self.actions if not a.skipped]
+
+
+@dataclass(frozen=True)
+class UnpromoteAction:
+    """One planned unpromote: reverse the Phase-2a promotion of ``row``, or a skip with a reason.
+
+    ``two_artifact`` distinguishes a MEMORY.md promotion (a ``promoted-<slug>.md`` file AND a
+    MEMORY.md index line — both must be removed) from a CLAUDE.md promotion (one in-file block).
+    ``tier``/``target`` echo the ``promoted_to`` marker the apply path reverses.
+    """
+
+    row: PromotedRow
+    tier: str | None
+    target: str | None
+    two_artifact: bool
+    skipped: bool
+    skip_reason: str | None
+
+
+@dataclass(frozen=True)
+class UnpromotePlan:
+    actions: list[UnpromoteAction] = field(default_factory=list)
+    dry_run: bool = True
+
+    @property
+    def applicable(self) -> list[UnpromoteAction]:
+        return [a for a in self.actions if not a.skipped]
+
+
+# Tiers an unpromote can reverse, mapped to whether the promotion wrote two artifacts.
+# Mirrors the Phase-2a _APPLY_ROUTING targets: CODEBASE_PATTERN -> MEMORY.md (file + index),
+# ARCHITECTURAL_DECISION -> CLAUDE.md (single in-file block). A tier outside this map (a future
+# target, or a row whose marker is missing) is surfaced as a skip rather than mis-reversed.
+_UNPROMOTE_TWO_ARTIFACT: dict[str, bool] = {
+    "MEMORY.md": True,
+    "CLAUDE.md": False,
+}
+
+
 # --- Pure functions --------------------------------------------------------
 
 
@@ -130,6 +198,112 @@ def build_plan(
             continue
         actions.append(ApplyAction(c, target, skipped=False, skip_reason=None))
     return ApplyPlan(actions=actions, dry_run=dry_run)
+
+
+class MergeKeeperError(ValueError):
+    """Raised when a merge pair has no safe keeper (a side is already superseded).
+
+    Selection is undefined once either side has been superseded — superseding the loser onto
+    a dead keeper would orphan it, and superseding an already-dead loser is a clobber. The
+    apply path treats this as a skip-with-reason, not a crash.
+    """
+
+
+def select_merge_keeper(row_a: MergeRow, row_b: MergeRow) -> tuple[MergeRow, MergeRow]:
+    """Pure: pick (keeper, loser) for a merge pair. No I/O, no mutation.
+
+    Tie-break order, most-significant first:
+      1. higher ``recall_count`` keeps (it is the more-used entry),
+      2. tie -> older ``created_at`` keeps (the original; the later one is the duplicate),
+      3. tie -> smaller ``id`` keeps (stable, deterministic across runs).
+
+    Raises ``MergeKeeperError`` if EITHER side is already superseded — there is no safe keeper.
+    """
+    if row_a.superseded_by is not None or row_b.superseded_by is not None:
+        raise MergeKeeperError(
+            f"cannot select a merge keeper: a side is already superseded "
+            f"({row_a.id} superseded_by={row_a.superseded_by!r}, "
+            f"{row_b.id} superseded_by={row_b.superseded_by!r})"
+        )
+    # Sort key returns the KEEPER as the minimum: negate recall (higher first), then
+    # created_at ascending (older first), then id ascending (smaller first).
+    keeper, loser = sorted((row_a, row_b), key=lambda r: (-r.recall_count, r.created_at, r.id))
+    return keeper, loser
+
+
+def build_merge_plan(
+    pairs: list[tuple[str, str]],
+    rows_by_id: dict[str, MergeRow],
+    dry_run: bool,
+) -> MergeApplyPlan:
+    """Pure: turn (id_a, id_b) pairs + resolved rows into keeper/loser merge actions.
+
+    A pair is skipped (never raises out of planning) when a side does not resolve, or when
+    ``select_merge_keeper`` refuses because a side is already superseded. The actual
+    supersede UPDATE — and its idempotent 0-row handling — happens in ``run_merge_apply``.
+    """
+    actions: list[MergeAction] = []
+    for id_a, id_b in pairs:
+        row_a = rows_by_id.get(id_a)
+        row_b = rows_by_id.get(id_b)
+        if row_a is None or row_b is None:
+            missing = [i for i, r in ((id_a, row_a), (id_b, row_b)) if r is None]
+            actions.append(
+                MergeAction(
+                    id_a,
+                    id_b,
+                    None,
+                    None,
+                    skipped=True,
+                    skip_reason=f"id(s) not a current learning: {', '.join(missing)}",
+                )
+            )
+            continue
+        try:
+            keeper, loser = select_merge_keeper(row_a, row_b)
+        except MergeKeeperError as exc:
+            actions.append(MergeAction(id_a, id_b, None, None, skipped=True, skip_reason=str(exc)))
+            continue
+        actions.append(
+            MergeAction(id_a, id_b, keeper.id, loser.id, skipped=False, skip_reason=None)
+        )
+    return MergeApplyPlan(actions=actions, dry_run=dry_run)
+
+
+def build_unpromote_plan(rows: list[PromotedRow], dry_run: bool) -> UnpromotePlan:
+    """Pure: map promoted rows -> unpromote actions. No I/O.
+
+    A row whose ``promoted_to`` marker is absent (tier is None — the tag was already cleared)
+    is skipped as already-undone. A row whose tier is not a reversible target (rules/, a future
+    tier) is skipped rather than mis-reversed. Otherwise the action records whether the
+    promotion wrote two artifacts (MEMORY.md file + index line) or one (CLAUDE.md block); the
+    actual file removal + guarded clear happens in ``run_unpromote``.
+    """
+    actions: list[UnpromoteAction] = []
+    for row in rows:
+        if row.tier is None:
+            actions.append(
+                UnpromoteAction(
+                    row, None, None, False,
+                    skipped=True, skip_reason="already unpromoted (no promoted_to marker)",
+                )
+            )
+            continue
+        if row.tier not in _UNPROMOTE_TWO_ARTIFACT:
+            actions.append(
+                UnpromoteAction(
+                    row, row.tier, row.target, False,
+                    skipped=True, skip_reason=f"unreversible tier {row.tier!r}",
+                )
+            )
+            continue
+        actions.append(
+            UnpromoteAction(
+                row, row.tier, row.target, _UNPROMOTE_TWO_ARTIFACT[row.tier],
+                skipped=False, skip_reason=None,
+            )
+        )
+    return UnpromotePlan(actions=actions, dry_run=dry_run)
 
 
 def _short(text: str, width: int = 80) -> str:
@@ -204,9 +378,18 @@ def memory_index_line(candidate: PromotionCandidate, filename: str) -> str:
     return f"- [{title}]({filename}) — promoted, recalled {candidate.recall_count}×"
 
 
+def claude_md_marker_for_id(learning_id: str) -> str:
+    """Exact, structured CLAUDE.md idempotency marker for a learning id (no substring traps).
+
+    The single source of truth for the marker shape, so the unpromote path matches EXACTLY the
+    string the promote path wrote.
+    """
+    return f"<!-- promoted_from_archival_memory: {learning_id} -->"
+
+
 def claude_md_marker(candidate: PromotionCandidate) -> str:
     """Exact, structured idempotency marker carrying the FULL learning id (no substring traps)."""
-    return f"<!-- promoted_from_archival_memory: {candidate.id} -->"
+    return claude_md_marker_for_id(candidate.id)
 
 
 def claude_md_block(candidate: PromotionCandidate) -> str:
@@ -242,6 +425,7 @@ _PROVENANCE_SQL = """
     WHERE id = $1::uuid
       AND LOWER(project) = LOWER($5)
       AND superseded_by IS NULL
+      AND archived_at IS NULL
 """
 
 
@@ -279,8 +463,95 @@ _CANDIDATES_BY_IDS_SQL = """
     FROM archival_memory
     WHERE LOWER(project) = LOWER($1)
       AND superseded_by IS NULL
+      AND archived_at IS NULL
       AND id::text = ANY($2::text[])
 """
+
+
+# Stale-archive UPDATE (issue #63 Phase 2b Step 3). ONE statement (mirrors
+# supersede_row's single-statement discipline): the COLUMN archived_at drives
+# query exclusion; the superseded_via MARKER drives provenance/undo symmetry.
+# Unlike a merge, a stale row has no survivor, so by=null and reason="stale".
+# Guards (all in this one statement):
+#   * `LOWER(project) = LOWER($2)` — a caller-supplied id is matched per project, so a
+#     globally-unique UUID from ANOTHER project cannot be archived here (mirrors
+#     clear_promoted_marker's project scoping).
+#   * `superseded_by IS NULL` — never stamp `reason="stale"` over a row whose real
+#     provenance is a concurrent merge/store supersede (don't clobber the survivor link).
+#   * `archived_at IS NULL` — a concurrent archive collapses to a 0-row no-op (idempotent).
+# `at` reuses the same NOW() as archived_at.
+_ARCHIVE_ROW_SQL = """
+    UPDATE archival_memory
+    SET archived_at = NOW(),
+        metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+            'superseded_via',
+            jsonb_build_object(
+                'by', NULL,
+                'reason', 'stale',
+                'at', NOW()
+            )
+        )
+    WHERE id = $1::uuid
+      AND LOWER(project) = LOWER($2)
+      AND superseded_by IS NULL
+      AND archived_at IS NULL
+"""
+
+
+def _parse_archive_count(status: str) -> int:
+    """Parse asyncpg's ``"UPDATE N"`` command tag into the row count (0 on any
+    unparseable tag), mirroring memory_service_pg._parse_update_count."""
+    try:
+        return int(status.split()[-1])
+    except (ValueError, IndexError, AttributeError):
+        return 0
+
+
+async def archive_row(conn: Any, *, learning_id: str, project: str) -> int:
+    """Stale-archive ``learning_id`` in one guarded UPDATE. Returns the row count.
+
+    Sets ``archived_at = NOW()`` and stamps the ``superseded_via`` marker
+    ``{"by": null, "reason": "stale", "at": <ts>}`` for audit/undo symmetry. The
+    column drives recall exclusion; the marker drives provenance. The single guarded
+    UPDATE rejects three cases as a 0-row no-op (idempotent, never a raise):
+    ``archived_at IS NULL`` (already archived), ``superseded_by IS NULL`` (a row
+    concurrently retired by merge/store — its real provenance must not be clobbered
+    with ``reason="stale"``), and ``LOWER(project) = LOWER($2)`` (a globally-unique
+    UUID from another project cannot be archived here). Does NOT catch
+    UndefinedColumnError — on a pre-migration schema it propagates so the caller owns
+    the compat policy.
+    """
+    status = await conn.execute(_ARCHIVE_ROW_SQL, learning_id, project)
+    return _parse_archive_count(status)
+
+
+# Unpromote clear (issue #63 Phase 2b Step 4): the INVERSE of _PROVENANCE_SQL. ONE guarded
+# UPDATE that removes ONLY the promoted_to key (`metadata - 'promoted_to'`); it deliberately
+# does NOT touch superseded_via or any other key. Guarded by `metadata ? 'promoted_to'` so a
+# row whose tag was already cleared (re-run / concurrent unpromote) collapses to a 0-row no-op
+# rather than re-stamping. Project-scoped so a stray id can't clear another project's row. This
+# is stage 3 of the W-2 ordering — it runs only AFTER the file artifact(s) are removed, so the
+# DB tag never outlives the artifacts it points at.
+_CLEAR_PROMOTED_SQL = """
+    UPDATE archival_memory
+    SET metadata = metadata - 'promoted_to'
+    WHERE id = $1::uuid
+      AND LOWER(project) = LOWER($2)
+      AND metadata ? 'promoted_to'
+"""
+
+
+async def clear_promoted_marker(conn: Any, *, learning_id: str, project: str) -> int:
+    """Clear ``metadata.promoted_to`` on a row in one guarded UPDATE. Returns the row count.
+
+    The inverse of ``write_provenance``: removes ONLY the ``promoted_to`` key (never touches
+    ``superseded_via`` etc.). Guarded by ``metadata ? 'promoted_to'`` so re-clearing an
+    already-cleared row is a 0-row no-op (idempotent), never a raise — the caller owns the
+    skip/report policy. This is the final stage of an unpromote, run only after every file
+    artifact has been removed, so a partial failure never strands a cleared tag.
+    """
+    status = await conn.execute(_CLEAR_PROMOTED_SQL, learning_id, project)
+    return _parse_archive_count(status)
 
 
 async def fetch_candidates_by_ids(pool, project: str, ids: list[str]) -> list[PromotionCandidate]:
@@ -333,6 +604,47 @@ def _append_line_if_absent(path: Path, line: str) -> bool:
     base = existing if existing.endswith("\n") or not existing else existing + "\n"
     _atomic_write(path, base + line + "\n")
     return True
+
+
+def remove_line_by_marker(path: Path, marker: str) -> bool:
+    """Splice out every line of ``path`` containing ``marker`` (atomic rewrite).
+
+    Returns True if any line was removed. A missing file or an absent marker is a no-op
+    (returns False) — the inverse of ``_append_line_if_absent``, so an unpromote re-run after a
+    partial failure (line already gone) simply continues. Used to remove a MEMORY.md index line
+    by the promoted file's name (the exact ``(promoted-<slug>.md)`` reference).
+    """
+    if not path.exists():
+        return False
+    lines = path.read_text().splitlines(keepends=True)
+    kept = [ln for ln in lines if marker not in ln]
+    if len(kept) == len(lines):
+        return False
+    _atomic_write(path, "".join(kept))
+    return True
+
+
+def remove_file_if_present(path: Path) -> bool:
+    """Delete ``path`` if it exists. Returns True if a file was removed, False if already absent.
+
+    Stage 1 of a two-artifact unpromote. Idempotent: a re-run after a partial failure (file
+    already deleted) is a no-op, so the reversal completes the remaining stages.
+    """
+    if not path.exists():
+        return False
+    path.unlink()
+    return True
+
+
+def remove_block_by_marker(path: Path, marker: str) -> bool:
+    """Remove the single CLAUDE.md block line carrying ``marker`` (the exact full-id marker).
+
+    The promote path appends ONE line ending in the exact ``<!-- promoted_from_archival_memory:
+    <id> -->`` marker; unpromote removes exactly that line by its full-id marker (never an
+    8-char substring), so unrelated text can't be spliced. Missing file / absent marker -> a
+    no-op (returns False), so a re-run after a partial failure resumes cleanly.
+    """
+    return remove_line_by_marker(path, marker)
 
 
 def backup_database(dest: Path, *, run=subprocess.run) -> Path:
@@ -540,6 +852,270 @@ async def run_apply(
     return ApplyResult(plan=plan, applied=applied, backup_path=backup_path, failed=failed)
 
 
+@dataclass(frozen=True)
+class MergeApplyResult:
+    plan: MergeApplyPlan
+    applied: list[str] = field(default_factory=list)  # loser ids actually superseded
+    skipped: list[tuple[str, str, str]] = field(default_factory=list)  # (id_a, id_b, reason)
+    backup_path: Path | None = None
+
+
+async def run_merge_apply(
+    pool,
+    project: str,
+    pairs: list[tuple[str, str]],
+    *,
+    execute: bool,
+    backup_dir: Path,
+    timestamp: str,
+    lock_dir: Path | None = None,
+    run=subprocess.run,
+) -> MergeApplyResult:
+    """Resolve merge pairs, pick keepers, and (only if execute) back up then supersede losers.
+
+    Same safety envelope as ``run_apply``: dry-run (execute=False) performs ZERO writes and
+    takes NO backup; under execute a per-project flock serializes the run, a DB-table dump is
+    taken before the first write, and each loser is retired through the shared
+    ``supersede_row`` helper with reason="merge".
+
+    Idempotent: a 0-row supersede (the loser was already superseded — e.g. by a concurrent
+    store-time supersede between the fetch and the write) is reported as a skip, NOT an error.
+    This contrasts with ``write_provenance`` (which demands UPDATE 1): a merge that finds the
+    work already done is a success-shaped no-op, not a failure.
+    """
+    rows_by_id: dict[str, MergeRow] = {}
+    for id_a, id_b in pairs:
+        rows_by_id.update(await fetch_merge_pair_details(pool, project, id_a, id_b))
+    plan = build_merge_plan(pairs, rows_by_id, dry_run=not execute)
+
+    skipped = [(a.id_a, a.id_b, a.skip_reason or "") for a in plan.actions if a.skipped]
+
+    if not execute or not plan.applicable:
+        return MergeApplyResult(plan=plan, applied=[], skipped=skipped, backup_path=None)
+
+    lock_root = lock_dir if lock_dir is not None else backup_dir
+    with _apply_lock(lock_root, project):
+        backup_path = backup_database(backup_dir / f"memory-merge-{timestamp}.sql", run=run)
+        applied: list[str] = []
+        async with pool.acquire() as conn:
+            for action in plan.applicable:
+                if action.keeper_id is None or action.loser_id is None:
+                    continue  # unreachable for applicable actions; defensive
+                count = await supersede_row(
+                    conn,
+                    loser_id=action.loser_id,
+                    keeper_id=action.keeper_id,
+                    reason="merge",
+                    # Keeper-liveness guard (same statement): a keeper chosen at plan
+                    # time may be superseded by a concurrent store/merge between
+                    # fetch_merge_pair_details and this UPDATE. Without this the loser
+                    # would be retired onto a DEAD keeper, violating select_merge_keeper's
+                    # "a dead side is unsafe" invariant. 0-row now also covers that race.
+                    require_active_keeper=True,
+                    # Same-statement project guard (defense-in-depth): the loser is
+                    # already pre-filtered by the project-scoped fetch_merge_pair_details,
+                    # but binding `project` here makes the UPDATE self-enforcing so a
+                    # future change that drops that pre-fetch can't supersede a row in
+                    # another project (UUIDs are global). A cross-project loser collapses
+                    # to a 0-row no-op, handled identically to the already-superseded case.
+                    project=project,
+                )
+                if count == 0:
+                    # Already superseded, OR the keeper died after planning (keeper-liveness
+                    # guard matched nothing): the guarded UPDATE retired no row. Skip + report,
+                    # never raise — the loser is untouched and the pair is safe to re-plan.
+                    skipped.append((action.id_a, action.id_b, "already superseded (0-row update)"))
+                    continue
+                applied.append(action.loser_id)
+    return MergeApplyResult(plan=plan, applied=applied, skipped=skipped, backup_path=backup_path)
+
+
+@dataclass(frozen=True)
+class StaleArchiveResult:
+    applied: list[str] = field(default_factory=list)  # ids actually archived
+    skipped: list[tuple[str, str]] = field(default_factory=list)  # (id, reason)
+    backup_path: Path | None = None
+    dry_run: bool = True
+
+
+async def run_stale_archive(
+    pool,
+    project: str,
+    ids: list[str],
+    *,
+    execute: bool,
+    backup_dir: Path,
+    timestamp: str,
+    lock_dir: Path | None = None,
+    run=subprocess.run,
+) -> StaleArchiveResult:
+    """Stale-archive approved ids; (only if execute) back up then archive each.
+
+    Same safety envelope as ``run_merge_apply``: dry-run (execute=False) performs
+    ZERO writes and takes NO backup; under execute a per-project flock serializes
+    the run, a DB-table dump is taken before the first write, and each id is
+    retired through the shared ``archive_row`` helper (archived_at = NOW() + a
+    {by:null, reason:"stale"} marker).
+
+    Idempotent: a 0-row archive (the row was already archived) is reported as a
+    skip, NOT an error — a stale-archive that finds the work already done is a
+    success-shaped no-op (mirrors run_merge_apply's 0-row handling).
+    """
+    if not execute or not ids:
+        skipped = [(i, "dry-run") for i in ids] if not execute else []
+        return StaleArchiveResult(applied=[], skipped=skipped, backup_path=None, dry_run=True)
+
+    lock_root = lock_dir if lock_dir is not None else backup_dir
+    with _apply_lock(lock_root, project):
+        backup_path = backup_database(backup_dir / f"memory-archive-{timestamp}.sql", run=run)
+        applied: list[str] = []
+        skipped: list[tuple[str, str]] = []
+        async with pool.acquire() as conn:
+            for learning_id in ids:
+                count = await archive_row(conn, learning_id=learning_id, project=project)
+                if count == 0:
+                    # The guarded UPDATE matched nothing: the row is already archived,
+                    # was concurrently superseded (merge/store — don't clobber its real
+                    # provenance), or belongs to another project. Skip + report, never raise.
+                    skipped.append(
+                        (
+                            learning_id,
+                            "not eligible (already archived, superseded, or wrong project)",
+                        )
+                    )
+                    continue
+                applied.append(learning_id)
+    return StaleArchiveResult(
+        applied=applied, skipped=skipped, backup_path=backup_path, dry_run=False
+    )
+
+
+@dataclass(frozen=True)
+class UnpromoteResult:
+    plan: UnpromotePlan
+    applied: list[str] = field(default_factory=list)  # ids whose promoted_to was cleared
+    skipped: list[tuple[str, str]] = field(default_factory=list)  # (id, reason)
+    failed: list[tuple[str, str]] = field(default_factory=list)  # (id, reason)
+    backup_path: Path | None = None
+
+
+def _unpromote_one_row(action: UnpromoteAction, memory_dir: Path, claude_md_path: Path) -> None:
+    """Remove the file artifact(s) for one unpromote action, in the W-2 order, BEFORE the DB clear.
+
+    Two-artifact (MEMORY.md): delete ``promoted-<slug>.md`` FIRST, THEN splice the MEMORY.md
+    index line by the file's basename. The removable path is derived STRUCTURALLY as
+    ``memory_dir / Path(target).name`` so a stale/corrupt/cross-worktree absolute DB target can
+    never escape the active ``memory_dir`` and unlink an unrelated file; the same basename roots
+    both the delete and the index splice so they stay consistent. As a defense in depth, a target
+    whose ``resolve()`` lies OUTSIDE ``memory_dir`` (e.g. a ``../`` traversal or a path from
+    another worktree) is treated as a FAILED action — it raises ``OSError`` so the caller leaves
+    ``promoted_to`` intact and the action is re-runnable, rather than silently deleting nothing.
+    If the index splice raises after the file delete, the DB clear is NOT reached (the caller
+    never gets here), so the action stays re-runnable. Single-artifact (CLAUDE.md): remove the
+    in-file block by the exact full-id marker. Each stage is idempotent (already-absent -> no-op),
+    so a re-run after a partial failure resumes.
+    """
+    target = Path(action.target) if action.target else None
+    if action.two_artifact:
+        if target is not None:
+            memory_root = memory_dir.resolve()
+            # Reject a target that resolves outside the active memory_dir (stale/corrupt/
+            # cross-worktree absolute path). Surfaced as a failed action; promoted_to untouched.
+            # A RELATIVE target (a promotion run with a relative --memory-dir stores one) is
+            # resolved against memory_dir, NOT the process CWD — otherwise a legit unpromote run
+            # from a different directory false-positives here. Basename-only deletion is unchanged,
+            # and a relative `..` traversal still escapes memory_root and is refused.
+            resolved = (memory_root / target.name).resolve()
+            target_resolved = (
+                target.resolve(strict=False)
+                if target.is_absolute()
+                else (memory_root / target).resolve()
+            )
+            if resolved.parent != memory_root or target_resolved != resolved:
+                raise OSError(
+                    f"unpromote target {action.target!r} resolves outside memory_dir "
+                    f"{memory_dir} — refusing to unlink (action left re-runnable)"
+                )
+            # Derive the removable file STRUCTURALLY under memory_dir (cannot escape).
+            safe_file = memory_root / target.name
+            remove_file_if_present(safe_file)  # stage 1: delete the promoted-<slug>.md FIRST
+            # stage 2: splice the MEMORY.md index line that references that exact filename.
+            # Match the EXACT wrapped `({filename})` reference the Phase-2a writer
+            # (memory_index_line) emits, NOT the bare basename: a bare-basename substring
+            # match would also splice a sibling line whose filename CONTAINS this one
+            # (e.g. `promoted-foo.md` inside `promoted-foo.md.bak`). The `(...)` wrapper
+            # is part of the written format, so it disambiguates without false matches.
+            remove_line_by_marker(memory_dir / "MEMORY.md", f"({target.name})")
+    else:
+        # Single CLAUDE.md block, matched by the exact full-id marker the promote path wrote.
+        remove_block_by_marker(claude_md_path, claude_md_marker_for_id(action.row.id))
+
+
+async def run_unpromote(
+    pool,
+    project: str,
+    ids: list[str],
+    *,
+    execute: bool,
+    memory_dir: Path,
+    claude_md_path: Path,
+    backup_dir: Path,
+    timestamp: str,
+    lock_dir: Path | None = None,
+    run=subprocess.run,
+) -> UnpromoteResult:
+    """Reverse the Phase-2a promotion of each approved id; (only if execute) back up first.
+
+    Same safety envelope as ``run_apply``: dry-run (execute=False) performs ZERO writes and
+    takes NO backup; under execute a per-project flock serializes the run and a DB-table dump
+    AND a snapshot of the files about to be mutated (MEMORY.md, CLAUDE.md) are taken before the
+    first removal.
+
+    W-2 ordering invariant — per applicable row, in this order:
+      1. remove the file artifact(s) (two-artifact: delete ``promoted-<slug>.md`` then splice
+         the MEMORY.md index line; single-artifact: remove the CLAUDE.md block),
+      2. ONLY THEN clear ``promoted_to`` via a guarded UPDATE.
+    A failure in stage 1/2 propagates BEFORE the clear, so the DB tag is never cleared while an
+    artifact is stranded — the action is re-runnable. A 0-row clear (the tag was already gone,
+    e.g. a concurrent unpromote) is reported as a skip, never raised.
+    """
+    rows = await fetch_promoted_rows(pool, project, ids)
+    plan = build_unpromote_plan(rows, dry_run=not execute)
+
+    if not execute or not plan.applicable:
+        return UnpromoteResult(plan=plan, applied=[], backup_path=None)
+
+    lock_root = lock_dir if lock_dir is not None else memory_dir
+    with _apply_lock(lock_root, project):
+        backup_path = backup_database(backup_dir / f"memory-unpromote-{timestamp}.sql", run=run)
+        backup_files(backup_dir, timestamp, [memory_dir / "MEMORY.md", claude_md_path])
+        applied: list[str] = []
+        skipped: list[tuple[str, str]] = []
+        failed: list[tuple[str, str]] = []
+        async with pool.acquire() as conn:
+            for action in plan.applicable:
+                rid = action.row.id
+                try:
+                    # Stages 1-2: remove file artifact(s) BEFORE touching the DB tag.
+                    _unpromote_one_row(action, memory_dir, claude_md_path)
+                except OSError as exc:
+                    # A file removal failed: do NOT clear promoted_to (W-2). The row stays
+                    # tagged so a re-run completes the reversal; surface it and keep going.
+                    failed.append((rid, str(exc)))
+                    continue
+                # Stage 3: clear the DB tag only after every artifact is gone.
+                count = await clear_promoted_marker(conn, learning_id=rid, project=project)
+                if count == 0:
+                    # Tag already cleared (concurrent unpromote): the guarded UPDATE matched
+                    # nothing. The files are gone (stages 1-2 are idempotent). Skip + report.
+                    skipped.append((rid, "already cleared (0-row update)"))
+                    continue
+                applied.append(rid)
+    return UnpromoteResult(
+        plan=plan, applied=applied, skipped=skipped, failed=failed, backup_path=backup_path
+    )
+
+
 # --- CLI -------------------------------------------------------------------
 
 
@@ -604,6 +1180,34 @@ def validate_ids(ids: list[str]) -> tuple[list[str], list[str]]:
     return valid, invalid
 
 
+def parse_pairs(raw_pairs: list[str]) -> list[tuple[str, str]]:
+    """Parse ``--pair A:B`` strings into validated (id_a, id_b) uuid tuples.
+
+    Each pair is ``<uuid>:<uuid>``. Raises ValueError on a malformed pair or a non-uuid id so
+    a typo never reaches SQL. UUIDs are lowercased to match ``archival_memory.id::text``.
+    Duplicate pairs (order-insensitive) are de-duplicated, preserving first-seen order.
+    """
+    out: list[tuple[str, str]] = []
+    seen: set[frozenset[str]] = set()
+    for raw in raw_pairs:
+        parts = raw.split(":")
+        if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+            raise ValueError(f"malformed --pair {raw!r}: expected '<uuid>:<uuid>'")
+        a, b = parts[0].strip(), parts[1].strip()
+        for one in (a, b):
+            if not _UUID_RE.match(one):
+                raise ValueError(f"--pair {raw!r} contains a non-uuid id: {one!r}")
+        if a.lower() == b.lower():
+            raise ValueError(f"--pair {raw!r} merges an id with itself")
+        a, b = a.lower(), b.lower()
+        key = frozenset((a, b))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((a, b))
+    return out
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Apply approved memory promotions (issue #63 Phase 2a). Dry-run by default."
@@ -621,7 +1225,261 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--memory-dir", default=None, help="Override Claude memory dir")
     p.add_argument("--claude-md", default=None, help="Override CLAUDE.md path")
     p.add_argument("--backup-dir", default=None, help="Override backup output dir")
+    p.add_argument(
+        "--merge",
+        action="store_true",
+        help="Merge-supersede mode: retire the loser of each --pair onto its keeper "
+        "(dry-run by default; --execute backs up then writes).",
+    )
+    p.add_argument(
+        "--pair",
+        action="append",
+        default=[],
+        metavar="ID_A:ID_B",
+        help="A merge pair '<uuid>:<uuid>' (repeatable). Used only with --merge.",
+    )
+    p.add_argument(
+        "--archive",
+        action="store_true",
+        help="Stale-archive mode: set archived_at on each --ids/--manifest learning "
+        "(dry-run by default; --execute backs up then writes).",
+    )
+    p.add_argument(
+        "--unpromote",
+        action="store_true",
+        help="Unpromote/repair mode: reverse the Phase-2a promotion of each --ids/--manifest "
+        "learning — remove the promoted file artifact(s) then clear the promoted_to tag "
+        "(dry-run by default; --execute backs up then writes).",
+    )
     return p.parse_args(argv)
+
+
+def render_merge_plan(plan: MergeApplyPlan) -> str:
+    """Render the merge plan as a readable preview. Pure — writes nothing."""
+    lines: list[str] = []
+    banner = "DRY RUN — no changes written" if plan.dry_run else "EXECUTE — writing changes"
+    lines.append(f"## Merge-Supersede Plan ({banner})")
+    applicable = plan.applicable
+    lines.append(f"{len(applicable)} to supersede, {len(plan.actions) - len(applicable)} skipped")
+    lines.append("")
+    for a in plan.actions:
+        if a.skipped:
+            lines.append(f"  skip [{a.id_a[:8]}+{a.id_b[:8]}] {a.skip_reason}")
+        else:
+            lines.append(
+                f"  → keep [{(a.keeper_id or '')[:8]}], supersede [{(a.loser_id or '')[:8]}]"
+            )
+    if plan.dry_run and applicable:
+        lines.append("")
+        lines.append("_Re-run with --execute to apply (a DB backup is taken first)._")
+    return "\n".join(lines)
+
+
+async def _merge_main(args: argparse.Namespace, project: str) -> int:
+    """Merge-supersede CLI path. Dry-run by default; --execute backs up then writes."""
+    try:
+        pairs = parse_pairs(args.pair)
+    except ValueError as exc:
+        print(f"memory-apply: invalid merge pair: {exc}", file=sys.stderr)
+        return 2
+    if not pairs:
+        print("memory-apply: --merge needs at least one --pair '<uuid>:<uuid>'.", file=sys.stderr)
+        return 2
+
+    backup_dir = Path(args.backup_dir) if args.backup_dir else default_backup_dir()
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+
+    print(f"memory-apply: project={project} (merge-supersede)")
+    if args.execute:
+        print(f"  backup dir : {backup_dir}")
+    print("")
+
+    try:
+        pool = await get_pool()
+        result = await run_merge_apply(
+            pool,
+            project,
+            pairs,
+            execute=args.execute,
+            backup_dir=backup_dir,
+            timestamp=timestamp,
+        )
+    except (OSError, RuntimeError, PostgresError) as exc:
+        # RuntimeError covers a failed pg_dump backup (apply aborts before any write);
+        # PostgresError is caught so a DB failure can't echo the DSN in a traceback.
+        print(f"memory-apply: aborted ({type(exc).__name__}): {exc}", file=sys.stderr)
+        return 1
+
+    print(render_merge_plan(result.plan))
+    if args.execute:
+        print("")
+        print(f"Superseded {len(result.applied)} learning(s).")
+        if result.backup_path:
+            print(f"DB backup: {result.backup_path}")
+    return 0
+
+
+def render_archive_plan(ids: list[str], *, dry_run: bool) -> str:
+    """Render the stale-archive plan as a readable preview. Pure — writes nothing."""
+    lines: list[str] = []
+    banner = "DRY RUN — no changes written" if dry_run else "EXECUTE — writing changes"
+    lines.append(f"## Stale-Archive Plan ({banner})")
+    lines.append(f"{len(ids)} to archive")
+    lines.append("")
+    for i in ids:
+        lines.append(f"  → archive [{i[:8]}]")
+    if dry_run and ids:
+        lines.append("")
+        lines.append("_Re-run with --execute to apply (a DB backup is taken first)._")
+    return "\n".join(lines)
+
+
+async def _archive_main(args: argparse.Namespace, project: str) -> int:
+    """Stale-archive CLI path. Dry-run by default; --execute backs up then writes."""
+    try:
+        ids = parse_ids(args.ids, args.manifest)
+    except (OSError, ValueError) as exc:
+        print(f"memory-apply: could not read ids: {exc}", file=sys.stderr)
+        return 2
+    ids, invalid = validate_ids(ids)
+    for bad in invalid:
+        print(f"memory-apply: ignoring malformed id (not a uuid): {bad!r}", file=sys.stderr)
+    if not ids:
+        print(
+            "memory-apply: --archive needs at least one valid id (use --ids or --manifest).",
+            file=sys.stderr,
+        )
+        return 2
+
+    backup_dir = Path(args.backup_dir) if args.backup_dir else default_backup_dir()
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+
+    print(f"memory-apply: project={project} (stale-archive)")
+    if args.execute:
+        print(f"  backup dir : {backup_dir}")
+    print("")
+
+    try:
+        pool = await get_pool()
+        result = await run_stale_archive(
+            pool,
+            project,
+            ids,
+            execute=args.execute,
+            backup_dir=backup_dir,
+            timestamp=timestamp,
+        )
+    except (OSError, RuntimeError, PostgresError) as exc:
+        # RuntimeError covers a failed pg_dump backup (apply aborts before any write);
+        # PostgresError is caught so a DB failure can't echo the DSN in a traceback.
+        print(f"memory-apply: aborted ({type(exc).__name__}): {exc}", file=sys.stderr)
+        return 1
+
+    print(render_archive_plan(ids, dry_run=result.dry_run))
+    if args.execute:
+        print("")
+        print(f"Archived {len(result.applied)} learning(s).")
+        if result.backup_path:
+            print(f"DB backup: {result.backup_path}")
+        for sid, reason in result.skipped:
+            print(f"  skip [{sid[:8]}]: {reason}", file=sys.stderr)
+    return 0
+
+
+def render_unpromote_plan(plan: UnpromotePlan) -> str:
+    """Render the unpromote plan as a readable preview. Pure — writes nothing."""
+    lines: list[str] = []
+    banner = "DRY RUN — no changes written" if plan.dry_run else "EXECUTE — writing changes"
+    lines.append(f"## Unpromote / Repair Plan ({banner})")
+    applicable = plan.applicable
+    lines.append(f"{len(applicable)} to unpromote, {len(plan.actions) - len(applicable)} skipped")
+    lines.append("")
+    for a in plan.actions:
+        if a.skipped:
+            lines.append(f"  skip [{a.row.id[:8]}] {a.skip_reason}")
+        else:
+            kind = "file + index" if a.two_artifact else "block"
+            lines.append(f"  ↩ {a.tier}  [{a.row.id[:8]}] remove {kind} → {a.target}")
+    if plan.dry_run and applicable:
+        lines.append("")
+        lines.append("_Re-run with --execute to apply (a DB backup is taken first)._")
+    return "\n".join(lines)
+
+
+async def _unpromote_main(args: argparse.Namespace, project: str) -> int:
+    """Unpromote/repair CLI path. Dry-run by default; --execute backs up then writes."""
+    try:
+        ids = parse_ids(args.ids, args.manifest)
+    except (OSError, ValueError) as exc:
+        print(f"memory-apply: could not read ids: {exc}", file=sys.stderr)
+        return 2
+    ids, invalid = validate_ids(ids)
+    for bad in invalid:
+        print(f"memory-apply: ignoring malformed id (not a uuid): {bad!r}", file=sys.stderr)
+    if not ids:
+        print(
+            "memory-apply: --unpromote needs at least one valid id (use --ids or --manifest).",
+            file=sys.stderr,
+        )
+        return 2
+
+    project_dir = _project_dir()
+    # Same fail-closed guard as the promote path: the DB project comes from the arg, but the
+    # file removal roots derive from the working tree. If they disagree, require explicit
+    # --memory-dir AND --claude-md so an --execute can never remove another tree's artifacts.
+    cwd_project = project_from_path(project_dir)
+    if args.execute and project != cwd_project and not (args.memory_dir and args.claude_md):
+        print(
+            f"memory-apply: refusing to --execute: requested project '{project}' differs from "
+            f"the working tree's project '{cwd_project}'. Pass explicit --memory-dir and "
+            "--claude-md so the removal target is unambiguous.",
+            file=sys.stderr,
+        )
+        return 2
+
+    memory_dir = Path(args.memory_dir) if args.memory_dir else default_memory_dir(project_dir)
+    claude_md = Path(args.claude_md) if args.claude_md else Path(project_dir) / "CLAUDE.md"
+    backup_dir = Path(args.backup_dir) if args.backup_dir else default_backup_dir()
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+
+    print(f"memory-apply: project={project} (unpromote/repair)")
+    print(f"  memory dir : {memory_dir}")
+    print(f"  CLAUDE.md  : {claude_md}")
+    if args.execute:
+        print(f"  backup dir : {backup_dir}")
+    print("")
+
+    try:
+        pool = await get_pool()
+        result = await run_unpromote(
+            pool,
+            project,
+            ids,
+            execute=args.execute,
+            memory_dir=memory_dir,
+            claude_md_path=claude_md,
+            backup_dir=backup_dir,
+            timestamp=timestamp,
+        )
+    except (OSError, RuntimeError, PostgresError) as exc:
+        # RuntimeError covers a failed pg_dump backup (apply aborts before any removal);
+        # PostgresError is caught so a DB failure can't echo the DSN in a traceback.
+        print(f"memory-apply: aborted ({type(exc).__name__}): {exc}", file=sys.stderr)
+        return 1
+
+    print(render_unpromote_plan(result.plan))
+    if args.execute:
+        print("")
+        print(f"Unpromoted {len(result.applied)} learning(s).")
+        if result.backup_path:
+            print(f"DB backup: {result.backup_path}")
+        for sid, reason in result.skipped:
+            print(f"  skip [{sid[:8]}]: {reason}", file=sys.stderr)
+        if result.failed:
+            for fid, reason in result.failed:
+                print(f"  ⚠️ not cleared [{fid[:8]}]: {reason}", file=sys.stderr)
+            return 1
+    return 0
 
 
 async def main(argv: list[str] | None = None) -> int:
@@ -632,6 +1490,19 @@ async def main(argv: list[str] | None = None) -> int:
     if not project:
         print("memory-apply: could not resolve a project. Pass one explicitly.", file=sys.stderr)
         return 2
+
+    if sum(bool(m) for m in (args.merge, args.archive, args.unpromote)) > 1:
+        print(
+            "memory-apply: --merge, --archive and --unpromote are mutually exclusive.",
+            file=sys.stderr,
+        )
+        return 2
+    if args.merge:
+        return await _merge_main(args, project)
+    if args.archive:
+        return await _archive_main(args, project)
+    if args.unpromote:
+        return await _unpromote_main(args, project)
 
     try:
         ids = parse_ids(args.ids, args.manifest)

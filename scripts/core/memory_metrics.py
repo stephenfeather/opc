@@ -87,12 +87,23 @@ def _get_version() -> str:
 async def get_totals(
     conn: Any, start: datetime | None, end: datetime | None
 ) -> dict[str, Any]:
-    """Count active, superseded, and total learnings."""
+    """Count active, superseded, archived, and total learnings.
+
+    Issue #63 Phase 2b (SF-2): adds a DISTINCT ``archived`` lifecycle counter
+    without dropping any rows from ``total``. ``active`` now means truly active —
+    neither superseded NOR stale-archived — so the three buckets (active,
+    superseded, archived) are mutually exclusive lifecycle states.
+    """
     row = await conn.fetchrow(
         """
         SELECT
-            COUNT(*) FILTER (WHERE superseded_by IS NULL) AS active,
+            COUNT(*) FILTER (
+                WHERE superseded_by IS NULL AND archived_at IS NULL
+            ) AS active,
             COUNT(*) FILTER (WHERE superseded_by IS NOT NULL) AS superseded,
+            COUNT(*) FILTER (
+                WHERE archived_at IS NOT NULL AND superseded_by IS NULL
+            ) AS archived,
             COUNT(*) AS total
         FROM archival_memory
         WHERE ($1::timestamptz IS NULL OR created_at >= $1)
@@ -103,6 +114,7 @@ async def get_totals(
     return {
         "active_learnings": row["active"],
         "superseded_learnings": row["superseded"],
+        "archived_learnings": row["archived"],
         "total_learnings": row["total"],
     }
 

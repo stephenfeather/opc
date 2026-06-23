@@ -286,6 +286,7 @@ async def load_learnings(
 
     Filters:
     - superseded_by IS NULL (active only)
+    - archived_at IS NULL (excludes stale-retired rows, issue #63 Phase 2b)
     - embedding IS NOT NULL
     - Excludes SYNTHESIZED_PATTERN to prevent feedback loops
 
@@ -295,10 +296,16 @@ async def load_learnings(
 
     Returns (learnings, rejected_count) so callers can detect parse failures.
     """
+    # Issue #63 Phase 2b round-2 finding 3: a stale-archived row is RETIRED by
+    # design and carries superseded_by IS NULL (no survivor), so a
+    # superseded-only filter would wrongly seed new patterns from it. Match the
+    # unconditional archived_at filter used by push_learnings (this batch path
+    # has no MemoryServicePG capability probe).
     query = """
         SELECT id, content, embedding, metadata, session_id, created_at
         FROM archival_memory
         WHERE superseded_by IS NULL
+          AND archived_at IS NULL
           AND embedding IS NOT NULL
           AND (metadata->>'learning_type') IS DISTINCT FROM 'SYNTHESIZED_PATTERN'
         ORDER BY created_at DESC

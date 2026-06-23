@@ -591,6 +591,29 @@ class TestLoadLearnings:
         assert learnings == []
         assert rejected == 0
 
+    @pytest.mark.asyncio
+    async def test_query_excludes_archived_rows(self):
+        """Issue #63 Phase 2b round-2 finding 3: an archived (stale-retired)
+        learning is non-superseded by design, so load_learnings must filter
+        ``archived_at IS NULL`` in addition to ``superseded_by IS NULL`` or
+        pattern detection/synthesis would train on retired rows.
+        """
+        captured: dict[str, str] = {}
+
+        async def _capture_fetch(query, *args):
+            captured["query"] = query
+            return []
+
+        pool, conn = _make_pool()
+        conn.fetch = _capture_fetch
+
+        await load_learnings(pool)
+
+        assert "superseded_by IS NULL" in captured["query"]
+        assert "archived_at IS NULL" in captured["query"], (
+            "load_learnings must exclude stale-archived rows"
+        )
+
 
 # ---------------------------------------------------------------------------
 # load_tags_for_learnings tests (I/O handler)

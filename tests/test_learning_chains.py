@@ -221,9 +221,199 @@ class TestRecallChainFilter:
             results = await search_learnings_hybrid_rrf("test query", k=5, expand=False)
 
         assert len(results) == 1
-        # Exactly the cascade ran: boosted+chain, plain+chain, plain (no chain).
-        # Probe fetches are excluded because the caches are pinned above.
+        # Issue #63 Phase 2b round-2 finding 2: the superseded-only (no-archive)
+        # middle tier runs ONLY on a provable missing-archived_at asyncpg error.
+        # This test raises a generic Exception about superseded_by (not an
+        # asyncpg UndefinedColumnError for archived_at), so the cascade SKIPS the
+        # archived-dropping middle tier and degrades straight to no-chain:
+        # boosted+chain(+archived), plain+chain(+archived), then plain (no
+        # chain) = 3 fetches. Probe fetches are excluded (caches pinned above).
         assert call_count == 3
+
+    async def test_rrf_plainto_fallback_keeps_archived_predicate(self):
+        """Issue #63 Phase 2b round-2 finding 1: when the expanded to_tsquery
+        path returns NO rows and the cascade falls back to plainto_tsquery, the
+        plainto fallback CTE must still carry ``archived_at IS NULL``. On a
+        migrated DB this normal no-results fallback must not silently recall
+        archived rows as active.
+        """
+        now = datetime.now(UTC)
+        plainto_chain_sqls: list[str] = []
+
+        async def fake_fetch(sql, *args):
+            # Expanded path uses to_tsquery and returns NO rows so the cascade
+            # falls back to plainto_tsquery (the normal no-results fallback).
+            if "to_tsquery" in sql and "plainto_tsquery" not in sql:
+                return []
+            if "plainto_tsquery" in sql and "superseded_by" in sql:
+                plainto_chain_sqls.append(sql)
+            return [{
+                "id": uuid.uuid4(),
+                "session_id": "test",
+                "content": "test learning",
+                "metadata": '{"type": "session_learning"}',
+                "created_at": now,
+                "rrf_score": 0.023,
+                "boosted_score": 0.023,
+                "raw_rrf_score": 0.023,
+                "recall_count": 0,
+                "last_recalled": None,
+                "fts_rank": 1,
+                "vec_rank": 2,
+            }]
+
+        conn = AsyncMock()
+        conn.fetch = fake_fetch
+        _attach_tx(conn)
+
+        pool = MagicMock()
+        pool.acquire.return_value = FakeAcquire(conn)
+
+        mock_embedder = MagicMock()
+        mock_embedder.embed = AsyncMock(return_value=[0.1] * 1024)
+        mock_embedder.aclose = AsyncMock()
+
+        from scripts.core import recall_backends as rb
+        rb._set_project_column_cache_for_tests(False)
+        rb._set_embedding_model_column_cache_for_tests(False)
+        rb._set_hnsw_iterative_scan_cache_for_tests(True)
+
+        pgvector_patch = "scripts.core.db.postgres_pool.init_pgvector"
+        embed_patch = "scripts.core.db.embedding_service.EmbeddingService"
+        with patch("scripts.core.db.postgres_pool.get_pool", return_value=pool), \
+             patch(pgvector_patch, new_callable=AsyncMock), \
+             patch(embed_patch, return_value=mock_embedder):
+            from scripts.core.recall_learnings import search_learnings_hybrid_rrf
+            # expand=True so the cascade uses to_tsquery first, then the plainto
+            # no-results fallback runs.
+            results = await search_learnings_hybrid_rrf(
+                "test query", k=5, expand=True,
+            )
+
+        assert len(results) == 1
+        # The plainto fallback's chain CTE must include archived_at IS NULL.
+        assert plainto_chain_sqls, "plainto chain fallback never ran"
+        assert any(
+            "archived_at IS NULL" in sql for sql in plainto_chain_sqls
+        ), "plainto fallback dropped the archived_at predicate"
+
+    async def test_rrf_non_schema_error_does_not_drop_archived(self):
+        """Issue #63 Phase 2b round-2 finding 2: a NON-schema failure (e.g. a
+        lock timeout) on the full lifecycle query must NOT silently degrade to a
+        weaker recall that omits ``archived_at IS NULL``. Only a concrete missing
+        archived_at column may drop the archived predicate.
+
+        Here every fetch raises a generic (non-UndefinedColumn) error; the
+        cascade must propagate rather than return archived-inclusive rows.
+        """
+        class _LockTimeoutError(Exception):
+            pass
+
+        archived_dropped = False
+
+        async def fake_fetch(sql, *args):
+            nonlocal archived_dropped
+            if "superseded_by" in sql and "archived_at IS NULL" not in sql:
+                # A weaker (archived-dropped but superseded-kept) tier ran: this
+                # is exactly the silent degradation the fix must prevent for a
+                # non-schema error.
+                archived_dropped = True
+            raise _LockTimeoutError("lock timeout")
+
+        conn = AsyncMock()
+        conn.fetch = fake_fetch
+        _attach_tx(conn)
+
+        pool = MagicMock()
+        pool.acquire.return_value = FakeAcquire(conn)
+
+        mock_embedder = MagicMock()
+        mock_embedder.embed = AsyncMock(return_value=[0.1] * 1024)
+        mock_embedder.aclose = AsyncMock()
+
+        from scripts.core import recall_backends as rb
+        rb._set_project_column_cache_for_tests(False)
+        rb._set_embedding_model_column_cache_for_tests(False)
+        rb._set_hnsw_iterative_scan_cache_for_tests(True)
+
+        pgvector_patch = "scripts.core.db.postgres_pool.init_pgvector"
+        embed_patch = "scripts.core.db.embedding_service.EmbeddingService"
+        with patch("scripts.core.db.postgres_pool.get_pool", return_value=pool), \
+             patch(pgvector_patch, new_callable=AsyncMock), \
+             patch(embed_patch, return_value=mock_embedder):
+            from scripts.core.recall_learnings import search_learnings_hybrid_rrf
+            with pytest.raises(_LockTimeoutError):
+                await search_learnings_hybrid_rrf(
+                    "test query", k=5, expand=False,
+                )
+
+        assert not archived_dropped, (
+            "non-schema error degraded to an archived-dropped recall tier"
+        )
+
+    async def test_rrf_missing_archived_column_degrades_to_superseded_only(self):
+        """Issue #63 Phase 2b round-2 finding 2: an UndefinedColumnError naming
+        archived_at (the migration gap this cascade exists for) MUST still
+        degrade to the superseded-only tier so a partially-migrated DB keeps the
+        superseded filter rather than crashing.
+        """
+        now = datetime.now(UTC)
+        try:
+            from asyncpg.exceptions import UndefinedColumnError
+        except ImportError:  # pragma: no cover
+            pytest.skip("asyncpg not installed")
+
+        superseded_only_ran = False
+
+        async def fake_fetch(sql, *args):
+            nonlocal superseded_only_ran
+            if "archived_at IS NULL" in sql:
+                raise UndefinedColumnError(
+                    'column "archived_at" does not exist'
+                )
+            if "superseded_by" in sql:
+                superseded_only_ran = True
+            return [{
+                "id": uuid.uuid4(),
+                "session_id": "test",
+                "content": "test learning",
+                "metadata": '{"type": "session_learning"}',
+                "created_at": now,
+                "rrf_score": 0.023,
+                "fts_rank": 1,
+                "vec_rank": 2,
+            }]
+
+        conn = AsyncMock()
+        conn.fetch = fake_fetch
+        _attach_tx(conn)
+
+        pool = MagicMock()
+        pool.acquire.return_value = FakeAcquire(conn)
+
+        mock_embedder = MagicMock()
+        mock_embedder.embed = AsyncMock(return_value=[0.1] * 1024)
+        mock_embedder.aclose = AsyncMock()
+
+        from scripts.core import recall_backends as rb
+        rb._set_project_column_cache_for_tests(False)
+        rb._set_embedding_model_column_cache_for_tests(False)
+        rb._set_hnsw_iterative_scan_cache_for_tests(True)
+
+        pgvector_patch = "scripts.core.db.postgres_pool.init_pgvector"
+        embed_patch = "scripts.core.db.embedding_service.EmbeddingService"
+        with patch("scripts.core.db.postgres_pool.get_pool", return_value=pool), \
+             patch(pgvector_patch, new_callable=AsyncMock), \
+             patch(embed_patch, return_value=mock_embedder):
+            from scripts.core.recall_learnings import search_learnings_hybrid_rrf
+            results = await search_learnings_hybrid_rrf(
+                "test query", k=5, expand=False,
+            )
+
+        assert len(results) == 1
+        assert superseded_only_ran, (
+            "missing archived_at did not degrade to the superseded-only tier"
+        )
 
 
 # ---------------------------------------------------------------------------

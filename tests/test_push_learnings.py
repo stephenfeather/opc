@@ -230,6 +230,12 @@ class TestBuildStaleQueryParams:
         assert "myproject" in params
         assert 10 in params
 
+    def test_excludes_archived_rows(self):
+        """Issue #63 Phase 2b: never push stale-archived learnings."""
+        sql, _ = build_stale_query_params("opc", 5)
+        assert "superseded_by IS NULL" in sql
+        assert "archived_at IS NULL" in sql
+
 
 class TestBuildPatternQueryParams:
     def test_returns_project_and_k(self):
@@ -239,6 +245,12 @@ class TestBuildPatternQueryParams:
         assert "detected_patterns" in sql
         assert "recall_count = 0" in sql
         assert "a.project" in sql
+
+    def test_excludes_archived_rows(self):
+        """Issue #63 Phase 2b: never push stale-archived pattern reps."""
+        sql, _ = build_pattern_query_params("opc", 3)
+        assert "a.superseded_by IS NULL" in sql
+        assert "a.archived_at IS NULL" in sql
 
 
 # ---------------------------------------------------------------------------

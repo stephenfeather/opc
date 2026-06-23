@@ -1,6 +1,6 @@
 // src/memory-awareness.ts
 import { readFileSync as readFileSync2 } from "fs";
-import { spawnSync } from "child_process";
+import { spawnSync as spawnSync2 } from "child_process";
 
 // src/shared/opc-path.ts
 import { existsSync, readFileSync } from "fs";
@@ -45,6 +45,73 @@ function getOpcDir() {
   }
   return null;
 }
+function requireOpcDir() {
+  const opcDir = getOpcDir();
+  if (!opcDir) {
+    console.log(JSON.stringify({ result: "continue" }));
+    process.exit(0);
+  }
+  return opcDir;
+}
+
+// src/shared/db-utils-pg.ts
+import { spawn, spawnSync } from "child_process";
+function getPgConnectionString() {
+  const url = process.env.CONTINUOUS_CLAUDE_DB_URL || process.env.DATABASE_URL || process.env.OPC_POSTGRES_URL;
+  if (!url) {
+    throw new Error(
+      "Database URL not set. Set CONTINUOUS_CLAUDE_DB_URL (preferred), DATABASE_URL, or OPC_POSTGRES_URL. For local Docker dev, run `docker compose -f docker/docker-compose.yml up -d` and export the credentials from docker/.env before invoking this hook."
+    );
+  }
+  return url;
+}
+function runPgQuery(pythonCode, args = []) {
+  const opcDir = requireOpcDir();
+  const resolvedDbUrl = getPgConnectionString();
+  const wrappedCode = `
+import sys
+import os
+import asyncio
+import json
+
+# Add opc to path for imports (read from env to avoid code injection)
+_opc_dir = os.environ.get('_OPC_DIR')
+if not _opc_dir:
+    raise RuntimeError('_OPC_DIR environment variable not set - must be called via runPgQuery()')
+sys.path.insert(0, _opc_dir)
+os.chdir(_opc_dir)
+
+${pythonCode}
+`;
+  try {
+    const result = spawnSync("uv", ["run", "python", "-c", wrappedCode, ...args], {
+      encoding: "utf-8",
+      maxBuffer: 1024 * 1024,
+      timeout: 5e3,
+      // 5 second timeout - fail gracefully if DB unreachable
+      cwd: opcDir,
+      env: {
+        ...process.env,
+        // Never rewrite opc's uv.lock from a hook-triggered uv run (issue #71
+        // follow-up); use the lock as-is. Intentional updates use `uv lock`.
+        UV_FROZEN: "1",
+        CONTINUOUS_CLAUDE_DB_URL: resolvedDbUrl,
+        _OPC_DIR: opcDir
+      }
+    });
+    return {
+      success: result.status === 0,
+      stdout: result.stdout?.trim() || "",
+      stderr: result.stderr || ""
+    };
+  } catch (err) {
+    return {
+      success: false,
+      stdout: "",
+      stderr: String(err)
+    };
+  }
+}
 
 // src/memory-awareness.ts
 /*!
@@ -59,6 +126,7 @@ function getOpcDir() {
  * 3. If score > threshold, show visible hint with top learning preview
  * 4. Claude proactively discloses and acts on relevant memories
  */
+var SURFACED_ID_CAP = 500;
 function readStdin() {
   return readFileSync2(0, "utf-8");
 }
@@ -261,7 +329,89 @@ function isConversationalTurn(prompt) {
   const body = (CONVERSATIONAL_LEAD.has(tokens[0]) ? tokens.slice(1) : tokens).join(" ");
   return PRONOUN_IMPERATIVE.test(body) || SELECTION_IMPERATIVE.test(body);
 }
-function checkMemoryRelevance(intent, projectDir) {
+function extractFullIds(results) {
+  if (!Array.isArray(results)) return [];
+  return results.map((r) => r && typeof r.id === "string" ? r.id : "").filter((id) => id.length > 0);
+}
+function buildExcludeArgs(ids) {
+  if (!ids || ids.length === 0) return [];
+  return ["--exclude-ids", ...ids];
+}
+function unionCap(prior, fresh, cap) {
+  const merged = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const id of [...prior || [], ...fresh || []]) {
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    merged.push(id);
+  }
+  if (merged.length <= cap) return merged;
+  return merged.slice(merged.length - cap);
+}
+function readSurfacedIds(sessionId) {
+  if (!sessionId) return [];
+  const pythonCode = `
+import asyncpg, json
+
+db_url = os.environ['CONTINUOUS_CLAUDE_DB_URL']
+session_id = sys.argv[1]
+
+async def main():
+    conn = await asyncpg.connect(db_url)
+    try:
+        row = await conn.fetchrow(
+            "SELECT surfaced_learning_ids FROM sessions WHERE claude_session_id = $1",
+            session_id,
+        )
+    finally:
+        await conn.close()
+    ids = row['surfaced_learning_ids'] if row and row['surfaced_learning_ids'] else []
+    print(json.dumps([str(x) for x in ids]))
+
+asyncio.run(main())
+`;
+  try {
+    const res = runPgQuery(pythonCode, [sessionId]);
+    if (!res.success || !res.stdout) return [];
+    const parsed = JSON.parse(res.stdout);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((x) => typeof x === "string" && x.length > 0);
+  } catch {
+    return [];
+  }
+}
+function persistSurfacedIds(sessionId, freshIds) {
+  if (!sessionId || !freshIds || freshIds.length === 0) return;
+  const capped = freshIds.slice(0, SURFACED_ID_CAP);
+  const pythonCode = `
+import asyncpg, json
+
+db_url = os.environ['CONTINUOUS_CLAUDE_DB_URL']
+session_id = sys.argv[1]
+fresh = json.loads(sys.argv[2])
+
+async def main():
+    conn = await asyncpg.connect(db_url)
+    try:
+        await conn.execute(
+            "UPDATE sessions SET surfaced_learning_ids = "
+            "ARRAY(SELECT DISTINCT unnest("
+            "COALESCE(surfaced_learning_ids, '{}'::uuid[]) || $2::uuid[]"
+            ")) WHERE claude_session_id = $1",
+            session_id,
+            fresh,
+        )
+    finally:
+        await conn.close()
+
+asyncio.run(main())
+`;
+  try {
+    runPgQuery(pythonCode, [sessionId, JSON.stringify(capped)]);
+  } catch {
+  }
+}
+function checkMemoryRelevance(intent, projectDir, excludeIds = []) {
   if (!intent || intent.length < 3) return null;
   const opcDir = getOpcDir();
   if (!opcDir) return null;
@@ -271,7 +421,7 @@ function checkMemoryRelevance(intent, projectDir) {
   const safeProjectTag = projectTag && !projectTag.startsWith("-") ? projectTag : "";
   const tagArgs = safeProjectTag ? ["--tags", safeProjectTag] : [];
   const projectArgs = safeProjectTag ? ["--project", safeProjectTag, "--project-first"] : [];
-  const result = spawnSync("uv", [
+  const result = spawnSync2("uv", [
     "run",
     "python",
     "scripts/core/recall_learnings.py",
@@ -285,7 +435,11 @@ function checkMemoryRelevance(intent, projectDir) {
     "--source",
     "hook",
     ...tagArgs,
-    ...projectArgs
+    ...projectArgs,
+    // Issue #228 item 2: drop already-surfaced learnings BEFORE rank so the
+    // hook stops re-surfacing the same top memories every turn. Appended to
+    // the argv array (not shell) so full UUIDs are passed safely.
+    ...buildExcludeArgs(excludeIds)
   ], {
     encoding: "utf-8",
     cwd: opcDir,
@@ -318,7 +472,10 @@ function checkMemoryRelevance(intent, projectDir) {
     });
     return {
       count: data.results.length,
-      results
+      results,
+      // Capture the FULL untruncated ids (not the 8-char display slice above)
+      // for the per-session exclusion union (issue #228 item 2).
+      fullIds: extractFullIds(data.results)
     };
   } catch {
     return null;
@@ -343,8 +500,13 @@ async function main() {
   if (intent.length < 3) {
     return;
   }
-  const match = checkMemoryRelevance(intent, projectDir);
+  const priorSurfaced = readSurfacedIds(input.session_id);
+  const match = checkMemoryRelevance(intent, projectDir, priorSurfaced);
   if (match) {
+    persistSurfacedIds(
+      input.session_id,
+      unionCap(priorSurfaced, match.fullIds, SURFACED_ID_CAP)
+    );
     const resultLines = match.results.map(
       (r, i) => `${i + 1}. [${r.type}] ${r.content} (id: ${r.id})`
     ).join("\n");
@@ -364,6 +526,12 @@ if (typeof process !== "undefined" && process.argv[1] && (process.argv[1].endsWi
   });
 }
 export {
+  SURFACED_ID_CAP,
+  buildExcludeArgs,
+  extractFullIds,
   isConversationalTurn,
-  sanitizeSearchTerm
+  persistSurfacedIds,
+  readSurfacedIds,
+  sanitizeSearchTerm,
+  unionCap
 };

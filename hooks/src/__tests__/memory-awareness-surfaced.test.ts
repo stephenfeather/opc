@@ -1,0 +1,179 @@
+/**
+ * Tests for already-surfaced filtering in memory-awareness.ts (issue #228 item 2).
+ *
+ * The hook re-surfaces the same top memories every turn. To suppress prior-turn
+ * picks BEFORE ranking, it tracks surfaced learning UUIDs per session (in the
+ * sessions.surfaced_learning_ids column, keyed by claude_session_id) and passes
+ * them to recall_learnings.py as --exclude-ids.
+ *
+ * Covered:
+ *  1. reads surfaced ids and passes them as --exclude-ids with FULL uuids
+ *  2. captures full (untruncated) uuids for the union, not the 8-char slice
+ *  3. unions returned uuids into the session after recall
+ *  4. graceful degradation: no row / null column / DB error -> recall still
+ *     runs, no --exclude-ids, hook does not throw
+ *  5. cap enforcement bounds the persisted/argv id set
+ */
+
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+// Mock the DB layer so no real Postgres is touched. runPgQuery is the single
+// IO seam for both reading prior surfaced ids and persisting the union.
+vi.mock('../shared/db-utils-pg.js', () => ({
+  runPgQuery: vi.fn(() => ({ success: true, stdout: '[]', stderr: '' })),
+}));
+
+import { runPgQuery } from '../shared/db-utils-pg.js';
+import {
+  SURFACED_ID_CAP,
+  extractFullIds,
+  buildExcludeArgs,
+  unionCap,
+  readSurfacedIds,
+  persistSurfacedIds,
+} from '../memory-awareness.js';
+
+const mockedRunPgQuery = vi.mocked(runPgQuery);
+
+const U = (n: number) =>
+  `00000000-0000-0000-0000-${String(n).padStart(12, '0')}`;
+
+describe('extractFullIds', () => {
+  it('captures full untruncated uuids, not the 8-char display slice', () => {
+    const results = [{ id: U(1) }, { id: U(2) }];
+    expect(extractFullIds(results)).toEqual([U(1), U(2)]);
+    // Each id is a full 36-char uuid, NOT a slice(0,8).
+    for (const id of extractFullIds(results)) {
+      expect(id.length).toBe(36);
+    }
+  });
+
+  it('drops missing/empty ids', () => {
+    const results = [{ id: U(1) }, {}, { id: '' }, { id: U(2) }];
+    expect(extractFullIds(results)).toEqual([U(1), U(2)]);
+  });
+
+  it('returns [] for empty/garbage input', () => {
+    expect(extractFullIds([])).toEqual([]);
+    expect(extractFullIds(undefined as any)).toEqual([]);
+  });
+});
+
+describe('buildExcludeArgs', () => {
+  it('builds --exclude-ids with full uuids', () => {
+    expect(buildExcludeArgs([U(1), U(2)])).toEqual(['--exclude-ids', U(1), U(2)]);
+  });
+
+  it('returns [] (flag omitted) when the list is empty', () => {
+    expect(buildExcludeArgs([])).toEqual([]);
+  });
+});
+
+describe('unionCap', () => {
+  it('unions and dedupes prior + fresh ids', () => {
+    expect(unionCap([U(1), U(2)], [U(2), U(3)], 500)).toEqual([U(1), U(2), U(3)]);
+  });
+
+  it('bounds the result to the cap (most recent kept)', () => {
+    const prior = Array.from({ length: 600 }, (_, i) => U(i));
+    const fresh = [U(9001), U(9002)];
+    const out = unionCap(prior, fresh, 500);
+    expect(out.length).toBe(500);
+    // The freshly surfaced ids must survive the cap.
+    expect(out).toContain(U(9001));
+    expect(out).toContain(U(9002));
+  });
+
+  it('handles null/empty prior', () => {
+    expect(unionCap([], [U(1)], 500)).toEqual([U(1)]);
+    expect(unionCap(null as any, [U(1)], 500)).toEqual([U(1)]);
+  });
+});
+
+describe('readSurfacedIds', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('reads surfaced ids for the session as full uuids', () => {
+    mockedRunPgQuery.mockReturnValue({
+      success: true,
+      stdout: JSON.stringify([U(1), U(2)]),
+      stderr: '',
+    });
+    expect(readSurfacedIds('sess-abc')).toEqual([U(1), U(2)]);
+    // The session id is bound as the query arg.
+    const call = mockedRunPgQuery.mock.calls[0];
+    expect(call[1]).toContain('sess-abc');
+  });
+
+  it('returns [] when there is no session row (null/empty stdout)', () => {
+    mockedRunPgQuery.mockReturnValue({ success: true, stdout: '', stderr: '' });
+    expect(readSurfacedIds('sess-none')).toEqual([]);
+  });
+
+  it('returns [] when the column is NULL (json null)', () => {
+    mockedRunPgQuery.mockReturnValue({ success: true, stdout: 'null', stderr: '' });
+    expect(readSurfacedIds('sess-null')).toEqual([]);
+  });
+
+  it('returns [] and never throws on DB error', () => {
+    mockedRunPgQuery.mockReturnValue({ success: false, stdout: '', stderr: 'boom' });
+    expect(() => readSurfacedIds('sess-err')).not.toThrow();
+    expect(readSurfacedIds('sess-err')).toEqual([]);
+  });
+
+  it('returns [] when runPgQuery itself throws', () => {
+    mockedRunPgQuery.mockImplementation(() => {
+      throw new Error('spawn failed');
+    });
+    expect(() => readSurfacedIds('sess-throw')).not.toThrow();
+    expect(readSurfacedIds('sess-throw')).toEqual([]);
+  });
+});
+
+describe('persistSurfacedIds', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockedRunPgQuery.mockReturnValue({ success: true, stdout: 'ok', stderr: '' });
+  });
+
+  it('passes the session id and fresh ids to the union UPDATE', () => {
+    persistSurfacedIds('sess-x', [U(1), U(2)]);
+    expect(mockedRunPgQuery).toHaveBeenCalledTimes(1);
+    const [code, args] = mockedRunPgQuery.mock.calls[0];
+    // SQL-side atomic union expression is used.
+    expect(code).toContain('surfaced_learning_ids');
+    expect(args).toContain('sess-x');
+    // Fresh ids are bound (as a json/array arg the python wrapper expands).
+    const joined = (args as string[]).join(' ');
+    expect(joined).toContain(U(1));
+    expect(joined).toContain(U(2));
+  });
+
+  it('is a no-op when there are no fresh ids', () => {
+    persistSurfacedIds('sess-x', []);
+    expect(mockedRunPgQuery).not.toHaveBeenCalled();
+  });
+
+  it('caps the fresh ids passed for persistence', () => {
+    const fresh = Array.from({ length: SURFACED_ID_CAP + 50 }, (_, i) => U(i));
+    persistSurfacedIds('sess-x', fresh);
+    const [, args] = mockedRunPgQuery.mock.calls[0];
+    // The bound id payload must not exceed the cap.
+    const idArgs = (args as string[]).filter((a) => a.includes('-'));
+    expect(idArgs.length).toBeLessThanOrEqual(SURFACED_ID_CAP);
+  });
+
+  it('never throws on DB error', () => {
+    mockedRunPgQuery.mockReturnValue({ success: false, stdout: '', stderr: 'boom' });
+    expect(() => persistSurfacedIds('sess-x', [U(1)])).not.toThrow();
+  });
+
+  it('never throws when runPgQuery throws', () => {
+    mockedRunPgQuery.mockImplementation(() => {
+      throw new Error('spawn failed');
+    });
+    expect(() => persistSurfacedIds('sess-x', [U(1)])).not.toThrow();
+  });
+});

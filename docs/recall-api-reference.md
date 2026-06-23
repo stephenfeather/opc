@@ -207,6 +207,37 @@ over 32 chars, prompt-like text) is **dropped to `NULL`** rather than stored,
 so arbitrary text cannot leak into the append-only log. No query text is ever
 logged (privacy). See the [Recall Event Log](#recall-event-log) section.
 
+### `--exclude-ids` (default: none)
+
+Already-surfaced filtering (issue #228 item 2). Space-separated list of full
+learning UUIDs to drop from the results, e.g.
+`--exclude-ids 11111111-1111-1111-1111-111111111111 2222...`. Optional;
+`nargs="*"` with an empty-list default, so omitting it (or passing it with no
+values) is a no-op identical to prior behavior.
+
+**Semantics — where the filter runs:** the exclusion is applied **after** the
+`pool_size` telemetry capture and **before** rerank. Two consequences follow
+from that ordering:
+
+- Excluded ids are removed from the candidate pool *before* `rerank()`, so a
+  previously-surfaced learning **cannot rank back into the top-k** and then be
+  trimmed away — it is gone before ranking even runs.
+- `pool_size` (issue #228 item 1 selection-rate telemetry) is captured on the
+  **raw backend pool**, *before* this filter, so exclusion **does not affect**
+  the recorded `pool_size` / selection-rate denominator. Exclusion is a
+  downstream filter, like `--tags`, and is intentionally invisible to the pool
+  telemetry.
+
+Id matching normalizes both sides to strings, so a `UUID`-typed result id and a
+plain-string exclude value compare equal. The filter is a pure post-fetch Python
+step, so it applies uniformly across all backends (text-only, vector, hybrid
+RRF) and both the single-pass and `--project-first` two-pass dispatch paths.
+
+Primary consumer: the `memory-awareness` UserPromptSubmit hook, which tracks the
+learning ids it has surfaced per session (in `sessions.surfaced_learning_ids`,
+keyed by `claude_session_id`) and passes them here so it stops re-surfacing the
+same top memories every turn.
+
 ### `--provider` (default: local)
 
 Embedding provider. Choices: `local` (BGE), `voyage` (Voyage AI).

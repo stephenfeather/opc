@@ -1058,6 +1058,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "Opt-in; degrades to global recall if no project resolves."
         ),
     )
+    parser.add_argument(
+        "--exclude-ids",
+        nargs="*",
+        default=[],
+        metavar="UUID",
+        help=(
+            "Learning IDs to drop from results (already-surfaced filtering, "
+            "issue #228 item 2). Space-separated full UUIDs. Applied AFTER the "
+            "pool_size telemetry capture and BEFORE rerank, so excluded picks "
+            "cannot rank back into top-k and selection-rate telemetry is "
+            "unaffected."
+        ),
+    )
     parser.add_argument("--structured", action="store_true", help="Group results by type")
     parser.add_argument(
         "--source",
@@ -1154,6 +1167,15 @@ async def main() -> int:
     # for the primary telemetry source (the memory-awareness hook, no --tags)
     # it is exact.
     pool_size = len(results)
+
+    # Issue #228 item 2: drop already-surfaced learnings BEFORE enrichment and
+    # rerank, so excluded picks can never rank back into top-k. This runs AFTER
+    # the pool_size capture above (exclusion is a downstream filter, like the
+    # tag filter) so item 1's selection-rate telemetry stays the RAW backend
+    # pool. Normalize both sides to str to bridge UUID/str id typing.
+    exclude = {str(x) for x in args.exclude_ids}
+    if exclude:
+        results = [r for r in results if str(r["id"]) not in exclude]
 
     # Pattern enrichment
     if (not args.no_rerank or args.json_full) and backend == "postgres":

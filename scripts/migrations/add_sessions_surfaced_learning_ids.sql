@@ -1,0 +1,23 @@
+-- Migration: Add surfaced_learning_ids to sessions (issue #228 item 2)
+-- Already-surfaced filtering. The memory-awareness hook re-surfaces the same
+-- top memories every turn. To suppress prior-turn picks BEFORE ranking, the
+-- hook tracks the learning IDs it has already surfaced per session and passes
+-- them to recall_learnings.py as --exclude-ids. This adds one nullable column:
+--   surfaced_learning_ids -- the union (deduped) of full learning UUIDs the
+--                            hook has surfaced for this session, keyed by
+--                            claude_session_id (= the hook's stdin
+--                            input.session_id).
+--
+-- The column is nullable with NO default. ADD COLUMN with no default is a
+-- metadata-only change in PostgreSQL 11+ (no table rewrite, no row locks), so
+-- this is cheap on a populated table. A NULL means "nothing surfaced yet" and
+-- is treated by the hook (COALESCE to '{}') as an empty exclusion set, so
+-- pre-migration rows stay valid.
+--
+-- IF NOT EXISTS keeps the migration idempotent and safe to re-run. No index is
+-- needed: lookups are point reads on the claude_session_id key (already
+-- indexed via idx_sessions_claude / equality on the per-session hook query).
+--
+-- Apply with `psql -f` (autocommit).
+
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS surfaced_learning_ids UUID[];

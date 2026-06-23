@@ -14,6 +14,14 @@
 import { readFileSync, existsSync } from 'fs';
 import { spawnSync } from 'child_process';
 import { getOpcDir } from './shared/opc-path.js';
+import { runPgQuery } from './shared/db-utils-pg.js';
+
+/**
+ * Upper bound on the per-session surfaced-id set (issue #228 item 2).
+ * Bounds the recall argv and the persisted array so a long session can't grow
+ * the exclusion list without limit.
+ */
+export const SURFACED_ID_CAP = 500;
 
 interface UserPromptSubmitInput {
   session_id: string;
@@ -32,6 +40,10 @@ interface LearningResult {
 interface MemoryMatch {
   count: number;
   results: LearningResult[];
+  // Full (untruncated) UUIDs of the surfaced results, for the per-session
+  // exclusion union (issue #228 item 2). LearningResult.id is sliced to 8
+  // chars for display, so the union must use this separate full-id list.
+  fullIds: string[];
 }
 
 function readStdin(): string {
@@ -199,11 +211,131 @@ export function isConversationalTurn(prompt: string): boolean {
 }
 
 /**
+ * Capture the FULL untruncated learning UUIDs from recall results for the
+ * surfaced-id union (issue #228 item 2). The display path slices ids to 8
+ * chars for the hint; this MUST use the full id so exclusion works next turn.
+ */
+export function extractFullIds(results: any[]): string[] {
+  if (!Array.isArray(results)) return [];
+  return results
+    .map((r) => (r && typeof r.id === 'string' ? r.id : ''))
+    .filter((id) => id.length > 0);
+}
+
+/**
+ * Build the `--exclude-ids <uuid> ...` argv fragment, or [] (flag omitted)
+ * when there is nothing to exclude.
+ */
+export function buildExcludeArgs(ids: string[]): string[] {
+  if (!ids || ids.length === 0) return [];
+  return ['--exclude-ids', ...ids];
+}
+
+/**
+ * Dedupe-union prior surfaced ids with freshly returned ids and bound the set
+ * to `cap`. Freshly surfaced ids are kept preferentially (they sit at the tail
+ * and the cap trims from the head) so the most recent picks always stay
+ * excluded.
+ */
+export function unionCap(prior: string[], fresh: string[], cap: number): string[] {
+  const merged: string[] = [];
+  const seen = new Set<string>();
+  for (const id of [...(prior || []), ...(fresh || [])]) {
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    merged.push(id);
+  }
+  if (merged.length <= cap) return merged;
+  // Trim from the head; the tail (most-recently-surfaced) survives.
+  return merged.slice(merged.length - cap);
+}
+
+/**
+ * Read prior surfaced learning ids for this session (issue #228 item 2).
+ * Best-effort: any DB error / missing row / NULL column yields []. Keyed by
+ * claude_session_id (= the hook's stdin input.session_id).
+ */
+export function readSurfacedIds(sessionId: string): string[] {
+  if (!sessionId) return [];
+  const pythonCode = `
+import asyncpg, json
+
+db_url = os.environ['CONTINUOUS_CLAUDE_DB_URL']
+session_id = sys.argv[1]
+
+async def main():
+    conn = await asyncpg.connect(db_url)
+    try:
+        row = await conn.fetchrow(
+            "SELECT surfaced_learning_ids FROM sessions WHERE claude_session_id = $1",
+            session_id,
+        )
+    finally:
+        await conn.close()
+    ids = row['surfaced_learning_ids'] if row and row['surfaced_learning_ids'] else []
+    print(json.dumps([str(x) for x in ids]))
+
+asyncio.run(main())
+`;
+  try {
+    const res = runPgQuery(pythonCode, [sessionId]);
+    if (!res.success || !res.stdout) return [];
+    const parsed = JSON.parse(res.stdout);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((x): x is string => typeof x === 'string' && x.length > 0);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Persist the freshly surfaced ids into the session's surfaced set via an
+ * SQL-side atomic dedupe-union (issue #228 item 2). Best-effort: caps the
+ * payload and swallows all DB errors so the hook never breaks.
+ */
+export function persistSurfacedIds(sessionId: string, freshIds: string[]): void {
+  if (!sessionId || !freshIds || freshIds.length === 0) return;
+  const capped = freshIds.slice(0, SURFACED_ID_CAP);
+  const pythonCode = `
+import asyncpg, json
+
+db_url = os.environ['CONTINUOUS_CLAUDE_DB_URL']
+session_id = sys.argv[1]
+fresh = json.loads(sys.argv[2])
+
+async def main():
+    conn = await asyncpg.connect(db_url)
+    try:
+        await conn.execute(
+            "UPDATE sessions SET surfaced_learning_ids = "
+            "ARRAY(SELECT DISTINCT unnest("
+            "COALESCE(surfaced_learning_ids, '{}'::uuid[]) || $2::uuid[]"
+            ")) WHERE claude_session_id = $1",
+            session_id,
+            fresh,
+        )
+    finally:
+        await conn.close()
+
+asyncio.run(main())
+`;
+  try {
+    runPgQuery(pythonCode, [sessionId, JSON.stringify(capped)]);
+  } catch {
+    // Best-effort: never break the hook on a persistence failure.
+  }
+}
+
+/**
  * Fast memory relevance check using text search.
  * For text-only mode, we search by the most significant keyword
  * (text ILIKE looks for substring match, not multi-word).
  */
-function checkMemoryRelevance(intent: string, projectDir: string): MemoryMatch | null {
+function checkMemoryRelevance(
+  intent: string,
+  projectDir: string,
+  excludeIds: string[] = []
+): MemoryMatch | null {
   if (!intent || intent.length < 3) return null;
 
   const opcDir = getOpcDir();
@@ -248,7 +380,11 @@ function checkMemoryRelevance(intent: string, projectDir: string): MemoryMatch |
     '--provider', 'voyage',
     '--source', 'hook',
     ...tagArgs,
-    ...projectArgs
+    ...projectArgs,
+    // Issue #228 item 2: drop already-surfaced learnings BEFORE rank so the
+    // hook stops re-surfacing the same top memories every turn. Appended to
+    // the argv array (not shell) so full UUIDs are passed safely.
+    ...buildExcludeArgs(excludeIds)
   ], {
     encoding: 'utf-8',
     cwd: opcDir,
@@ -296,7 +432,10 @@ function checkMemoryRelevance(intent: string, projectDir: string): MemoryMatch |
 
     return {
       count: data.results.length,
-      results
+      results,
+      // Capture the FULL untruncated ids (not the 8-char display slice above)
+      // for the per-session exclusion union (issue #228 item 2).
+      fullIds: extractFullIds(data.results)
     };
   } catch {
     return null;
@@ -337,10 +476,22 @@ async function main() {
     return;
   }
 
+  // Issue #228 item 2: read learnings already surfaced this session so recall
+  // can exclude them BEFORE ranking (stops re-surfacing the same top memories
+  // every turn). Best-effort — readSurfacedIds swallows all DB errors to [].
+  const priorSurfaced = readSurfacedIds(input.session_id);
+
   // Check memory relevance using semantic search
-  const match = checkMemoryRelevance(intent, projectDir);
+  const match = checkMemoryRelevance(intent, projectDir, priorSurfaced);
 
   if (match) {
+    // Union the freshly surfaced full UUIDs into the session's surfaced set so
+    // next turn excludes them too. Best-effort; capped and error-swallowing.
+    persistSurfacedIds(
+      input.session_id,
+      unionCap(priorSurfaced, match.fullIds, SURFACED_ID_CAP)
+    );
+
     // Build structured context for Claude
     const resultLines = match.results.map((r, i) =>
       `${i + 1}. [${r.type}] ${r.content} (id: ${r.id})`

@@ -817,5 +817,223 @@ class TestMainWiring:
         assert captured["fetch_k"] == 4  # compute_fetch_k(k, no_rerank=True) == k
 
 
+# ---------------------------------------------------------------------------
+# --exclude-ids (issue #228 item 2: already-surfaced filtering)
+# ---------------------------------------------------------------------------
+
+
+class TestExcludeIds:
+    """main(): --exclude-ids drops surfaced learnings BEFORE rerank, AFTER the
+    pool_size capture (so item 1's selection-rate telemetry is unaffected)."""
+
+    @staticmethod
+    def _argv(*extra: str) -> list[str]:
+        return [
+            "recall_learnings.py",
+            "--query",
+            "x",
+            "--source",
+            "hook",
+            "--text-only",
+            "--json",
+            "--k",
+            "5",
+            *extra,
+        ]
+
+    @staticmethod
+    def _result(rid, content="x", sim=0.5):
+        # A result dict carrying the fields _build_json_result requires so the
+        # real _format_output can render it (for capsys-based assertions).
+        return {
+            "id": rid,
+            "content": content,
+            "similarity": sim,
+            "session_id": "sess",
+            "created_at": "2026-06-23T00:00:00+00:00",
+        }
+
+    @staticmethod
+    def _wire(monkeypatch, rl, reranker_mod, results):
+        async def fake_dispatch(params, *, project=None, capture=None):
+            return [dict(r) for r in results]
+
+        async def identity(res):
+            return res
+
+        monkeypatch.setattr(rl, "_dispatch_search", fake_dispatch)
+        monkeypatch.setattr(rl, "get_backend", lambda: "postgres")
+        monkeypatch.setattr(rl, "enrich_with_pattern_strength", identity)
+        monkeypatch.setattr(rl, "enrich_with_kg_context", identity)
+        # rerank is a LOCAL import inside main() from scripts.core.reranker --
+        # patch the source module, not recall_learnings.
+        monkeypatch.setattr(
+            reranker_mod, "rerank", lambda res, ctx, k: res[:k]
+        )
+
+    async def test_exclude_ids_drops_matching_result(self, monkeypatch, capsys):
+        import json as _json
+
+        import scripts.core.recall_learnings as rl
+        import scripts.core.reranker as reranker_mod
+
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        keep1, drop, keep2 = (str(uuid.uuid4()) for _ in range(3))
+        results = [
+            self._result(keep1, "a", 0.9),
+            self._result(drop, "b", 0.8),
+            self._result(keep2, "c", 0.7),
+        ]
+        monkeypatch.setattr(
+            rl.sys, "argv", self._argv("--exclude-ids", drop), raising=False
+        )
+        self._wire(monkeypatch, rl, reranker_mod, results)
+
+        captured: dict = {}
+
+        async def fake_record(
+            ids, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+        ):
+            captured["ids"] = list(ids)
+
+        monkeypatch.setattr(rl, "record_recall", fake_record)
+
+        rc = await rl.main()
+        assert rc == 0
+        out = capsys.readouterr().out
+        payload = _json.loads(out)
+        out_ids = {r["id"] for r in payload["results"]}
+        assert drop not in out_ids
+        assert {keep1, keep2} <= out_ids
+        assert drop not in captured["ids"]
+
+    async def test_pool_size_captured_before_exclusion(self, monkeypatch):
+        # Regression guard for item 1: pool_size must be the RAW backend pool
+        # (pre-exclusion), since exclusion is a downstream filter applied after
+        # the pool_size capture.
+        import scripts.core.recall_learnings as rl
+        import scripts.core.reranker as reranker_mod
+
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        ids = [str(uuid.uuid4()) for _ in range(6)]
+        results = [
+            {"id": i, "content": "x", "similarity": 0.5} for i in ids
+        ]
+        # Exclude 2 of the 6 raw candidates.
+        monkeypatch.setattr(
+            rl.sys,
+            "argv",
+            self._argv("--exclude-ids", ids[0], ids[1]),
+            raising=False,
+        )
+        self._wire(monkeypatch, rl, reranker_mod, results)
+        monkeypatch.setattr(rl, "_format_output", lambda *a, **k: "", raising=False)
+
+        captured: dict = {}
+
+        async def fake_record(
+            ids_arg, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+        ):
+            captured["pool_size"] = pool_size
+            captured["ids"] = list(ids_arg)
+
+        monkeypatch.setattr(rl, "record_recall", fake_record)
+
+        rc = await rl.main()
+        assert rc == 0
+        # pool_size is the pre-exclusion raw pool (6), NOT the post-exclusion 4.
+        assert captured["pool_size"] == 6
+        assert ids[0] not in captured["ids"]
+        assert ids[1] not in captured["ids"]
+        assert len(captured["ids"]) == 4
+
+    async def test_no_exclude_ids_no_regression(self, monkeypatch):
+        import scripts.core.recall_learnings as rl
+        import scripts.core.reranker as reranker_mod
+
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        ids = [str(uuid.uuid4()) for _ in range(3)]
+        results = [{"id": i, "content": "x", "similarity": 0.5} for i in ids]
+        monkeypatch.setattr(rl.sys, "argv", self._argv(), raising=False)
+        self._wire(monkeypatch, rl, reranker_mod, results)
+        monkeypatch.setattr(rl, "_format_output", lambda *a, **k: "", raising=False)
+
+        captured: dict = {}
+
+        async def fake_record(
+            ids_arg, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+        ):
+            captured["ids"] = list(ids_arg)
+            captured["pool_size"] = pool_size
+
+        monkeypatch.setattr(rl, "record_recall", fake_record)
+
+        rc = await rl.main()
+        assert rc == 0
+        assert set(captured["ids"]) == set(ids)
+        assert captured["pool_size"] == 3
+
+    async def test_exclude_all_candidates_graceful_empty(self, monkeypatch, capsys):
+        import json as _json
+
+        import scripts.core.recall_learnings as rl
+        import scripts.core.reranker as reranker_mod
+
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        ids = [str(uuid.uuid4()) for _ in range(3)]
+        results = [{"id": i, "content": "x", "similarity": 0.5} for i in ids]
+        monkeypatch.setattr(
+            rl.sys, "argv", self._argv("--exclude-ids", *ids), raising=False
+        )
+        self._wire(monkeypatch, rl, reranker_mod, results)
+
+        async def fake_record(
+            ids_arg, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+        ):
+            return None
+
+        monkeypatch.setattr(rl, "record_recall", fake_record)
+
+        rc = await rl.main()
+        assert rc == 0
+        out = capsys.readouterr().out
+        payload = _json.loads(out)  # must be valid JSON, no crash
+        assert payload["results"] == []
+
+    async def test_exclude_id_string_matches_uuid_result(self, monkeypatch):
+        # str/UUID normalization: a result id typed as uuid.UUID is dropped when
+        # the exclude id is passed as a plain string. (DB rows normally carry
+        # str ids; this exercises the str() coercion on both sides directly.)
+        import scripts.core.recall_learnings as rl
+        import scripts.core.reranker as reranker_mod
+
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        drop_uuid = uuid.uuid4()
+        keep_uuid = uuid.uuid4()
+        results = [
+            self._result(drop_uuid, "b", 0.8),
+            self._result(keep_uuid, "c", 0.7),
+        ]
+        monkeypatch.setattr(
+            rl.sys, "argv", self._argv("--exclude-ids", str(drop_uuid)), raising=False
+        )
+        self._wire(monkeypatch, rl, reranker_mod, results)
+        monkeypatch.setattr(rl, "_format_output", lambda *a, **k: "", raising=False)
+
+        captured: dict = {}
+
+        async def fake_record(
+            ids_arg, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+        ):
+            captured["ids"] = [str(i) for i in ids_arg]
+
+        monkeypatch.setattr(rl, "record_recall", fake_record)
+
+        rc = await rl.main()
+        assert rc == 0
+        assert str(drop_uuid) not in captured["ids"]
+        assert str(keep_uuid) in captured["ids"]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

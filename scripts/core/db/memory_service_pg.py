@@ -517,7 +517,7 @@ class MemoryServicePG:
 
             if supersedes:
                 try:
-                    await conn.execute(
+                    status = await conn.execute(
                         """
                         UPDATE archival_memory
                         SET superseded_by = $1::uuid, superseded_at = NOW()
@@ -525,6 +525,19 @@ class MemoryServicePG:
                         """,
                         memory_id, supersedes,
                     )
+                    # A zero-row UPDATE means the target was not superseded: it is
+                    # already superseded (e.g. a concurrent writer claimed it
+                    # between the caller's dedup probe and now), missing, or a
+                    # stale id. asyncpg does NOT raise on zero matches, so surface
+                    # it instead of silently leaving an unlinked active row.
+                    # Full transactional abort-and-retry is tracked separately;
+                    # this at least makes the lost supersede observable.
+                    if status == "UPDATE 0":
+                        logger.warning(
+                            "Supersede UPDATE matched 0 rows: target %s not "
+                            "superseded by %s (already superseded, missing, or "
+                            "stale id)", supersedes, memory_id,
+                        )
                 except asyncpg.UndefinedColumnError:
                     logger.debug(
                         "Supersede UPDATE failed (column missing) for %s -> %s",

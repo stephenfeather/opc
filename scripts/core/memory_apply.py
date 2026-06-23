@@ -43,8 +43,14 @@ if _repo_root not in sys.path:
 
 from asyncpg.exceptions import PostgresError  # noqa: E402
 
+from scripts.core.db.memory_service_pg import supersede_row  # noqa: E402
 from scripts.core.db.postgres_pool import close_pool, get_pool  # noqa: E402
-from scripts.core.memory_review import PromotionCandidate, route_destination  # noqa: E402
+from scripts.core.memory_review import (  # noqa: E402
+    MergeRow,
+    PromotionCandidate,
+    fetch_merge_pair_details,
+    route_destination,
+)
 from scripts.core.project_naming import canonicalize_project, project_from_path  # noqa: E402
 
 # pg_dump backup target. The container is `opc-postgres` (matches docker-compose.yml's
@@ -90,6 +96,28 @@ class ApplyPlan:
         return [a for a in self.actions if not a.skipped]
 
 
+@dataclass(frozen=True)
+class MergeAction:
+    """One planned merge-supersede: keeper_id supersedes loser_id, or a skip with a reason."""
+
+    id_a: str
+    id_b: str
+    keeper_id: str | None
+    loser_id: str | None
+    skipped: bool
+    skip_reason: str | None
+
+
+@dataclass(frozen=True)
+class MergeApplyPlan:
+    actions: list[MergeAction] = field(default_factory=list)
+    dry_run: bool = True
+
+    @property
+    def applicable(self) -> list[MergeAction]:
+        return [a for a in self.actions if not a.skipped]
+
+
 # --- Pure functions --------------------------------------------------------
 
 
@@ -130,6 +158,76 @@ def build_plan(
             continue
         actions.append(ApplyAction(c, target, skipped=False, skip_reason=None))
     return ApplyPlan(actions=actions, dry_run=dry_run)
+
+
+class MergeKeeperError(ValueError):
+    """Raised when a merge pair has no safe keeper (a side is already superseded).
+
+    Selection is undefined once either side has been superseded — superseding the loser onto
+    a dead keeper would orphan it, and superseding an already-dead loser is a clobber. The
+    apply path treats this as a skip-with-reason, not a crash.
+    """
+
+
+def select_merge_keeper(row_a: MergeRow, row_b: MergeRow) -> tuple[MergeRow, MergeRow]:
+    """Pure: pick (keeper, loser) for a merge pair. No I/O, no mutation.
+
+    Tie-break order, most-significant first:
+      1. higher ``recall_count`` keeps (it is the more-used entry),
+      2. tie -> older ``created_at`` keeps (the original; the later one is the duplicate),
+      3. tie -> smaller ``id`` keeps (stable, deterministic across runs).
+
+    Raises ``MergeKeeperError`` if EITHER side is already superseded — there is no safe keeper.
+    """
+    if row_a.superseded_by is not None or row_b.superseded_by is not None:
+        raise MergeKeeperError(
+            f"cannot select a merge keeper: a side is already superseded "
+            f"({row_a.id} superseded_by={row_a.superseded_by!r}, "
+            f"{row_b.id} superseded_by={row_b.superseded_by!r})"
+        )
+    # Sort key returns the KEEPER as the minimum: negate recall (higher first), then
+    # created_at ascending (older first), then id ascending (smaller first).
+    keeper, loser = sorted((row_a, row_b), key=lambda r: (-r.recall_count, r.created_at, r.id))
+    return keeper, loser
+
+
+def build_merge_plan(
+    pairs: list[tuple[str, str]],
+    rows_by_id: dict[str, MergeRow],
+    dry_run: bool,
+) -> MergeApplyPlan:
+    """Pure: turn (id_a, id_b) pairs + resolved rows into keeper/loser merge actions.
+
+    A pair is skipped (never raises out of planning) when a side does not resolve, or when
+    ``select_merge_keeper`` refuses because a side is already superseded. The actual
+    supersede UPDATE — and its idempotent 0-row handling — happens in ``run_merge_apply``.
+    """
+    actions: list[MergeAction] = []
+    for id_a, id_b in pairs:
+        row_a = rows_by_id.get(id_a)
+        row_b = rows_by_id.get(id_b)
+        if row_a is None or row_b is None:
+            missing = [i for i, r in ((id_a, row_a), (id_b, row_b)) if r is None]
+            actions.append(
+                MergeAction(
+                    id_a,
+                    id_b,
+                    None,
+                    None,
+                    skipped=True,
+                    skip_reason=f"id(s) not a current learning: {', '.join(missing)}",
+                )
+            )
+            continue
+        try:
+            keeper, loser = select_merge_keeper(row_a, row_b)
+        except MergeKeeperError as exc:
+            actions.append(MergeAction(id_a, id_b, None, None, skipped=True, skip_reason=str(exc)))
+            continue
+        actions.append(
+            MergeAction(id_a, id_b, keeper.id, loser.id, skipped=False, skip_reason=None)
+        )
+    return MergeApplyPlan(actions=actions, dry_run=dry_run)
 
 
 def _short(text: str, width: int = 80) -> str:
@@ -540,6 +638,70 @@ async def run_apply(
     return ApplyResult(plan=plan, applied=applied, backup_path=backup_path, failed=failed)
 
 
+@dataclass(frozen=True)
+class MergeApplyResult:
+    plan: MergeApplyPlan
+    applied: list[str] = field(default_factory=list)  # loser ids actually superseded
+    skipped: list[tuple[str, str, str]] = field(default_factory=list)  # (id_a, id_b, reason)
+    backup_path: Path | None = None
+
+
+async def run_merge_apply(
+    pool,
+    project: str,
+    pairs: list[tuple[str, str]],
+    *,
+    execute: bool,
+    backup_dir: Path,
+    timestamp: str,
+    lock_dir: Path | None = None,
+    run=subprocess.run,
+) -> MergeApplyResult:
+    """Resolve merge pairs, pick keepers, and (only if execute) back up then supersede losers.
+
+    Same safety envelope as ``run_apply``: dry-run (execute=False) performs ZERO writes and
+    takes NO backup; under execute a per-project flock serializes the run, a DB-table dump is
+    taken before the first write, and each loser is retired through the shared
+    ``supersede_row`` helper with reason="merge".
+
+    Idempotent: a 0-row supersede (the loser was already superseded — e.g. by a concurrent
+    store-time supersede between the fetch and the write) is reported as a skip, NOT an error.
+    This contrasts with ``write_provenance`` (which demands UPDATE 1): a merge that finds the
+    work already done is a success-shaped no-op, not a failure.
+    """
+    rows_by_id: dict[str, MergeRow] = {}
+    for id_a, id_b in pairs:
+        rows_by_id.update(await fetch_merge_pair_details(pool, project, id_a, id_b))
+    plan = build_merge_plan(pairs, rows_by_id, dry_run=not execute)
+
+    skipped = [(a.id_a, a.id_b, a.skip_reason or "") for a in plan.actions if a.skipped]
+
+    if not execute or not plan.applicable:
+        return MergeApplyResult(plan=plan, applied=[], skipped=skipped, backup_path=None)
+
+    lock_root = lock_dir if lock_dir is not None else backup_dir
+    with _apply_lock(lock_root, project):
+        backup_path = backup_database(backup_dir / f"memory-merge-{timestamp}.sql", run=run)
+        applied: list[str] = []
+        async with pool.acquire() as conn:
+            for action in plan.applicable:
+                if action.keeper_id is None or action.loser_id is None:
+                    continue  # unreachable for applicable actions; defensive
+                count = await supersede_row(
+                    conn,
+                    loser_id=action.loser_id,
+                    keeper_id=action.keeper_id,
+                    reason="merge",
+                )
+                if count == 0:
+                    # Already superseded (idempotent / concurrent store-time supersede):
+                    # the guarded UPDATE matched nothing. Skip + report, never raise.
+                    skipped.append((action.id_a, action.id_b, "already superseded (0-row update)"))
+                    continue
+                applied.append(action.loser_id)
+    return MergeApplyResult(plan=plan, applied=applied, skipped=skipped, backup_path=backup_path)
+
+
 # --- CLI -------------------------------------------------------------------
 
 
@@ -604,6 +766,34 @@ def validate_ids(ids: list[str]) -> tuple[list[str], list[str]]:
     return valid, invalid
 
 
+def parse_pairs(raw_pairs: list[str]) -> list[tuple[str, str]]:
+    """Parse ``--pair A:B`` strings into validated (id_a, id_b) uuid tuples.
+
+    Each pair is ``<uuid>:<uuid>``. Raises ValueError on a malformed pair or a non-uuid id so
+    a typo never reaches SQL. UUIDs are lowercased to match ``archival_memory.id::text``.
+    Duplicate pairs (order-insensitive) are de-duplicated, preserving first-seen order.
+    """
+    out: list[tuple[str, str]] = []
+    seen: set[frozenset[str]] = set()
+    for raw in raw_pairs:
+        parts = raw.split(":")
+        if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+            raise ValueError(f"malformed --pair {raw!r}: expected '<uuid>:<uuid>'")
+        a, b = parts[0].strip(), parts[1].strip()
+        for one in (a, b):
+            if not _UUID_RE.match(one):
+                raise ValueError(f"--pair {raw!r} contains a non-uuid id: {one!r}")
+        if a.lower() == b.lower():
+            raise ValueError(f"--pair {raw!r} merges an id with itself")
+        a, b = a.lower(), b.lower()
+        key = frozenset((a, b))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((a, b))
+    return out
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Apply approved memory promotions (issue #63 Phase 2a). Dry-run by default."
@@ -621,7 +811,85 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--memory-dir", default=None, help="Override Claude memory dir")
     p.add_argument("--claude-md", default=None, help="Override CLAUDE.md path")
     p.add_argument("--backup-dir", default=None, help="Override backup output dir")
+    p.add_argument(
+        "--merge",
+        action="store_true",
+        help="Merge-supersede mode: retire the loser of each --pair onto its keeper "
+        "(dry-run by default; --execute backs up then writes).",
+    )
+    p.add_argument(
+        "--pair",
+        action="append",
+        default=[],
+        metavar="ID_A:ID_B",
+        help="A merge pair '<uuid>:<uuid>' (repeatable). Used only with --merge.",
+    )
     return p.parse_args(argv)
+
+
+def render_merge_plan(plan: MergeApplyPlan) -> str:
+    """Render the merge plan as a readable preview. Pure — writes nothing."""
+    lines: list[str] = []
+    banner = "DRY RUN — no changes written" if plan.dry_run else "EXECUTE — writing changes"
+    lines.append(f"## Merge-Supersede Plan ({banner})")
+    applicable = plan.applicable
+    lines.append(f"{len(applicable)} to supersede, {len(plan.actions) - len(applicable)} skipped")
+    lines.append("")
+    for a in plan.actions:
+        if a.skipped:
+            lines.append(f"  skip [{a.id_a[:8]}+{a.id_b[:8]}] {a.skip_reason}")
+        else:
+            lines.append(
+                f"  → keep [{(a.keeper_id or '')[:8]}], supersede [{(a.loser_id or '')[:8]}]"
+            )
+    if plan.dry_run and applicable:
+        lines.append("")
+        lines.append("_Re-run with --execute to apply (a DB backup is taken first)._")
+    return "\n".join(lines)
+
+
+async def _merge_main(args: argparse.Namespace, project: str) -> int:
+    """Merge-supersede CLI path. Dry-run by default; --execute backs up then writes."""
+    try:
+        pairs = parse_pairs(args.pair)
+    except ValueError as exc:
+        print(f"memory-apply: invalid merge pair: {exc}", file=sys.stderr)
+        return 2
+    if not pairs:
+        print("memory-apply: --merge needs at least one --pair '<uuid>:<uuid>'.", file=sys.stderr)
+        return 2
+
+    backup_dir = Path(args.backup_dir) if args.backup_dir else default_backup_dir()
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+
+    print(f"memory-apply: project={project} (merge-supersede)")
+    if args.execute:
+        print(f"  backup dir : {backup_dir}")
+    print("")
+
+    try:
+        pool = await get_pool()
+        result = await run_merge_apply(
+            pool,
+            project,
+            pairs,
+            execute=args.execute,
+            backup_dir=backup_dir,
+            timestamp=timestamp,
+        )
+    except (OSError, RuntimeError, PostgresError) as exc:
+        # RuntimeError covers a failed pg_dump backup (apply aborts before any write);
+        # PostgresError is caught so a DB failure can't echo the DSN in a traceback.
+        print(f"memory-apply: aborted ({type(exc).__name__}): {exc}", file=sys.stderr)
+        return 1
+
+    print(render_merge_plan(result.plan))
+    if args.execute:
+        print("")
+        print(f"Superseded {len(result.applied)} learning(s).")
+        if result.backup_path:
+            print(f"DB backup: {result.backup_path}")
+    return 0
 
 
 async def main(argv: list[str] | None = None) -> int:
@@ -632,6 +900,9 @@ async def main(argv: list[str] | None = None) -> int:
     if not project:
         print("memory-apply: could not resolve a project. Pass one explicitly.", file=sys.stderr)
         return 2
+
+    if args.merge:
+        return await _merge_main(args, project)
 
     try:
         ids = parse_ids(args.ids, args.manifest)

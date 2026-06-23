@@ -18,6 +18,7 @@ import asyncio
 import os
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 _repo_root = str(Path(__file__).resolve().parent.parent.parent)
@@ -86,6 +87,21 @@ class MergeCandidate:
     similarity: float
     preview_a: str
     preview_b: str
+
+
+@dataclass(frozen=True)
+class MergeRow:
+    """The keeper-selection signals for one side of a merge pair.
+
+    Distinct from ``MergeCandidate`` (which carries previews for the report): this is the
+    minimal row the apply path needs to pick a keeper — recall_count and created_at for the
+    tie-break, and ``superseded_by`` so an already-superseded side is refused before any write.
+    """
+
+    id: str
+    recall_count: int
+    created_at: datetime
+    superseded_by: str | None
 
 
 @dataclass(frozen=True)
@@ -342,10 +358,46 @@ _ACTIVE_TOTAL_SQL = """
     WHERE LOWER(project) = LOWER($1) AND superseded_by IS NULL
 """
 
+# Resolve both ids of a merge pair in ONE round-trip (plan note N-1: never per-id fetches).
+# Carries the keeper-selection signals only (recall_count, created_at) plus superseded_by so
+# the apply path can refuse a pair whose side is already superseded. Mirrors
+# _CANDIDATES_BY_IDS_SQL (id = ANY, project-scoped) but does NOT filter superseded_by here —
+# the apply path needs to SEE an already-superseded side to refuse/skip it, not have it hidden.
+_MERGE_PAIR_DETAILS_SQL = """
+    SELECT id::text AS id,
+           recall_count,
+           created_at,
+           superseded_by::text AS superseded_by
+    FROM archival_memory
+    WHERE LOWER(project) = LOWER($1)
+      AND id::text = ANY($2::text[])
+"""
+
 
 async def fetch_active_total(pool, project: str) -> int:
     async with pool.acquire() as conn:
         return int(await conn.fetchval(_ACTIVE_TOTAL_SQL, project) or 0)
+
+
+async def fetch_merge_pair_details(pool, project: str, id_a: str, id_b: str) -> dict[str, MergeRow]:
+    """Resolve a merge pair's two ids to ``MergeRow``s in one batched, project-scoped query.
+
+    Returns a dict keyed by id::text so a caller can index either side; an id that does not
+    resolve (hard-deleted / wrong project) is simply absent from the dict. Read-only — this
+    module never writes. The apply path consumes these rows to pick a keeper and to refuse a
+    pair whose side is already superseded.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(_MERGE_PAIR_DETAILS_SQL, project, [id_a, id_b])
+    return {
+        r["id"]: MergeRow(
+            id=r["id"],
+            recall_count=int(r["recall_count"]),
+            created_at=r["created_at"],
+            superseded_by=r["superseded_by"],
+        )
+        for r in rows
+    }
 
 
 async def fetch_promotion_candidates(

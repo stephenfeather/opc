@@ -5,10 +5,14 @@ backup. The read-only detector (memory_review.py) is untouched; all write logic 
 here. Pure planning/rendering is unit-tested; I/O handlers use tmp dirs + mocked pools.
 """
 
+import datetime as _dt
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+_DT_A = _dt.datetime(2026, 1, 1, tzinfo=_dt.UTC)
+_DT_B = _dt.datetime(2026, 2, 1, tzinfo=_dt.UTC)
 
 from scripts.core.memory_apply import (
     ApplyAction,
@@ -34,6 +38,7 @@ from scripts.core.memory_apply import _parse_args as parse_apply_args
 from scripts.core.memory_review import PromotionCandidate
 
 _UUID = "11111111-1111-1111-1111-111111111111"
+_UUID2 = "22222222-2222-2222-2222-222222222222"
 
 
 def _cand(id="a1", lt="CODEBASE_PATTERN", dest="MEMORY.md", recall=12, content="A useful pattern"):
@@ -43,6 +48,75 @@ def _cand(id="a1", lt="CODEBASE_PATTERN", dest="MEMORY.md", recall=12, content="
 
 
 # --- route_apply_target (pure) ---
+
+
+def _mrow(id="a", recall=0, created="2026-01-01", superseded_by=None):
+    import datetime as _dt
+
+    from scripts.core.memory_review import MergeRow
+
+    y, m, d = (int(x) for x in created.split("-"))
+    return MergeRow(
+        id=id,
+        recall_count=recall,
+        created_at=_dt.datetime(y, m, d, tzinfo=_dt.UTC),
+        superseded_by=superseded_by,
+    )
+
+
+class TestSelectMergeKeeper:
+    """Pure keeper selection: higher recall, then older created_at, then smaller id."""
+
+    def test_higher_recall_wins(self):
+        from scripts.core.memory_apply import select_merge_keeper
+
+        a = _mrow(id="aaaa", recall=3)
+        b = _mrow(id="bbbb", recall=9)
+        keeper, loser = select_merge_keeper(a, b)
+        assert keeper.id == "bbbb"
+        assert loser.id == "aaaa"
+
+    def test_recall_tie_older_created_at_wins(self):
+        from scripts.core.memory_apply import select_merge_keeper
+
+        older = _mrow(id="zzzz", recall=5, created="2026-01-01")
+        newer = _mrow(id="aaaa", recall=5, created="2026-06-01")
+        keeper, loser = select_merge_keeper(newer, older)
+        assert keeper.id == "zzzz"  # older keeper despite larger id
+        assert loser.id == "aaaa"
+
+    def test_full_tie_smaller_id_wins(self):
+        from scripts.core.memory_apply import select_merge_keeper
+
+        a = _mrow(id="aaaa", recall=5, created="2026-01-01")
+        b = _mrow(id="bbbb", recall=5, created="2026-01-01")
+        keeper, loser = select_merge_keeper(b, a)  # order-independent
+        assert keeper.id == "aaaa"
+        assert loser.id == "bbbb"
+
+    def test_pure_does_not_mutate_inputs(self):
+        from scripts.core.memory_apply import select_merge_keeper
+
+        a = _mrow(id="aaaa", recall=3)
+        b = _mrow(id="bbbb", recall=9)
+        select_merge_keeper(a, b)
+        assert a.recall_count == 3 and b.recall_count == 9  # frozen, untouched
+
+    def test_raises_when_keeper_side_already_superseded(self):
+        from scripts.core.memory_apply import MergeKeeperError, select_merge_keeper
+
+        a = _mrow(id="aaaa", recall=9, superseded_by="cccc")  # would-be keeper, dead
+        b = _mrow(id="bbbb", recall=3)
+        with pytest.raises(MergeKeeperError):
+            select_merge_keeper(a, b)
+
+    def test_raises_when_loser_side_already_superseded(self):
+        from scripts.core.memory_apply import MergeKeeperError, select_merge_keeper
+
+        a = _mrow(id="aaaa", recall=9)
+        b = _mrow(id="bbbb", recall=3, superseded_by="cccc")
+        with pytest.raises(MergeKeeperError):
+            select_merge_keeper(a, b)
 
 
 class TestRouteApplyTarget:
@@ -261,6 +335,113 @@ class TestCliParsing:
         d = default_memory_dir("/Users/x/opc")
         assert d.name == "memory"
         assert "-Users-x-opc" in str(d)
+
+
+class TestMergeCliParsing:
+    def test_merge_flag_defaults_false(self):
+        ns = parse_apply_args(["opc", "--ids", "a"])
+        assert ns.merge is False
+
+    def test_merge_flag_set(self):
+        ns = parse_apply_args(["opc", "--merge", "--pair", f"{_UUID}:{_UUID2}"])
+        assert ns.merge is True
+
+    def test_pair_is_repeatable(self):
+        ns = parse_apply_args(
+            ["opc", "--merge", "--pair", f"{_UUID}:{_UUID2}", "--pair", f"{_UUID2}:{_UUID}"]
+        )
+        assert ns.pair == [f"{_UUID}:{_UUID2}", f"{_UUID2}:{_UUID}"]
+
+    def test_parse_pairs_splits_on_colon(self):
+        from scripts.core.memory_apply import parse_pairs
+
+        assert parse_pairs([f"{_UUID}:{_UUID2}"]) == [(_UUID, _UUID2)]
+
+    def test_parse_pairs_rejects_malformed(self):
+        from scripts.core.memory_apply import parse_pairs
+
+        with pytest.raises(ValueError, match="pair"):
+            parse_pairs(["only-one-id"])
+
+    def test_parse_pairs_validates_uuids(self):
+        from scripts.core.memory_apply import parse_pairs
+
+        with pytest.raises(ValueError):
+            parse_pairs(["not-a-uuid:also-bad"])
+
+
+class TestMergeCliMain:
+    async def test_merge_dry_run_writes_nothing(self, tmp_path, monkeypatch):
+        import scripts.core.memory_apply as ma
+
+        rows = [
+            {"id": _UUID, "recall_count": 3, "created_at": _DT_A, "superseded_by": None},
+            {"id": _UUID2, "recall_count": 9, "created_at": _DT_B, "superseded_by": None},
+        ]
+        pool, conn = _pool()
+        conn.fetch.side_effect = [rows]
+        backup_called = False
+
+        def _run(*a, **k):
+            nonlocal backup_called
+            backup_called = True
+            return MagicMock(returncode=0)
+
+        async def _get_pool():
+            return pool
+
+        monkeypatch.setattr(ma, "get_pool", _get_pool)
+        monkeypatch.setattr(ma, "project_from_path", lambda _p: "opc")
+        rc = await ma.main(
+            ["opc", "--merge", "--pair", f"{_UUID}:{_UUID2}", "--backup-dir", str(tmp_path)]
+        )
+        assert rc == 0
+        assert backup_called is False
+        conn.execute.assert_not_called()  # no supersede, no backup in dry-run
+
+    async def test_merge_execute_backs_up_then_supersedes(self, tmp_path, monkeypatch):
+        import scripts.core.memory_apply as ma
+
+        rows = [
+            {"id": _UUID, "recall_count": 3, "created_at": _DT_A, "superseded_by": None},
+            {"id": _UUID2, "recall_count": 9, "created_at": _DT_B, "superseded_by": None},
+        ]
+        pool, conn = _pool()
+        conn.fetch.side_effect = [rows]
+        order = []
+
+        def _backup(dest, **kw):
+            order.append("backup")
+            Path(dest).parent.mkdir(parents=True, exist_ok=True)
+            Path(dest).write_text("-- dump")
+            return Path(dest)
+
+        async def _exec(*a, **k):
+            order.append("supersede")
+            return "UPDATE 1"
+
+        conn.execute = _exec
+
+        async def _get_pool():
+            return pool
+
+        monkeypatch.setattr(ma, "get_pool", _get_pool)
+        monkeypatch.setattr(ma, "project_from_path", lambda _p: "opc")
+        monkeypatch.setattr(ma, "backup_database", _backup)
+        rc = await ma.main(
+            [
+                "opc",
+                "--merge",
+                "--pair",
+                f"{_UUID}:{_UUID2}",
+                "--execute",
+                "--backup-dir",
+                str(tmp_path),
+            ]
+        )
+        assert rc == 0
+        assert order and order[0] == "backup"
+        assert "supersede" in order
 
 
 class TestCliMain:
@@ -648,6 +829,189 @@ class TestRunApply:
         backups = {p.name for p in backup_dir.glob("*.bak")}
         assert any("MEMORY.md" in n for n in backups)
         assert any("CLAUDE.md" in n for n in backups)
+
+
+class TestRunMergeApply:
+    """Merge-supersede apply path: same safety envelope as promotion, reason='merge'."""
+
+    _A = "11111111-1111-1111-1111-111111111111"
+    _B = "22222222-2222-2222-2222-222222222222"
+
+    def _merge_rows(self, recall_a=3, recall_b=9, sup_a=None, sup_b=None):
+        # row_b wins keeper (higher recall) by default.
+        return [
+            {
+                "id": self._A,
+                "recall_count": recall_a,
+                "created_at": _DT_A,
+                "superseded_by": sup_a,
+            },
+            {
+                "id": self._B,
+                "recall_count": recall_b,
+                "created_at": _DT_B,
+                "superseded_by": sup_b,
+            },
+        ]
+
+    async def test_dry_run_writes_nothing_and_no_backup(self, tmp_path):
+        from scripts.core.memory_apply import run_merge_apply
+
+        pool, conn = _pool(rows=self._merge_rows())
+        backup_dir = tmp_path / "backups"
+        backup_called = False
+
+        def _run(*a, **k):
+            nonlocal backup_called
+            backup_called = True
+            return MagicMock(returncode=0)
+
+        result = await run_merge_apply(
+            pool,
+            "opc",
+            [(self._A, self._B)],
+            execute=False,
+            backup_dir=backup_dir,
+            timestamp="20260101-000000",
+            run=_run,
+        )
+        assert result.plan.dry_run is True
+        assert result.applied == []
+        assert result.backup_path is None
+        assert backup_called is False
+        conn.execute.assert_not_called()  # no supersede UPDATE in dry-run
+
+    async def test_execute_backs_up_then_supersedes_loser_with_merge_reason(self, tmp_path):
+        from scripts.core.memory_apply import run_merge_apply
+
+        pool, conn = _pool()
+        conn.fetch.side_effect = [self._merge_rows()]  # one pair -> one detail fetch
+        order = []
+
+        def _run(cmd, **kw):
+            order.append("backup")
+            Path(kw["stdout"].name).write_text("-- dump")
+            return MagicMock(returncode=0)
+
+        async def _exec(*a, **k):
+            order.append("supersede")
+            return "UPDATE 1"
+
+        conn.execute = _exec
+        backup_dir = tmp_path / "backups"
+
+        result = await run_merge_apply(
+            pool,
+            "opc",
+            [(self._A, self._B)],
+            execute=True,
+            backup_dir=backup_dir,
+            timestamp="20260101-000000",
+            run=_run,
+        )
+        assert result.backup_path is not None and result.backup_path.exists()
+        assert order[0] == "backup"  # backup precedes any write
+        assert "supersede" in order
+        # row_b (recall 9) is keeper, row_a (recall 3) is loser
+        assert result.applied == [self._A]
+
+    async def test_supersede_called_with_keeper_loser_and_merge_reason(self, tmp_path):
+        from scripts.core.memory_apply import run_merge_apply
+
+        pool, conn = _pool()
+        conn.fetch.side_effect = [self._merge_rows()]
+        captured = {}
+
+        async def _exec(sql, *params, **kw):
+            captured["sql"] = sql
+            captured["params"] = params
+            return "UPDATE 1"
+
+        conn.execute = _exec
+
+        def _run(cmd, **kw):
+            Path(kw["stdout"].name).write_text("-- dump")
+            return MagicMock(returncode=0)
+
+        await run_merge_apply(
+            pool,
+            "opc",
+            [(self._A, self._B)],
+            execute=True,
+            backup_dir=tmp_path / "b",
+            timestamp="t",
+            run=_run,
+        )
+        # keeper=_B, loser=_A, reason="merge" all reach supersede_row's UPDATE
+        assert self._A in captured["params"]  # loser
+        assert self._B in captured["params"]  # keeper
+        assert "merge" in captured["params"]
+        assert "superseded_by IS NULL" in captured["sql"]
+
+    async def test_idempotent_zero_row_update_skips_without_raising(self, tmp_path):
+        from scripts.core.memory_apply import run_merge_apply
+
+        pool, conn = _pool()
+        conn.fetch.side_effect = [self._merge_rows()]
+        conn.execute = AsyncMock(return_value="UPDATE 0")  # already superseded concurrently
+
+        def _run(cmd, **kw):
+            Path(kw["stdout"].name).write_text("-- dump")
+            return MagicMock(returncode=0)
+
+        result = await run_merge_apply(
+            pool,
+            "opc",
+            [(self._A, self._B)],
+            execute=True,
+            backup_dir=tmp_path / "b",
+            timestamp="t",
+            run=_run,
+        )
+        assert result.applied == []  # nothing applied
+        assert len(result.skipped) == 1  # reported as a skip, not a failure
+        # no exception raised -> the assertion below proves we returned normally
+
+    async def test_already_superseded_pair_skips_no_raise(self, tmp_path):
+        from scripts.core.memory_apply import run_merge_apply
+
+        pool, conn = _pool()
+        # row_a already superseded -> select_merge_keeper refuses -> skip, no write
+        conn.fetch.side_effect = [self._merge_rows(sup_a=self._B)]
+
+        def _run(cmd, **kw):
+            Path(kw["stdout"].name).write_text("-- dump")
+            return MagicMock(returncode=0)
+
+        result = await run_merge_apply(
+            pool,
+            "opc",
+            [(self._A, self._B)],
+            execute=True,
+            backup_dir=tmp_path / "b",
+            timestamp="t",
+            run=_run,
+        )
+        assert result.applied == []
+        assert len(result.skipped) == 1
+        conn.execute.assert_not_called()  # no supersede attempted
+
+    async def test_missing_side_skips(self, tmp_path):
+        from scripts.core.memory_apply import run_merge_apply
+
+        pool, conn = _pool()
+        # only one id resolves -> cannot form a pair -> skip
+        conn.fetch.side_effect = [[self._merge_rows()[0]]]
+
+        result = await run_merge_apply(
+            pool,
+            "opc",
+            [(self._A, self._B)],
+            execute=False,
+            backup_dir=tmp_path / "b",
+            timestamp="t",
+        )
+        assert len(result.skipped) == 1
 
 
 class TestBackupFiles:

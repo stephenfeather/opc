@@ -258,6 +258,86 @@ class TestFetchMergeCandidates:
         assert "a.id < nn.id" not in _MERGE_SQL
 
 
+class TestFetchMergePairDetails:
+    """fetch_merge_pair_details: resolve two ids to MergeRows in ONE batched query."""
+
+    _A = "11111111-1111-1111-1111-111111111111"
+    _B = "22222222-2222-2222-2222-222222222222"
+
+    def _rows(self):
+        import datetime as _dt
+
+        return [
+            {
+                "id": self._A,
+                "recall_count": 5,
+                "created_at": _dt.datetime(2026, 1, 1, tzinfo=_dt.UTC),
+                "superseded_by": None,
+            },
+            {
+                "id": self._B,
+                "recall_count": 9,
+                "created_at": _dt.datetime(2026, 2, 1, tzinfo=_dt.UTC),
+                "superseded_by": None,
+            },
+        ]
+
+    async def test_returns_both_rows_keyed_by_id(self):
+        from scripts.core.memory_review import MergeRow, fetch_merge_pair_details
+
+        pool, conn = _pool_returning(self._rows())
+        out = await fetch_merge_pair_details(pool, "opc", self._A, self._B)
+        assert isinstance(out[self._A], MergeRow)
+        assert isinstance(out[self._B], MergeRow)
+        assert out[self._A].recall_count == 5
+        assert out[self._B].recall_count == 9
+        assert out[self._A].superseded_by is None
+
+    async def test_carries_created_at_and_superseded_by(self):
+        from scripts.core.memory_review import fetch_merge_pair_details
+
+        rows = self._rows()
+        rows[0]["superseded_by"] = self._B  # row_a already superseded
+        pool, conn = _pool_returning(rows)
+        out = await fetch_merge_pair_details(pool, "opc", self._A, self._B)
+        assert out[self._A].superseded_by == self._B
+        assert out[self._A].created_at is not None
+        assert out[self._B].created_at is not None
+
+    async def test_single_batched_any_query_not_per_id(self):
+        from scripts.core.memory_review import fetch_merge_pair_details
+
+        pool, conn = _pool_returning(self._rows())
+        await fetch_merge_pair_details(pool, "opc", self._A, self._B)
+        # ONE round-trip, batched via id = ANY (plan note N-1), never two per-id fetches.
+        assert conn.fetch.await_count == 1
+        sql = conn.fetch.await_args.args[0]
+        assert "ANY(" in sql
+        assert "= ANY" in sql or "id::text = ANY" in sql
+
+    async def test_scoped_by_project_and_selects_required_columns(self):
+        from scripts.core.memory_review import fetch_merge_pair_details
+
+        pool, conn = _pool_returning(self._rows())
+        await fetch_merge_pair_details(pool, "binbrain", self._A, self._B)
+        args = conn.fetch.await_args.args
+        sql = args[0]
+        assert "LOWER(project)" in sql
+        assert "recall_count" in sql
+        assert "created_at" in sql
+        assert "superseded_by" in sql
+        assert "binbrain" in args  # project bound, not interpolated
+
+    async def test_missing_id_absent_from_result(self):
+        # Only one of the two ids resolves (e.g. the other was hard-deleted).
+        from scripts.core.memory_review import fetch_merge_pair_details
+
+        pool, conn = _pool_returning([self._rows()[0]])
+        out = await fetch_merge_pair_details(pool, "opc", self._A, self._B)
+        assert self._A in out
+        assert self._B not in out
+
+
 class TestFetchStaleSummary:
     async def test_returns_buckets_and_open_thread_count(self):
         bucket_rows = [

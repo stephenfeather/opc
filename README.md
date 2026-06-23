@@ -19,6 +19,7 @@ This project began as a fork of [Continuous-Claude-v3](https://github.com/parcad
 - **Cross-session pattern detection** - Identifies recurring patterns across sessions (repeated errors, tool preferences, architectural decisions) and boosts them in recall
 - **Knowledge graph** - A structured layer over `archival_memory` that extracts typed entities (files, tools, errors, languages, etc.) and relationships (`solves`, `uses`, `supersedes`, ...) from each learning at store time, then enriches recall results with shared entity context and a `kg_overlap` reranker signal. See [docs/knowledge-graph.md](docs/knowledge-graph.md) for details.
 - **Learning chains** - Learnings can supersede previous entries, keeping the knowledge base current without duplication
+- **Memory curation** - A review→apply loop to keep the corpus clean: promote high-value learnings into `CLAUDE.md`/`MEMORY.md`, merge-supersede near-duplicate pairs, stale-archive retired entries, and reverse a promotion (unpromote). All actions are dry-run by default, backed up before writing, idempotent, and project-scoped. See [Memory Curation](#memory-curation) below and the [API reference](docs/recall-api-reference.md#memory-curation-api-reference).
 - **Temporal decay tracking** - Tracks when learnings are recalled and decays stale entries that haven't been useful recently
 - **Semantic deduplication** - Prevents storing near-duplicate learnings using embedding similarity checks across sessions, with per-session rejection tracking
 - **Tag-based filtering** - Store and recall learnings with tags for precise filtering (`--tags`, `--tags-strict`)
@@ -154,6 +155,37 @@ uv run python scripts/core/documents/cli.py query "who flagged home meds" --coll
 ```
 
 Supported formats: `.pdf` (text layer), `.docx`, `.txt`, `.csv`, `.md`, `.html`/`.htm`, `.xml`. Scanned/image-only PDFs are recorded as `skipped_needs_ocr` for a future OCR phase. The registry path defaults to `~/.claude/opc/document_collections.yaml` (override with `OPC_DOC_REGISTRY`); ceilings are tunable via `OPC_DOC_MAX_FILE_MB` and `OPC_DOC_MAX_CHUNKS`. A cron line calling `scripts/core/documents/rescan_cron.sh` keeps collections current.
+
+## Memory Curation
+
+Apply **approved** curation actions to the corpus with `scripts/core/memory_apply.py`. Every mode is
+**dry-run by default** — add `--execute` to write (a `pg_dump` backup runs first). Actions are
+idempotent and project-scoped.
+
+```bash
+# Promote approved learnings into CLAUDE.md / MEMORY.md (dry-run, then apply)
+uv run python scripts/core/memory_apply.py --ids <id1>,<id2>
+uv run python scripts/core/memory_apply.py --ids <id1>,<id2> --execute
+
+# Merge-supersede a near-duplicate pair: keep the higher-recall row, retire the loser
+uv run python scripts/core/memory_apply.py --merge --pair <id_a>:<id_b> --execute
+
+# Stale-archive retired learnings (sets archived_at; column is nullable for manual recovery)
+uv run python scripts/core/memory_apply.py --archive --ids <id1>,<id2> --execute
+
+# Unpromote: reverse a promotion (remove the file artifact, clear the promoted_to tag)
+uv run python scripts/core/memory_apply.py --unpromote --ids <id1> --execute
+```
+
+`--archive` needs the `archived_at` column. A fresh DB has it from `docker/init-schema.sql`; an
+existing DB runs the migration once (recall degrades gracefully until then):
+
+```bash
+docker exec -i opc-postgres psql -U claude -d continuous_claude -f - \
+  < scripts/migrations/add_archived_at.sql
+```
+
+Full flag reference, the safety model, and the keeper tie-break: [docs/recall-api-reference.md](docs/recall-api-reference.md#memory-curation-api-reference).
 
 ## Hook Scripts
 

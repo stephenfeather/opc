@@ -793,3 +793,103 @@ Feedback stats appear in `memory_metrics.py` output under `feedback_alltime`:
 ```text
 Feedback (all-time):  7 helpful, 3 not helpful out of 10 (70.0% helpful), 5 unique learnings rated
 ```
+
+---
+
+# Memory Curation API Reference
+
+`scripts/core/memory_apply.py` applies **approved** curation actions to `archival_memory` and the
+local memory files (`CLAUDE.md`, `MEMORY.md`). It is the apply half of the review→apply loop: the
+read-only detector `scripts/core/memory_review.py` proposes candidates, you approve ids, and this
+tool enacts them. Issue #63 Phases 2a/2b.
+
+```bash
+uv run python scripts/core/memory_apply.py [project] <mode flags> [--execute]
+```
+
+## Safety model (every mode)
+
+- **Dry-run by default.** Without `--execute` the tool resolves the plan, prints it, and writes
+  **nothing** — no DB rows, no files.
+- **`--execute` backs up first.** Before the first write it takes a `pg_dump` of `archival_memory`
+  and, for file-touching modes, a snapshot of `MEMORY.md`/`CLAUDE.md`. A backup failure aborts the
+  run before any change.
+- **Idempotent.** Every mutation is a guarded UPDATE / file op; re-running an already-applied action
+  is a reported skip, never an error. Safe to re-run after a partial failure.
+- **Per-project flock.** Concurrent runs are serialized per lock root: promote and unpromote lock
+  on the memory directory, while merge and archive lock on the backup directory — so overriding
+  `--backup-dir` across simultaneous same-project merge/archive runs can defeat the lock (the
+  guarded, idempotent SQL still prevents corruption).
+- **Project-scoped.** Writes are guarded by `LOWER(project) = LOWER($n)`; a global UUID from another
+  project is skipped, not mutated.
+
+## Modes
+
+Exactly one mode per invocation. `--merge`, `--archive`, and `--unpromote` are mutually exclusive;
+omitting all three is **promote** mode.
+
+| Mode | Flag | Inputs | Effect |
+|------|------|--------|--------|
+| **Promote** (default) | *(none)* | `--ids` / `--manifest` | Append approved learnings to `CLAUDE.md` or `MEMORY.md` and stamp `metadata.promoted_to` (Phase 2a) |
+| **Merge-supersede** | `--merge` | `--pair ID_A:ID_B` (repeatable) | Keep the higher-recall row of each near-duplicate pair; mark the loser `superseded_by → keeper` (tie-break: higher recall → older `created_at` → smaller id) |
+| **Stale-archive** | `--archive` | `--ids` / `--manifest` | Set `archived_at = NOW()` on each stale learning (no survivor) and stamp a `superseded_via {reason:"stale"}` marker. The row is retained (`archived_at` is nullable) for manual recovery or backup restore — there is no `--unarchive` CLI yet |
+| **Unpromote/repair** | `--unpromote` | `--ids` / `--manifest` | Reverse a promotion: remove the promoted file artifact(s) **then** clear the `promoted_to` tag (file-first, so a partial failure never strands the DB tag) |
+
+## Flags
+
+### `project` (positional, optional)
+Project to scope the action to. Defaults to the current working directory (worktree-aware).
+
+### `--ids`
+Comma-separated approved learning ids. Used by promote / `--archive` / `--unpromote`.
+
+### `--manifest`
+Path to a file of approved ids (one per line). Alternative to `--ids`.
+
+### `--pair ID_A:ID_B`
+A merge pair, repeatable (`--pair a:b --pair c:d`). Used only with `--merge`. Each id is validated
+as a UUID; malformed pairs and self-merges are rejected, and pairs are de-duplicated
+order-insensitively.
+
+### `--execute`
+Perform the writes. Without it the run is a dry-run. A DB backup (and file snapshot for
+file-touching modes) runs first.
+
+### `--memory-dir`, `--claude-md`, `--backup-dir`
+Override the Claude memory directory, the `CLAUDE.md` path, and the backup output directory. Default
+to the project's standard locations.
+
+## Examples
+
+```bash
+# Promote two approved learnings (dry-run, then apply)
+uv run python scripts/core/memory_apply.py --ids 1111...,2222...
+uv run python scripts/core/memory_apply.py --ids 1111...,2222... --execute
+
+# Merge-supersede a near-duplicate pair (keep higher-recall, retire the loser)
+uv run python scripts/core/memory_apply.py --merge --pair 1111...:2222... --execute
+
+# Stale-archive a batch of approved ids from a manifest file
+uv run python scripts/core/memory_apply.py --archive --manifest approved-stale.txt --execute
+
+# Reverse a promotion (remove the file artifact, clear the promoted_to tag)
+uv run python scripts/core/memory_apply.py --unpromote --ids 1111... --execute
+```
+
+## Stale-archive migration (`--archive`)
+
+`--archive` and the `archived_at IS NULL` recall filter require the `archived_at` column on
+`archival_memory`. A fresh DB gets it from `docker/init-schema.sql`; an existing DB must run the
+migration once:
+
+```bash
+docker exec -i opc-postgres psql -U claude -d continuous_claude -f - \
+  < scripts/migrations/add_archived_at.sql
+```
+
+The migration is idempotent (`ADD COLUMN IF NOT EXISTS` + `CREATE INDEX CONCURRENTLY IF NOT
+EXISTS`). Until it runs, **recall** degrades gracefully (a capability probe omits the `archived_at`
+clause rather than crashing), but **`--archive --execute` aborts** (exit 1, after taking its backup)
+because `archive_row` requires the column — run the migration before archiving. `CREATE INDEX
+CONCURRENTLY` cannot run inside a transaction block — apply the file with `psql -f` (autocommit),
+not `psql -1`.

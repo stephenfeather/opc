@@ -243,3 +243,77 @@ async def test_dedup_error_does_not_block_storage(
 
     assert result["success"] is True
     assert result["memory_id"] == "new-uuid-123"
+
+
+@pytest.mark.asyncio
+async def test_supersede_target_does_not_block_replacement(
+    mock_memory_service, mock_embedder
+):
+    """A supersede whose only near-dup is the row it replaces must store (issue #235).
+
+    The corrected content is expected to resemble the row being superseded, so
+    the dedup gate must not count the supersede target as a blocking duplicate.
+    """
+    mock_memory_service.search_vector_global.return_value = [
+        {
+            "id": "bad-row-uuid",
+            "session_id": "old-session",
+            "content": "The wrong learning being corrected",
+            "similarity": 0.97,
+        }
+    ]
+
+    p1, p2, p3 = _patches(mock_memory_service, mock_embedder)
+    with p1, p2, p3:
+        result = await store_learning_v2(
+            session_id="my-session",
+            content="The corrected learning",
+            supersedes="bad-row-uuid",
+        )
+
+    assert result["success"] is True
+    assert "skipped" not in result
+    assert result["memory_id"] == "new-uuid-123"
+    assert result.get("superseded") == "bad-row-uuid"
+    mock_memory_service.store.assert_called_once()
+    # The supersede target id is passed through to the store layer.
+    _, store_kwargs = mock_memory_service.store.call_args
+    assert store_kwargs.get("supersedes") == "bad-row-uuid"
+    # The dedup probe fetched an extra neighbor so a *different* dup can still surface.
+    _, probe_kwargs = mock_memory_service.search_vector_global.call_args
+    assert probe_kwargs.get("limit") == 2
+
+
+@pytest.mark.asyncio
+async def test_supersede_still_rejects_a_different_duplicate(
+    mock_memory_service, mock_embedder
+):
+    """Superseding row X must still reject when a DIFFERENT row Y is a near-dup."""
+    mock_memory_service.search_vector_global.return_value = [
+        {
+            "id": "other-dup-uuid",
+            "session_id": "other-session",
+            "content": "An unrelated near-duplicate",
+            "similarity": 0.96,
+        },
+        {
+            "id": "bad-row-uuid",
+            "session_id": "old-session",
+            "content": "The wrong learning being corrected",
+            "similarity": 0.95,
+        },
+    ]
+
+    p1, p2, p3 = _patches(mock_memory_service, mock_embedder)
+    with p1, p2, p3:
+        result = await store_learning_v2(
+            session_id="my-session",
+            content="The corrected learning",
+            supersedes="bad-row-uuid",
+        )
+
+    assert result["success"] is True
+    assert result["skipped"] is True
+    assert "duplicate" in result["reason"]
+    assert result["existing_id"] == "other-dup-uuid"
+    mock_memory_service.store.assert_not_called()

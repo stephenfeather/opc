@@ -737,10 +737,18 @@ async def store_learning_v2(
         # and the embedding_model column.
         dedup_model = embedding_model if backend == "postgres" else None
         threshold = _dedup_threshold()
+        # Issue #235: a supersede deliberately replaces an existing row with a
+        # correction that is *expected* to resemble it. Without special-casing,
+        # the dedup gate flags the supersede target as a duplicate and returns
+        # before the supersede ever runs, making --supersedes dead-on-arrival.
+        # Probe one extra neighbor and drop the supersede target from the
+        # results, so the intentional replace proceeds while a *different*
+        # near-duplicate still rejects the write.
+        dedup_limit = 2 if supersedes else 1
         try:
             if hasattr(memory, "search_vector_global"):
                 existing = await memory.search_vector_global(
-                    embedding, threshold=threshold, limit=1,
+                    embedding, threshold=threshold, limit=dedup_limit,
                     embedding_model=dedup_model,
                 )
             else:
@@ -748,8 +756,14 @@ async def store_learning_v2(
                     "search_vector_global unavailable, using session-scoped dedup"
                 )
                 existing = await memory.search_vector(
-                    embedding, limit=1, embedding_model=dedup_model,
+                    embedding, limit=dedup_limit, embedding_model=dedup_model,
                 )
+
+            if supersedes and existing:
+                existing = [
+                    row for row in existing
+                    if str(row.get("id", "")) != str(supersedes)
+                ]
 
             dedup = check_dedup_result(
                 existing=existing, threshold=threshold, default_session=session_id

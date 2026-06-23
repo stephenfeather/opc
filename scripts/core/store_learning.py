@@ -268,6 +268,28 @@ def check_dedup_result(
     return None
 
 
+async def _supersede_persists(memory: Any, backend: str) -> bool:
+    """Whether a supersede link will actually be written for this store.
+
+    Supersede is honored only on postgres AND only when the ``superseded_by``
+    column exists. On a pre-migration DB the UPDATE is swallowed
+    (``UndefinedColumnError``), so the caller must not treat the supersede as
+    effective — otherwise the dedup-exclusion would orphan a duplicate active
+    row (issue #235, round-2 schema-drift case). The capability probe is cached
+    on the service, so this adds no per-call query cost in steady state.
+    """
+    if backend != "postgres":
+        return False
+    check = getattr(memory, "_check_superseded_column", None)
+    if check is None:
+        return False
+    try:
+        return bool(await check())
+    except Exception:
+        # A capability probe failure must not enable an unsafe exclusion.
+        return False
+
+
 def parse_tags(tags_str: str | None) -> list[str] | None:
     """Parse comma-separated tag string into a list.
 
@@ -745,12 +767,16 @@ async def store_learning_v2(
         # results, so the intentional replace proceeds while a *different*
         # near-duplicate still rejects the write.
         #
-        # Gate on backend: supersede is only persisted on postgres (see the
-        # store() call below). Excluding the target on a backend that will NOT
-        # mark the old row replaced would silently write a duplicate active
-        # learning with no supersede relation — a dedup regression. So the
-        # exclusion must use the same condition as persistence.
-        active_supersedes = supersedes if backend == "postgres" else None
+        # Gate on actual supersede capability, not just backend type. Supersede
+        # is persisted only on postgres AND only when the superseded_by column
+        # exists — on a pre-migration DB the UPDATE is swallowed
+        # (UndefinedColumnError) and the old row is never marked replaced.
+        # Excluding the target from dedup when the link will NOT be written would
+        # silently insert a duplicate active learning with no supersede relation
+        # — the same regression the backend gate closes for sqlite, via schema
+        # drift instead of backend type. When capability is absent we fall back
+        # to plain dedup (active_supersedes=None), which still protects the row.
+        active_supersedes = supersedes if await _supersede_persists(memory, backend) else None
         dedup_limit = 2 if active_supersedes else 1
         try:
             if hasattr(memory, "search_vector_global"):

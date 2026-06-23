@@ -472,8 +472,14 @@ _CANDIDATES_BY_IDS_SQL = """
 # supersede_row's single-statement discipline): the COLUMN archived_at drives
 # query exclusion; the superseded_via MARKER drives provenance/undo symmetry.
 # Unlike a merge, a stale row has no survivor, so by=null and reason="stale".
-# Guarded by `archived_at IS NULL` so a concurrent archive collapses to a 0-row
-# no-op rather than re-stamping. `at` reuses the same NOW() as archived_at.
+# Guards (all in this one statement):
+#   * `LOWER(project) = LOWER($2)` — a caller-supplied id is matched per project, so a
+#     globally-unique UUID from ANOTHER project cannot be archived here (mirrors
+#     clear_promoted_marker's project scoping).
+#   * `superseded_by IS NULL` — never stamp `reason="stale"` over a row whose real
+#     provenance is a concurrent merge/store supersede (don't clobber the survivor link).
+#   * `archived_at IS NULL` — a concurrent archive collapses to a 0-row no-op (idempotent).
+# `at` reuses the same NOW() as archived_at.
 _ARCHIVE_ROW_SQL = """
     UPDATE archival_memory
     SET archived_at = NOW(),
@@ -485,7 +491,10 @@ _ARCHIVE_ROW_SQL = """
                 'at', NOW()
             )
         )
-    WHERE id = $1::uuid AND archived_at IS NULL
+    WHERE id = $1::uuid
+      AND LOWER(project) = LOWER($2)
+      AND superseded_by IS NULL
+      AND archived_at IS NULL
 """
 
 
@@ -498,17 +507,21 @@ def _parse_archive_count(status: str) -> int:
         return 0
 
 
-async def archive_row(conn: Any, *, learning_id: str) -> int:
+async def archive_row(conn: Any, *, learning_id: str, project: str) -> int:
     """Stale-archive ``learning_id`` in one guarded UPDATE. Returns the row count.
 
     Sets ``archived_at = NOW()`` and stamps the ``superseded_via`` marker
     ``{"by": null, "reason": "stale", "at": <ts>}`` for audit/undo symmetry. The
-    column drives recall exclusion; the marker drives provenance. Guarded by
-    ``archived_at IS NULL`` so re-archiving an already-archived row is a 0-row
-    no-op (idempotent), never a raise. Does NOT catch UndefinedColumnError — on a
-    pre-migration schema it propagates so the caller owns the compat policy.
+    column drives recall exclusion; the marker drives provenance. The single guarded
+    UPDATE rejects three cases as a 0-row no-op (idempotent, never a raise):
+    ``archived_at IS NULL`` (already archived), ``superseded_by IS NULL`` (a row
+    concurrently retired by merge/store — its real provenance must not be clobbered
+    with ``reason="stale"``), and ``LOWER(project) = LOWER($2)`` (a globally-unique
+    UUID from another project cannot be archived here). Does NOT catch
+    UndefinedColumnError — on a pre-migration schema it propagates so the caller owns
+    the compat policy.
     """
-    status = await conn.execute(_ARCHIVE_ROW_SQL, learning_id)
+    status = await conn.execute(_ARCHIVE_ROW_SQL, learning_id, project)
     return _parse_archive_count(status)
 
 
@@ -893,10 +906,17 @@ async def run_merge_apply(
                     loser_id=action.loser_id,
                     keeper_id=action.keeper_id,
                     reason="merge",
+                    # Keeper-liveness guard (same statement): a keeper chosen at plan
+                    # time may be superseded by a concurrent store/merge between
+                    # fetch_merge_pair_details and this UPDATE. Without this the loser
+                    # would be retired onto a DEAD keeper, violating select_merge_keeper's
+                    # "a dead side is unsafe" invariant. 0-row now also covers that race.
+                    require_active_keeper=True,
                 )
                 if count == 0:
-                    # Already superseded (idempotent / concurrent store-time supersede):
-                    # the guarded UPDATE matched nothing. Skip + report, never raise.
+                    # Already superseded, OR the keeper died after planning (keeper-liveness
+                    # guard matched nothing): the guarded UPDATE retired no row. Skip + report,
+                    # never raise — the loser is untouched and the pair is safe to re-plan.
                     skipped.append((action.id_a, action.id_b, "already superseded (0-row update)"))
                     continue
                 applied.append(action.loser_id)
@@ -945,11 +965,17 @@ async def run_stale_archive(
         skipped: list[tuple[str, str]] = []
         async with pool.acquire() as conn:
             for learning_id in ids:
-                count = await archive_row(conn, learning_id=learning_id)
+                count = await archive_row(conn, learning_id=learning_id, project=project)
                 if count == 0:
-                    # Already archived (idempotent / concurrent archive): the guarded
-                    # UPDATE matched nothing. Skip + report, never raise.
-                    skipped.append((learning_id, "already archived (0-row update)"))
+                    # The guarded UPDATE matched nothing: the row is already archived,
+                    # was concurrently superseded (merge/store — don't clobber its real
+                    # provenance), or belongs to another project. Skip + report, never raise.
+                    skipped.append(
+                        (
+                            learning_id,
+                            "not eligible (already archived, superseded, or wrong project)",
+                        )
+                    )
                     continue
                 applied.append(learning_id)
     return StaleArchiveResult(
@@ -970,15 +996,33 @@ def _unpromote_one_row(action: UnpromoteAction, memory_dir: Path, claude_md_path
     """Remove the file artifact(s) for one unpromote action, in the W-2 order, BEFORE the DB clear.
 
     Two-artifact (MEMORY.md): delete ``promoted-<slug>.md`` FIRST, THEN splice the MEMORY.md
-    index line by the file's basename. If the index splice raises after the file delete, the
-    DB clear is NOT reached (the caller never gets here), so the action stays re-runnable.
-    Single-artifact (CLAUDE.md): remove the in-file block by the exact full-id marker. Each
-    stage is idempotent (already-absent -> no-op), so a re-run after a partial failure resumes.
+    index line by the file's basename. The removable path is derived STRUCTURALLY as
+    ``memory_dir / Path(target).name`` so a stale/corrupt/cross-worktree absolute DB target can
+    never escape the active ``memory_dir`` and unlink an unrelated file; the same basename roots
+    both the delete and the index splice so they stay consistent. As a defense in depth, a target
+    whose ``resolve()`` lies OUTSIDE ``memory_dir`` (e.g. a ``../`` traversal or a path from
+    another worktree) is treated as a FAILED action — it raises ``OSError`` so the caller leaves
+    ``promoted_to`` intact and the action is re-runnable, rather than silently deleting nothing.
+    If the index splice raises after the file delete, the DB clear is NOT reached (the caller
+    never gets here), so the action stays re-runnable. Single-artifact (CLAUDE.md): remove the
+    in-file block by the exact full-id marker. Each stage is idempotent (already-absent -> no-op),
+    so a re-run after a partial failure resumes.
     """
     target = Path(action.target) if action.target else None
     if action.two_artifact:
         if target is not None:
-            remove_file_if_present(target)  # stage 1: delete the promoted-<slug>.md file FIRST
+            memory_root = memory_dir.resolve()
+            # Reject a target that resolves outside the active memory_dir (stale/corrupt/
+            # cross-worktree absolute path). Surfaced as a failed action; promoted_to untouched.
+            resolved = (memory_root / target.name).resolve()
+            if resolved.parent != memory_root or target.resolve(strict=False) != resolved:
+                raise OSError(
+                    f"unpromote target {action.target!r} resolves outside memory_dir "
+                    f"{memory_dir} — refusing to unlink (action left re-runnable)"
+                )
+            # Derive the removable file STRUCTURALLY under memory_dir (cannot escape).
+            safe_file = memory_root / target.name
+            remove_file_if_present(safe_file)  # stage 1: delete the promoted-<slug>.md FIRST
             # stage 2: splice the MEMORY.md index line that references that exact filename.
             remove_line_by_marker(memory_dir / "MEMORY.md", target.name)
     else:

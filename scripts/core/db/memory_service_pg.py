@@ -111,12 +111,41 @@ def _parse_update_count(status: str) -> int:
         return 0
 
 
+# Base supersede UPDATE (W-3): superseded_by, superseded_at, and the superseded_via
+# marker in ONE statement, guarded by the loser's `superseded_by IS NULL` so a
+# concurrent supersede collapses to a 0-row no-op. The trailing WHERE term is
+# appended per call (string concat, NOT str.format — the body contains literal
+# `{}` jsonb): empty on the store-time hot path (the just-inserted keeper is
+# trivially active), or a same-statement keeper-liveness guard on the merge path.
+_SUPERSEDE_ROW_SQL = """
+        UPDATE archival_memory
+        SET superseded_by = $1::uuid,
+            superseded_at = NOW(),
+            metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+                'superseded_via',
+                jsonb_build_object(
+                    'by', $1::text,
+                    'reason', $2::text,
+                    'at', NOW()
+                )
+            )
+        WHERE id = $3::uuid AND superseded_by IS NULL"""
+
+# Same-statement keeper-liveness term (merge path only): the loser is only retired
+# if the chosen keeper is still active. Reuses $1 (the keeper id) — no extra param.
+_KEEPER_ACTIVE_GUARD = (
+    "\n          AND EXISTS (SELECT 1 FROM archival_memory k"
+    " WHERE k.id = $1::uuid AND k.superseded_by IS NULL)"
+)
+
+
 async def supersede_row(
     conn: Any,
     *,
     loser_id: str,
     keeper_id: str,
     reason: str,
+    require_active_keeper: bool = False,
 ) -> int:
     """Mark ``loser_id`` as superseded by ``keeper_id`` in one guarded UPDATE.
 
@@ -130,28 +159,24 @@ async def supersede_row(
     ``reason`` is one of ``merge`` | ``stale`` | ``store`` and ``at`` reuses the
     same ``NOW()`` as ``superseded_at`` (no clock skew).
 
-    Returns the number of rows updated (0 = already superseded, missing, or a
-    stale id). Does NOT decide what a zero-row result means — each caller owns
-    that policy. Does NOT catch ``asyncpg.UndefinedColumnError``: on a
-    pre-migration schema it propagates so callers own the compat policy.
+    When ``require_active_keeper`` is True (the merge path), the SAME statement
+    gains a keeper-liveness guard: the loser is retired only if the keeper is
+    itself still active (``superseded_by IS NULL``). This closes the race where a
+    keeper chosen at plan time is superseded by a concurrent store/merge before
+    this UPDATE — without it the loser would be pointed at a dead keeper,
+    violating ``select_merge_keeper``'s "a dead side is unsafe" invariant. Default
+    False keeps the store-time hot path byte-for-byte unchanged (the just-inserted
+    keeper is trivially active, and the extra subquery is not worth paying on every
+    store) and is still a SINGLE UPDATE in both modes.
+
+    Returns the number of rows updated (0 = already superseded, missing, a stale
+    id, or — with ``require_active_keeper`` — a keeper that died after planning).
+    Does NOT decide what a zero-row result means — each caller owns that policy.
+    Does NOT catch ``asyncpg.UndefinedColumnError``: on a pre-migration schema it
+    propagates so callers own the compat policy.
     """
-    status = await conn.execute(
-        """
-        UPDATE archival_memory
-        SET superseded_by = $1::uuid,
-            superseded_at = NOW(),
-            metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
-                'superseded_via',
-                jsonb_build_object(
-                    'by', $1::text,
-                    'reason', $2::text,
-                    'at', NOW()
-                )
-            )
-        WHERE id = $3::uuid AND superseded_by IS NULL
-        """,
-        keeper_id, reason, loser_id,
-    )
+    sql = _SUPERSEDE_ROW_SQL + (_KEEPER_ACTIVE_GUARD if require_active_keeper else "")
+    status = await conn.execute(sql, keeper_id, reason, loser_id)
     return _parse_update_count(status)
 
 

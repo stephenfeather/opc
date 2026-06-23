@@ -972,6 +972,65 @@ class TestRunMergeApply:
         assert len(result.skipped) == 1  # reported as a skip, not a failure
         # no exception raised -> the assertion below proves we returned normally
 
+    async def test_merge_requires_active_keeper(self, tmp_path):
+        # Finding 2: the merge path must guard keeper-liveness in the SAME statement so a
+        # loser is never retired onto a keeper that died after planning. Assert the flag
+        # is threaded through to supersede_row.
+        from scripts.core.memory_apply import run_merge_apply
+
+        pool, conn = _pool()
+        conn.fetch.side_effect = [self._merge_rows()]
+        captured = {}
+
+        async def _exec(sql, *params, **kw):
+            captured["kwargs"] = kw
+            return "UPDATE 1"
+
+        # run_merge_apply calls supersede_row(conn, ..., require_active_keeper=True);
+        # patch supersede_row to capture how it was invoked.
+        import scripts.core.memory_apply as ma
+
+        async def _supersede(conn, **kw):
+            captured["supersede_kwargs"] = kw
+            return 1
+
+        def _run(cmd, **kw):
+            Path(kw["stdout"].name).write_text("-- dump")
+            return MagicMock(returncode=0)
+
+        from unittest.mock import patch
+
+        with patch.object(ma, "supersede_row", _supersede):
+            result = await run_merge_apply(
+                pool, "opc", [(self._A, self._B)],
+                execute=True, backup_dir=tmp_path / "b", timestamp="t", run=_run,
+            )
+        assert captured["supersede_kwargs"].get("require_active_keeper") is True
+        assert captured["supersede_kwargs"].get("reason") == "merge"
+        assert result.applied == [self._A]
+
+    async def test_keeper_died_after_plan_is_skip_not_raise(self, tmp_path):
+        # Finding 2: keeper superseded concurrently after planning -> the keeper-liveness
+        # guard makes the UPDATE match 0 rows. The loser must NOT be applied; reported as a
+        # skip, never raised (idempotent / re-plannable).
+        from scripts.core.memory_apply import run_merge_apply
+
+        pool, conn = _pool()
+        conn.fetch.side_effect = [self._merge_rows()]
+        # 0-row because the keeper died after planning (same-statement liveness guard).
+        conn.execute = AsyncMock(return_value="UPDATE 0")
+
+        def _run(cmd, **kw):
+            Path(kw["stdout"].name).write_text("-- dump")
+            return MagicMock(returncode=0)
+
+        result = await run_merge_apply(
+            pool, "opc", [(self._A, self._B)],
+            execute=True, backup_dir=tmp_path / "b", timestamp="t", run=_run,
+        )
+        assert result.applied == []  # loser NOT retired onto a dead keeper
+        assert len(result.skipped) == 1  # surfaced as a skip, not a raise
+
     async def test_already_superseded_pair_skips_no_raise(self, tmp_path):
         from scripts.core.memory_apply import run_merge_apply
 
@@ -1132,7 +1191,7 @@ class TestArchiveRow:
 
         pool, conn = _pool()
         conn.execute = AsyncMock(return_value="UPDATE 1")
-        count = await archive_row(conn, learning_id=_UUID)
+        count = await archive_row(conn, learning_id=_UUID, project="opc")
         assert count == 1
         conn.execute.assert_awaited_once()  # ONE statement
         sql = conn.execute.await_args.args[0]
@@ -1147,8 +1206,34 @@ class TestArchiveRow:
 
         pool, conn = _pool()
         conn.execute = AsyncMock(return_value="UPDATE 0")
-        count = await archive_row(conn, learning_id=_UUID)
+        count = await archive_row(conn, learning_id=_UUID, project="opc")
         assert count == 0  # idempotent: never raises on a no-op
+
+    async def test_guarded_by_project_and_not_superseded(self):
+        # Finding 1: a global UUID from ANOTHER project, or a row concurrently superseded
+        # (its real provenance must not be clobbered with reason="stale"), must not be
+        # archived. Both guards belong in the SAME UPDATE; project is threaded + bound.
+        from scripts.core.memory_apply import archive_row
+
+        pool, conn = _pool()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+        await archive_row(conn, learning_id=_UUID, project="opc")
+        sql = conn.execute.await_args.args[0]
+        assert "LOWER(project) = LOWER($2)" in sql  # wrong-project id cannot be archived
+        assert "superseded_by IS NULL" in sql  # don't clobber a superseded row's provenance
+        assert "archived_at IS NULL" in sql  # still idempotent on re-archive
+        # project bound as a parameter, not interpolated
+        params = conn.execute.await_args.args[1:]
+        assert "opc" in params
+
+    async def test_wrong_project_zero_row_not_archived(self):
+        # The DB returns UPDATE 0 because the project guard excluded a cross-project id.
+        from scripts.core.memory_apply import archive_row
+
+        pool, conn = _pool()
+        conn.execute = AsyncMock(return_value="UPDATE 0")
+        count = await archive_row(conn, learning_id=_UUID, project="other-project")
+        assert count == 0  # not archived; no raise
 
 
 class TestRunStaleArchive:
@@ -1220,6 +1305,58 @@ class TestRunStaleArchive:
         )
         assert result.applied == []  # nothing newly archived
         assert _UUID in [s[0] for s in result.skipped]  # reported as skipped, not raised
+
+    async def test_threads_project_into_archive_row(self, tmp_path, monkeypatch):
+        # Finding 1: run_stale_archive must pass its project down to archive_row so the
+        # guarded UPDATE can reject cross-project ids and superseded rows.
+        import scripts.core.memory_apply as ma
+
+        pool, conn = _pool()
+        captured = {}
+
+        def _backup(dest, **kw):
+            Path(dest).parent.mkdir(parents=True, exist_ok=True)
+            Path(dest).write_text("-- dump")
+            return Path(dest)
+
+        async def _archive(conn, **kw):
+            captured["kwargs"] = kw
+            return 1
+
+        monkeypatch.setattr(ma, "backup_database", _backup)
+        monkeypatch.setattr(ma, "archive_row", _archive)
+        result = await ma.run_stale_archive(
+            pool, "opc", [_UUID],
+            execute=True, backup_dir=tmp_path, timestamp="ts", lock_dir=tmp_path,
+        )
+        assert captured["kwargs"].get("project") == "opc"
+        assert captured["kwargs"].get("learning_id") == _UUID
+        assert result.applied == [_UUID]
+
+    async def test_zero_row_skip_reason_covers_wrong_project(self, tmp_path, monkeypatch):
+        # The 0-row skip wording must reflect the new guards (archived/superseded/project),
+        # not just "already archived".
+        import scripts.core.memory_apply as ma
+
+        pool, conn = _pool()
+
+        def _backup(dest, **kw):
+            Path(dest).parent.mkdir(parents=True, exist_ok=True)
+            Path(dest).write_text("-- dump")
+            return Path(dest)
+
+        async def _exec(*a, **k):
+            return "UPDATE 0"  # excluded by project / superseded / archived guard
+
+        conn.execute = _exec
+        monkeypatch.setattr(ma, "backup_database", _backup)
+        result = await ma.run_stale_archive(
+            pool, "opc", [_UUID],
+            execute=True, backup_dir=tmp_path, timestamp="ts", lock_dir=tmp_path,
+        )
+        assert result.applied == []
+        reason = [s[1] for s in result.skipped if s[0] == _UUID][0]
+        assert "not eligible" in reason.lower()
 
 
 class TestArchiveCliMain:
@@ -1529,6 +1666,46 @@ class TestRunUnpromote:
         # The file delete happened (stage 1), but the index splice failed (stage 2),
         # so the DB clear (stage 3) must NOT have run.
         assert cleared is False, "promoted_to must not be cleared when index splice fails"
+        assert "a" not in result.applied
+        assert result.failed and result.failed[0][0] == "a"
+
+    async def test_out_of_root_target_not_deleted_and_not_cleared(self, tmp_path):
+        # Finding 3: a stale/corrupt/cross-worktree ABSOLUTE promoted_to.target that
+        # resolves OUTSIDE the active memory_dir must NOT be unlinked. The action lands in
+        # `failed` and promoted_to is NOT cleared, so it stays re-runnable (no data loss).
+        from scripts.core.memory_apply import run_unpromote
+
+        memory_dir, claude_md, backup_dir = self._setup(tmp_path)
+        (memory_dir / "MEMORY.md").write_text("# Index\n")
+        # A file OUTSIDE memory_dir that the DB target points at (e.g. a stale worktree path).
+        outside = tmp_path / "outside-promoted-x.md"
+        outside.write_text("DO NOT DELETE ME")
+        pool, conn = _pool()
+        conn.fetch.side_effect = [
+            [{"id": "a", "content": "c", "recall_count": 12,
+              "learning_type": "CODEBASE_PATTERN",
+              "promoted_tier": "MEMORY.md", "promoted_target": str(outside)}]
+        ]
+        cleared = False
+
+        async def _exec(*a, **k):
+            nonlocal cleared
+            cleared = True
+            return "UPDATE 1"
+
+        conn.execute = _exec
+
+        def _run(cmd, **kw):
+            Path(kw["stdout"].name).write_text("-- dump")
+            return MagicMock(returncode=0)
+
+        result = await run_unpromote(
+            pool, "opc", ["a"], execute=True, memory_dir=memory_dir,
+            claude_md_path=claude_md, backup_dir=backup_dir, timestamp="ts", run=_run,
+        )
+        assert outside.exists(), "an out-of-root target must never be unlinked"
+        assert outside.read_text() == "DO NOT DELETE ME"
+        assert cleared is False, "promoted_to must not be cleared for an out-of-root target"
         assert "a" not in result.applied
         assert result.failed and result.failed[0][0] == "a"
 

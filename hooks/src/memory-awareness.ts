@@ -282,37 +282,44 @@ asyncio.run(main())
     if (!res.success || !res.stdout) return [];
     const parsed = JSON.parse(res.stdout);
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter((x): x is string => typeof x === 'string' && x.length > 0);
+    const ids = parsed.filter((x): x is string => typeof x === 'string' && x.length > 0);
+    // Defensive bound: a pre-existing oversized row (schema drift, or rows
+    // written before the cap was enforced) must not produce an unbounded
+    // --exclude-ids argv. Keep the most-recent tail, consistent with unionCap.
+    return ids.length > SURFACED_ID_CAP ? ids.slice(-SURFACED_ID_CAP) : ids;
   } catch {
     return [];
   }
 }
 
 /**
- * Persist the freshly surfaced ids into the session's surfaced set via an
- * SQL-side atomic dedupe-union (issue #228 item 2). Best-effort: caps the
- * payload and swallows all DB errors so the hook never breaks.
+ * Persist the session's surfaced set (issue #228 item 2). The caller passes the
+ * complete, already-deduped-and-capped array (via unionCap), so the write
+ * REPLACES the column rather than re-unioning with the existing value — a
+ * re-union would re-add ids that unionCap trimmed and let the array grow without
+ * bound. Per-session hook invocations are serial, so a plain replace is safe.
+ * Best-effort: caps defensively and swallows all DB errors so the hook never
+ * breaks.
  */
-export function persistSurfacedIds(sessionId: string, freshIds: string[]): void {
-  if (!sessionId || !freshIds || freshIds.length === 0) return;
-  const capped = freshIds.slice(0, SURFACED_ID_CAP);
+export function persistSurfacedIds(sessionId: string, ids: string[]): void {
+  if (!sessionId || !ids || ids.length === 0) return;
+  // Keep the most-recent tail if somehow over cap (matches unionCap semantics).
+  const capped = ids.length > SURFACED_ID_CAP ? ids.slice(-SURFACED_ID_CAP) : ids;
   const pythonCode = `
 import asyncpg, json
 
 db_url = os.environ['CONTINUOUS_CLAUDE_DB_URL']
 session_id = sys.argv[1]
-fresh = json.loads(sys.argv[2])
+ids = json.loads(sys.argv[2])
 
 async def main():
     conn = await asyncpg.connect(db_url)
     try:
         await conn.execute(
-            "UPDATE sessions SET surfaced_learning_ids = "
-            "ARRAY(SELECT DISTINCT unnest("
-            "COALESCE(surfaced_learning_ids, '{}'::uuid[]) || $2::uuid[]"
-            ")) WHERE claude_session_id = $1",
+            "UPDATE sessions SET surfaced_learning_ids = $2::uuid[] "
+            "WHERE claude_session_id = $1",
             session_id,
-            fresh,
+            ids,
         )
     finally:
         await conn.close()

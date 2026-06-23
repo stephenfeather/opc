@@ -88,6 +88,20 @@ describe('unionCap', () => {
     expect(unionCap([], [U(1)], 500)).toEqual([U(1)]);
     expect(unionCap(null as any, [U(1)], 500)).toEqual([U(1)]);
   });
+
+  it('stays exactly at cap when a full session adds fresh ids (round-1 regression)', () => {
+    // Prior already at the cap; new ids arrive. The result must remain exactly
+    // SURFACED_ID_CAP, include all fresh ids, and evict the oldest — the bound
+    // the appending persist SQL failed to enforce.
+    const prior = Array.from({ length: SURFACED_ID_CAP }, (_, i) => U(i));
+    const fresh = [U(900), U(901), U(902)];
+    const out = unionCap(prior, fresh, SURFACED_ID_CAP);
+    expect(out.length).toBe(SURFACED_ID_CAP);
+    for (const f of fresh) expect(out).toContain(f);
+    expect(out).not.toContain(U(0));
+    expect(out).not.toContain(U(1));
+    expect(out).not.toContain(U(2));
+  });
 });
 
 describe('readSurfacedIds', () => {
@@ -130,6 +144,20 @@ describe('readSurfacedIds', () => {
     expect(() => readSurfacedIds('sess-throw')).not.toThrow();
     expect(readSurfacedIds('sess-throw')).toEqual([]);
   });
+
+  it('defensively caps an oversized stored row to SURFACED_ID_CAP (newest kept)', () => {
+    // A row written before the cap was enforced (or via schema drift) must not
+    // produce an unbounded --exclude-ids argv on read.
+    const stored = Array.from({ length: SURFACED_ID_CAP + 25 }, (_, i) => U(i));
+    mockedRunPgQuery.mockReturnValue({
+      success: true,
+      stdout: JSON.stringify(stored),
+      stderr: '',
+    });
+    const out = readSurfacedIds('sess-big');
+    expect(out.length).toBe(SURFACED_ID_CAP);
+    expect(out[out.length - 1]).toBe(U(SURFACED_ID_CAP + 24));
+  });
 });
 
 describe('persistSurfacedIds', () => {
@@ -138,31 +166,38 @@ describe('persistSurfacedIds', () => {
     mockedRunPgQuery.mockReturnValue({ success: true, stdout: 'ok', stderr: '' });
   });
 
-  it('passes the session id and fresh ids to the union UPDATE', () => {
+  it('REPLACES the column with the caller-provided set (no re-union)', () => {
     persistSurfacedIds('sess-x', [U(1), U(2)]);
     expect(mockedRunPgQuery).toHaveBeenCalledTimes(1);
     const [code, args] = mockedRunPgQuery.mock.calls[0];
-    // SQL-side atomic union expression is used.
     expect(code).toContain('surfaced_learning_ids');
+    // Replace assignment, NOT an append/re-union against the existing column.
+    // A re-union (`|| $2` + unnest) would re-add ids that unionCap trimmed and
+    // let the array grow without bound — the round-1 finding.
+    expect(code).toContain('= $2::uuid[]');
+    expect(code).not.toContain('unnest');
+    expect(code).not.toContain('||');
     expect(args).toContain('sess-x');
-    // Fresh ids are bound (as a json/array arg the python wrapper expands).
-    const joined = (args as string[]).join(' ');
-    expect(joined).toContain(U(1));
-    expect(joined).toContain(U(2));
+    // Ids are bound as the json array arg the python wrapper expands.
+    const payload = JSON.parse((args as string[])[1]);
+    expect(payload).toEqual([U(1), U(2)]);
   });
 
-  it('is a no-op when there are no fresh ids', () => {
+  it('is a no-op when there are no ids', () => {
     persistSurfacedIds('sess-x', []);
     expect(mockedRunPgQuery).not.toHaveBeenCalled();
   });
 
-  it('caps the fresh ids passed for persistence', () => {
-    const fresh = Array.from({ length: SURFACED_ID_CAP + 50 }, (_, i) => U(i));
-    persistSurfacedIds('sess-x', fresh);
+  it('defensively caps the bound id array to SURFACED_ID_CAP', () => {
+    const ids = Array.from({ length: SURFACED_ID_CAP + 50 }, (_, i) => U(i));
+    persistSurfacedIds('sess-x', ids);
     const [, args] = mockedRunPgQuery.mock.calls[0];
-    // The bound id payload must not exceed the cap.
-    const idArgs = (args as string[]).filter((a) => a.includes('-'));
-    expect(idArgs.length).toBeLessThanOrEqual(SURFACED_ID_CAP);
+    // Parse the actual bound array and assert its LENGTH is capped (the old
+    // test counted args, not ids, and so never caught an over-cap payload).
+    const payload = JSON.parse((args as string[])[1]) as string[];
+    expect(payload.length).toBe(SURFACED_ID_CAP);
+    // Most-recent tail survives (consistent with unionCap head-trim).
+    expect(payload[payload.length - 1]).toBe(U(SURFACED_ID_CAP + 49));
   });
 
   it('never throws on DB error', () => {

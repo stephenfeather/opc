@@ -375,31 +375,30 @@ asyncio.run(main())
     if (!res.success || !res.stdout) return [];
     const parsed = JSON.parse(res.stdout);
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter((x) => typeof x === "string" && x.length > 0);
+    const ids = parsed.filter((x) => typeof x === "string" && x.length > 0);
+    return ids.length > SURFACED_ID_CAP ? ids.slice(-SURFACED_ID_CAP) : ids;
   } catch {
     return [];
   }
 }
-function persistSurfacedIds(sessionId, freshIds) {
-  if (!sessionId || !freshIds || freshIds.length === 0) return;
-  const capped = freshIds.slice(0, SURFACED_ID_CAP);
+function persistSurfacedIds(sessionId, ids) {
+  if (!sessionId || !ids || ids.length === 0) return;
+  const capped = ids.length > SURFACED_ID_CAP ? ids.slice(-SURFACED_ID_CAP) : ids;
   const pythonCode = `
 import asyncpg, json
 
 db_url = os.environ['CONTINUOUS_CLAUDE_DB_URL']
 session_id = sys.argv[1]
-fresh = json.loads(sys.argv[2])
+ids = json.loads(sys.argv[2])
 
 async def main():
     conn = await asyncpg.connect(db_url)
     try:
         await conn.execute(
-            "UPDATE sessions SET surfaced_learning_ids = "
-            "ARRAY(SELECT DISTINCT unnest("
-            "COALESCE(surfaced_learning_ids, '{}'::uuid[]) || $2::uuid[]"
-            ")) WHERE claude_session_id = $1",
+            "UPDATE sessions SET surfaced_learning_ids = $2::uuid[] "
+            "WHERE claude_session_id = $1",
             session_id,
-            fresh,
+            ids,
         )
     finally:
         await conn.close()

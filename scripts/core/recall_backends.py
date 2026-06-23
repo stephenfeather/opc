@@ -821,6 +821,28 @@ def _is_project_capability_error(exc: BaseException) -> bool:
     return bool(_PROJECT_COLUMN_ERROR_RE.search(str(exc)))
 
 
+# Matches Postgres undefined_column messages about the archived_at column in
+# any qualification: 'column "archived_at"', 'column a.archived_at',
+# 'column archival_memory.archived_at'.
+_ARCHIVED_AT_COLUMN_ERROR_RE = re.compile(
+    r'column\s+"?(?:[\w]+\.)?"?archived_at"?\s+does not exist', re.IGNORECASE,
+)
+
+def _is_missing_archived_at_error(exc: BaseException) -> bool:
+    """True only for a CONCRETE asyncpg UndefinedColumnError naming archived_at.
+
+    Issue #63 Phase 2b round-2 finding 2: dropping the ``archived_at IS NULL``
+    lifecycle predicate is a SCHEMA-degradation that may ONLY happen when the
+    column is provably absent. Any other failure (lock timeout, transient error,
+    operator error) must NOT silently weaken the lifecycle filter into an
+    archived-rows-inclusive recall.
+    """
+    errors = _missing_relation_errors()
+    if not errors or not isinstance(exc, errors):
+        return False
+    return bool(_ARCHIVED_AT_COLUMN_ERROR_RE.search(str(exc)))
+
+
 # SESSION-level GUC that makes pgvector's HNSW return true nearest-k under WHERE
 # filters (issue #153). pgvector applies the leg's project/model/type filters
 # AFTER the ANN scan, so a bounded `ORDER BY <=> $q LIMIT $N` can under-fill or
@@ -1540,17 +1562,36 @@ async def search_learnings_hybrid_rrf(
             except Exception as exc:
                 if _is_project_capability_error(exc):
                     raise
-                logger.debug("RRF plain+chain fallback", exc_info=True)
-                try:
-                    # Issue #63 Phase 2b: drop only the archived clause first, so a
-                    # superseded-but-not-archived DB keeps the superseded filter.
-                    rows = await conn.fetch(
-                        cte_plain_noarchive + plain_tail, *plain_args,
+                # Issue #63 Phase 2b round-2 finding 2: dropping ONLY the
+                # archived_at predicate (superseded-only middle tier) is a
+                # schema-degradation that may run ONLY when archived_at is
+                # provably absent. A non-schema failure (lock timeout, transient
+                # error) must NOT silently degrade into an archived-rows recall.
+                if _is_missing_archived_at_error(exc):
+                    logger.debug(
+                        "RRF plain+chain fallback (archived_at column absent)",
+                        exc_info=True,
                     )
-                except Exception as exc:
-                    if _is_project_capability_error(exc):
-                        raise
-                    logger.debug("RRF plain+chain(no-archive) fallback", exc_info=True)
+                    try:
+                        rows = await conn.fetch(
+                            cte_plain_noarchive + plain_tail, *plain_args,
+                        )
+                    except Exception as exc:
+                        if _is_project_capability_error(exc):
+                            raise
+                        logger.debug(
+                            "RRF plain+chain(no-archive) fallback", exc_info=True
+                        )
+                        rows = await conn.fetch(
+                            cte_plain_nochain + plain_tail, *plain_args,
+                        )
+                else:
+                    # Pre-existing chain fallback (superseded_by absent or other
+                    # capability gap): drop the chain filter entirely. Preserved
+                    # from main so a missing superseded_by still degrades; a
+                    # genuinely transient error re-raises from the no-chain
+                    # attempt rather than returning weakened rows here.
+                    logger.debug("RRF plain+chain fallback", exc_info=True)
                     rows = await conn.fetch(
                         cte_plain_nochain + plain_tail, *plain_args,
                     )
@@ -1568,13 +1609,25 @@ async def search_learnings_hybrid_rrf(
                 query, embedding_str, rrf_k, k * 2,
                 *plain_extra, candidate_count,
             )
+            # Issue #63 Phase 2b round-2 finding 1: the plainto no-results
+            # fallback MUST carry the full lifecycle filter (superseded_by AND
+            # archived_at). Omitting archived=True here recalled archived rows
+            # as active whenever the expanded query missed and the plain query
+            # matched on a migrated DB.
             fb_cte_boosted = _cte(
                 chain=True, ts=False, pf=boosted_pf, mf=boosted_mf,
-                candidate_param=boosted_candidate_idx,
+                candidate_param=boosted_candidate_idx, archived=True,
             )
             fb_cte_plain = _cte(
                 chain=True, ts=False, pf=plain_pf, mf=plain_mf,
-                candidate_param=plain_candidate_idx,
+                candidate_param=plain_candidate_idx, archived=True,
+            )
+            # Superseded-only middle tier (drops ONLY archived_at) for a DB that
+            # has superseded_by but not archived_at — used only on a provable
+            # missing-archived_at error (finding 2 discipline).
+            fb_cte_plain_noarchive = _cte(
+                chain=True, ts=False, pf=plain_pf, mf=plain_mf,
+                candidate_param=plain_candidate_idx, archived=False,
             )
             try:
                 if has_decay_columns:
@@ -1586,21 +1639,55 @@ async def search_learnings_hybrid_rrf(
             except Exception as exc:
                 if _is_project_capability_error(exc):
                     raise
-                logger.debug("plainto_tsquery chain fallback", exc_info=True)
-                try:
-                    no_chain_cte = _cte(
-                        chain=False, ts=False, pf=plain_pf, mf=plain_mf,
-                        candidate_param=plain_candidate_idx,
-                    )
-                    rows = await conn.fetch(
-                        no_chain_cte + plain_tail, *fb_plain,
-                    )
-                except Exception as exc:
-                    if _is_project_capability_error(exc):
-                        raise
+                no_chain_cte = _cte(
+                    chain=False, ts=False, pf=plain_pf, mf=plain_mf,
+                    candidate_param=plain_candidate_idx,
+                )
+                if _is_missing_archived_at_error(exc):
+                    # archived_at absent: keep the superseded filter, drop only
+                    # archived_at; degrade to no-chain only if superseded_by is
+                    # also absent.
                     logger.debug(
-                        "plainto_tsquery fallback also failed", exc_info=True
+                        "plainto_tsquery chain fallback "
+                        "(archived_at column absent)",
+                        exc_info=True,
                     )
+                    try:
+                        rows = await conn.fetch(
+                            fb_cte_plain_noarchive + plain_tail, *fb_plain,
+                        )
+                    except Exception as exc:
+                        if _is_project_capability_error(exc):
+                            raise
+                        logger.debug(
+                            "plainto_tsquery plain+chain(no-archive) fallback",
+                            exc_info=True,
+                        )
+                        try:
+                            rows = await conn.fetch(
+                                no_chain_cte + plain_tail, *fb_plain,
+                            )
+                        except Exception as exc:
+                            if _is_project_capability_error(exc):
+                                raise
+                            logger.debug(
+                                "plainto_tsquery fallback also failed",
+                                exc_info=True,
+                            )
+                else:
+                    # Pre-existing plainto chain fallback (superseded_by absent
+                    # or other capability gap): drop the chain filter entirely.
+                    logger.debug("plainto_tsquery chain fallback", exc_info=True)
+                    try:
+                        rows = await conn.fetch(
+                            no_chain_cte + plain_tail, *fb_plain,
+                        )
+                    except Exception as exc:
+                        if _is_project_capability_error(exc):
+                            raise
+                        logger.debug(
+                            "plainto_tsquery fallback also failed", exc_info=True
+                        )
         return rows
 
     async with pool.acquire() as conn:

@@ -219,6 +219,22 @@ class MemoryServicePG:
     # exist and crashing every recall.
     _has_archived_at_column: bool | None = None
 
+    @classmethod
+    def reset_capability_caches(cls) -> None:
+        """Reset both class-level schema capability caches to ``None``.
+
+        Issue #63 Phase 2b round-2 finding 4: ``_has_superseded_column`` and
+        ``_has_archived_at_column`` are cached on the CLASS, so they are
+        process-wide rather than scoped to a specific DB/pool. When the postgres
+        pool is closed/reset (e.g. the process repoints at a DB with a different
+        migration state, or a test swaps pools), the cached probe results no
+        longer describe the live DB. Clearing both caches forces the next probe
+        to re-run against the current connection. ``close_pool``/``reset_pool``
+        call this via a lazy import to avoid a circular import.
+        """
+        cls._has_superseded_column = None
+        cls._has_archived_at_column = None
+
     def __init__(
         self,
         session_id: str = "default",

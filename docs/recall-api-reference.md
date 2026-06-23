@@ -327,6 +327,10 @@ point-in-time via `UPDATE archival_memory ... RETURNING id, project`, so no
 extra round trip is added. **Zero-result recalls are logged too** — with empty
 `recalled_ids`/`recalled_projects` arrays and `result_count = 0` — because
 finding nothing is the signature of over-restrictive project scoping (#130).
+Each row also records the **candidate pool size** (`pool_size`) and the
+over-fetch ceiling (`fetch_k`) so the recall **selection rate**
+(`result_count / pool_size`) is measurable (issue #228) — including for
+zero-result events, which now carry a non-NULL denominator.
 
 **Counters and the log are decoupled by design.** The counter columns
 (`recall_count` / `last_recalled` on `archival_memory`) and `recall_log` are
@@ -345,8 +349,17 @@ analysis source of truth.
 | `recalled_ids` | `UUID[]` | Ids of the rows whose counters were bumped |
 | `recalled_projects` | `TEXT[]` | Parallel to `recalled_ids`; `NULL` elements = unattributed memories |
 | `result_count` | `INTEGER` | Number of recalled rows (length of the arrays) |
+| `pool_size` | `INTEGER` | Issue #228 selection-shape telemetry: the raw backend candidate pool (the over-fetch, `compute_fetch_k = max(3*k, 50)` when reranking) captured **before** enrichment/tag-filter/rerank trim it. `NULL` = pre-#228 row or legacy-INSERT fallback (rate unknown) |
+| `fetch_k` | `INTEGER` | The requested over-fetch ceiling (`max(3*k, 50)` when reranking, else `k`). With `pool_size` it shows corpus saturation — `pool_size < fetch_k` means the backend had fewer candidates than requested. `NULL` = pre-#228 / legacy fallback |
 | `source` | `TEXT` | Short caller label from `--source` (`hook`/`mcp`/`cli`); validated `^[a-z][a-z0-9_-]{0,31}$` at the writer, invalid → `NULL`; `NULL` = unknown |
 | `created_at` | `TIMESTAMPTZ` | Event time, defaults to `NOW()` |
+
+`pool_size` is the raw backend candidate pool, captured before client-side
+`--tags` filtering and the rerank trim. With `--tags`, the returned
+`result_count` reflects that extra filtering, so the selection rate over
+`pool_size` is a **lower bound**; for the primary telemetry source (the
+memory-awareness hook, which passes no `--tags`) it is exact. Selection rate is
+**not stored** — compute it at query time (see *Selection-shape analysis*).
 
 ### Write semantics
 
@@ -361,6 +374,13 @@ analysis source of truth.
   the counter UPDATE (not a CTE or transaction). On a pre-migration DB that
   lacks `recall_log`, the INSERT fails alone, is swallowed (debug log), and the
   counter UPDATE still persists.
+- **Column-skew safe (issue #228):** the writer attempts the 7-column INSERT
+  (including `pool_size`/`fetch_k`) first; on `UndefinedColumnError` — a DB where
+  `recall_log` exists but `add_recall_log_pool_size.sql` has not run — it falls
+  back to the legacy 5-column INSERT so the recall event is **still logged**
+  (`pool_size`/`fetch_k` simply stay absent for that row). The new telemetry
+  never regresses existing #140 logging. Run the migration to populate the new
+  columns.
 - **Version-skew safe:** if `archival_memory.project` itself is missing
   (temporal-decay columns applied but `add_project_column.sql` not), the
   `RETURNING project` fetch raises `UndefinedColumnError`; recall falls back to
@@ -411,6 +431,32 @@ FROM recall_log
 WHERE created_at > NOW() - INTERVAL '30 days'
 GROUP BY caller_project ORDER BY empty_recalls DESC;
 ```
+
+### Selection-shape analysis (answers issue #228)
+
+The recall **selection rate** — what fraction of the candidate pool was actually
+returned — is computed at query time from `result_count` and `pool_size`. A low
+rate across a narrow score band is the signal the LLM-selector work (issue #228
+item 3) targets; this query is its measurement baseline. Only rows written after
+the migration have a non-NULL `pool_size`, so filter them in:
+
+```sql
+SELECT caller_project,
+       COUNT(*) AS recalls,
+       ROUND(AVG(result_count::numeric / NULLIF(pool_size, 0)), 3) AS avg_selection_rate,
+       ROUND(AVG(pool_size), 1) AS avg_pool_size,
+       COUNT(*) FILTER (WHERE pool_size = fetch_k) AS saturated_recalls
+FROM recall_log
+WHERE pool_size IS NOT NULL          -- post-#228 rows only
+  AND created_at > NOW() - INTERVAL '30 days'  -- idx_recall_log_created
+GROUP BY caller_project
+ORDER BY avg_selection_rate;
+```
+
+`NULLIF(pool_size, 0)` keeps zero-pool recalls (no candidates at all) from
+dividing by zero — their rate is `NULL` and drops out of the average.
+`saturated_recalls` (`pool_size = fetch_k`) counts events where the backend
+filled the entire over-fetch ceiling, i.e. the corpus was larger than the pool.
 
 **Retention:** automated (issue #146). The memory daemon prunes rows older than
 `daemon.recall_log_retention_days` (default `90`) every

@@ -216,6 +216,14 @@ CREATE TABLE IF NOT EXISTS recall_log (
     recalled_ids UUID[] NOT NULL,
     recalled_projects TEXT[] NOT NULL,   -- NULL elements = unattributed memories
     result_count INTEGER NOT NULL,
+    -- Issue #228 selection-shape telemetry: pool_size = the raw backend
+    -- candidate pool (the over-fetch, compute_fetch_k = max(3*k,50) when
+    -- reranking); fetch_k = the requested over-fetch ceiling. Selection rate is
+    -- computed at QUERY time: result_count::float / NULLIF(pool_size, 0). Both
+    -- nullable with NO default so pre-#228 rows (and the legacy INSERT
+    -- fallback) stay valid — NULL means "rate unknown / pre-telemetry".
+    pool_size INTEGER,
+    fetch_k INTEGER,
     -- source is validated at the writer (record_recall) against the regex
     -- ^[a-z][a-z0-9_-]{0,31}$, NOT with a DB CHECK constraint: a CHECK
     -- violation would abort the whole INSERT and silently drop the entire

@@ -549,7 +549,9 @@ class TestMainDegradesWithWarning:
         monkeypatch.setattr(rl, "_dispatch_search_project_first", fake_first)
         monkeypatch.setattr(rl, "get_backend", lambda: "postgres")
 
-        async def noop_record(_ids, *, caller_project=None, source=None):
+        async def noop_record(
+            _ids, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+        ):
             return None
 
         monkeypatch.setattr(rl, "record_recall", noop_record)
@@ -852,7 +854,9 @@ class TestProjectFirstThreadsCapture:
         monkeypatch.setattr(rl, "enrich_with_kg_context",
                             lambda r: _identity_async(r))
 
-        async def noop_record(_ids, *, caller_project=None, source=None):
+        async def noop_record(
+            _ids, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+        ):
             return None
 
         monkeypatch.setattr(rl, "record_recall", noop_record)

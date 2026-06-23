@@ -47,12 +47,18 @@ class _CapturingConn:
         *,
         fetch_error: Exception | None = None,
         execute_error: Exception | None = None,
+        undefined_column: str | None = None,
     ):
         self.fetch_calls: list[tuple[str, tuple]] = []
         self.execute_calls: list[tuple[str, tuple]] = []
         self._fetch_rows = fetch_rows if fetch_rows is not None else []
         self._fetch_error = fetch_error
         self._execute_error = execute_error
+        # Issue #228: simulate a pre-migration DB where a column is absent.
+        # When set, any execute() whose SQL mentions this column name is
+        # recorded (so the failed attempt is observable) THEN raises
+        # UndefinedColumnError, exercising the legacy-INSERT fallback.
+        self._undefined_column = undefined_column
 
     async def fetch(self, sql: str, *args):
         self.fetch_calls.append((sql, args))
@@ -62,6 +68,12 @@ class _CapturingConn:
 
     async def execute(self, sql: str, *args):
         self.execute_calls.append((sql, args))
+        if self._undefined_column is not None and self._undefined_column in sql:
+            from asyncpg.exceptions import UndefinedColumnError
+
+            raise UndefinedColumnError(
+                f'column "{self._undefined_column}" does not exist'
+            )
         if self._execute_error is not None:
             raise self._execute_error
         return "INSERT 0 1"
@@ -179,6 +191,86 @@ class TestRecordRecallLogging:
         assert args[2] == ["opc", None]  # parallel array preserves NULL element
         assert args[3] == 2
         assert args[4] == "hook"
+        # Issue #228: INSERT is now 7 columns (pool_size/fetch_k appended).
+        assert len(args) == 7
+        assert args[5] is None  # pool_size unset here -> NULL
+        assert args[6] is None  # fetch_k unset here -> NULL
+
+    async def test_insert_binds_pool_size_and_fetch_k(self, monkeypatch):
+        # Issue #228: pool_size/fetch_k are bound as $6/$7 so selection rate
+        # (result_count / pool_size) is computable at query time.
+        rid = str(uuid.uuid4())
+        conn = _CapturingConn(fetch_rows=[_row(rid, "opc")])
+        _patch_postgres(monkeypatch)
+        _patch_pool(monkeypatch, conn)
+
+        await record_recall(
+            [rid], caller_project="opc", source="hook", pool_size=50, fetch_k=50
+        )
+
+        assert len(conn.execute_calls) == 1
+        insert_sql, args = conn.execute_calls[0]
+        assert "pool_size" in insert_sql
+        assert "fetch_k" in insert_sql
+        assert args[5] == 50  # pool_size
+        assert args[6] == 50  # fetch_k
+
+    async def test_zero_result_logs_pool_size_and_fetch_k(self, monkeypatch):
+        # Issue #228: a "ran, picked nothing" recall now carries a denominator
+        # (pool_size) so an empty result is distinguishable from a tiny pool.
+        conn = _CapturingConn(fetch_rows=[])
+        _patch_postgres(monkeypatch)
+        _patch_pool(monkeypatch, conn)
+
+        await record_recall(
+            [], caller_project="opc", source="cli", pool_size=12, fetch_k=50
+        )
+
+        assert len(conn.execute_calls) == 1
+        _insert_sql, args = conn.execute_calls[0]
+        assert args[3] == 0  # result_count
+        assert args[5] == 12  # pool_size (the denominator)
+        assert args[6] == 50  # fetch_k
+
+    async def test_pre_migration_columns_absent_falls_back_to_legacy_insert(
+        self, monkeypatch
+    ):
+        # Issue #228: recall_log exists but add_recall_log_pool_size.sql hasn't
+        # run, so pool_size/fetch_k are absent. The 7-col INSERT raises
+        # UndefinedColumnError; record_recall must fall back to the legacy
+        # 5-col INSERT so the #140 recall event is STILL logged. Must not raise.
+        rid = str(uuid.uuid4())
+        conn = _CapturingConn(
+            fetch_rows=[_row(rid, "opc")], undefined_column="pool_size"
+        )
+        _patch_postgres(monkeypatch)
+        _patch_pool(monkeypatch, conn)
+
+        await record_recall([rid], caller_project="opc", pool_size=50, fetch_k=50)
+
+        assert len(conn.execute_calls) == 2
+        first_sql, _first_args = conn.execute_calls[0]
+        second_sql, second_args = conn.execute_calls[1]
+        # First attempt was the 7-col INSERT (mentions pool_size) and failed.
+        assert "pool_size" in first_sql
+        # Fallback is the legacy 5-col INSERT: no pool_size, exactly 5 args.
+        assert "pool_size" not in second_sql
+        assert len(second_args) == 5
+
+    async def test_backward_compatible_pool_size_defaults_none(self, monkeypatch):
+        # Issue #228: omitting pool_size/fetch_k binds them as NULL ("rate
+        # unknown"), keeping pre-#228 callers valid.
+        rid = str(uuid.uuid4())
+        conn = _CapturingConn(fetch_rows=[_row(rid, "opc")])
+        _patch_postgres(monkeypatch)
+        _patch_pool(monkeypatch, conn)
+
+        await record_recall([rid])
+
+        assert len(conn.execute_calls) == 1
+        args = conn.execute_calls[0][1]
+        assert args[5] is None  # pool_size
+        assert args[6] is None  # fetch_k
 
     async def test_no_insert_when_update_returns_zero_rows(self, monkeypatch):
         # No rows matched (e.g. concurrently deleted ids) -> skip the INSERT.
@@ -453,7 +545,9 @@ class TestMainWiring:
 
         captured: dict = {}
 
-        async def fake_record(ids, *, caller_project=None, source=None):
+        async def fake_record(
+            ids, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+        ):
             captured["ids"] = ids
             captured["caller_project"] = caller_project
             captured["source"] = source
@@ -496,7 +590,9 @@ class TestMainWiring:
 
         called = {"record": False}
 
-        async def fake_record(ids, *, caller_project=None, source=None):
+        async def fake_record(
+            ids, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+        ):
             called["record"] = True
 
         monkeypatch.setattr(rl, "record_recall", fake_record)
@@ -540,7 +636,9 @@ class TestMainWiring:
             order.append("format")
             return ""
 
-        async def fake_record(ids, *, caller_project=None, source=None):
+        async def fake_record(
+            ids, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+        ):
             order.append("record")
 
         monkeypatch.setattr(rl, "_format_output", fake_format, raising=False)
@@ -590,7 +688,9 @@ class TestMainWiring:
         monkeypatch.setattr(rl, "_format_output", fake_format, raising=False)
         monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(a[0] if a else ""))
 
-        async def slow_record(ids, *, caller_project=None, source=None):
+        async def slow_record(
+            ids, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+        ):
             await asyncio.sleep(5)  # far longer than the injected 0.05 bound
 
         monkeypatch.setattr(rl, "record_recall", slow_record)
@@ -604,6 +704,117 @@ class TestMainWiring:
         # 5s sleep was cancelled, so anything well under 5s proves the bound.
         assert elapsed < 3.0
         assert printed  # output was still produced before the timeout
+
+    async def test_main_captures_pool_size_before_rerank_trim(self, monkeypatch):
+        # Issue #228: pool_size must be the RAW backend candidate pool captured
+        # BEFORE enrichment/tag-filter/rerank trim it, so selection rate is
+        # computable. Rerank is ON here and trims 6 -> k=3.
+        import scripts.core.recall_learnings as rl
+        import scripts.core.reranker as reranker_mod
+
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        monkeypatch.setattr(
+            rl.sys,
+            "argv",
+            [
+                "recall_learnings.py",
+                "--query",
+                "x",
+                "--source",
+                "hook",
+                "--text-only",
+                "--json",
+                "--k",
+                "3",
+            ],
+            raising=False,
+        )
+
+        async def fake_dispatch(params, *, project=None, capture=None):
+            return [
+                {"id": str(uuid.uuid4()), "content": "x", "similarity": 0.5}
+                for _ in range(6)
+            ]
+
+        monkeypatch.setattr(rl, "_dispatch_search", fake_dispatch)
+        monkeypatch.setattr(rl, "get_backend", lambda: "postgres")
+        monkeypatch.setattr(rl, "_format_output", lambda *a, **k: "", raising=False)
+
+        async def identity(results):
+            return results
+
+        monkeypatch.setattr(rl, "enrich_with_pattern_strength", identity)
+        monkeypatch.setattr(rl, "enrich_with_kg_context", identity)
+        # rerank is imported locally inside main() from scripts.core.reranker.
+        monkeypatch.setattr(
+            reranker_mod, "rerank", lambda results, ctx, k: results[:k]
+        )
+
+        captured: dict = {}
+
+        async def fake_record(
+            ids, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+        ):
+            captured["ids"] = ids
+            captured["pool_size"] = pool_size
+            captured["fetch_k"] = fetch_k
+
+        monkeypatch.setattr(rl, "record_recall", fake_record)
+
+        rc = await rl.main()
+        assert rc == 0
+        assert captured["pool_size"] == 6  # raw pool BEFORE trim
+        assert len(captured["ids"]) == 3  # trimmed to k
+        assert captured["fetch_k"] == max(3 * 3, 50)  # == 50
+
+    async def test_main_passes_fetch_k_no_rerank(self, monkeypatch):
+        # Issue #228: with --no-rerank, compute_fetch_k(k)==k, and no trim
+        # happens, so pool_size == returned count == k.
+        import scripts.core.recall_learnings as rl
+
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        monkeypatch.setattr(
+            rl.sys,
+            "argv",
+            [
+                "recall_learnings.py",
+                "--query",
+                "x",
+                "--source",
+                "hook",
+                "--text-only",
+                "--json",
+                "--no-rerank",
+                "--k",
+                "4",
+            ],
+            raising=False,
+        )
+
+        async def fake_dispatch(params, *, project=None, capture=None):
+            return [
+                {"id": str(uuid.uuid4()), "content": "x", "similarity": 0.5}
+                for _ in range(4)
+            ]
+
+        monkeypatch.setattr(rl, "_dispatch_search", fake_dispatch)
+        monkeypatch.setattr(rl, "get_backend", lambda: "postgres")
+        monkeypatch.setattr(rl, "_format_output", lambda *a, **k: "", raising=False)
+
+        captured: dict = {}
+
+        async def fake_record(
+            ids, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+        ):
+            captured["pool_size"] = pool_size
+            captured["fetch_k"] = fetch_k
+
+        monkeypatch.setattr(rl, "record_recall", fake_record)
+
+        rc = await rl.main()
+        assert rc == 0
+        assert captured["pool_size"] == 4
+        assert captured["fetch_k"] == 4  # compute_fetch_k(k, no_rerank=True) == k
 
 
 if __name__ == "__main__":

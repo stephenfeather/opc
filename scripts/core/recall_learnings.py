@@ -467,8 +467,14 @@ async def record_recall(
     result_ids: list[str],
     caller_project: str | None = None,
     source: str | None = None,
+    pool_size: int | None = None,
+    fetch_k: int | None = None,
 ) -> None:
     """Update last_recalled/recall_count and log the recall event (issue #140).
+
+    ``pool_size`` (raw backend candidate pool) and ``fetch_k`` (requested
+    over-fetch ceiling) are logged for selection-rate telemetry (#228);
+    selection rate = result_count / pool_size, computed at query time.
 
     Batch-updates the recalled rows in a single ``UPDATE ... RETURNING id,
     project`` (point-in-time truth, zero extra round trips), then best-effort
@@ -510,7 +516,9 @@ async def record_recall(
             # Zero-result recall: no rows to bump, but log the event so
             # over-restrictive scoping (#130) is visible.
             if not result_ids:
-                await _insert_recall_log(conn, caller_project, [], [], source)
+                await _insert_recall_log(
+                    conn, caller_project, [], [], source, pool_size, fetch_k
+                )
                 return
 
             try:
@@ -550,7 +558,13 @@ async def record_recall(
             recalled_ids = [str(r["id"]) for r in rows]
             recalled_projects = [r["project"] for r in rows]
             await _insert_recall_log(
-                conn, caller_project, recalled_ids, recalled_projects, source
+                conn,
+                caller_project,
+                recalled_ids,
+                recalled_projects,
+                source,
+                pool_size,
+                fetch_k,
             )
     except Exception:
         # Best-effort telemetry must never break recall, but failures (e.g.
@@ -564,28 +578,65 @@ async def _insert_recall_log(
     recalled_ids: list[str],
     recalled_projects: list[str | None],
     source: str | None,
+    pool_size: int | None = None,
+    fetch_k: int | None = None,
 ) -> None:
-    """Best-effort append one recall_log row (issue #140).
+    """Best-effort append one recall_log row (issue #140, #228).
 
     Runs as a separate autocommitted statement after the counter UPDATE (NOT a
     CTE or transaction) so a pre-migration DB lacking ``recall_log`` fails here
     alone — the failure is swallowed (debug log) and the counter UPDATE stands.
+
+    ``pool_size``/``fetch_k`` (#228) are written via a 7-column INSERT. On a DB
+    where add_recall_log_pool_size.sql hasn't run those columns are absent, so
+    we fall back to the legacy 5-column INSERT — the #140 recall event is still
+    logged (the new telemetry is best-effort and must not regress logging).
     """
+    from asyncpg.exceptions import UndefinedColumnError
+
     try:
         await conn.execute(
             """
             INSERT INTO recall_log (
                 caller_project, recalled_ids, recalled_projects,
-                result_count, source
+                result_count, source, pool_size, fetch_k
             )
-            VALUES ($1, $2, $3, $4, $5)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             """,
             caller_project,
             recalled_ids,
             recalled_projects,
             len(recalled_ids),
             source,
+            pool_size,
+            fetch_k,
         )
+    except UndefinedColumnError:
+        # Pre-migration DB: recall_log exists but add_recall_log_pool_size.sql
+        # has not run, so pool_size/fetch_k are absent. Fall back to the legacy
+        # 5-column INSERT so the #140 recall event is STILL logged (the new
+        # telemetry is best-effort and must not regress existing logging).
+        # Each conn.execute is a separate autocommitted statement (no
+        # surrounding transaction), so the failed 7-col INSERT does not poison
+        # this retry.
+        logger.debug("recall_log pool_size/fetch_k absent; legacy insert")
+        try:
+            await conn.execute(
+                """
+                INSERT INTO recall_log (
+                    caller_project, recalled_ids, recalled_projects,
+                    result_count, source
+                )
+                VALUES ($1, $2, $3, $4, $5)
+                """,
+                caller_project,
+                recalled_ids,
+                recalled_projects,
+                len(recalled_ids),
+                source,
+            )
+        except Exception:
+            logger.debug("recall_log legacy insert failed", exc_info=True)
     except Exception:
         logger.debug("recall_log insert failed", exc_info=True)
 
@@ -1096,6 +1147,14 @@ async def main() -> int:
             print(f"Error: {e}", file=sys.stderr)
         return 1
 
+    # Issue #228: capture the raw backend candidate pool (the over-fetch, up to
+    # fetch_k) BEFORE enrichment/tag-filter/rerank trim it, so selection rate
+    # (result_count / pool_size) is computable. With client-side --tags filtering
+    # the returned count reflects extra filtering, so the rate is a lower bound;
+    # for the primary telemetry source (the memory-awareness hook, no --tags)
+    # it is exact.
+    pool_size = len(results)
+
     # Pattern enrichment
     if (not args.no_rerank or args.json_full) and backend == "postgres":
         results = await enrich_with_pattern_strength(results)
@@ -1158,6 +1217,8 @@ async def main() -> int:
                     [r["id"] for r in results],
                     caller_project=caller_project,
                     source=args.source,
+                    pool_size=pool_size,
+                    fetch_k=fetch_k,
                 ),
                 timeout=RECORD_RECALL_TIMEOUT,
             )

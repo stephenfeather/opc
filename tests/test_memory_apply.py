@@ -17,6 +17,7 @@ _DT_B = _dt.datetime(2026, 2, 1, tzinfo=_dt.UTC)
 from scripts.core.memory_apply import (
     ApplyAction,
     ApplyPlan,
+    UnpromoteAction,
     append_claude_md,
     apply_memory_file,
     backup_database,
@@ -1009,6 +1010,35 @@ class TestRunMergeApply:
         assert captured["supersede_kwargs"].get("reason") == "merge"
         assert result.applied == [self._A]
 
+    async def test_merge_passes_project_into_supersede_row(self, tmp_path):
+        # Defense-in-depth: run_merge_apply must thread the apply `project` into
+        # supersede_row so the guarded UPDATE is self-enforcing even if a future change
+        # drops the project-scoped fetch_merge_pair_details pre-filter.
+        from scripts.core.memory_apply import run_merge_apply
+
+        pool, conn = _pool()
+        conn.fetch.side_effect = [self._merge_rows()]
+        captured = {}
+
+        import scripts.core.memory_apply as ma
+
+        async def _supersede(conn, **kw):
+            captured["supersede_kwargs"] = kw
+            return 1
+
+        def _run(cmd, **kw):
+            Path(kw["stdout"].name).write_text("-- dump")
+            return MagicMock(returncode=0)
+
+        from unittest.mock import patch
+
+        with patch.object(ma, "supersede_row", _supersede):
+            await run_merge_apply(
+                pool, "opc", [(self._A, self._B)],
+                execute=True, backup_dir=tmp_path / "b", timestamp="t", run=_run,
+            )
+        assert captured["supersede_kwargs"].get("project") == "opc"
+
     async def test_keeper_died_after_plan_is_skip_not_raise(self, tmp_path):
         # Finding 2: keeper superseded concurrently after planning -> the keeper-liveness
         # guard makes the UPDATE match 0 rows. The loser must NOT be applied; reported as a
@@ -1543,6 +1573,55 @@ class TestRemoveLineByMarker:
 
         removed = remove_line_by_marker(tmp_path / "nope.md", "marker")
         assert removed is False
+
+
+class TestUnpromoteIndexMarkerExactness:
+    """Defense-in-depth (Issue #63 Phase 2b hardening): the MEMORY.md index splice must match
+    the EXACT wrapped ``({filename})`` reference the Phase-2a writer emits, not the bare
+    basename. A bare-basename substring match would splice an unintended line when one promoted
+    filename is a substring of another. The classic trap is a backup/variant filename that
+    CONTAINS the target's basename as a prefix (e.g. the target ``promoted-foo.md`` is a literal
+    substring of a sibling index line referencing ``promoted-foo.md.bak``), so a bare-basename
+    match would splice BOTH lines. Matching ``(promoted-foo.md)`` exactly leaves the other line
+    intact."""
+
+    def test_splices_only_exact_wrapped_filename(self, tmp_path):
+        from scripts.core.memory_apply import _unpromote_one_row
+        from scripts.core.memory_review import PromotedRow
+
+        memory_dir = tmp_path / "mem"
+        memory_dir.mkdir()
+        # The target's basename `promoted-foo.md` is a literal substring of the sibling
+        # filename `promoted-foo.md.bak` — a bare-basename splice would remove BOTH lines.
+        target_file = memory_dir / "promoted-foo.md"
+        target_file.write_text("body")
+        memory_md = memory_dir / "MEMORY.md"
+        memory_md.write_text(
+            "# Index\n"
+            "- [Foo](promoted-foo.md) — promoted, recalled 5×\n"
+            "- [FooBak](promoted-foo.md.bak) — promoted, recalled 7×\n"
+        )
+
+        action = UnpromoteAction(
+            row=PromotedRow(
+                id="a", content="c", recall_count=5, learning_type="CODEBASE_PATTERN",
+                tier="MEMORY.md", target=str(target_file),
+            ),
+            tier="MEMORY.md",
+            target=str(target_file),
+            two_artifact=True,
+            skipped=False,
+            skip_reason=None,
+        )
+
+        _unpromote_one_row(action, memory_dir, tmp_path / "CLAUDE.md")
+
+        text = memory_md.read_text()
+        # The exact (promoted-foo.md) line is gone...
+        assert "(promoted-foo.md)" not in text
+        # ...but the substring-colliding (promoted-foo.md.bak) line survives.
+        assert "(promoted-foo.md.bak)" in text
+        assert not target_file.exists()  # the target file itself was deleted
 
 
 class TestRunUnpromote:

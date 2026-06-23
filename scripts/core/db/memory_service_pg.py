@@ -138,6 +138,15 @@ _KEEPER_ACTIVE_GUARD = (
     " WHERE k.id = $1::uuid AND k.superseded_by IS NULL)"
 )
 
+# Optional same-statement project guard (defense-in-depth): the loser is retired only
+# if it lives in the bound project. The base UPDATE matches the loser by GLOBAL uuid
+# with NO project predicate — safe today only because callers pre-filter ids through a
+# project-scoped fetch. This term lets a caller make the statement self-enforcing so a
+# future code path that skips that pre-fetch can't supersede a row in ANOTHER project.
+# Binds $4 — the next free positional after keeper($1), reason($2), loser($3); the
+# keeper guard reuses $1, so $4 is correct whether or not that guard is present.
+_PROJECT_GUARD = "\n          AND LOWER(project) = LOWER($4::text)"
+
 
 async def supersede_row(
     conn: Any,
@@ -146,6 +155,7 @@ async def supersede_row(
     keeper_id: str,
     reason: str,
     require_active_keeper: bool = False,
+    project: str | None = None,
 ) -> int:
     """Mark ``loser_id`` as superseded by ``keeper_id`` in one guarded UPDATE.
 
@@ -169,14 +179,30 @@ async def supersede_row(
     keeper is trivially active, and the extra subquery is not worth paying on every
     store) and is still a SINGLE UPDATE in both modes.
 
+    When ``project`` is provided (defense-in-depth), the SAME statement gains a
+    project guard: the loser is retired only if it lives in ``project`` (matched
+    case-insensitively). The base UPDATE selects the loser by GLOBAL uuid with NO
+    project predicate, so it is safe today only because callers pre-filter ids
+    through a project-scoped fetch; passing ``project`` makes the statement
+    self-enforcing so a future caller that drops that pre-fetch can't supersede a
+    row in ANOTHER project. The bound value uses ``$4`` — the next free positional
+    after keeper/reason/loser; the keeper guard reuses ``$1`` so ``$4`` is correct
+    whether or not that guard is present. Default None keeps the store-time hot path
+    byte-for-byte unchanged (no project predicate, exactly three bound params).
+
     Returns the number of rows updated (0 = already superseded, missing, a stale
-    id, or — with ``require_active_keeper`` — a keeper that died after planning).
+    id, a cross-project loser when ``project`` is set, or — with
+    ``require_active_keeper`` — a keeper that died after planning).
     Does NOT decide what a zero-row result means — each caller owns that policy.
     Does NOT catch ``asyncpg.UndefinedColumnError``: on a pre-migration schema it
     propagates so callers own the compat policy.
     """
     sql = _SUPERSEDE_ROW_SQL + (_KEEPER_ACTIVE_GUARD if require_active_keeper else "")
-    status = await conn.execute(sql, keeper_id, reason, loser_id)
+    if project is not None:
+        sql += _PROJECT_GUARD
+        status = await conn.execute(sql, keeper_id, reason, loser_id, project)
+    else:
+        status = await conn.execute(sql, keeper_id, reason, loser_id)
     return _parse_update_count(status)
 
 

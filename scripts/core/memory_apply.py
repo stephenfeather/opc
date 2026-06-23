@@ -912,6 +912,13 @@ async def run_merge_apply(
                     # would be retired onto a DEAD keeper, violating select_merge_keeper's
                     # "a dead side is unsafe" invariant. 0-row now also covers that race.
                     require_active_keeper=True,
+                    # Same-statement project guard (defense-in-depth): the loser is
+                    # already pre-filtered by the project-scoped fetch_merge_pair_details,
+                    # but binding `project` here makes the UPDATE self-enforcing so a
+                    # future change that drops that pre-fetch can't supersede a row in
+                    # another project (UUIDs are global). A cross-project loser collapses
+                    # to a 0-row no-op, handled identically to the already-superseded case.
+                    project=project,
                 )
                 if count == 0:
                     # Already superseded, OR the keeper died after planning (keeper-liveness
@@ -1024,7 +1031,12 @@ def _unpromote_one_row(action: UnpromoteAction, memory_dir: Path, claude_md_path
             safe_file = memory_root / target.name
             remove_file_if_present(safe_file)  # stage 1: delete the promoted-<slug>.md FIRST
             # stage 2: splice the MEMORY.md index line that references that exact filename.
-            remove_line_by_marker(memory_dir / "MEMORY.md", target.name)
+            # Match the EXACT wrapped `({filename})` reference the Phase-2a writer
+            # (memory_index_line) emits, NOT the bare basename: a bare-basename substring
+            # match would also splice a sibling line whose filename CONTAINS this one
+            # (e.g. `promoted-foo.md` inside `promoted-foo.md.bak`). The `(...)` wrapper
+            # is part of the written format, so it disambiguates without false matches.
+            remove_line_by_marker(memory_dir / "MEMORY.md", f"({target.name})")
     else:
         # Single CLAUDE.md block, matched by the exact full-id marker the promote path wrote.
         remove_block_by_marker(claude_md_path, claude_md_marker_for_id(action.row.id))

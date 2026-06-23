@@ -17,13 +17,15 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-// Mock the DB layer so no real Postgres is touched. runPgQuery is the single
-// IO seam for both reading prior surfaced ids and persisting the union.
+// Mock the DB layer so no real Postgres is touched. readSurfacedIds uses the
+// synchronous runPgQuery (needed before recall); persistSurfacedIds uses the
+// detached runPgQueryDetached (fire-and-forget, off the prompt hot path).
 vi.mock('../shared/db-utils-pg.js', () => ({
   runPgQuery: vi.fn(() => ({ success: true, stdout: '[]', stderr: '' })),
+  runPgQueryDetached: vi.fn(() => undefined),
 }));
 
-import { runPgQuery } from '../shared/db-utils-pg.js';
+import { runPgQuery, runPgQueryDetached } from '../shared/db-utils-pg.js';
 import {
   SURFACED_ID_CAP,
   extractFullIds,
@@ -34,6 +36,7 @@ import {
 } from '../memory-awareness.js';
 
 const mockedRunPgQuery = vi.mocked(runPgQuery);
+const mockedRunPgQueryDetached = vi.mocked(runPgQueryDetached);
 
 const U = (n: number) =>
   `00000000-0000-0000-0000-${String(n).padStart(12, '0')}`;
@@ -163,35 +166,43 @@ describe('readSurfacedIds', () => {
 describe('persistSurfacedIds', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockedRunPgQuery.mockReturnValue({ success: true, stdout: 'ok', stderr: '' });
   });
 
-  it('REPLACES the column with the caller-provided set (no re-union)', () => {
+  it('runs DETACHED (off the prompt hot path), not synchronously', () => {
     persistSurfacedIds('sess-x', [U(1), U(2)]);
-    expect(mockedRunPgQuery).toHaveBeenCalledTimes(1);
-    const [code, args] = mockedRunPgQuery.mock.calls[0];
+    expect(mockedRunPgQueryDetached).toHaveBeenCalledTimes(1);
+    // Persistence is only needed next turn, so it must NOT use the synchronous
+    // seam that would add a DB round-trip to the prompt-submit budget.
+    expect(mockedRunPgQuery).not.toHaveBeenCalled();
+  });
+
+  it('UPSERTS keyed on the PK id (no silent no-op when the row is missing)', () => {
+    persistSurfacedIds('sess-x', [U(1), U(2)]);
+    const [code, args] = mockedRunPgQueryDetached.mock.calls[0];
     expect(code).toContain('surfaced_learning_ids');
-    // Replace assignment, NOT an append/re-union against the existing column.
-    // A re-union (`|| $2` + unnest) would re-add ids that unionCap trimmed and
-    // let the array grow without bound — the round-1 finding.
-    expect(code).toContain('= $2::uuid[]');
+    // Upsert, not a bare UPDATE that no-ops when the SessionStart row is absent.
+    expect(code).toContain('INSERT INTO sessions');
+    expect(code).toContain('ON CONFLICT (id) DO UPDATE');
+    // Replace assignment via EXCLUDED, NOT an append/re-union against the
+    // existing column (a `|| $2` + unnest re-union would re-add ids unionCap
+    // trimmed and let the array grow without bound — the round-1 finding).
+    expect(code).toContain('EXCLUDED.surfaced_learning_ids');
     expect(code).not.toContain('unnest');
     expect(code).not.toContain('||');
     expect(args).toContain('sess-x');
-    // Ids are bound as the json array arg the python wrapper expands.
     const payload = JSON.parse((args as string[])[1]);
     expect(payload).toEqual([U(1), U(2)]);
   });
 
   it('is a no-op when there are no ids', () => {
     persistSurfacedIds('sess-x', []);
-    expect(mockedRunPgQuery).not.toHaveBeenCalled();
+    expect(mockedRunPgQueryDetached).not.toHaveBeenCalled();
   });
 
   it('defensively caps the bound id array to SURFACED_ID_CAP', () => {
     const ids = Array.from({ length: SURFACED_ID_CAP + 50 }, (_, i) => U(i));
     persistSurfacedIds('sess-x', ids);
-    const [, args] = mockedRunPgQuery.mock.calls[0];
+    const [, args] = mockedRunPgQueryDetached.mock.calls[0];
     // Parse the actual bound array and assert its LENGTH is capped (the old
     // test counted args, not ids, and so never caught an over-cap payload).
     const payload = JSON.parse((args as string[])[1]) as string[];
@@ -200,13 +211,8 @@ describe('persistSurfacedIds', () => {
     expect(payload[payload.length - 1]).toBe(U(SURFACED_ID_CAP + 49));
   });
 
-  it('never throws on DB error', () => {
-    mockedRunPgQuery.mockReturnValue({ success: false, stdout: '', stderr: 'boom' });
-    expect(() => persistSurfacedIds('sess-x', [U(1)])).not.toThrow();
-  });
-
-  it('never throws when runPgQuery throws', () => {
-    mockedRunPgQuery.mockImplementation(() => {
+  it('never throws when the detached spawn throws', () => {
+    mockedRunPgQueryDetached.mockImplementation(() => {
       throw new Error('spawn failed');
     });
     expect(() => persistSurfacedIds('sess-x', [U(1)])).not.toThrow();

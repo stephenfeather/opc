@@ -233,10 +233,20 @@ plain-string exclude value compare equal. The filter is a pure post-fetch Python
 step, so it applies uniformly across all backends (text-only, vector, hybrid
 RRF) and both the single-pass and `--project-first` two-pass dispatch paths.
 
+**Backfill — avoiding starvation:** because the filter runs *after* the backend
+returns its fixed over-fetch pool, `fetch_k` is increased by the size of the
+exclude set when `--exclude-ids` is non-empty. Otherwise a session that had
+already surfaced the entire top-of-pool would filter every candidate out and
+return nothing, even when fresh lower-ranked candidates exist. The bump is
+bounded by the hook's surfaced-id cap, so the extra fetch and rerank cost stays
+small.
+
 Primary consumer: the `memory-awareness` UserPromptSubmit hook, which tracks the
-learning ids it has surfaced per session (in `sessions.surfaced_learning_ids`,
-keyed by `claude_session_id`) and passes them here so it stops re-surfacing the
-same top memories every turn.
+learning ids it has surfaced per session (in `sessions.surfaced_learning_ids`)
+and passes them here so it stops re-surfacing the same top memories every turn.
+The hook reads and upserts that column keyed on the sessions PK `id` (which
+session-register sets equal to the Claude session id), so the per-prompt lookup
+is a primary-key read needing no extra index.
 
 ### `--provider` (default: local)
 

@@ -14,7 +14,7 @@
 import { readFileSync, existsSync } from 'fs';
 import { spawnSync } from 'child_process';
 import { getOpcDir } from './shared/opc-path.js';
-import { runPgQuery } from './shared/db-utils-pg.js';
+import { runPgQuery, runPgQueryDetached } from './shared/db-utils-pg.js';
 
 /**
  * Upper bound on the per-session surfaced-id set (issue #228 item 2).
@@ -252,8 +252,10 @@ export function unionCap(prior: string[], fresh: string[], cap: number): string[
 
 /**
  * Read prior surfaced learning ids for this session (issue #228 item 2).
- * Best-effort: any DB error / missing row / NULL column yields []. Keyed by
- * claude_session_id (= the hook's stdin input.session_id).
+ * Best-effort: any DB error / missing row / NULL column yields []. Keyed by the
+ * sessions PK `id`, which session-register sets to the hook's stdin
+ * input.session_id (id == claude_session_id for every registered session), so
+ * this is a primary-key lookup (sessions_pkey) — no extra index needed.
  */
 export function readSurfacedIds(sessionId: string): string[] {
   if (!sessionId) return [];
@@ -267,7 +269,7 @@ async def main():
     conn = await asyncpg.connect(db_url)
     try:
         row = await conn.fetchrow(
-            "SELECT surfaced_learning_ids FROM sessions WHERE claude_session_id = $1",
+            "SELECT surfaced_learning_ids FROM sessions WHERE id = $1",
             session_id,
         )
     finally:
@@ -297,9 +299,19 @@ asyncio.run(main())
  * complete, already-deduped-and-capped array (via unionCap), so the write
  * REPLACES the column rather than re-unioning with the existing value — a
  * re-union would re-add ids that unionCap trimmed and let the array grow without
- * bound. Per-session hook invocations are serial, so a plain replace is safe.
- * Best-effort: caps defensively and swallows all DB errors so the hook never
- * breaks.
+ * bound.
+ *
+ * Uses an UPSERT keyed on the PK `id` (== input.session_id for registered
+ * sessions): a plain UPDATE silently no-ops with "UPDATE 0" if the SessionStart
+ * row is missing (registration skipped/failed/cleaned), which would make the
+ * feature never persist and re-surface forever. The INSERT branch creates a
+ * minimal row so persistence still takes effect.
+ *
+ * Runs DETACHED (fire-and-forget): the result is only needed NEXT turn, so it
+ * must not add a synchronous DB round-trip to the prompt-submit hot path on top
+ * of recall's own budget. Per-session hook invocations are serial (one prompt
+ * at a time), so last-writer-wins replace is safe. Best-effort: caps defensively
+ * and swallows all errors so the hook never breaks.
  */
 export function persistSurfacedIds(sessionId: string, ids: string[]): void {
   if (!sessionId || !ids || ids.length === 0) return;
@@ -316,8 +328,9 @@ async def main():
     conn = await asyncpg.connect(db_url)
     try:
         await conn.execute(
-            "UPDATE sessions SET surfaced_learning_ids = $2::uuid[] "
-            "WHERE claude_session_id = $1",
+            "INSERT INTO sessions (id, project, claude_session_id, surfaced_learning_ids) "
+            "VALUES ($1, '', $1, $2::uuid[]) "
+            "ON CONFLICT (id) DO UPDATE SET surfaced_learning_ids = EXCLUDED.surfaced_learning_ids",
             session_id,
             ids,
         )
@@ -327,7 +340,7 @@ async def main():
 asyncio.run(main())
 `;
   try {
-    runPgQuery(pythonCode, [sessionId, JSON.stringify(capped)]);
+    runPgQueryDetached(pythonCode, [sessionId, JSON.stringify(capped)]);
   } catch {
     // Best-effort: never break the hook on a persistence failure.
   }

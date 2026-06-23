@@ -1090,6 +1090,13 @@ async def main() -> int:
 
     output_mode = select_output(json_flag=args.json, json_full=args.json_full)
     fetch_k = compute_fetch_k(args.k, no_rerank=args.no_rerank)
+    # Issue #228 item 2: the exclusion filter (below) drops already-surfaced rows
+    # AFTER the backend returns its fixed over-fetch pool. Over-fetch by the
+    # exclude-set size so a session that has already surfaced the top of the pool
+    # still gets k FRESH candidates instead of starving. Bounded by the hook's
+    # surfaced-id cap, so the extra fetch is small and the rerank stays cheap.
+    if args.exclude_ids:
+        fetch_k += len(set(args.exclude_ids))
 
     if output_mode == "human":
         print(f'Recalling learnings for: "{args.query}"')

@@ -112,6 +112,38 @@ ${pythonCode}
     };
   }
 }
+function runPgQueryDetached(pythonCode, args = []) {
+  const resolvedDbUrl = getPgConnectionString();
+  const opcDir = requireOpcDir();
+  try {
+    const wrappedCode = `
+import sys
+import os
+import asyncio
+import json
+
+# Add opc to path for imports
+sys.path.insert(0, '${opcDir}')
+os.chdir('${opcDir}')
+
+${pythonCode}
+`;
+    const child = spawn("uv", ["run", "python", "-c", wrappedCode, ...args], {
+      detached: true,
+      stdio: "ignore",
+      cwd: opcDir,
+      env: {
+        ...process.env,
+        // Never rewrite opc's uv.lock from a hook-triggered uv run (issue #71
+        // follow-up); the frequent heartbeat path runs through here.
+        UV_FROZEN: "1",
+        CONTINUOUS_CLAUDE_DB_URL: resolvedDbUrl
+      }
+    });
+    child.unref();
+  } catch {
+  }
+}
 
 // src/memory-awareness.ts
 /*!
@@ -360,7 +392,7 @@ async def main():
     conn = await asyncpg.connect(db_url)
     try:
         row = await conn.fetchrow(
-            "SELECT surfaced_learning_ids FROM sessions WHERE claude_session_id = $1",
+            "SELECT surfaced_learning_ids FROM sessions WHERE id = $1",
             session_id,
         )
     finally:
@@ -395,8 +427,9 @@ async def main():
     conn = await asyncpg.connect(db_url)
     try:
         await conn.execute(
-            "UPDATE sessions SET surfaced_learning_ids = $2::uuid[] "
-            "WHERE claude_session_id = $1",
+            "INSERT INTO sessions (id, project, claude_session_id, surfaced_learning_ids) "
+            "VALUES ($1, '', $1, $2::uuid[]) "
+            "ON CONFLICT (id) DO UPDATE SET surfaced_learning_ids = EXCLUDED.surfaced_learning_ids",
             session_id,
             ids,
         )
@@ -406,7 +439,7 @@ async def main():
 asyncio.run(main())
 `;
   try {
-    runPgQuery(pythonCode, [sessionId, JSON.stringify(capped)]);
+    runPgQueryDetached(pythonCode, [sessionId, JSON.stringify(capped)]);
   } catch {
   }
 }

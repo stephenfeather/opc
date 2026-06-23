@@ -947,6 +947,37 @@ class TestExcludeIds:
         assert ids[1] not in captured["ids"]
         assert len(captured["ids"]) == 4
 
+    async def test_exclude_ids_bumps_fetch_k_for_backfill(self, monkeypatch):
+        # Issue #228 item 2 (round-2): exclusion runs AFTER the backend's fixed
+        # over-fetch, so the pool is over-fetched by the exclude-set size. Without
+        # this a session that already surfaced the top of the pool would starve
+        # (all over-fetched rows filtered out) instead of getting fresh results.
+        import scripts.core.recall_learnings as rl
+        import scripts.core.reranker as reranker_mod
+
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        ids = [str(uuid.uuid4()) for _ in range(3)]
+        results = [{"id": i, "content": "x", "similarity": 0.5} for i in ids]
+        # k=5 -> base fetch_k = max(3*5, 50) = 50; two distinct excludes -> 52.
+        monkeypatch.setattr(
+            rl.sys, "argv", self._argv("--exclude-ids", ids[0], ids[1]), raising=False
+        )
+        self._wire(monkeypatch, rl, reranker_mod, results)
+        monkeypatch.setattr(rl, "_format_output", lambda *a, **k: "", raising=False)
+
+        captured: dict = {}
+
+        async def fake_record(
+            ids_arg, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+        ):
+            captured["fetch_k"] = fetch_k
+
+        monkeypatch.setattr(rl, "record_recall", fake_record)
+
+        rc = await rl.main()
+        assert rc == 0
+        assert captured["fetch_k"] == max(3 * 5, 50) + 2
+
     async def test_no_exclude_ids_no_regression(self, monkeypatch):
         import scripts.core.recall_learnings as rl
         import scripts.core.reranker as reranker_mod

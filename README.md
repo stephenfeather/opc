@@ -170,7 +170,7 @@ uv run python scripts/core/memory_apply.py --ids <id1>,<id2> --execute
 # Merge-supersede a near-duplicate pair: keep the higher-recall row, retire the loser
 uv run python scripts/core/memory_apply.py --merge --pair <id_a>:<id_b> --execute
 
-# Stale-archive retired learnings (sets archived_at; reversible)
+# Stale-archive retired learnings (sets archived_at; column is nullable for manual recovery)
 uv run python scripts/core/memory_apply.py --archive --ids <id1>,<id2> --execute
 
 # Unpromote: reverse a promotion (remove the file artifact, clear the promoted_to tag)

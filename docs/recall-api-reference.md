@@ -816,7 +816,10 @@ uv run python scripts/core/memory_apply.py [project] <mode flags> [--execute]
   run before any change.
 - **Idempotent.** Every mutation is a guarded UPDATE / file op; re-running an already-applied action
   is a reported skip, never an error. Safe to re-run after a partial failure.
-- **Per-project flock.** Concurrent runs for the same project are serialized.
+- **Per-project flock.** Concurrent runs are serialized per lock root: promote and unpromote lock
+  on the memory directory, while merge and archive lock on the backup directory — so overriding
+  `--backup-dir` across simultaneous same-project merge/archive runs can defeat the lock (the
+  guarded, idempotent SQL still prevents corruption).
 - **Project-scoped.** Writes are guarded by `LOWER(project) = LOWER($n)`; a global UUID from another
   project is skipped, not mutated.
 
@@ -829,7 +832,7 @@ omitting all three is **promote** mode.
 |------|------|--------|--------|
 | **Promote** (default) | *(none)* | `--ids` / `--manifest` | Append approved learnings to `CLAUDE.md` or `MEMORY.md` and stamp `metadata.promoted_to` (Phase 2a) |
 | **Merge-supersede** | `--merge` | `--pair ID_A:ID_B` (repeatable) | Keep the higher-recall row of each near-duplicate pair; mark the loser `superseded_by → keeper` (tie-break: higher recall → older `created_at` → smaller id) |
-| **Stale-archive** | `--archive` | `--ids` / `--manifest` | Set `archived_at = NOW()` on each stale learning (no survivor) and stamp a `superseded_via {reason:"stale"}` marker. Reversible via the unarchive path |
+| **Stale-archive** | `--archive` | `--ids` / `--manifest` | Set `archived_at = NOW()` on each stale learning (no survivor) and stamp a `superseded_via {reason:"stale"}` marker. The row is retained (`archived_at` is nullable) for manual recovery or backup restore — there is no `--unarchive` CLI yet |
 | **Unpromote/repair** | `--unpromote` | `--ids` / `--manifest` | Reverse a promotion: remove the promoted file artifact(s) **then** clear the `promoted_to` tag (file-first, so a partial failure never strands the DB tag) |
 
 ## Flags
@@ -885,6 +888,8 @@ docker exec -i opc-postgres psql -U claude -d continuous_claude -f - \
 ```
 
 The migration is idempotent (`ADD COLUMN IF NOT EXISTS` + `CREATE INDEX CONCURRENTLY IF NOT
-EXISTS`). Until it runs, recall degrades gracefully (a capability probe omits the `archived_at`
-clause rather than crashing) and `--archive` is a no-op. `CREATE INDEX CONCURRENTLY` cannot run
-inside a transaction block — apply the file with `psql -f` (autocommit), not `psql -1`.
+EXISTS`). Until it runs, **recall** degrades gracefully (a capability probe omits the `archived_at`
+clause rather than crashing), but **`--archive --execute` aborts** (exit 1, after taking its backup)
+because `archive_row` requires the column — run the migration before archiving. `CREATE INDEX
+CONCURRENTLY` cannot run inside a transaction block — apply the file with `psql -f` (autocommit),
+not `psql -1`.

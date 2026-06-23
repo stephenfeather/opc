@@ -1021,8 +1021,17 @@ def _unpromote_one_row(action: UnpromoteAction, memory_dir: Path, claude_md_path
             memory_root = memory_dir.resolve()
             # Reject a target that resolves outside the active memory_dir (stale/corrupt/
             # cross-worktree absolute path). Surfaced as a failed action; promoted_to untouched.
+            # A RELATIVE target (a promotion run with a relative --memory-dir stores one) is
+            # resolved against memory_dir, NOT the process CWD — otherwise a legit unpromote run
+            # from a different directory false-positives here. Basename-only deletion is unchanged,
+            # and a relative `..` traversal still escapes memory_root and is refused.
             resolved = (memory_root / target.name).resolve()
-            if resolved.parent != memory_root or target.resolve(strict=False) != resolved:
+            target_resolved = (
+                target.resolve(strict=False)
+                if target.is_absolute()
+                else (memory_root / target).resolve()
+            )
+            if resolved.parent != memory_root or target_resolved != resolved:
                 raise OSError(
                     f"unpromote target {action.target!r} resolves outside memory_dir "
                     f"{memory_dir} — refusing to unlink (action left re-runnable)"

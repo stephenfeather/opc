@@ -1624,6 +1624,74 @@ class TestUnpromoteIndexMarkerExactness:
         assert not target_file.exists()  # the target file itself was deleted
 
 
+class TestUnpromoteRelativeTarget:
+    """Issue #63 Phase 2b (PR #237 gemini finding): a promotion run with a RELATIVE ``--memory-dir``
+    stores a relative ``promoted_to.target``. The containment check must resolve a relative target
+    against ``memory_dir``, NOT the process CWD — otherwise a legitimate unpromote run from a
+    different working directory (e.g. the repo root) false-positives into ``OSError`` and the action
+    never completes. Resolving relative-to-``memory_dir`` keeps the security property intact: only
+    the basename is ever unlinked, and a relative ``..`` traversal still escapes ``memory_dir`` and
+    raises (covered separately)."""
+
+    def test_relative_target_resolved_against_memory_dir_not_cwd(self, tmp_path):
+        from scripts.core.memory_apply import _unpromote_one_row
+        from scripts.core.memory_review import PromotedRow
+
+        memory_dir = tmp_path / "mem"
+        memory_dir.mkdir()
+        target_file = memory_dir / "promoted-foo.md"
+        target_file.write_text("body")
+        memory_md = memory_dir / "MEMORY.md"
+        memory_md.write_text("# Index\n- [Foo](promoted-foo.md) — promoted, recalled 5×\n")
+
+        # target stored as a BARE RELATIVE basename, as a relative --memory-dir promote writes it.
+        # pytest's CWD is the repo root (!= memory_dir), so the pre-fix CWD-relative resolve
+        # mismatches `resolved` and raises a false-positive OSError.
+        action = UnpromoteAction(
+            row=PromotedRow(
+                id="a", content="c", recall_count=5, learning_type="CODEBASE_PATTERN",
+                tier="MEMORY.md", target="promoted-foo.md",
+            ),
+            tier="MEMORY.md",
+            target="promoted-foo.md",
+            two_artifact=True,
+            skipped=False,
+            skip_reason=None,
+        )
+
+        # Must NOT raise: the relative target is resolved against memory_dir and removed.
+        _unpromote_one_row(action, memory_dir, tmp_path / "CLAUDE.md")
+
+        assert not target_file.exists()
+        assert "(promoted-foo.md)" not in memory_md.read_text()
+
+    def test_relative_traversal_target_still_raises(self, tmp_path):
+        """A RELATIVE target that escapes memory_dir via .. must still be refused (security)."""
+        from scripts.core.memory_apply import _unpromote_one_row
+        from scripts.core.memory_review import PromotedRow
+
+        memory_dir = tmp_path / "mem"
+        memory_dir.mkdir()
+        outside = tmp_path / "evil.md"
+        outside.write_text("secret")
+
+        action = UnpromoteAction(
+            row=PromotedRow(
+                id="a", content="c", recall_count=5, learning_type="CODEBASE_PATTERN",
+                tier="MEMORY.md", target="../evil.md",
+            ),
+            tier="MEMORY.md",
+            target="../evil.md",
+            two_artifact=True,
+            skipped=False,
+            skip_reason=None,
+        )
+
+        with pytest.raises(OSError):
+            _unpromote_one_row(action, memory_dir, tmp_path / "CLAUDE.md")
+        assert outside.exists(), "a relative ..-traversal target must never be unlinked"
+
+
 class TestRunUnpromote:
     """The W-2 ordering invariant. Two-artifact: delete promoted-<slug>.md FIRST, THEN splice
     the MEMORY.md index line, THEN clear promoted_to. Single-artifact: remove the CLAUDE.md

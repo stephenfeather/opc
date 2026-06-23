@@ -45,6 +45,7 @@ import json
 import logging
 import os
 import sys
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -266,6 +267,51 @@ def check_dedup_result(
             "existing_id": str(top_match.get("id", "")),
         }
     return None
+
+
+def _canonical_supersedes(supersedes: str | None) -> str | None:
+    """Canonicalize a supersedes id to a lowercase UUID string.
+
+    asyncpg returns row ids in canonical lowercase, so the dedup-exclusion
+    filter must compare against the same form — an uppercase or otherwise
+    non-canonical operator input would fail to match and silently re-break the
+    replace (issue #235). A value that is not a valid UUID is not a real row id;
+    return None so the caller falls back to plain dedup instead of passing the
+    bad value to the DB's ``$2::uuid`` cast (which raises
+    ``InvalidTextRepresentationError``). Pure function.
+    """
+    if not supersedes:
+        return None
+    try:
+        return str(uuid.UUID(str(supersedes)))
+    except (ValueError, TypeError, AttributeError):
+        logger.warning(
+            "Invalid supersedes id %r (not a UUID); ignoring and falling back "
+            "to plain dedup", supersedes,
+        )
+        return None
+
+
+async def _supersede_persists(memory: Any, backend: str) -> bool:
+    """Whether a supersede link will actually be written for this store.
+
+    Supersede is honored only on postgres AND only when the ``superseded_by``
+    column exists. On a pre-migration DB the UPDATE is swallowed
+    (``UndefinedColumnError``), so the caller must not treat the supersede as
+    effective — otherwise the dedup-exclusion would orphan a duplicate active
+    row (issue #235, round-2 schema-drift case). The capability probe is cached
+    on the service, so this adds no per-call query cost in steady state.
+    """
+    if backend != "postgres":
+        return False
+    check = getattr(memory, "_check_superseded_column", None)
+    if check is None:
+        return False
+    try:
+        return bool(await check())
+    except Exception:
+        # A capability probe failure must not enable an unsafe exclusion.
+        return False
 
 
 def parse_tags(tags_str: str | None) -> list[str] | None:
@@ -737,10 +783,38 @@ async def store_learning_v2(
         # and the embedding_model column.
         dedup_model = embedding_model if backend == "postgres" else None
         threshold = _dedup_threshold()
+        # Issue #235: a supersede deliberately replaces an existing row with a
+        # correction that is *expected* to resemble it. Without special-casing,
+        # the dedup gate flags the supersede target as a duplicate and returns
+        # before the supersede ever runs, making --supersedes dead-on-arrival.
+        # Probe one extra neighbor and drop the supersede target from the
+        # results, so the intentional replace proceeds while a *different*
+        # near-duplicate still rejects the write.
+        #
+        # Gate on actual supersede capability, not just backend type. Supersede
+        # is persisted only on postgres AND only when the superseded_by column
+        # exists — on a pre-migration DB the UPDATE is swallowed
+        # (UndefinedColumnError) and the old row is never marked replaced.
+        # Excluding the target from dedup when the link will NOT be written would
+        # silently insert a duplicate active learning with no supersede relation
+        # — the same regression the backend gate closes for sqlite, via schema
+        # drift instead of backend type. When capability is absent we fall back
+        # to plain dedup (active_supersedes=None), which still protects the row.
+        #
+        # Canonicalize the id to a lowercase UUID string: asyncpg returns row
+        # ids in canonical lowercase, so comparing the raw operator input (which
+        # may be uppercase or otherwise non-canonical) would fail to exclude the
+        # target — silently re-breaking the replace for uppercase UUIDs. An
+        # unparseable id is not a real row, so fall back to plain dedup rather
+        # than letting the bad value reach the DB's $2::uuid cast and raise.
+        active_supersedes = _canonical_supersedes(supersedes)
+        if active_supersedes and not await _supersede_persists(memory, backend):
+            active_supersedes = None
+        dedup_limit = 2 if active_supersedes else 1
         try:
             if hasattr(memory, "search_vector_global"):
                 existing = await memory.search_vector_global(
-                    embedding, threshold=threshold, limit=1,
+                    embedding, threshold=threshold, limit=dedup_limit,
                     embedding_model=dedup_model,
                 )
             else:
@@ -748,8 +822,14 @@ async def store_learning_v2(
                     "search_vector_global unavailable, using session-scoped dedup"
                 )
                 existing = await memory.search_vector(
-                    embedding, limit=1, embedding_model=dedup_model,
+                    embedding, limit=dedup_limit, embedding_model=dedup_model,
                 )
+
+            if active_supersedes and existing:
+                existing = [
+                    row for row in existing
+                    if str(row.get("id", "")) != str(active_supersedes)
+                ]
 
             dedup = check_dedup_result(
                 existing=existing, threshold=threshold, default_session=session_id
@@ -825,7 +905,7 @@ async def store_learning_v2(
             embedding=embedding,
             content_hash=content_hash,
             host_id=host_id,
-            supersedes=supersedes if backend == "postgres" else None,
+            supersedes=active_supersedes,
             tags=tags if backend == "postgres" else None,
             project=project if backend == "postgres" else None,
             source_time=source_time if backend == "postgres" else None,
@@ -861,8 +941,8 @@ async def store_learning_v2(
             "content_length": len(content),
             "embedding_dim": len(embedding),
         }
-        if supersedes and backend == "postgres":
-            result_dict["superseded"] = supersedes
+        if active_supersedes:
+            result_dict["superseded"] = active_supersedes
         if kg_stats:
             result_dict["kg_stats"] = kg_stats
         return result_dict

@@ -516,8 +516,17 @@ class MemoryServicePG:
                     )
 
             if supersedes:
+                # Intentionally NOT scoped by session_id/agent_id (unlike
+                # delete_archival). Supersede is a curation operation: a
+                # correction stored in the current session must be able to
+                # retire a bad/stale row created in ANY prior session. Adding a
+                # session/agent scope here would silently no-op cross-session
+                # corrections (the primary use case) and defeat the feature.
+                # The link is non-destructive and reversible, and the store is a
+                # local single-operator tool. Do not "harden" this to match the
+                # DELETE scoping without removing cross-session curation.
                 try:
-                    await conn.execute(
+                    status = await conn.execute(
                         """
                         UPDATE archival_memory
                         SET superseded_by = $1::uuid, superseded_at = NOW()
@@ -525,6 +534,19 @@ class MemoryServicePG:
                         """,
                         memory_id, supersedes,
                     )
+                    # A zero-row UPDATE means the target was not superseded: it is
+                    # already superseded (e.g. a concurrent writer claimed it
+                    # between the caller's dedup probe and now), missing, or a
+                    # stale id. asyncpg does NOT raise on zero matches, so surface
+                    # it instead of silently leaving an unlinked active row.
+                    # Full transactional abort-and-retry is tracked separately;
+                    # this at least makes the lost supersede observable.
+                    if status == "UPDATE 0":
+                        logger.warning(
+                            "Supersede UPDATE matched 0 rows: target %s not "
+                            "superseded by %s (already superseded, missing, or "
+                            "stale id)", supersedes, memory_id,
+                        )
                 except asyncpg.UndefinedColumnError:
                     logger.debug(
                         "Supersede UPDATE failed (column missing) for %s -> %s",

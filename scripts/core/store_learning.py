@@ -744,7 +744,14 @@ async def store_learning_v2(
         # Probe one extra neighbor and drop the supersede target from the
         # results, so the intentional replace proceeds while a *different*
         # near-duplicate still rejects the write.
-        dedup_limit = 2 if supersedes else 1
+        #
+        # Gate on backend: supersede is only persisted on postgres (see the
+        # store() call below). Excluding the target on a backend that will NOT
+        # mark the old row replaced would silently write a duplicate active
+        # learning with no supersede relation — a dedup regression. So the
+        # exclusion must use the same condition as persistence.
+        active_supersedes = supersedes if backend == "postgres" else None
+        dedup_limit = 2 if active_supersedes else 1
         try:
             if hasattr(memory, "search_vector_global"):
                 existing = await memory.search_vector_global(
@@ -759,10 +766,10 @@ async def store_learning_v2(
                     embedding, limit=dedup_limit, embedding_model=dedup_model,
                 )
 
-            if supersedes and existing:
+            if active_supersedes and existing:
                 existing = [
                     row for row in existing
-                    if str(row.get("id", "")) != str(supersedes)
+                    if str(row.get("id", "")) != str(active_supersedes)
                 ]
 
             dedup = check_dedup_result(
@@ -839,7 +846,7 @@ async def store_learning_v2(
             embedding=embedding,
             content_hash=content_hash,
             host_id=host_id,
-            supersedes=supersedes if backend == "postgres" else None,
+            supersedes=active_supersedes,
             tags=tags if backend == "postgres" else None,
             project=project if backend == "postgres" else None,
             source_time=source_time if backend == "postgres" else None,
@@ -875,8 +882,8 @@ async def store_learning_v2(
             "content_length": len(content),
             "embedding_dim": len(embedding),
         }
-        if supersedes and backend == "postgres":
-            result_dict["superseded"] = supersedes
+        if active_supersedes:
+            result_dict["superseded"] = active_supersedes
         if kg_stats:
             result_dict["kg_stats"] = kg_stats
         return result_dict

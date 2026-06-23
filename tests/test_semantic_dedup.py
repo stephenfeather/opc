@@ -264,7 +264,9 @@ async def test_supersede_target_does_not_block_replacement(
     ]
 
     p1, p2, p3 = _patches(mock_memory_service, mock_embedder)
-    with p1, p2, p3:
+    with p1, p2, p3, patch(
+        f"{STORE_MOD}.detect_backend", MagicMock(return_value="postgres")
+    ):
         result = await store_learning_v2(
             session_id="my-session",
             content="The corrected learning",
@@ -305,7 +307,9 @@ async def test_supersede_still_rejects_a_different_duplicate(
     ]
 
     p1, p2, p3 = _patches(mock_memory_service, mock_embedder)
-    with p1, p2, p3:
+    with p1, p2, p3, patch(
+        f"{STORE_MOD}.detect_backend", MagicMock(return_value="postgres")
+    ):
         result = await store_learning_v2(
             session_id="my-session",
             content="The corrected learning",
@@ -317,3 +321,47 @@ async def test_supersede_still_rejects_a_different_duplicate(
     assert "duplicate" in result["reason"]
     assert result["existing_id"] == "other-dup-uuid"
     mock_memory_service.store.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_supersede_on_sqlite_still_blocks_duplicate(mock_embedder):
+    """On a non-postgres backend, supersede is NOT persisted, so the dedup gate
+    must still reject a matching row instead of silently writing a duplicate.
+
+    Guards against the bypass where excluding the supersede target on a backend
+    that never marks the old row replaced would store an orphaned duplicate.
+    """
+    memory = AsyncMock()
+    memory.search_vector_global = AsyncMock(
+        return_value=[
+            {
+                "id": "bad-row-uuid",
+                "session_id": "old-session",
+                "content": "The wrong learning being corrected",
+                "similarity": 0.97,
+            }
+        ]
+    )
+    memory.search_vector = AsyncMock(return_value=[])
+    memory.store = AsyncMock(return_value="should-not-be-used")
+    memory.close = AsyncMock()
+
+    mock_create = AsyncMock(return_value=memory)
+    mock_embed_cls = MagicMock(return_value=mock_embedder)
+
+    with (
+        patch(f"{STORE_MOD}.create_memory_service", mock_create),
+        patch(f"{STORE_MOD}.detect_backend", MagicMock(return_value="sqlite")),
+        patch(f"{STORE_MOD}.EmbeddingService", mock_embed_cls),
+    ):
+        result = await store_learning_v2(
+            session_id="my-session",
+            content="The corrected learning",
+            supersedes="bad-row-uuid",
+        )
+
+    assert result["success"] is True
+    assert result["skipped"] is True
+    assert "duplicate" in result["reason"]
+    assert result["existing_id"] == "bad-row-uuid"
+    memory.store.assert_not_called()

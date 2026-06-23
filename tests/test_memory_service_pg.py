@@ -491,6 +491,53 @@ class TestStore:
         ]
         assert len(supersede_calls) == 1
 
+    async def test_store_supersede_uses_helper_with_reason_store(self):
+        """D1/D2: store() routes through supersede_row with reason='store'."""
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        conn = AsyncMock()
+        conn.execute = AsyncMock(return_value="INSERT 0 1")
+        svc = MemoryServicePG(session_id="s1")
+
+        with patch(
+            "scripts.core.db.memory_service_pg.get_transaction",
+            return_value=FakeTransaction(conn),
+        ), patch(
+            "scripts.core.db.memory_service_pg.supersede_row",
+            new=AsyncMock(return_value=1),
+        ) as mock_helper:
+            await svc.store("new fact", supersedes="old-uuid")
+
+        mock_helper.assert_awaited_once()
+        kwargs = mock_helper.await_args.kwargs
+        assert kwargs["loser_id"] == "old-uuid"
+        assert kwargs["reason"] == "store"
+        # keeper is the freshly generated memory id (non-empty)
+        assert kwargs["keeper_id"]
+
+    async def test_store_supersede_zero_rows_warns(self, caplog):
+        """store() owns the 0-row policy: best-effort warning, no raise."""
+        import logging
+
+        from scripts.core.db.memory_service_pg import MemoryServicePG
+
+        conn = AsyncMock()
+        conn.execute = AsyncMock(return_value="INSERT 0 1")
+        svc = MemoryServicePG(session_id="s1")
+
+        with patch(
+            "scripts.core.db.memory_service_pg.get_transaction",
+            return_value=FakeTransaction(conn),
+        ), patch(
+            "scripts.core.db.memory_service_pg.supersede_row",
+            new=AsyncMock(return_value=0),
+        ), caplog.at_level(
+            logging.WARNING, logger="scripts.core.db.memory_service_pg"
+        ):
+            await svc.store("new fact", supersedes="old-uuid")
+
+        assert any("0 row" in r.getMessage() for r in caplog.records)
+
 
 # ==================== Search methods delegate to query builders ====================
 

@@ -98,6 +98,63 @@ async def embedding_model_column_available(conn: Any) -> bool:
     return await probe(conn)
 
 
+def _parse_update_count(status: str) -> int:
+    """Parse asyncpg's ``"UPDATE N"`` command tag into the row count.
+
+    asyncpg returns a command-status string (e.g. ``"UPDATE 1"``); a zero-row
+    UPDATE returns ``"UPDATE 0"`` and does NOT raise. Returns 0 for any
+    unparseable tag so callers can treat it as a no-op.
+    """
+    try:
+        return int(status.split()[-1])
+    except (ValueError, IndexError, AttributeError):
+        return 0
+
+
+async def supersede_row(
+    conn: Any,
+    *,
+    loser_id: str,
+    keeper_id: str,
+    reason: str,
+) -> int:
+    """Mark ``loser_id`` as superseded by ``keeper_id`` in one guarded UPDATE.
+
+    The single owner of the ``superseded_by`` write invariant (Issue #63 D1).
+    Policy-neutral: it sets ``superseded_by``, ``superseded_at``, and the
+    ``superseded_via`` provenance marker (D2) in a single statement (W-3),
+    guarded by ``superseded_by IS NULL`` so a concurrent supersede between a
+    caller's fetch and apply collapses to a zero-row no-op rather than a clobber.
+
+    The marker records ``{"by": keeper_id, "reason": reason, "at": <ts>}`` where
+    ``reason`` is one of ``merge`` | ``stale`` | ``store`` and ``at`` reuses the
+    same ``NOW()`` as ``superseded_at`` (no clock skew).
+
+    Returns the number of rows updated (0 = already superseded, missing, or a
+    stale id). Does NOT decide what a zero-row result means — each caller owns
+    that policy. Does NOT catch ``asyncpg.UndefinedColumnError``: on a
+    pre-migration schema it propagates so callers own the compat policy.
+    """
+    status = await conn.execute(
+        """
+        UPDATE archival_memory
+        SET superseded_by = $1::uuid,
+            superseded_at = NOW(),
+            metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+                'superseded_via',
+                jsonb_build_object(
+                    'by', $1::text,
+                    'reason', $2::text,
+                    'at', NOW()
+                )
+            )
+        WHERE id = $3::uuid AND superseded_by IS NULL
+        """,
+        keeper_id, reason, loser_id,
+    )
+    return _parse_update_count(status)
+
+
 class EmbeddingProvider(Protocol):
     """Protocol for embedding providers."""
 
@@ -516,6 +573,11 @@ class MemoryServicePG:
                     )
 
             if supersedes:
+                # Route through the shared supersede_row helper (Issue #63 D1):
+                # one owner of the superseded_by write invariant, shared with the
+                # Phase 2b curation apply path. The helper stamps the
+                # superseded_via marker with reason="store" (D2).
+                #
                 # Intentionally NOT scoped by session_id/agent_id (unlike
                 # delete_archival). Supersede is a curation operation: a
                 # correction stored in the current session must be able to
@@ -526,30 +588,29 @@ class MemoryServicePG:
                 # local single-operator tool. Do not "harden" this to match the
                 # DELETE scoping without removing cross-session curation.
                 try:
-                    status = await conn.execute(
-                        """
-                        UPDATE archival_memory
-                        SET superseded_by = $1::uuid, superseded_at = NOW()
-                        WHERE id = $2::uuid AND superseded_by IS NULL
-                        """,
-                        memory_id, supersedes,
+                    rows = await supersede_row(
+                        conn,
+                        loser_id=supersedes,
+                        keeper_id=memory_id,
+                        reason="store",
                     )
-                    # A zero-row UPDATE means the target was not superseded: it is
+                    # store() owns the 0-row policy: best-effort warning. A
+                    # zero-row UPDATE means the target was not superseded — it is
                     # already superseded (e.g. a concurrent writer claimed it
                     # between the caller's dedup probe and now), missing, or a
                     # stale id. asyncpg does NOT raise on zero matches, so surface
                     # it instead of silently leaving an unlinked active row.
                     # Full transactional abort-and-retry is tracked separately;
                     # this at least makes the lost supersede observable.
-                    if status == "UPDATE 0":
+                    if rows == 0:
                         logger.warning(
-                            "Supersede UPDATE matched 0 rows: target %s not "
+                            "Supersede matched 0 rows: target %s not "
                             "superseded by %s (already superseded, missing, or "
                             "stale id)", supersedes, memory_id,
                         )
                 except asyncpg.UndefinedColumnError:
                     logger.debug(
-                        "Supersede UPDATE failed (column missing) for %s -> %s",
+                        "Supersede failed (column missing) for %s -> %s",
                         supersedes, memory_id, exc_info=True,
                     )
 

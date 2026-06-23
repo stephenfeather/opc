@@ -1280,3 +1280,467 @@ class TestArchiveCliMain:
     def test_archive_flag_parses(self):
         args = parse_apply_args(["opc", "--archive", "--ids", _UUID])
         assert args.archive is True
+
+
+# --- Unpromote / repair (issue #63 Phase 2b Step 4) ---
+
+
+def _prow(id="a", *, tier="MEMORY.md", target="/m/promoted-x.md", lt="CODEBASE_PATTERN",
+          content="A useful pattern", recall=12):
+    from scripts.core.memory_review import PromotedRow
+
+    return PromotedRow(
+        id=id, content=content, recall_count=recall, learning_type=lt, tier=tier, target=target
+    )
+
+
+class TestBuildUnpromotePlan:
+    """build_unpromote_plan (pure): map promoted rows -> unpromote actions, distinguishing the
+    single-artifact CLAUDE.md block from the two-artifact MEMORY.md (file + index line), and
+    skipping a row whose promoted_to is already absent (tier/target None)."""
+
+    def test_memory_tier_is_two_artifact(self):
+        from scripts.core.memory_apply import build_unpromote_plan
+
+        plan = build_unpromote_plan([_prow("a", tier="MEMORY.md")], dry_run=True)
+        assert len(plan.actions) == 1
+        act = plan.actions[0]
+        assert act.skipped is False
+        assert act.two_artifact is True
+        assert act.tier == "MEMORY.md"
+
+    def test_claude_tier_is_single_artifact(self):
+        from scripts.core.memory_apply import build_unpromote_plan
+
+        plan = build_unpromote_plan(
+            [_prow("a", tier="CLAUDE.md", target="/c/CLAUDE.md", lt="ARCHITECTURAL_DECISION")],
+            dry_run=True,
+        )
+        act = plan.actions[0]
+        assert act.skipped is False
+        assert act.two_artifact is False
+        assert act.tier == "CLAUDE.md"
+
+    def test_skips_row_with_no_promoted_marker(self):
+        from scripts.core.memory_apply import build_unpromote_plan
+
+        plan = build_unpromote_plan([_prow("a", tier=None, target=None)], dry_run=True)
+        act = plan.actions[0]
+        assert act.skipped is True
+        assert "already" in (act.skip_reason or "").lower()
+
+    def test_unknown_tier_skipped(self):
+        from scripts.core.memory_apply import build_unpromote_plan
+
+        plan = build_unpromote_plan([_prow("a", tier="rules/", target="/x")], dry_run=True)
+        assert plan.actions[0].skipped is True
+
+    def test_dry_run_flag_carried(self):
+        from scripts.core.memory_apply import build_unpromote_plan
+
+        assert build_unpromote_plan([_prow()], dry_run=True).dry_run is True
+        assert build_unpromote_plan([_prow()], dry_run=False).dry_run is False
+
+    def test_pure_no_io(self):
+        from scripts.core.memory_apply import build_unpromote_plan
+
+        rows = [_prow("a"), _prow("b", tier="CLAUDE.md", target="/c/CLAUDE.md")]
+        plan = build_unpromote_plan(rows, dry_run=True)
+        assert len(plan.applicable) == 2  # both routable
+
+
+class TestClearPromotedMarker:
+    """clear_promoted_marker: ONE guarded UPDATE that removes ONLY the promoted_to key
+    (metadata - 'promoted_to'), guarded so it matches only a row that still has it.
+    Idempotent: a 0-row clear is a no-op, never a raise. Never touches superseded_via."""
+
+    async def test_single_update_removes_only_promoted_to(self):
+        from scripts.core.memory_apply import clear_promoted_marker
+
+        pool, conn = _pool()
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+        count = await clear_promoted_marker(conn, learning_id=_UUID, project="opc")
+        assert count == 1
+        conn.execute.assert_awaited_once()
+        sql = conn.execute.await_args.args[0]
+        assert "promoted_to" in sql
+        assert "- 'promoted_to'" in sql or "- $" in sql  # subtracts the key
+        assert "superseded_via" not in sql  # must not touch other keys
+        assert "metadata ? 'promoted_to'" in sql  # guarded to rows still carrying it
+
+    async def test_already_cleared_returns_zero_not_raise(self):
+        from scripts.core.memory_apply import clear_promoted_marker
+
+        pool, conn = _pool()
+        conn.execute = AsyncMock(return_value="UPDATE 0")
+        count = await clear_promoted_marker(conn, learning_id=_UUID, project="opc")
+        assert count == 0  # idempotent: no raise
+
+
+class TestRemoveLineByMarker:
+    """remove_line_by_marker: splice a single line out of a file by a substring marker,
+    atomically. Absent marker -> no-op (already removed); returns whether a line was removed."""
+
+    def test_removes_matching_line(self, tmp_path):
+        from scripts.core.memory_apply import remove_line_by_marker
+
+        f = tmp_path / "MEMORY.md"
+        f.write_text("# Index\n- [x](promoted-x.md) — promoted\n- [y](other.md)\n")
+        removed = remove_line_by_marker(f, "promoted-x.md")
+        assert removed is True
+        text = f.read_text()
+        assert "promoted-x.md" not in text
+        assert "other.md" in text  # other lines untouched
+
+    def test_absent_marker_is_noop(self, tmp_path):
+        from scripts.core.memory_apply import remove_line_by_marker
+
+        f = tmp_path / "MEMORY.md"
+        f.write_text("# Index\n- [y](other.md)\n")
+        removed = remove_line_by_marker(f, "promoted-x.md")
+        assert removed is False
+        assert f.read_text() == "# Index\n- [y](other.md)\n"
+
+    def test_missing_file_is_noop(self, tmp_path):
+        from scripts.core.memory_apply import remove_line_by_marker
+
+        removed = remove_line_by_marker(tmp_path / "nope.md", "marker")
+        assert removed is False
+
+
+class TestRunUnpromote:
+    """The W-2 ordering invariant. Two-artifact: delete promoted-<slug>.md FIRST, THEN splice
+    the MEMORY.md index line, THEN clear promoted_to. Single-artifact: remove the CLAUDE.md
+    block FIRST, then clear. A clear is a guarded UPDATE; 0-row -> skip, never raise."""
+
+    def _setup(self, tmp_path):
+        memory_dir = tmp_path / "mem"
+        memory_dir.mkdir()
+        claude_md = tmp_path / "CLAUDE.md"
+        backup_dir = tmp_path / "backups"
+        return memory_dir, claude_md, backup_dir
+
+    async def test_dry_run_writes_nothing_no_backup(self, tmp_path):
+        from scripts.core.memory_apply import run_unpromote
+
+        memory_dir, claude_md, backup_dir = self._setup(tmp_path)
+        slug_file = memory_dir / "promoted-x.md"
+        slug_file.write_text("body")
+        (memory_dir / "MEMORY.md").write_text("- [x](promoted-x.md) — promoted\n")
+        pool, conn = _pool()
+        conn.fetch.side_effect = [
+            [{"id": "a", "content": "c", "recall_count": 12,
+              "learning_type": "CODEBASE_PATTERN",
+              "promoted_tier": "MEMORY.md", "promoted_target": str(slug_file)}]
+        ]
+        backup_called = False
+
+        def _run(*a, **k):
+            nonlocal backup_called
+            backup_called = True
+            return MagicMock(returncode=0)
+
+        result = await run_unpromote(
+            pool, "opc", ["a"], execute=False, memory_dir=memory_dir,
+            claude_md_path=claude_md, backup_dir=backup_dir, timestamp="ts", run=_run,
+        )
+        assert result.plan.dry_run is True
+        assert backup_called is False
+        assert slug_file.exists()  # nothing deleted in dry-run
+        conn.execute.assert_not_called()
+
+    async def test_two_artifact_order_file_then_index_then_clear(self, tmp_path):
+        from scripts.core.memory_apply import run_unpromote
+
+        memory_dir, claude_md, backup_dir = self._setup(tmp_path)
+        slug_file = memory_dir / "promoted-x.md"
+        slug_file.write_text("body")
+        memory_md = memory_dir / "MEMORY.md"
+        memory_md.write_text("# Index\n- [x](promoted-x.md) — promoted\n")
+        pool, conn = _pool()
+        conn.fetch.side_effect = [
+            [{"id": "a", "content": "c", "recall_count": 12,
+              "learning_type": "CODEBASE_PATTERN",
+              "promoted_tier": "MEMORY.md", "promoted_target": str(slug_file)}]
+        ]
+        order = []
+
+        def _run(cmd, **kw):
+            order.append("backup")
+            Path(kw["stdout"].name).write_text("-- dump")
+            return MagicMock(returncode=0)
+
+        async def _exec(*a, **k):
+            # the DB clear must come AFTER the file is gone and the index line spliced
+            order.append("clear")
+            assert not slug_file.exists(), "file must be deleted before DB clear"
+            assert "promoted-x.md" not in memory_md.read_text(), "index spliced before clear"
+            return "UPDATE 1"
+
+        conn.execute = _exec
+        result = await run_unpromote(
+            pool, "opc", ["a"], execute=True, memory_dir=memory_dir,
+            claude_md_path=claude_md, backup_dir=backup_dir, timestamp="ts", run=_run,
+        )
+        assert order[0] == "backup"
+        assert "clear" in order
+        assert not slug_file.exists()
+        assert "promoted-x.md" not in memory_md.read_text()
+        assert result.applied == ["a"]
+
+    async def test_two_artifact_partial_failure_does_not_clear(self, tmp_path, monkeypatch):
+        # W-2: index-line removal fails AFTER the file delete -> promoted_to is NOT cleared,
+        # so the action is re-runnable (the file is gone but the DB still points at it).
+        import scripts.core.memory_apply as ma
+        from scripts.core.memory_apply import run_unpromote
+
+        memory_dir, claude_md, backup_dir = self._setup(tmp_path)
+        slug_file = memory_dir / "promoted-x.md"
+        slug_file.write_text("body")
+        memory_md = memory_dir / "MEMORY.md"
+        memory_md.write_text("# Index\n- [x](promoted-x.md) — promoted\n")
+        pool, conn = _pool()
+        conn.fetch.side_effect = [
+            [{"id": "a", "content": "c", "recall_count": 12,
+              "learning_type": "CODEBASE_PATTERN",
+              "promoted_tier": "MEMORY.md", "promoted_target": str(slug_file)}]
+        ]
+        cleared = False
+
+        async def _exec(*a, **k):
+            nonlocal cleared
+            cleared = True
+            return "UPDATE 1"
+
+        conn.execute = _exec
+
+        def _run(cmd, **kw):
+            Path(kw["stdout"].name).write_text("-- dump")
+            return MagicMock(returncode=0)
+
+        def _boom(*a, **k):
+            raise OSError("disk full splicing index")
+
+        monkeypatch.setattr(ma, "remove_line_by_marker", _boom)
+        result = await run_unpromote(
+            pool, "opc", ["a"], execute=True, memory_dir=memory_dir,
+            claude_md_path=claude_md, backup_dir=backup_dir, timestamp="ts", run=_run,
+        )
+        # The file delete happened (stage 1), but the index splice failed (stage 2),
+        # so the DB clear (stage 3) must NOT have run.
+        assert cleared is False, "promoted_to must not be cleared when index splice fails"
+        assert "a" not in result.applied
+        assert result.failed and result.failed[0][0] == "a"
+
+    async def test_single_artifact_removes_block_then_clears(self, tmp_path):
+        from scripts.core.memory_apply import claude_md_block, claude_md_marker, run_unpromote
+        from scripts.core.memory_review import PromotionCandidate
+
+        memory_dir, claude_md, backup_dir = self._setup(tmp_path)
+        cand = PromotionCandidate(
+            id="a", content="Decide X", recall_count=12,
+            learning_type="ARCHITECTURAL_DECISION", destination="CLAUDE.md",
+        )
+        marker = claude_md_marker(cand)
+        claude_md.write_text("# Project\n## Promoted Decisions\n" + claude_md_block(cand) + "\n")
+        pool, conn = _pool()
+        conn.fetch.side_effect = [
+            [{"id": "a", "content": "Decide X", "recall_count": 12,
+              "learning_type": "ARCHITECTURAL_DECISION",
+              "promoted_tier": "CLAUDE.md", "promoted_target": str(claude_md)}]
+        ]
+        order = []
+
+        def _run(cmd, **kw):
+            order.append("backup")
+            Path(kw["stdout"].name).write_text("-- dump")
+            return MagicMock(returncode=0)
+
+        async def _exec(*a, **k):
+            order.append("clear")
+            assert marker not in claude_md.read_text(), "block spliced before DB clear"
+            return "UPDATE 1"
+
+        conn.execute = _exec
+        result = await run_unpromote(
+            pool, "opc", ["a"], execute=True, memory_dir=memory_dir,
+            claude_md_path=claude_md, backup_dir=backup_dir, timestamp="ts", run=_run,
+        )
+        assert order[0] == "backup"
+        assert marker not in claude_md.read_text()
+        assert result.applied == ["a"]
+
+    async def test_idempotent_already_unpromoted_no_raise_no_write(self, tmp_path):
+        # No promoted_to row resolves -> plan has nothing applicable; files already absent.
+        from scripts.core.memory_apply import run_unpromote
+
+        memory_dir, claude_md, backup_dir = self._setup(tmp_path)
+        (memory_dir / "MEMORY.md").write_text("# Index\n")
+        pool, conn = _pool()
+        conn.fetch.side_effect = [[]]  # fetch_promoted_rows returns nothing
+        backup_called = False
+
+        def _run(*a, **k):
+            nonlocal backup_called
+            backup_called = True
+            return MagicMock(returncode=0)
+
+        result = await run_unpromote(
+            pool, "opc", ["a"], execute=True, memory_dir=memory_dir,
+            claude_md_path=claude_md, backup_dir=backup_dir, timestamp="ts", run=_run,
+        )
+        assert result.applied == []
+        assert backup_called is False  # nothing applicable -> no backup, no write
+        conn.execute.assert_not_called()
+
+    async def test_clear_zero_row_reports_skip_not_raise(self, tmp_path):
+        # Stages 1-2 succeed but the guarded clear matches 0 rows (concurrent clear) ->
+        # reported as skipped, never raised.
+        from scripts.core.memory_apply import run_unpromote
+
+        memory_dir, claude_md, backup_dir = self._setup(tmp_path)
+        slug_file = memory_dir / "promoted-x.md"
+        slug_file.write_text("body")
+        (memory_dir / "MEMORY.md").write_text("- [x](promoted-x.md) — promoted\n")
+        pool, conn = _pool()
+        conn.fetch.side_effect = [
+            [{"id": "a", "content": "c", "recall_count": 12,
+              "learning_type": "CODEBASE_PATTERN",
+              "promoted_tier": "MEMORY.md", "promoted_target": str(slug_file)}]
+        ]
+        conn.execute = AsyncMock(return_value="UPDATE 0")
+
+        def _run(cmd, **kw):
+            Path(kw["stdout"].name).write_text("-- dump")
+            return MagicMock(returncode=0)
+
+        result = await run_unpromote(
+            pool, "opc", ["a"], execute=True, memory_dir=memory_dir,
+            claude_md_path=claude_md, backup_dir=backup_dir, timestamp="ts", run=_run,
+        )
+        assert result.applied == []
+        assert "a" in [s[0] for s in result.skipped]
+        assert not slug_file.exists()  # stages 1-2 still ran
+
+    async def test_backup_taken_before_any_removal(self, tmp_path, monkeypatch):
+        import scripts.core.memory_apply as ma
+        from scripts.core.memory_apply import run_unpromote
+
+        memory_dir, claude_md, backup_dir = self._setup(tmp_path)
+        slug_file = memory_dir / "promoted-x.md"
+        slug_file.write_text("body")
+        (memory_dir / "MEMORY.md").write_text("- [x](promoted-x.md) — promoted\n")
+        pool, conn = _pool()
+        conn.fetch.side_effect = [
+            [{"id": "a", "content": "c", "recall_count": 12,
+              "learning_type": "CODEBASE_PATTERN",
+              "promoted_tier": "MEMORY.md", "promoted_target": str(slug_file)}]
+        ]
+        order = []
+
+        def _backup(dest, **kw):
+            order.append("backup")
+            assert slug_file.exists(), "backup must precede any file removal"
+            Path(dest).parent.mkdir(parents=True, exist_ok=True)
+            Path(dest).write_text("-- dump")
+            return Path(dest)
+
+        async def _exec(*a, **k):
+            return "UPDATE 1"
+
+        conn.execute = _exec
+        monkeypatch.setattr(ma, "backup_database", _backup)
+        await run_unpromote(
+            pool, "opc", ["a"], execute=True, memory_dir=memory_dir,
+            claude_md_path=claude_md, backup_dir=backup_dir, timestamp="ts", lock_dir=tmp_path,
+        )
+        assert order and order[0] == "backup"
+
+
+class TestUnpromoteCli:
+    def test_unpromote_flag_parses(self):
+        args = parse_apply_args(["opc", "--unpromote", "--ids", _UUID])
+        assert args.unpromote is True
+
+    async def test_mutually_exclusive_with_merge(self, monkeypatch):
+        import scripts.core.memory_apply as ma
+
+        monkeypatch.setattr(ma, "project_from_path", lambda _p: "opc")
+        rc = await ma.main(["opc", "--unpromote", "--merge", "--ids", _UUID])
+        assert rc == 2
+
+    async def test_mutually_exclusive_with_archive(self, monkeypatch):
+        import scripts.core.memory_apply as ma
+
+        monkeypatch.setattr(ma, "project_from_path", lambda _p: "opc")
+        rc = await ma.main(["opc", "--unpromote", "--archive", "--ids", _UUID])
+        assert rc == 2
+
+    async def test_dry_run_writes_nothing(self, tmp_path, monkeypatch):
+        import scripts.core.memory_apply as ma
+
+        pool, conn = _pool()
+        conn.fetch.side_effect = [[]]  # no promoted rows
+        backup_called = False
+
+        def _run(*a, **k):
+            nonlocal backup_called
+            backup_called = True
+            return MagicMock(returncode=0)
+
+        async def _get_pool():
+            return pool
+
+        monkeypatch.setattr(ma, "get_pool", _get_pool)
+        monkeypatch.setattr(ma, "project_from_path", lambda _p: "opc")
+        rc = await ma.main([
+            "opc", "--unpromote", "--ids", _UUID,
+            "--memory-dir", str(tmp_path / "m"), "--claude-md", str(tmp_path / "CLAUDE.md"),
+            "--backup-dir", str(tmp_path / "b"),
+        ])
+        assert rc == 0
+        assert backup_called is False
+        conn.execute.assert_not_called()
+
+    async def test_execute_backs_up_first(self, tmp_path, monkeypatch):
+        import scripts.core.memory_apply as ma
+
+        memory_dir = tmp_path / "m"
+        memory_dir.mkdir()
+        slug_file = memory_dir / "promoted-x.md"
+        slug_file.write_text("body")
+        (memory_dir / "MEMORY.md").write_text("- [x](promoted-x.md) — promoted\n")
+        pool, conn = _pool()
+        conn.fetch.side_effect = [
+            [{"id": _UUID, "content": "c", "recall_count": 12,
+              "learning_type": "CODEBASE_PATTERN",
+              "promoted_tier": "MEMORY.md", "promoted_target": str(slug_file)}]
+        ]
+        order = []
+
+        def _backup(dest, **kw):
+            order.append("backup")
+            Path(dest).parent.mkdir(parents=True, exist_ok=True)
+            Path(dest).write_text("-- dump")
+            return Path(dest)
+
+        async def _exec(*a, **k):
+            order.append("clear")
+            return "UPDATE 1"
+
+        conn.execute = _exec
+
+        async def _get_pool():
+            return pool
+
+        monkeypatch.setattr(ma, "get_pool", _get_pool)
+        monkeypatch.setattr(ma, "project_from_path", lambda _p: "opc")
+        monkeypatch.setattr(ma, "backup_database", _backup)
+        rc = await ma.main([
+            "opc", "--unpromote", "--ids", _UUID, "--execute",
+            "--memory-dir", str(memory_dir), "--claude-md", str(tmp_path / "CLAUDE.md"),
+            "--backup-dir", str(tmp_path / "b"),
+        ])
+        assert rc == 0
+        assert order and order[0] == "backup"
+        assert "clear" in order

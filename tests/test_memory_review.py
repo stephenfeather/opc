@@ -405,6 +405,72 @@ class TestFetchStaleIds:
         assert "UPDATE" not in sql and "DELETE" not in sql and "INSERT" not in sql
 
 
+class TestFetchPromotedRows:
+    """fetch_promoted_rows (issue #63 Phase 2b Step 4): read-only — resolve approved
+    ids to the rows that currently carry metadata.promoted_to, so the unpromote apply
+    knows the tier/target/slug it must reverse."""
+
+    _A = "11111111-1111-1111-1111-111111111111"
+    _B = "22222222-2222-2222-2222-222222222222"
+
+    def _row(self, id, *, tier="MEMORY.md", target="/m/promoted-x.md", lt="CODEBASE_PATTERN"):
+        return {
+            "id": id,
+            "content": "A useful pattern",
+            "recall_count": 12,
+            "learning_type": lt,
+            "promoted_tier": tier,
+            "promoted_target": target,
+        }
+
+    async def test_returns_rows_with_promoted_marker(self):
+        from scripts.core.memory_review import PromotedRow, fetch_promoted_rows
+
+        rows = [self._row(self._A), self._row(self._B, target="/c/CLAUDE.md")]
+        pool, conn = _pool_returning(rows)
+        out = await fetch_promoted_rows(pool, "opc", [self._A, self._B])
+        assert all(isinstance(r, PromotedRow) for r in out)
+        by_id = {r.id: r for r in out}
+        assert by_id[self._A].tier == "MEMORY.md"
+        assert by_id[self._A].target == "/m/promoted-x.md"
+        assert by_id[self._A].learning_type == "CODEBASE_PATTERN"
+
+    async def test_query_filters_promoted_to_tag_and_ids(self):
+        from scripts.core.memory_review import fetch_promoted_rows
+
+        pool, conn = _pool_returning([])
+        await fetch_promoted_rows(pool, "opc", [self._A])
+        sql = conn.fetch.await_args.args[0]
+        assert "promoted_to" in sql
+        assert "= ANY" in sql  # id-scoped to the approved set
+
+    async def test_scoped_by_project(self):
+        from scripts.core.memory_review import fetch_promoted_rows
+
+        pool, conn = _pool_returning([])
+        await fetch_promoted_rows(pool, "binbrain", [self._A])
+        args = conn.fetch.await_args.args
+        assert "LOWER(project)" in args[0]
+        assert "binbrain" in args  # bound, not interpolated
+
+    async def test_empty_ids_returns_empty_without_query(self):
+        from scripts.core.memory_review import fetch_promoted_rows
+
+        pool, conn = _pool_returning([])
+        out = await fetch_promoted_rows(pool, "opc", [])
+        assert out == []
+        conn.fetch.assert_not_called()
+
+    async def test_read_only_no_writes(self):
+        from scripts.core.memory_review import fetch_promoted_rows
+
+        pool, conn = _pool_returning([])
+        await fetch_promoted_rows(pool, "opc", [self._A])
+        conn.execute.assert_not_called()
+        sql = conn.fetch.await_args.args[0].upper()
+        assert "UPDATE" not in sql and "DELETE" not in sql and "INSERT" not in sql
+
+
 class TestBuildReview:
     async def test_assembles_full_report(self):
         pool, conn = _pool_returning([])

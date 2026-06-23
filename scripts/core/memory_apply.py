@@ -48,8 +48,10 @@ from scripts.core.db.memory_service_pg import supersede_row  # noqa: E402
 from scripts.core.db.postgres_pool import close_pool, get_pool  # noqa: E402
 from scripts.core.memory_review import (  # noqa: E402
     MergeRow,
+    PromotedRow,
     PromotionCandidate,
     fetch_merge_pair_details,
+    fetch_promoted_rows,
     route_destination,
 )
 from scripts.core.project_naming import canonicalize_project, project_from_path  # noqa: E402
@@ -117,6 +119,43 @@ class MergeApplyPlan:
     @property
     def applicable(self) -> list[MergeAction]:
         return [a for a in self.actions if not a.skipped]
+
+
+@dataclass(frozen=True)
+class UnpromoteAction:
+    """One planned unpromote: reverse the Phase-2a promotion of ``row``, or a skip with a reason.
+
+    ``two_artifact`` distinguishes a MEMORY.md promotion (a ``promoted-<slug>.md`` file AND a
+    MEMORY.md index line — both must be removed) from a CLAUDE.md promotion (one in-file block).
+    ``tier``/``target`` echo the ``promoted_to`` marker the apply path reverses.
+    """
+
+    row: PromotedRow
+    tier: str | None
+    target: str | None
+    two_artifact: bool
+    skipped: bool
+    skip_reason: str | None
+
+
+@dataclass(frozen=True)
+class UnpromotePlan:
+    actions: list[UnpromoteAction] = field(default_factory=list)
+    dry_run: bool = True
+
+    @property
+    def applicable(self) -> list[UnpromoteAction]:
+        return [a for a in self.actions if not a.skipped]
+
+
+# Tiers an unpromote can reverse, mapped to whether the promotion wrote two artifacts.
+# Mirrors the Phase-2a _APPLY_ROUTING targets: CODEBASE_PATTERN -> MEMORY.md (file + index),
+# ARCHITECTURAL_DECISION -> CLAUDE.md (single in-file block). A tier outside this map (a future
+# target, or a row whose marker is missing) is surfaced as a skip rather than mis-reversed.
+_UNPROMOTE_TWO_ARTIFACT: dict[str, bool] = {
+    "MEMORY.md": True,
+    "CLAUDE.md": False,
+}
 
 
 # --- Pure functions --------------------------------------------------------
@@ -231,6 +270,42 @@ def build_merge_plan(
     return MergeApplyPlan(actions=actions, dry_run=dry_run)
 
 
+def build_unpromote_plan(rows: list[PromotedRow], dry_run: bool) -> UnpromotePlan:
+    """Pure: map promoted rows -> unpromote actions. No I/O.
+
+    A row whose ``promoted_to`` marker is absent (tier is None — the tag was already cleared)
+    is skipped as already-undone. A row whose tier is not a reversible target (rules/, a future
+    tier) is skipped rather than mis-reversed. Otherwise the action records whether the
+    promotion wrote two artifacts (MEMORY.md file + index line) or one (CLAUDE.md block); the
+    actual file removal + guarded clear happens in ``run_unpromote``.
+    """
+    actions: list[UnpromoteAction] = []
+    for row in rows:
+        if row.tier is None:
+            actions.append(
+                UnpromoteAction(
+                    row, None, None, False,
+                    skipped=True, skip_reason="already unpromoted (no promoted_to marker)",
+                )
+            )
+            continue
+        if row.tier not in _UNPROMOTE_TWO_ARTIFACT:
+            actions.append(
+                UnpromoteAction(
+                    row, row.tier, row.target, False,
+                    skipped=True, skip_reason=f"unreversible tier {row.tier!r}",
+                )
+            )
+            continue
+        actions.append(
+            UnpromoteAction(
+                row, row.tier, row.target, _UNPROMOTE_TWO_ARTIFACT[row.tier],
+                skipped=False, skip_reason=None,
+            )
+        )
+    return UnpromotePlan(actions=actions, dry_run=dry_run)
+
+
 def _short(text: str, width: int = 80) -> str:
     text = " ".join(text.split())
     return text if len(text) <= width else text[: width - 1] + "…"
@@ -303,9 +378,18 @@ def memory_index_line(candidate: PromotionCandidate, filename: str) -> str:
     return f"- [{title}]({filename}) — promoted, recalled {candidate.recall_count}×"
 
 
+def claude_md_marker_for_id(learning_id: str) -> str:
+    """Exact, structured CLAUDE.md idempotency marker for a learning id (no substring traps).
+
+    The single source of truth for the marker shape, so the unpromote path matches EXACTLY the
+    string the promote path wrote.
+    """
+    return f"<!-- promoted_from_archival_memory: {learning_id} -->"
+
+
 def claude_md_marker(candidate: PromotionCandidate) -> str:
     """Exact, structured idempotency marker carrying the FULL learning id (no substring traps)."""
-    return f"<!-- promoted_from_archival_memory: {candidate.id} -->"
+    return claude_md_marker_for_id(candidate.id)
 
 
 def claude_md_block(candidate: PromotionCandidate) -> str:
@@ -428,6 +512,35 @@ async def archive_row(conn: Any, *, learning_id: str) -> int:
     return _parse_archive_count(status)
 
 
+# Unpromote clear (issue #63 Phase 2b Step 4): the INVERSE of _PROVENANCE_SQL. ONE guarded
+# UPDATE that removes ONLY the promoted_to key (`metadata - 'promoted_to'`); it deliberately
+# does NOT touch superseded_via or any other key. Guarded by `metadata ? 'promoted_to'` so a
+# row whose tag was already cleared (re-run / concurrent unpromote) collapses to a 0-row no-op
+# rather than re-stamping. Project-scoped so a stray id can't clear another project's row. This
+# is stage 3 of the W-2 ordering — it runs only AFTER the file artifact(s) are removed, so the
+# DB tag never outlives the artifacts it points at.
+_CLEAR_PROMOTED_SQL = """
+    UPDATE archival_memory
+    SET metadata = metadata - 'promoted_to'
+    WHERE id = $1::uuid
+      AND LOWER(project) = LOWER($2)
+      AND metadata ? 'promoted_to'
+"""
+
+
+async def clear_promoted_marker(conn: Any, *, learning_id: str, project: str) -> int:
+    """Clear ``metadata.promoted_to`` on a row in one guarded UPDATE. Returns the row count.
+
+    The inverse of ``write_provenance``: removes ONLY the ``promoted_to`` key (never touches
+    ``superseded_via`` etc.). Guarded by ``metadata ? 'promoted_to'`` so re-clearing an
+    already-cleared row is a 0-row no-op (idempotent), never a raise — the caller owns the
+    skip/report policy. This is the final stage of an unpromote, run only after every file
+    artifact has been removed, so a partial failure never strands a cleared tag.
+    """
+    status = await conn.execute(_CLEAR_PROMOTED_SQL, learning_id, project)
+    return _parse_archive_count(status)
+
+
 async def fetch_candidates_by_ids(pool, project: str, ids: list[str]) -> list[PromotionCandidate]:
     """Resolve approved ids to promotion candidates (independent of the recall threshold)."""
     if not ids:
@@ -478,6 +591,47 @@ def _append_line_if_absent(path: Path, line: str) -> bool:
     base = existing if existing.endswith("\n") or not existing else existing + "\n"
     _atomic_write(path, base + line + "\n")
     return True
+
+
+def remove_line_by_marker(path: Path, marker: str) -> bool:
+    """Splice out every line of ``path`` containing ``marker`` (atomic rewrite).
+
+    Returns True if any line was removed. A missing file or an absent marker is a no-op
+    (returns False) — the inverse of ``_append_line_if_absent``, so an unpromote re-run after a
+    partial failure (line already gone) simply continues. Used to remove a MEMORY.md index line
+    by the promoted file's name (the exact ``(promoted-<slug>.md)`` reference).
+    """
+    if not path.exists():
+        return False
+    lines = path.read_text().splitlines(keepends=True)
+    kept = [ln for ln in lines if marker not in ln]
+    if len(kept) == len(lines):
+        return False
+    _atomic_write(path, "".join(kept))
+    return True
+
+
+def remove_file_if_present(path: Path) -> bool:
+    """Delete ``path`` if it exists. Returns True if a file was removed, False if already absent.
+
+    Stage 1 of a two-artifact unpromote. Idempotent: a re-run after a partial failure (file
+    already deleted) is a no-op, so the reversal completes the remaining stages.
+    """
+    if not path.exists():
+        return False
+    path.unlink()
+    return True
+
+
+def remove_block_by_marker(path: Path, marker: str) -> bool:
+    """Remove the single CLAUDE.md block line carrying ``marker`` (the exact full-id marker).
+
+    The promote path appends ONE line ending in the exact ``<!-- promoted_from_archival_memory:
+    <id> -->`` marker; unpromote removes exactly that line by its full-id marker (never an
+    8-char substring), so unrelated text can't be spliced. Missing file / absent marker -> a
+    no-op (returns False), so a re-run after a partial failure resumes cleanly.
+    """
+    return remove_line_by_marker(path, marker)
 
 
 def backup_database(dest: Path, *, run=subprocess.run) -> Path:
@@ -803,6 +957,100 @@ async def run_stale_archive(
     )
 
 
+@dataclass(frozen=True)
+class UnpromoteResult:
+    plan: UnpromotePlan
+    applied: list[str] = field(default_factory=list)  # ids whose promoted_to was cleared
+    skipped: list[tuple[str, str]] = field(default_factory=list)  # (id, reason)
+    failed: list[tuple[str, str]] = field(default_factory=list)  # (id, reason)
+    backup_path: Path | None = None
+
+
+def _unpromote_one_row(action: UnpromoteAction, memory_dir: Path, claude_md_path: Path) -> None:
+    """Remove the file artifact(s) for one unpromote action, in the W-2 order, BEFORE the DB clear.
+
+    Two-artifact (MEMORY.md): delete ``promoted-<slug>.md`` FIRST, THEN splice the MEMORY.md
+    index line by the file's basename. If the index splice raises after the file delete, the
+    DB clear is NOT reached (the caller never gets here), so the action stays re-runnable.
+    Single-artifact (CLAUDE.md): remove the in-file block by the exact full-id marker. Each
+    stage is idempotent (already-absent -> no-op), so a re-run after a partial failure resumes.
+    """
+    target = Path(action.target) if action.target else None
+    if action.two_artifact:
+        if target is not None:
+            remove_file_if_present(target)  # stage 1: delete the promoted-<slug>.md file FIRST
+            # stage 2: splice the MEMORY.md index line that references that exact filename.
+            remove_line_by_marker(memory_dir / "MEMORY.md", target.name)
+    else:
+        # Single CLAUDE.md block, matched by the exact full-id marker the promote path wrote.
+        remove_block_by_marker(claude_md_path, claude_md_marker_for_id(action.row.id))
+
+
+async def run_unpromote(
+    pool,
+    project: str,
+    ids: list[str],
+    *,
+    execute: bool,
+    memory_dir: Path,
+    claude_md_path: Path,
+    backup_dir: Path,
+    timestamp: str,
+    lock_dir: Path | None = None,
+    run=subprocess.run,
+) -> UnpromoteResult:
+    """Reverse the Phase-2a promotion of each approved id; (only if execute) back up first.
+
+    Same safety envelope as ``run_apply``: dry-run (execute=False) performs ZERO writes and
+    takes NO backup; under execute a per-project flock serializes the run and a DB-table dump
+    AND a snapshot of the files about to be mutated (MEMORY.md, CLAUDE.md) are taken before the
+    first removal.
+
+    W-2 ordering invariant — per applicable row, in this order:
+      1. remove the file artifact(s) (two-artifact: delete ``promoted-<slug>.md`` then splice
+         the MEMORY.md index line; single-artifact: remove the CLAUDE.md block),
+      2. ONLY THEN clear ``promoted_to`` via a guarded UPDATE.
+    A failure in stage 1/2 propagates BEFORE the clear, so the DB tag is never cleared while an
+    artifact is stranded — the action is re-runnable. A 0-row clear (the tag was already gone,
+    e.g. a concurrent unpromote) is reported as a skip, never raised.
+    """
+    rows = await fetch_promoted_rows(pool, project, ids)
+    plan = build_unpromote_plan(rows, dry_run=not execute)
+
+    if not execute or not plan.applicable:
+        return UnpromoteResult(plan=plan, applied=[], backup_path=None)
+
+    lock_root = lock_dir if lock_dir is not None else memory_dir
+    with _apply_lock(lock_root, project):
+        backup_path = backup_database(backup_dir / f"memory-unpromote-{timestamp}.sql", run=run)
+        backup_files(backup_dir, timestamp, [memory_dir / "MEMORY.md", claude_md_path])
+        applied: list[str] = []
+        skipped: list[tuple[str, str]] = []
+        failed: list[tuple[str, str]] = []
+        async with pool.acquire() as conn:
+            for action in plan.applicable:
+                rid = action.row.id
+                try:
+                    # Stages 1-2: remove file artifact(s) BEFORE touching the DB tag.
+                    _unpromote_one_row(action, memory_dir, claude_md_path)
+                except OSError as exc:
+                    # A file removal failed: do NOT clear promoted_to (W-2). The row stays
+                    # tagged so a re-run completes the reversal; surface it and keep going.
+                    failed.append((rid, str(exc)))
+                    continue
+                # Stage 3: clear the DB tag only after every artifact is gone.
+                count = await clear_promoted_marker(conn, learning_id=rid, project=project)
+                if count == 0:
+                    # Tag already cleared (concurrent unpromote): the guarded UPDATE matched
+                    # nothing. The files are gone (stages 1-2 are idempotent). Skip + report.
+                    skipped.append((rid, "already cleared (0-row update)"))
+                    continue
+                applied.append(rid)
+    return UnpromoteResult(
+        plan=plan, applied=applied, skipped=skipped, failed=failed, backup_path=backup_path
+    )
+
+
 # --- CLI -------------------------------------------------------------------
 
 
@@ -929,6 +1177,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--archive",
         action="store_true",
         help="Stale-archive mode: set archived_at on each --ids/--manifest learning "
+        "(dry-run by default; --execute backs up then writes).",
+    )
+    p.add_argument(
+        "--unpromote",
+        action="store_true",
+        help="Unpromote/repair mode: reverse the Phase-2a promotion of each --ids/--manifest "
+        "learning — remove the promoted file artifact(s) then clear the promoted_to tag "
         "(dry-run by default; --execute backs up then writes).",
     )
     return p.parse_args(argv)
@@ -1066,6 +1321,102 @@ async def _archive_main(args: argparse.Namespace, project: str) -> int:
     return 0
 
 
+def render_unpromote_plan(plan: UnpromotePlan) -> str:
+    """Render the unpromote plan as a readable preview. Pure — writes nothing."""
+    lines: list[str] = []
+    banner = "DRY RUN — no changes written" if plan.dry_run else "EXECUTE — writing changes"
+    lines.append(f"## Unpromote / Repair Plan ({banner})")
+    applicable = plan.applicable
+    lines.append(f"{len(applicable)} to unpromote, {len(plan.actions) - len(applicable)} skipped")
+    lines.append("")
+    for a in plan.actions:
+        if a.skipped:
+            lines.append(f"  skip [{a.row.id[:8]}] {a.skip_reason}")
+        else:
+            kind = "file + index" if a.two_artifact else "block"
+            lines.append(f"  ↩ {a.tier}  [{a.row.id[:8]}] remove {kind} → {a.target}")
+    if plan.dry_run and applicable:
+        lines.append("")
+        lines.append("_Re-run with --execute to apply (a DB backup is taken first)._")
+    return "\n".join(lines)
+
+
+async def _unpromote_main(args: argparse.Namespace, project: str) -> int:
+    """Unpromote/repair CLI path. Dry-run by default; --execute backs up then writes."""
+    try:
+        ids = parse_ids(args.ids, args.manifest)
+    except (OSError, ValueError) as exc:
+        print(f"memory-apply: could not read ids: {exc}", file=sys.stderr)
+        return 2
+    ids, invalid = validate_ids(ids)
+    for bad in invalid:
+        print(f"memory-apply: ignoring malformed id (not a uuid): {bad!r}", file=sys.stderr)
+    if not ids:
+        print(
+            "memory-apply: --unpromote needs at least one valid id (use --ids or --manifest).",
+            file=sys.stderr,
+        )
+        return 2
+
+    project_dir = _project_dir()
+    # Same fail-closed guard as the promote path: the DB project comes from the arg, but the
+    # file removal roots derive from the working tree. If they disagree, require explicit
+    # --memory-dir AND --claude-md so an --execute can never remove another tree's artifacts.
+    cwd_project = project_from_path(project_dir)
+    if args.execute and project != cwd_project and not (args.memory_dir and args.claude_md):
+        print(
+            f"memory-apply: refusing to --execute: requested project '{project}' differs from "
+            f"the working tree's project '{cwd_project}'. Pass explicit --memory-dir and "
+            "--claude-md so the removal target is unambiguous.",
+            file=sys.stderr,
+        )
+        return 2
+
+    memory_dir = Path(args.memory_dir) if args.memory_dir else default_memory_dir(project_dir)
+    claude_md = Path(args.claude_md) if args.claude_md else Path(project_dir) / "CLAUDE.md"
+    backup_dir = Path(args.backup_dir) if args.backup_dir else default_backup_dir()
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+
+    print(f"memory-apply: project={project} (unpromote/repair)")
+    print(f"  memory dir : {memory_dir}")
+    print(f"  CLAUDE.md  : {claude_md}")
+    if args.execute:
+        print(f"  backup dir : {backup_dir}")
+    print("")
+
+    try:
+        pool = await get_pool()
+        result = await run_unpromote(
+            pool,
+            project,
+            ids,
+            execute=args.execute,
+            memory_dir=memory_dir,
+            claude_md_path=claude_md,
+            backup_dir=backup_dir,
+            timestamp=timestamp,
+        )
+    except (OSError, RuntimeError, PostgresError) as exc:
+        # RuntimeError covers a failed pg_dump backup (apply aborts before any removal);
+        # PostgresError is caught so a DB failure can't echo the DSN in a traceback.
+        print(f"memory-apply: aborted ({type(exc).__name__}): {exc}", file=sys.stderr)
+        return 1
+
+    print(render_unpromote_plan(result.plan))
+    if args.execute:
+        print("")
+        print(f"Unpromoted {len(result.applied)} learning(s).")
+        if result.backup_path:
+            print(f"DB backup: {result.backup_path}")
+        for sid, reason in result.skipped:
+            print(f"  skip [{sid[:8]}]: {reason}", file=sys.stderr)
+        if result.failed:
+            for fid, reason in result.failed:
+                print(f"  ⚠️ not cleared [{fid[:8]}]: {reason}", file=sys.stderr)
+            return 1
+    return 0
+
+
 async def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     project = (
@@ -1075,15 +1426,18 @@ async def main(argv: list[str] | None = None) -> int:
         print("memory-apply: could not resolve a project. Pass one explicitly.", file=sys.stderr)
         return 2
 
-    if args.merge and args.archive:
+    if sum(bool(m) for m in (args.merge, args.archive, args.unpromote)) > 1:
         print(
-            "memory-apply: --merge and --archive are mutually exclusive.", file=sys.stderr
+            "memory-apply: --merge, --archive and --unpromote are mutually exclusive.",
+            file=sys.stderr,
         )
         return 2
     if args.merge:
         return await _merge_main(args, project)
     if args.archive:
         return await _archive_main(args, project)
+    if args.unpromote:
+        return await _unpromote_main(args, project)
 
     try:
         ids = parse_ids(args.ids, args.manifest)

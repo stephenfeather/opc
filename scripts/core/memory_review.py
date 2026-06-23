@@ -105,6 +105,25 @@ class MergeRow:
 
 
 @dataclass(frozen=True)
+class PromotedRow:
+    """A row that currently carries a ``metadata.promoted_to`` marker (issue #63 Phase 2b
+    Step 4 — unpromote/repair).
+
+    Carries exactly what the unpromote apply needs to REVERSE a Phase-2a promotion: the
+    ``tier`` (MEMORY.md vs CLAUDE.md, which selects single- vs two-artifact removal) and the
+    exact ``target`` path that was tagged, plus content/recall so the artifact identity (the
+    CLAUDE.md exact-id marker, the MEMORY.md index line) can be reconstructed and spliced out.
+    """
+
+    id: str
+    content: str
+    recall_count: int
+    learning_type: str
+    tier: str | None
+    target: str | None
+
+
+@dataclass(frozen=True)
 class StaleBucket:
     label: str
     count: int
@@ -399,6 +418,28 @@ _STALE_IDS_SQL = """
 """
 
 
+# Promoted-row resolution (issue #63 Phase 2b Step 4): resolve approved ids to the rows that
+# STILL carry the metadata.promoted_to marker written by the Phase-2a promote path. The marker
+# is a structured object {tier, target, at}; tier selects single- vs two-artifact removal and
+# target is the exact file path that was tagged. Project- AND id-scoped (mirrors
+# _MERGE_PAIR_DETAILS_SQL's id = ANY); the `metadata ? 'promoted_to'` guard means a row whose
+# tag was already cleared is simply absent (the apply path treats absence as already-undone).
+# Does NOT filter superseded_by/archived_at — an unpromote may need to undo a promotion on a
+# row that was later superseded/archived, so the apply path must still SEE it. READ-ONLY.
+_PROMOTED_ROWS_SQL = """
+    SELECT id::text AS id,
+           content,
+           recall_count,
+           metadata->>'learning_type' AS learning_type,
+           metadata->'promoted_to'->>'tier' AS promoted_tier,
+           metadata->'promoted_to'->>'target' AS promoted_target
+    FROM archival_memory
+    WHERE LOWER(project) = LOWER($1)
+      AND id::text = ANY($2::text[])
+      AND metadata ? 'promoted_to'
+"""
+
+
 async def fetch_active_total(pool, project: str) -> int:
     async with pool.acquire() as conn:
         return int(await conn.fetchval(_ACTIVE_TOTAL_SQL, project) or 0)
@@ -416,6 +457,31 @@ async def fetch_stale_ids(pool, project: str) -> list[str]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(_STALE_IDS_SQL, project)
     return [r["id"] for r in rows]
+
+
+async def fetch_promoted_rows(pool, project: str, ids: list[str]) -> list[PromotedRow]:
+    """Resolve approved ids to the rows that STILL carry ``metadata.promoted_to`` (READ-ONLY).
+
+    Returns only rows whose Phase-2a promotion tag is present, so the unpromote apply
+    (memory_apply.run_unpromote) knows the exact tier/target it must reverse. An id whose tag
+    was already cleared (re-run / concurrent unpromote) is simply absent — the apply path
+    treats absence as already-undone. This module never writes.
+    """
+    if not ids:
+        return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(_PROMOTED_ROWS_SQL, project, list(ids))
+    return [
+        PromotedRow(
+            id=r["id"],
+            content=r["content"],
+            recall_count=int(r["recall_count"]),
+            learning_type=r["learning_type"],
+            tier=r["promoted_tier"],
+            target=r["promoted_target"],
+        )
+        for r in rows
+    ]
 
 
 async def fetch_merge_pair_details(pool, project: str, id_a: str, id_b: str) -> dict[str, MergeRow]:

@@ -1379,14 +1379,18 @@ async def main() -> int:
         selected = None
         # FINDING 3 (Codex round 2): the memory-awareness hook invokes recall
         # with --source hook and KILLS the process at 5s (spawnSync, see
-        # hooks/src/memory-awareness.ts:269). Worst-case surfaced-read (1s) +
-        # type-affinity (1.5s) + a 2.5s LLM call can hit the whole budget; if the
-        # process is killed mid-LLM-call the graceful fallback to rerank() never
-        # runs and the user gets NO recall output. Recall has no recall-wide
-        # pre-output deadline yet, so HARD-GATE the LLM stage off for hook-sourced
-        # calls. The flag is off-by-default and not hook-wired today; this closes
-        # the future risk. Enabling LLM selection on the hook path requires a
-        # recall-wide pre-output deadline first.
+        # hooks/src/memory-awareness.ts:269). The LLM call alone runs to a 10s
+        # deadline (LLM_SELECTOR_TIMEOUT; measured ~3s on a real 50-row pool) and
+        # sits on the pre-output path on top of surfaced-read + type-affinity, so
+        # it can easily exceed the hook's 5s budget; if the process is killed
+        # mid-LLM-call the graceful fallback to rerank() never runs and the user
+        # gets NO recall output. Recall has no recall-wide pre-output deadline
+        # yet, so HARD-GATE the LLM stage off for hook-sourced calls. The flag is
+        # off-by-default and not hook-wired today; this closes the future risk.
+        # Because the hook never reaches this code, LLM_SELECTOR_TIMEOUT is
+        # CLI/benchmark-scoped, not bounded by the 5s budget. Enabling LLM
+        # selection on the hook path requires a recall-wide pre-output deadline
+        # (and a much smaller timeout) first.
         if args.llm_rerank and args.source != "hook":
             # FINDING 4 (Codex round 2): split the two failure classes so an
             # operator's config error is not silently swallowed. Resolve the

@@ -372,14 +372,28 @@ class TestLLMSelectApiErrors:
         assert out is None
 
 
+# --- Timeout constant tuning (E1 live finding) ---
+class TestTimeoutConstant:
+    def test_timeout_exceeds_real_pool_latency_floor(self):
+        # E1 live test: a realistic 50-candidate manifest (~13KB) takes ~3.2s
+        # end-to-end against the real Anthropic API. The LLM selector is gated
+        # OFF the 5s-killed hook path (F3 --source hook gate), so this timeout is
+        # CLI/benchmark-scoped and must comfortably exceed the measured ~3s
+        # latency — otherwise llm_select times out on every normal pool and the
+        # feature silently never produces an LLM selection.
+        assert LLM_SELECTOR_TIMEOUT >= 5.0
+
+
 # --- Step 7: timeout ---
 class TestLLMSelectTimeout:
     async def test_llm_select_returns_none_on_timeout(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
         pool = [_make_candidate(id="a")]
 
+        # Inject a tiny explicit timeout (0.05s) and a sleep just past it, so the
+        # test stays fast and correct INDEPENDENT of LLM_SELECTOR_TIMEOUT's value.
         async def slow_post(*args, **kwargs):
-            await asyncio.sleep(LLM_SELECTOR_TIMEOUT + 1.0)
+            await asyncio.sleep(1.0)
             return _fake_post_response(["a"])
 
         with patch(

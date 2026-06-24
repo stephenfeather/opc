@@ -167,9 +167,10 @@ trimmed to `--k`).
 - **Fallback semantics (no regression):** the selector returns nothing and
   recall falls back to the standard contextual reranker on **every** failure
   mode — empty candidate pool, missing `ANTHROPIC_API_KEY`, API/network error,
-  timeout (bounded at 2.5s), malformed output, or an empty / all-unknown
-  selection. Because the fallback is the existing reranker, enabling
-  `--llm-rerank` can never produce worse results than the default path.
+  timeout (bounded at 10s; CLI/benchmark-scoped — the hook path is gated off,
+  see below), malformed output, or an empty / all-unknown selection. Because the
+  fallback is the existing reranker, enabling `--llm-rerank` can never produce
+  worse results than the default path.
 - **`--no-rerank` interaction:** `--llm-rerank` lives *inside* the rerank gate,
   so `--no-rerank` suppresses it too. Passing both `--no-rerank --llm-rerank`
   runs neither stage (raw retrieval order is returned).
@@ -197,6 +198,13 @@ trimmed to `--k`).
   memory-awareness hook) make no LLM call. If the selector is ever enabled in a
   hot path, weigh both the per-call token cost and the added latency, and
   consider dropping `recall.llm_selector_model` to a cheaper model.
+- **Latency:** a realistic 50-candidate manifest (~13KB; the default
+  `compute_fetch_k = max(3*k, 50) = 50` rows) measures roughly 3s end-to-end
+  against the Anthropic API. The selector's end-to-end deadline
+  (`LLM_SELECTOR_TIMEOUT`) is therefore set to **10s** — CLI/benchmark-scoped,
+  with comfortable headroom over the measured latency. It is intentionally not
+  bounded by the hook's 5s `spawnSync` budget because the LLM path is gated off
+  the hook (see "Ignored for `--source hook` calls" above).
 
 ### `--project`
 

@@ -31,10 +31,20 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-# Bounded so the call cannot blow the memory-awareness hook's 5s spawn budget;
-# on timeout we fall back to the sub-millisecond pure rerank(). Mirrors the
-# module-level timeout-constant pattern in recall_learnings.py.
-LLM_SELECTOR_TIMEOUT: float = 2.5
+# End-to-end deadline for the LLM selector call. Drives BOTH the httpx client
+# timeout and the asyncio.wait_for in call_anthropic (single source of truth);
+# on timeout we fall back to the sub-millisecond pure rerank().
+#
+# Tuning (E1 live finding): the selector is GATED OFF the 5s-killed
+# memory-awareness hook path (see the `--source hook` gate / F3 in
+# recall_learnings.py), so this is intentionally NOT bounded by the hook's 5s
+# spawn budget — the hook never reaches this code. It targets interactive CLI +
+# benchmark callers, which have no hard deadline. A realistic 50-candidate
+# manifest (~13KB; the default compute_fetch_k = max(3*k, 50) = 50 rows) measured
+# ~3.2s end-to-end against the real Anthropic API, so 2.5s timed out on EVERY
+# normal pool and the feature silently never produced an LLM selection. 10s gives
+# comfortable headroom over that measured ~3s latency.
+LLM_SELECTOR_TIMEOUT: float = 10.0
 
 # Truncation bound for each candidate's description in the manifest.
 MANIFEST_DESC_MAXLEN: int = 200

@@ -1378,15 +1378,25 @@ async def main() -> int:
         # fallback always has it. --k is preserved as the upper bound for both.
         selected = None
         if args.llm_rerank:
-            from scripts.core.config.handlers import get_config
-            from scripts.core.llm_selector import llm_select
+            # The graceful-fallback guarantee must cover the WHOLE call site, not
+            # just exceptions raised inside llm_select: config resolution and the
+            # module import happen here and could also fail. Wrap everything so
+            # any failure leaves selected=None and the line below falls back to
+            # the pure rerank(). Mirrors the hot-path degrade pattern above
+            # (:1346). Log only the exception type/details at DEBUG, never values.
+            try:
+                from scripts.core.config.handlers import get_config
+                from scripts.core.llm_selector import llm_select
 
-            selected = await llm_select(
-                results,
-                query=args.query,
-                model=get_config().recall.llm_selector_model,
-                k=args.k,
-            )
+                selected = await llm_select(
+                    results,
+                    query=args.query,
+                    model=get_config().recall.llm_selector_model,
+                    k=args.k,
+                )
+            except Exception:  # noqa: BLE001 - degrade to contextual rerank
+                logger.debug("llm-rerank stage failed; falling back", exc_info=True)
+                selected = None
         results = selected if selected is not None else rerank(results, ctx, k=args.k)
 
     # Output FIRST: best-effort recall logging must never delay user-visible

@@ -971,3 +971,103 @@ class TestLLMRerankIntegration:
             # No KeyError on r["id"] => telemetry saw the contract key.
             recorded_ids = mock_record.call_args[0][0]
             assert recorded_ids == ["id1"]
+
+    @pytest.mark.asyncio
+    async def test_main_falls_back_to_rerank_when_config_resolution_raises(self):
+        # Codex round 1 / FINDING 1: the graceful-fallback contract must cover
+        # failures at the CALL SITE (config resolution / module import), not just
+        # exceptions raised inside llm_select. If get_config() blows up under
+        # --llm-rerank, main() must still fall back to rerank() and return 0.
+        fake_results = _make_llm_results(3)
+        with (
+            patch("scripts.core.recall_learnings.get_backend", return_value="postgres"),
+            patch(
+                "scripts.core.recall_learnings.search_learnings_hybrid_rrf",
+                new_callable=AsyncMock,
+                return_value=fake_results,
+            ),
+            patch(
+                "scripts.core.recall_learnings.enrich_with_kg_context",
+                new_callable=AsyncMock,
+                side_effect=lambda rs: rs,
+            ),
+            patch(
+                "scripts.core.recall_learnings.enrich_with_pattern_strength",
+                new_callable=AsyncMock,
+                side_effect=lambda rs: rs,
+            ),
+            patch(
+                "scripts.core.recall_learnings.record_recall", new_callable=AsyncMock
+            ),
+            patch(
+                "scripts.core.config.handlers.get_config",
+                side_effect=RuntimeError("config explosion"),
+            ),
+            patch(
+                "scripts.core.reranker.rerank",
+                side_effect=lambda results, ctx, k=5: results[:k],
+            ) as mock_rerank,
+            patch(
+                "scripts.core.llm_selector.llm_select", new_callable=AsyncMock
+            ) as mock_llm,
+            patch(
+                "sys.argv",
+                ["recall", "-q", "test", "--k", "3", "--llm-rerank", "--json"],
+            ),
+        ):
+            from scripts.core.recall_learnings import main
+
+            exit_code = await main()
+            assert exit_code == 0
+            # config blew up BEFORE llm_select; selector never reached.
+            mock_llm.assert_not_called()
+            # graceful fallback: rerank ran with the configured k.
+            mock_rerank.assert_called_once()
+            assert mock_rerank.call_args.kwargs.get("k") == 3
+
+    @pytest.mark.asyncio
+    async def test_main_falls_back_to_rerank_when_llm_select_raises(self):
+        # FINDING 1 (companion): an unexpected raise from llm_select itself at the
+        # call site (defense in depth — llm_select promises None, but the call
+        # site must not trust that) must still fall back, not crash main().
+        fake_results = _make_llm_results(3)
+        with (
+            patch("scripts.core.recall_learnings.get_backend", return_value="postgres"),
+            patch(
+                "scripts.core.recall_learnings.search_learnings_hybrid_rrf",
+                new_callable=AsyncMock,
+                return_value=fake_results,
+            ),
+            patch(
+                "scripts.core.recall_learnings.enrich_with_kg_context",
+                new_callable=AsyncMock,
+                side_effect=lambda rs: rs,
+            ),
+            patch(
+                "scripts.core.recall_learnings.enrich_with_pattern_strength",
+                new_callable=AsyncMock,
+                side_effect=lambda rs: rs,
+            ),
+            patch(
+                "scripts.core.recall_learnings.record_recall", new_callable=AsyncMock
+            ),
+            patch(
+                "scripts.core.reranker.rerank",
+                side_effect=lambda results, ctx, k=5: results[:k],
+            ) as mock_rerank,
+            patch(
+                "scripts.core.llm_selector.llm_select",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("unexpected selector crash"),
+            ),
+            patch(
+                "sys.argv",
+                ["recall", "-q", "test", "--k", "3", "--llm-rerank", "--json"],
+            ),
+        ):
+            from scripts.core.recall_learnings import main
+
+            exit_code = await main()
+            assert exit_code == 0
+            mock_rerank.assert_called_once()
+            assert mock_rerank.call_args.kwargs.get("k") == 3

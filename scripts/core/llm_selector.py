@@ -55,6 +55,16 @@ def build_manifest(candidates: list[dict]) -> str:
 
     Line shape: ``[<learning_type or UNKNOWN>] <id> (<created_at iso or ?>): <desc>``
     where ``desc`` is the content truncated to ``MANIFEST_DESC_MAXLEN``.
+
+    Trust boundary: archival memory ``content`` is model-visible data that crosses
+    a trust boundary. A poisoned memory whose content embeds newlines (or fake
+    ``[TYPE] id (ts):`` row prefixes / instruction-like text) could otherwise
+    forge extra apparent candidate rows or inject instructions into the forced
+    tool call. To guarantee exactly one line per candidate, all whitespace
+    (newlines, carriage returns, tabs, runs of spaces) in ``content`` is
+    collapsed to single spaces BEFORE truncation — so an embedded prefix can
+    never start a new row. ``apply_selection`` additionally drops any id absent
+    from the real pool, so even a forged in-desc id cannot be selected.
     """
     lines: list[str] = []
     for c in candidates:
@@ -63,7 +73,10 @@ def build_manifest(candidates: list[dict]) -> str:
         cid = c.get("id", "?")
         created = c.get("created_at")
         ts = created.isoformat() if hasattr(created, "isoformat") else "?"
-        desc = (c.get("content") or "")[:MANIFEST_DESC_MAXLEN]
+        # Collapse all whitespace/control runs to single spaces so one candidate
+        # is always exactly one line (manifest-injection mitigation), THEN bound.
+        normalized = " ".join((c.get("content") or "").split())
+        desc = normalized[:MANIFEST_DESC_MAXLEN]
         lines.append(f"[{ltype}] {cid} ({ts}): {desc}")
     return "\n".join(lines)
 

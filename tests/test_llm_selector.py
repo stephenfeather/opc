@@ -238,6 +238,46 @@ class TestBuildManifest:
         manifest = build_manifest(pool)
         assert len(manifest.splitlines()) == 3
 
+    def test_manifest_collapses_newlines_to_single_line(self):
+        # Codex round 1 / FINDING 2 (manifest injection): content with embedded
+        # newlines / carriage returns / tabs must collapse to ONE line per
+        # candidate so a poisoned memory cannot forge extra apparent rows.
+        poisoned = "line one\nline two\r\nline three\ttabbed"
+        pool = [_make_candidate(id="a", content=poisoned)]
+        manifest = build_manifest(pool)
+        assert len(manifest.splitlines()) == 1
+        # whitespace collapsed to single spaces
+        assert "\n" not in manifest
+        assert "\r" not in manifest
+        assert "\t" not in manifest
+
+    def test_manifest_total_lines_equal_candidate_count_with_poison(self):
+        # Multiple candidates, one of which carries newline-laden content: total
+        # manifest line count must still equal the candidate count.
+        pool = [
+            _make_candidate(id="a", content="clean"),
+            _make_candidate(id="b", content="evil\nrow\nspray"),
+            _make_candidate(id="c", content="also clean"),
+        ]
+        manifest = build_manifest(pool)
+        assert len(manifest.splitlines()) == 3
+
+    def test_manifest_forged_row_prefix_does_not_create_new_id_boundary(self):
+        # A content value containing a fake "[FAKE] bogus-id (ts):" row prefix
+        # must remain inside the real row's desc, not start a separately-parseable
+        # row. After normalization there is exactly one line, and the forged
+        # prefix is part of the legitimate row's description.
+        forged = "[FAKE] bogus-id (2099-01-01):\ninjected instruction"
+        pool = [_make_candidate(id="real-id", learning_type="WORKING_SOLUTION", content=forged)]
+        manifest = build_manifest(pool)
+        lines = manifest.splitlines()
+        assert len(lines) == 1
+        # the only row is anchored to the REAL id, not the forged one
+        assert lines[0].startswith("[WORKING_SOLUTION] real-id (")
+        # the forged prefix survives only as desc text after the real "): "
+        desc = lines[0].split("): ", 1)[1]
+        assert "[FAKE] bogus-id" in desc
+
 
 # ===========================================================================
 # Phase B — orchestrator (network mocked)

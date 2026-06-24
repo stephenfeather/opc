@@ -39,6 +39,14 @@ LLM_SELECTOR_TIMEOUT: float = 2.5
 # Truncation bound for each candidate's description in the manifest.
 MANIFEST_DESC_MAXLEN: int = 200
 
+# Hard upper bound on the raw content slice processed per candidate BEFORE
+# whitespace normalization. Bounds CPU/memory on the synchronous pre-network hot
+# path: an oversized (multi-MB) archival memory must not be split/rejoined in
+# full just to render a 200-char desc. Generous (8x the desc cap) so normal text
+# still collapses to a full MANIFEST_DESC_MAXLEN line; the slice makes the work
+# O(cap) rather than O(len(content)).
+MANIFEST_RAW_SLICE: int = MANIFEST_DESC_MAXLEN * 8
+
 _ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 _ANTHROPIC_VERSION = "2023-06-01"
 _TOOL_NAME = "select_memories"
@@ -73,10 +81,14 @@ def build_manifest(candidates: list[dict]) -> str:
         cid = c.get("id", "?")
         created = c.get("created_at")
         ts = created.isoformat() if hasattr(created, "isoformat") else "?"
-        # Collapse all whitespace/control runs to single spaces so one candidate
-        # is always exactly one line (manifest-injection mitigation), THEN bound.
-        normalized = " ".join((c.get("content") or "").split())
-        desc = normalized[:MANIFEST_DESC_MAXLEN]
+        # Bound the work BEFORE normalizing (round 3): slice a generous prefix
+        # so split/join is O(cap), not O(len(content)) for an oversized memory.
+        # Then collapse all whitespace/control runs to single spaces so one
+        # candidate is always exactly one line (manifest-injection mitigation),
+        # and finally truncate to the desc cap. Collapsing a bounded prefix still
+        # removes any newline in it, so no newline can survive into the line.
+        raw = (c.get("content") or "")[:MANIFEST_RAW_SLICE]
+        desc = " ".join(raw.split())[:MANIFEST_DESC_MAXLEN]
         lines.append(f"[{ltype}] {cid} ({ts}): {desc}")
     return "\n".join(lines)
 

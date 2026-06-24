@@ -21,6 +21,7 @@ import pytest
 from scripts.core.llm_selector import (
     LLM_SELECTOR_TIMEOUT,
     MANIFEST_DESC_MAXLEN,
+    MANIFEST_RAW_SLICE,
     apply_selection,
     build_manifest,
     call_anthropic,
@@ -277,6 +278,35 @@ class TestBuildManifest:
         # the forged prefix survives only as desc text after the real "): "
         desc = lines[0].split("): ", 1)[1]
         assert "[FAKE] bogus-id" in desc
+
+    def test_manifest_construction_is_bounded_for_huge_content(self):
+        # Codex round 3 / FINDING 5: normalization must bound CPU/memory work,
+        # not just output length. A multi-megabyte whitespace-heavy content
+        # value must be sliced to a generous prefix BEFORE whitespace collapse,
+        # so the work is O(cap), not O(len(content)). A sentinel placed far past
+        # MANIFEST_RAW_SLICE must NOT appear in the manifest (proving only a
+        # bounded prefix was processed), and the one-line guarantee must hold.
+        sentinel = "ZZZSENTINELZZZ"
+        # 2 MB of whitespace+newlines, then the sentinel far past the raw cap.
+        huge = ("word \n" * 400_000) + sentinel
+        assert len(huge) > MANIFEST_RAW_SLICE  # precondition: sentinel is past the cap
+        pool = [_make_candidate(id="big", content=huge)]
+        manifest = build_manifest(pool)
+        lines = manifest.splitlines()
+        # (b) single line, no surviving control chars
+        assert len(lines) == 1
+        assert "\n" not in manifest and "\r" not in manifest and "\t" not in manifest
+        # (a) desc bounded to MANIFEST_DESC_MAXLEN
+        desc = lines[0].split("): ", 1)[1]
+        assert len(desc) <= MANIFEST_DESC_MAXLEN
+        # (c) only a bounded prefix was processed: content beyond the raw slice
+        #     (the sentinel) never reaches the manifest.
+        assert sentinel not in manifest
+
+    def test_manifest_raw_slice_constant_is_generous(self):
+        # The pre-normalization cap must be large enough that normal text still
+        # yields a full MANIFEST_DESC_MAXLEN desc after whitespace collapse.
+        assert MANIFEST_RAW_SLICE >= MANIFEST_DESC_MAXLEN
 
 
 # ===========================================================================

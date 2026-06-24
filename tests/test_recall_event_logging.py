@@ -978,6 +978,41 @@ class TestExcludeIds:
         assert rc == 0
         assert captured["fetch_k"] == max(3 * 5, 50) + 2
 
+    async def test_no_rerank_exclude_trims_to_k(self, monkeypatch, capsys):
+        # Codex P2: with --no-rerank the rerank k-trim is skipped, so the
+        # exclude over-fetch must be trimmed back to base_fetch_k (== k on the
+        # no-rerank path) or output exceeds the requested --k when excludes are
+        # stale / absent from the pool.
+        import json as _json
+
+        import scripts.core.recall_learnings as rl
+        import scripts.core.reranker as reranker_mod
+
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        ids = [str(uuid.uuid4()) for _ in range(5)]
+        results = [self._result(i, "x", 0.5) for i in ids]
+        stale = str(uuid.uuid4())  # not present in the fetched pool
+        argv = [
+            "recall_learnings.py", "--query", "x", "--source", "hook",
+            "--text-only", "--json", "--k", "2", "--no-rerank",
+            "--exclude-ids", stale,
+        ]
+        monkeypatch.setattr(rl.sys, "argv", argv, raising=False)
+        self._wire(monkeypatch, rl, reranker_mod, results)
+
+        async def fake_record(
+            ids_arg, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+        ):
+            return None
+
+        monkeypatch.setattr(rl, "record_recall", fake_record)
+
+        rc = await rl.main()
+        assert rc == 0
+        payload = _json.loads(capsys.readouterr().out)
+        # Output is capped to --k (2), not the full over-fetched pool.
+        assert len(payload["results"]) == 2
+
     async def test_no_exclude_ids_no_regression(self, monkeypatch):
         import scripts.core.recall_learnings as rl
         import scripts.core.reranker as reranker_mod

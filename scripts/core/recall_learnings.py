@@ -63,7 +63,9 @@ TYPE_AFFINITY_TIMEOUT = 1.5
 # in-process (no second hook subprocess) and sits BEFORE dispatch, so it is hard
 # bounded to keep a slow DB off the memory-awareness hook's 5s spawn budget; on
 # timeout the feature degrades to "no exclusion" and recall proceeds normally.
-SURFACED_READ_TIMEOUT = 1.5
+# A PK point read, so 1s is ample; kept tight because it sits BEFORE search on
+# the hot path (post-output telemetry has its own RECORD_RECALL_TIMEOUT budget).
+SURFACED_READ_TIMEOUT = 1.0
 # Cap on the per-session surfaced-id set, bounding both the exclude set and the
 # stored array. Keeps the most-recent ids when exceeded.
 SURFACED_ID_CAP = 500
@@ -1185,6 +1187,10 @@ async def main() -> int:
 
     output_mode = select_output(json_flag=args.json, json_full=args.json_full)
     fetch_k = compute_fetch_k(args.k, no_rerank=args.no_rerank)
+    # The unbumped over-fetch ceiling. After exclusion we trim back to this so
+    # enrichment/rerank never run on the inflated pool, and the --no-rerank path
+    # (where rerank's k-trim is skipped) still respects the result limit.
+    base_fetch_k = fetch_k
 
     # Issue #228 item 2: assemble the full already-surfaced exclusion set =
     # explicit --exclude-ids UNION the ids already surfaced for --surfaced-session
@@ -1301,8 +1307,12 @@ async def main() -> int:
     # tag filter) so item 1's selection-rate telemetry stays the RAW backend
     # pool. exclude_ids (explicit + session-surfaced) was assembled above and is
     # already str-normalized; normalize the result id too to bridge UUID/str.
+    # Trim back to base_fetch_k: the bump above only over-fetched to backfill
+    # past excluded rows, so once they're dropped, cap the pool so enrichment +
+    # rerank cost stays at the normal base. This also bounds the --no-rerank path
+    # (rerank's k-trim is skipped there) to the result limit.
     if exclude_ids:
-        results = [r for r in results if str(r["id"]) not in exclude_ids]
+        results = [r for r in results if str(r["id"]) not in exclude_ids][:base_fetch_k]
 
     # Pattern enrichment
     if (not args.no_rerank or args.json_full) and backend == "postgres":
@@ -1353,44 +1363,41 @@ async def main() -> int:
     # output under the memory-awareness hook's 5s spawn timeout (issue #140).
     print(_format_output(results, output_mode=output_mode, structured=args.structured))
 
-    # Record recall (skip benchmarking mode). Bounded by RECORD_RECALL_TIMEOUT
-    # so a slow DB write can't burn the hook's spawn budget; telemetry is
-    # best-effort and cancellation-safe (issue #140).
+    # Post-output telemetry (skip benchmarking mode): record the recall event
+    # (issue #140) AND persist the session's surfaced set (issue #228 item 2).
+    # Run CONCURRENTLY under ONE RECORD_RECALL_TIMEOUT budget so item 2's persist
+    # adds no post-output time on top of item 1's logging — both are best-effort
+    # and must not burn the memory-awareness hook's 5s spawn budget. gather with
+    # return_exceptions so one failing write never cancels the other or raises.
     if not args.json_full:
         caller_project = resolve_caller_project(
             args.project, os.environ.get("CLAUDE_PROJECT_DIR")
         )
+        telemetry = [
+            record_recall(
+                [r["id"] for r in results],
+                caller_project=caller_project,
+                source=args.source,
+                pool_size=pool_size,
+                fetch_k=fetch_k,
+            )
+        ]
+        # Persist prior UNION the ids returned this run (capped, most-recent
+        # kept) so next turn excludes them. Gated on surfaced_read_ok: skip
+        # after a failed read so the REPLACE write can't wipe the stored set
+        # with only this run's ids.
+        if args.surfaced_session and surfaced_read_ok:
+            new_surfaced = _union_cap(
+                prior_surfaced, [str(r["id"]) for r in results], SURFACED_ID_CAP
+            )
+            telemetry.append(persist_surfaced_ids(args.surfaced_session, new_surfaced))
         try:
             await asyncio.wait_for(
-                record_recall(
-                    [r["id"] for r in results],
-                    caller_project=caller_project,
-                    source=args.source,
-                    pool_size=pool_size,
-                    fetch_k=fetch_k,
-                ),
+                asyncio.gather(*telemetry, return_exceptions=True),
                 timeout=RECORD_RECALL_TIMEOUT,
             )
         except TimeoutError:
-            logger.debug("record_recall timed out; recall event dropped")
-
-    # Issue #228 item 2: persist the session's surfaced set = prior UNION the
-    # ids returned this run (capped, most-recent kept), so next turn excludes
-    # them. Runs in this same process (no detached hook subprocess) and is
-    # bounded + best-effort so a slow write can't burn the hook's spawn budget.
-    # Gated on surfaced_read_ok: skip after a failed read so the REPLACE write
-    # can't wipe the existing stored set with only this run's ids.
-    if args.surfaced_session and surfaced_read_ok:
-        new_surfaced = _union_cap(
-            prior_surfaced, [str(r["id"]) for r in results], SURFACED_ID_CAP
-        )
-        try:
-            await asyncio.wait_for(
-                persist_surfaced_ids(args.surfaced_session, new_surfaced),
-                timeout=RECORD_RECALL_TIMEOUT,
-            )
-        except TimeoutError:
-            logger.debug("persist_surfaced_ids timed out; surfaced set not updated")
+            logger.debug("post-output telemetry timed out; some writes dropped")
 
     return 0
 

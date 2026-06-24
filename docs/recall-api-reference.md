@@ -207,6 +207,66 @@ over 32 chars, prompt-like text) is **dropped to `NULL`** rather than stored,
 so arbitrary text cannot leak into the append-only log. No query text is ever
 logged (privacy). See the [Recall Event Log](#recall-event-log) section.
 
+### `--exclude-ids` (default: none)
+
+Already-surfaced filtering (issue #228 item 2). Space-separated list of full
+learning UUIDs to drop from the results, e.g.
+`--exclude-ids 11111111-1111-1111-1111-111111111111 2222...`. Optional;
+`nargs="*"` with an empty-list default, so omitting it (or passing it with no
+values) is a no-op identical to prior behavior.
+
+**Semantics — where the filter runs:** the exclusion is applied **after** the
+`pool_size` telemetry capture and **before** rerank. Two consequences follow
+from that ordering:
+
+- Excluded ids are removed from the candidate pool *before* `rerank()`, so a
+  previously-surfaced learning **cannot rank back into the top-k** and then be
+  trimmed away — it is gone before ranking even runs.
+- `pool_size` (issue #228 item 1 selection-rate telemetry) is captured on the
+  **raw backend pool**, *before* this filter, so exclusion **does not affect**
+  the recorded `pool_size` / selection-rate denominator. Exclusion is a
+  downstream filter, like `--tags`, and is intentionally invisible to the pool
+  telemetry.
+
+Id matching normalizes both sides to strings, so a `UUID`-typed result id and a
+plain-string exclude value compare equal. The filter is a pure post-fetch Python
+step, so it applies uniformly across all backends (text-only, vector, hybrid
+RRF) and both the single-pass and `--project-first` two-pass dispatch paths.
+
+**Backfill — avoiding starvation:** because the filter runs *after* the backend
+returns its fixed over-fetch pool, `fetch_k` is increased by the size of the
+exclude set when `--exclude-ids` is non-empty. Otherwise a session that had
+already surfaced the entire top-of-pool would filter every candidate out and
+return nothing, even when fresh lower-ranked candidates exist. The bump is
+bounded by the hook's surfaced-id cap, so the extra fetch and rerank cost stays
+small.
+
+Most callers do not pass `--exclude-ids` directly — the `memory-awareness` hook
+uses `--surfaced-session` (below), which assembles the exclusion set in-process.
+
+### `--surfaced-session` (default: none)
+
+Already-surfaced filtering for the `memory-awareness` UserPromptSubmit hook
+(issue #228 item 2). Takes a session id (the `sessions` PK `id`, which
+session-register sets equal to the Claude session id). When set, recall:
+
+1. **reads** that session's `sessions.surfaced_learning_ids` (a primary-key
+   read, no extra index) and unions them into the exclusion set alongside any
+   explicit `--exclude-ids`, applied with the same before-rerank / after-pool-size
+   semantics described above;
+2. after output, **upserts** `surfaced_learning_ids` to the prior set unioned
+   with the ids returned this run (deduped, capped at the most-recent 500),
+   keyed on the PK `id` via `ON CONFLICT (id) DO UPDATE` so a missing
+   SessionStart row does not silently drop the write.
+
+Both the read and the write run **in this recall process** — the hook passes a
+single session id instead of reading the column itself and passing a long
+`--exclude-ids` list, so the prompt hot path pays only one Python/uv startup per
+turn. Both are time-bounded and best-effort: on any DB error the read degrades
+to no exclusion and the write is skipped, so recall never breaks. The read also
+over-fetches by the exclude-set size (see the backfill note above) so a session
+that already surfaced the top of the pool still gets fresh results.
+
 ### `--provider` (default: local)
 
 Embedding provider. Choices: `local` (BGE), `voyage` (Voyage AI).

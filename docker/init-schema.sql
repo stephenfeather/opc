@@ -35,7 +35,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     archive_path TEXT,
     extraction_status TEXT DEFAULT 'pending',
     extraction_attempts INTEGER DEFAULT 0,
-    last_error TEXT
+    last_error TEXT,
+    -- Issue #228 item 2: union of full learning UUIDs the memory-awareness
+    -- hook has surfaced for this session (keyed by claude_session_id). Passed
+    -- to recall as --exclude-ids so prior-turn picks are dropped before rank.
+    surfaced_learning_ids UUID[]
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_host ON sessions(host_id);

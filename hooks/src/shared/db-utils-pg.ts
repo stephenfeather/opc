@@ -461,6 +461,9 @@ async def main():
             ('transcript_path', 'TEXT'),
             ('exited_at', 'TIMESTAMP'),
             ('pid', 'INTEGER'),
+            # Issue #228 item 2: already-surfaced filtering. Self-heal a fresh
+            # DB the hook touches before the migration runs.
+            ('surfaced_learning_ids', 'UUID[]'),
         ]:
             await conn.execute(f'ALTER TABLE sessions ADD COLUMN IF NOT EXISTS {col[0]} {col[1]}')
 

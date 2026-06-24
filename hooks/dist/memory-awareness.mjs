@@ -46,6 +46,12 @@ function getOpcDir() {
   return null;
 }
 
+// src/shared/pattern-router.ts
+var SAFE_ID_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
+function isValidId(id) {
+  return SAFE_ID_PATTERN.test(id);
+}
+
 // src/memory-awareness.ts
 /*!
  * Memory Awareness Hook (UserPromptSubmit)
@@ -261,7 +267,10 @@ function isConversationalTurn(prompt) {
   const body = (CONVERSATIONAL_LEAD.has(tokens[0]) ? tokens.slice(1) : tokens).join(" ");
   return PRONOUN_IMPERATIVE.test(body) || SELECTION_IMPERATIVE.test(body);
 }
-function checkMemoryRelevance(intent, projectDir) {
+function surfacedSessionArgs(sessionId) {
+  return sessionId && isValidId(sessionId) ? ["--surfaced-session", sessionId] : [];
+}
+function checkMemoryRelevance(intent, projectDir, sessionId) {
   if (!intent || intent.length < 3) return null;
   const opcDir = getOpcDir();
   if (!opcDir) return null;
@@ -285,7 +294,12 @@ function checkMemoryRelevance(intent, projectDir) {
     "--source",
     "hook",
     ...tagArgs,
-    ...projectArgs
+    ...projectArgs,
+    // Issue #228 item 2: recall drops learnings already surfaced this session
+    // BEFORE ranking (and upserts the updated set) so the hook stops
+    // re-surfacing the same top memories every turn. Passing the session id
+    // (not an id list) keeps this to a single in-recall DB round-trip.
+    ...surfacedSessionArgs(sessionId)
   ], {
     encoding: "utf-8",
     cwd: opcDir,
@@ -343,7 +357,7 @@ async function main() {
   if (intent.length < 3) {
     return;
   }
-  const match = checkMemoryRelevance(intent, projectDir);
+  const match = checkMemoryRelevance(intent, projectDir, input.session_id);
   if (match) {
     const resultLines = match.results.map(
       (r, i) => `${i + 1}. [${r.type}] ${r.content} (id: ${r.id})`
@@ -365,5 +379,6 @@ if (typeof process !== "undefined" && process.argv[1] && (process.argv[1].endsWi
 }
 export {
   isConversationalTurn,
-  sanitizeSearchTerm
+  sanitizeSearchTerm,
+  surfacedSessionArgs
 };

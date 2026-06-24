@@ -14,6 +14,7 @@
 import { readFileSync, existsSync } from 'fs';
 import { spawnSync } from 'child_process';
 import { getOpcDir } from './shared/opc-path.js';
+import { isValidId } from './shared/db-utils-pg.js';
 
 interface UserPromptSubmitInput {
   session_id: string;
@@ -199,11 +200,30 @@ export function isConversationalTurn(prompt: string): boolean {
 }
 
 /**
+ * Build the `--surfaced-session <id>` argv fragment for already-surfaced
+ * filtering (issue #228 item 2), or [] when there is no session id. recall
+ * reads the session's surfaced ids, excludes them before ranking, and upserts
+ * the updated set itself — all in its own (already-warm) process, so the hook
+ * adds no separate DB subprocess to the prompt hot path.
+ */
+export function surfacedSessionArgs(sessionId: string | undefined): string[] {
+  // Validate before forwarding (parity with session-register, defense-in-depth):
+  // a session id outside SAFE_ID_PATTERN omits the flag, so recall just runs
+  // without exclusion. The downstream lookup is parameterized, so this is belt-
+  // and-suspenders, not the only guard.
+  return sessionId && isValidId(sessionId) ? ['--surfaced-session', sessionId] : [];
+}
+
+/**
  * Fast memory relevance check using text search.
  * For text-only mode, we search by the most significant keyword
  * (text ILIKE looks for substring match, not multi-word).
  */
-function checkMemoryRelevance(intent: string, projectDir: string): MemoryMatch | null {
+function checkMemoryRelevance(
+  intent: string,
+  projectDir: string,
+  sessionId?: string
+): MemoryMatch | null {
   if (!intent || intent.length < 3) return null;
 
   const opcDir = getOpcDir();
@@ -248,7 +268,12 @@ function checkMemoryRelevance(intent: string, projectDir: string): MemoryMatch |
     '--provider', 'voyage',
     '--source', 'hook',
     ...tagArgs,
-    ...projectArgs
+    ...projectArgs,
+    // Issue #228 item 2: recall drops learnings already surfaced this session
+    // BEFORE ranking (and upserts the updated set) so the hook stops
+    // re-surfacing the same top memories every turn. Passing the session id
+    // (not an id list) keeps this to a single in-recall DB round-trip.
+    ...surfacedSessionArgs(sessionId)
   ], {
     encoding: 'utf-8',
     cwd: opcDir,
@@ -337,8 +362,11 @@ async function main() {
     return;
   }
 
-  // Check memory relevance using semantic search
-  const match = checkMemoryRelevance(intent, projectDir);
+  // Check memory relevance using semantic search. Issue #228 item 2: passing
+  // the session id lets recall exclude already-surfaced learnings BEFORE
+  // ranking and persist the updated set itself (in-process), so the hook stops
+  // re-surfacing the same top memories every turn without a second subprocess.
+  const match = checkMemoryRelevance(intent, projectDir, input.session_id);
 
   if (match) {
     // Build structured context for Claude

@@ -1125,29 +1125,30 @@ async def read_surfaced_ids(session_id: str) -> list[str]:
     """Read prior surfaced learning ids for a session (issue #228 item 2).
 
     Keyed on the sessions PK ``id`` (== the Claude session id for registered
-    sessions), so this is a primary-key read needing no extra index. Runs
-    in-process so the memory-awareness hook pays only one Python/uv startup per
-    prompt (no separate read subprocess). Best-effort: any error / missing row /
-    NULL column yields ``[]`` so recall never breaks. Defensively capped so a
+    sessions — session-register writes input.session_id to both ``id`` and
+    ``claude_session_id``, so the only rows this hook touches have them equal;
+    legacy rows where they differ predate this and never run this path). This is
+    a primary-key read needing no extra index, run in-process so the hook pays
+    only one Python/uv startup per prompt.
+
+    A genuine empty (no row / NULL column) returns ``[]``; a DB error is allowed
+    to RAISE so the caller can tell a real empty set apart from a failed read and
+    skip the destructive persist-replace after a failure. Defensively capped so a
     pre-existing oversized row cannot bloat the exclude set."""
     if get_backend() != "postgres" or not session_id:
         return []
-    try:
-        from scripts.core.db.postgres_pool import get_pool
+    from scripts.core.db.postgres_pool import get_pool
 
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT surfaced_learning_ids FROM sessions WHERE id = $1",
-                session_id,
-            )
-        if not row or not row["surfaced_learning_ids"]:
-            return []
-        ids = [str(x) for x in row["surfaced_learning_ids"]]
-        return ids[-SURFACED_ID_CAP:] if len(ids) > SURFACED_ID_CAP else ids
-    except Exception:
-        logger.debug("read_surfaced_ids failed", exc_info=True)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT surfaced_learning_ids FROM sessions WHERE id = $1",
+            session_id,
+        )
+    if not row or not row["surfaced_learning_ids"]:
         return []
+    ids = [str(x) for x in row["surfaced_learning_ids"]]
+    return ids[-SURFACED_ID_CAP:] if len(ids) > SURFACED_ID_CAP else ids
 
 
 async def persist_surfaced_ids(session_id: str, ids: list[str]) -> None:
@@ -1192,12 +1193,18 @@ async def main() -> int:
     # rows returned this run.
     exclude_ids: set[str] = {str(x) for x in args.exclude_ids}
     prior_surfaced: list[str] = []
+    # Track read SUCCESS separately from emptiness: a failed/timed-out read also
+    # yields prior_surfaced == [], and persisting _union_cap([], returned) would
+    # REPLACE the stored set and erase history. Only persist when the read
+    # succeeded (genuine empty is fine; failure must not overwrite).
+    surfaced_read_ok = False
     if args.surfaced_session:
         try:
             prior_surfaced = await asyncio.wait_for(
                 read_surfaced_ids(args.surfaced_session),
                 timeout=SURFACED_READ_TIMEOUT,
             )
+            surfaced_read_ok = True
         except Exception:  # noqa: BLE001 - degrade to no exclusion on any failure
             logger.debug("surfaced-id read failed/timed out", exc_info=True)
             prior_surfaced = []
@@ -1371,7 +1378,9 @@ async def main() -> int:
     # ids returned this run (capped, most-recent kept), so next turn excludes
     # them. Runs in this same process (no detached hook subprocess) and is
     # bounded + best-effort so a slow write can't burn the hook's spawn budget.
-    if args.surfaced_session:
+    # Gated on surfaced_read_ok: skip after a failed read so the REPLACE write
+    # can't wipe the existing stored set with only this run's ids.
+    if args.surfaced_session and surfaced_read_ok:
         new_surfaced = _union_cap(
             prior_surfaced, [str(r["id"]) for r in results], SURFACED_ID_CAP
         )

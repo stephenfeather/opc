@@ -1194,8 +1194,10 @@ class TestSurfacedSession:
         async def boom(session_id):
             raise RuntimeError("db down")
 
+        persist_calls: list = []
+
         async def fake_persist(session_id, ids):
-            return None
+            persist_calls.append((session_id, list(ids)))
 
         monkeypatch.setattr(rl, "read_surfaced_ids", boom)
         monkeypatch.setattr(rl, "persist_surfaced_ids", fake_persist)
@@ -1206,6 +1208,39 @@ class TestSurfacedSession:
         payload = _json.loads(capsys.readouterr().out)
         out_ids = {r["id"] for r in payload["results"]}
         assert out_ids == set(ids)
+        # Critical: persist is SKIPPED after a failed read, so the REPLACE write
+        # can't erase the existing stored surfaced set (round-4 finding).
+        assert persist_calls == []
+
+    async def test_genuine_empty_read_still_persists(self, monkeypatch):
+        # A successful read of an empty/absent set (returns []) is NOT a failure:
+        # persist must still run so the first turn's picks are stored.
+        import scripts.core.recall_learnings as rl
+        import scripts.core.reranker as reranker_mod
+
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        rid = str(uuid.uuid4())
+        results = [{"id": rid, "content": "x", "similarity": 0.5}]
+        monkeypatch.setattr(
+            rl.sys, "argv", self._argv("--surfaced-session", "sess-1"), raising=False
+        )
+        self._wire(monkeypatch, rl, reranker_mod, results)
+        monkeypatch.setattr(rl, "_format_output", lambda *a, **k: "", raising=False)
+
+        async def empty_read(session_id):
+            return []
+
+        persist_calls: list = []
+
+        async def fake_persist(session_id, ids):
+            persist_calls.append(list(ids))
+
+        monkeypatch.setattr(rl, "read_surfaced_ids", empty_read)
+        monkeypatch.setattr(rl, "persist_surfaced_ids", fake_persist)
+
+        rc = await rl.main()
+        assert rc == 0
+        assert persist_calls == [[rid]]
 
     async def test_session_surfaced_bumps_fetch_k(self, monkeypatch):
         import scripts.core.recall_learnings as rl

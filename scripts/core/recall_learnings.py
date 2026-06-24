@@ -59,6 +59,15 @@ RECORD_RECALL_TIMEOUT = 2.0
 # cancels the inference and reranking proceeds with neutral type_match.
 TYPE_AFFINITY_TIMEOUT = 1.5
 
+# Issue #228 item 2: already-surfaced filtering. The surfaced-id read happens
+# in-process (no second hook subprocess) and sits BEFORE dispatch, so it is hard
+# bounded to keep a slow DB off the memory-awareness hook's 5s spawn budget; on
+# timeout the feature degrades to "no exclusion" and recall proceeds normally.
+SURFACED_READ_TIMEOUT = 1.5
+# Cap on the per-session surfaced-id set, bounding both the exclude set and the
+# stored array. Keeps the most-recent ids when exceeded.
+SURFACED_ID_CAP = 500
+
 
 def _enable_faulthandler() -> None:
     """Enable faulthandler without breaking imports if log dir is missing."""
@@ -1071,6 +1080,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "unaffected."
         ),
     )
+    parser.add_argument(
+        "--surfaced-session",
+        metavar="SESSION_ID",
+        default=None,
+        help=(
+            "Session id (sessions PK / Claude session id) for already-surfaced "
+            "filtering (issue #228 item 2). When set, recall reads the ids "
+            "already surfaced for this session from sessions.surfaced_learning_ids, "
+            "unions them into the exclusion set (in addition to --exclude-ids), "
+            "and after output upserts the surfaced set with the ids returned this "
+            "run. Done in-process so the memory-awareness hook needs no separate "
+            "DB subprocess. Best-effort: degrades to no exclusion on any DB error."
+        ),
+    )
     parser.add_argument("--structured", action="store_true", help="Group results by type")
     parser.add_argument(
         "--source",
@@ -1084,19 +1107,109 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _union_cap(prior: list[str], fresh: list[str], cap: int) -> list[str]:
+    """Dedupe-union ``prior`` + ``fresh`` ids, bounding to ``cap`` (issue #228
+    item 2). Fresh ids sit at the tail; when over cap the head (oldest) is
+    trimmed, so the most-recently-surfaced ids always survive."""
+    merged: list[str] = []
+    seen: set[str] = set()
+    for cid in [*prior, *fresh]:
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        merged.append(cid)
+    return merged[len(merged) - cap :] if len(merged) > cap else merged
+
+
+async def read_surfaced_ids(session_id: str) -> list[str]:
+    """Read prior surfaced learning ids for a session (issue #228 item 2).
+
+    Keyed on the sessions PK ``id`` (== the Claude session id for registered
+    sessions), so this is a primary-key read needing no extra index. Runs
+    in-process so the memory-awareness hook pays only one Python/uv startup per
+    prompt (no separate read subprocess). Best-effort: any error / missing row /
+    NULL column yields ``[]`` so recall never breaks. Defensively capped so a
+    pre-existing oversized row cannot bloat the exclude set."""
+    if get_backend() != "postgres" or not session_id:
+        return []
+    try:
+        from scripts.core.db.postgres_pool import get_pool
+
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT surfaced_learning_ids FROM sessions WHERE id = $1",
+                session_id,
+            )
+        if not row or not row["surfaced_learning_ids"]:
+            return []
+        ids = [str(x) for x in row["surfaced_learning_ids"]]
+        return ids[-SURFACED_ID_CAP:] if len(ids) > SURFACED_ID_CAP else ids
+    except Exception:
+        logger.debug("read_surfaced_ids failed", exc_info=True)
+        return []
+
+
+async def persist_surfaced_ids(session_id: str, ids: list[str]) -> None:
+    """Upsert the session's surfaced set (issue #228 item 2).
+
+    UPSERTs keyed on the PK ``id`` so a missing SessionStart row does not make
+    persistence silently no-op (a bare UPDATE would). The caller passes the
+    already-deduped-and-capped union, so the write REPLACES the column — a
+    re-union against the existing value would re-add trimmed ids and grow the
+    array without bound. Best-effort: never raises."""
+    if get_backend() != "postgres" or not session_id or not ids:
+        return
+    capped = ids[-SURFACED_ID_CAP:] if len(ids) > SURFACED_ID_CAP else ids
+    try:
+        from scripts.core.db.postgres_pool import get_pool
+
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO sessions (id, project, claude_session_id, "
+                "surfaced_learning_ids) VALUES ($1, '', $1, $2::uuid[]) "
+                "ON CONFLICT (id) DO UPDATE SET "
+                "surfaced_learning_ids = EXCLUDED.surfaced_learning_ids",
+                session_id,
+                capped,
+            )
+    except Exception:
+        logger.debug("persist_surfaced_ids failed", exc_info=True)
+
+
 async def main() -> int:
     """Run semantic recall on session learnings."""
     args = _build_arg_parser().parse_args()
 
     output_mode = select_output(json_flag=args.json, json_full=args.json_full)
     fetch_k = compute_fetch_k(args.k, no_rerank=args.no_rerank)
-    # Issue #228 item 2: the exclusion filter (below) drops already-surfaced rows
-    # AFTER the backend returns its fixed over-fetch pool. Over-fetch by the
-    # exclude-set size so a session that has already surfaced the top of the pool
-    # still gets k FRESH candidates instead of starving. Bounded by the hook's
-    # surfaced-id cap, so the extra fetch is small and the rerank stays cheap.
-    if args.exclude_ids:
-        fetch_k += len(set(args.exclude_ids))
+
+    # Issue #228 item 2: assemble the full already-surfaced exclusion set =
+    # explicit --exclude-ids UNION the ids already surfaced for --surfaced-session
+    # (read in-process to avoid a second hook subprocess; see read_surfaced_ids).
+    # prior_surfaced is retained so the post-output persist can union it with the
+    # rows returned this run.
+    exclude_ids: set[str] = {str(x) for x in args.exclude_ids}
+    prior_surfaced: list[str] = []
+    if args.surfaced_session:
+        try:
+            prior_surfaced = await asyncio.wait_for(
+                read_surfaced_ids(args.surfaced_session),
+                timeout=SURFACED_READ_TIMEOUT,
+            )
+        except Exception:  # noqa: BLE001 - degrade to no exclusion on any failure
+            logger.debug("surfaced-id read failed/timed out", exc_info=True)
+            prior_surfaced = []
+        exclude_ids |= set(prior_surfaced)
+
+    # The exclusion filter (below) drops already-surfaced rows AFTER the backend
+    # returns its fixed over-fetch pool. Over-fetch by the exclude-set size so a
+    # session that has already surfaced the top of the pool still gets k FRESH
+    # candidates instead of starving. Bounded by the surfaced-id cap, so the
+    # extra fetch is small and the rerank stays cheap.
+    if exclude_ids:
+        fetch_k += len(exclude_ids)
 
     if output_mode == "human":
         print(f'Recalling learnings for: "{args.query}"')
@@ -1179,10 +1292,10 @@ async def main() -> int:
     # rerank, so excluded picks can never rank back into top-k. This runs AFTER
     # the pool_size capture above (exclusion is a downstream filter, like the
     # tag filter) so item 1's selection-rate telemetry stays the RAW backend
-    # pool. Normalize both sides to str to bridge UUID/str id typing.
-    exclude = {str(x) for x in args.exclude_ids}
-    if exclude:
-        results = [r for r in results if str(r["id"]) not in exclude]
+    # pool. exclude_ids (explicit + session-surfaced) was assembled above and is
+    # already str-normalized; normalize the result id too to bridge UUID/str.
+    if exclude_ids:
+        results = [r for r in results if str(r["id"]) not in exclude_ids]
 
     # Pattern enrichment
     if (not args.no_rerank or args.json_full) and backend == "postgres":
@@ -1253,6 +1366,22 @@ async def main() -> int:
             )
         except TimeoutError:
             logger.debug("record_recall timed out; recall event dropped")
+
+    # Issue #228 item 2: persist the session's surfaced set = prior UNION the
+    # ids returned this run (capped, most-recent kept), so next turn excludes
+    # them. Runs in this same process (no detached hook subprocess) and is
+    # bounded + best-effort so a slow write can't burn the hook's spawn budget.
+    if args.surfaced_session:
+        new_surfaced = _union_cap(
+            prior_surfaced, [str(r["id"]) for r in results], SURFACED_ID_CAP
+        )
+        try:
+            await asyncio.wait_for(
+                persist_surfaced_ids(args.surfaced_session, new_surfaced),
+                timeout=RECORD_RECALL_TIMEOUT,
+            )
+        except TimeoutError:
+            logger.debug("persist_surfaced_ids timed out; surfaced set not updated")
 
     return 0
 

@@ -14,14 +14,6 @@
 import { readFileSync, existsSync } from 'fs';
 import { spawnSync } from 'child_process';
 import { getOpcDir } from './shared/opc-path.js';
-import { runPgQuery, runPgQueryDetached } from './shared/db-utils-pg.js';
-
-/**
- * Upper bound on the per-session surfaced-id set (issue #228 item 2).
- * Bounds the recall argv and the persisted array so a long session can't grow
- * the exclusion list without limit.
- */
-export const SURFACED_ID_CAP = 500;
 
 interface UserPromptSubmitInput {
   session_id: string;
@@ -40,10 +32,6 @@ interface LearningResult {
 interface MemoryMatch {
   count: number;
   results: LearningResult[];
-  // Full (untruncated) UUIDs of the surfaced results, for the per-session
-  // exclusion union (issue #228 item 2). LearningResult.id is sliced to 8
-  // chars for display, so the union must use this separate full-id list.
-  fullIds: string[];
 }
 
 function readStdin(): string {
@@ -211,139 +199,14 @@ export function isConversationalTurn(prompt: string): boolean {
 }
 
 /**
- * Capture the FULL untruncated learning UUIDs from recall results for the
- * surfaced-id union (issue #228 item 2). The display path slices ids to 8
- * chars for the hint; this MUST use the full id so exclusion works next turn.
+ * Build the `--surfaced-session <id>` argv fragment for already-surfaced
+ * filtering (issue #228 item 2), or [] when there is no session id. recall
+ * reads the session's surfaced ids, excludes them before ranking, and upserts
+ * the updated set itself — all in its own (already-warm) process, so the hook
+ * adds no separate DB subprocess to the prompt hot path.
  */
-export function extractFullIds(results: any[]): string[] {
-  if (!Array.isArray(results)) return [];
-  return results
-    .map((r) => (r && typeof r.id === 'string' ? r.id : ''))
-    .filter((id) => id.length > 0);
-}
-
-/**
- * Build the `--exclude-ids <uuid> ...` argv fragment, or [] (flag omitted)
- * when there is nothing to exclude.
- */
-export function buildExcludeArgs(ids: string[]): string[] {
-  if (!ids || ids.length === 0) return [];
-  return ['--exclude-ids', ...ids];
-}
-
-/**
- * Dedupe-union prior surfaced ids with freshly returned ids and bound the set
- * to `cap`. Freshly surfaced ids are kept preferentially (they sit at the tail
- * and the cap trims from the head) so the most recent picks always stay
- * excluded.
- */
-export function unionCap(prior: string[], fresh: string[], cap: number): string[] {
-  const merged: string[] = [];
-  const seen = new Set<string>();
-  for (const id of [...(prior || []), ...(fresh || [])]) {
-    if (!id || seen.has(id)) continue;
-    seen.add(id);
-    merged.push(id);
-  }
-  if (merged.length <= cap) return merged;
-  // Trim from the head; the tail (most-recently-surfaced) survives.
-  return merged.slice(merged.length - cap);
-}
-
-/**
- * Read prior surfaced learning ids for this session (issue #228 item 2).
- * Best-effort: any DB error / missing row / NULL column yields []. Keyed by the
- * sessions PK `id`, which session-register sets to the hook's stdin
- * input.session_id (id == claude_session_id for every registered session), so
- * this is a primary-key lookup (sessions_pkey) — no extra index needed.
- */
-export function readSurfacedIds(sessionId: string): string[] {
-  if (!sessionId) return [];
-  const pythonCode = `
-import asyncpg, json
-
-db_url = os.environ['CONTINUOUS_CLAUDE_DB_URL']
-session_id = sys.argv[1]
-
-async def main():
-    conn = await asyncpg.connect(db_url)
-    try:
-        row = await conn.fetchrow(
-            "SELECT surfaced_learning_ids FROM sessions WHERE id = $1",
-            session_id,
-        )
-    finally:
-        await conn.close()
-    ids = row['surfaced_learning_ids'] if row and row['surfaced_learning_ids'] else []
-    print(json.dumps([str(x) for x in ids]))
-
-asyncio.run(main())
-`;
-  try {
-    const res = runPgQuery(pythonCode, [sessionId]);
-    if (!res.success || !res.stdout) return [];
-    const parsed = JSON.parse(res.stdout);
-    if (!Array.isArray(parsed)) return [];
-    const ids = parsed.filter((x): x is string => typeof x === 'string' && x.length > 0);
-    // Defensive bound: a pre-existing oversized row (schema drift, or rows
-    // written before the cap was enforced) must not produce an unbounded
-    // --exclude-ids argv. Keep the most-recent tail, consistent with unionCap.
-    return ids.length > SURFACED_ID_CAP ? ids.slice(-SURFACED_ID_CAP) : ids;
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Persist the session's surfaced set (issue #228 item 2). The caller passes the
- * complete, already-deduped-and-capped array (via unionCap), so the write
- * REPLACES the column rather than re-unioning with the existing value — a
- * re-union would re-add ids that unionCap trimmed and let the array grow without
- * bound.
- *
- * Uses an UPSERT keyed on the PK `id` (== input.session_id for registered
- * sessions): a plain UPDATE silently no-ops with "UPDATE 0" if the SessionStart
- * row is missing (registration skipped/failed/cleaned), which would make the
- * feature never persist and re-surface forever. The INSERT branch creates a
- * minimal row so persistence still takes effect.
- *
- * Runs DETACHED (fire-and-forget): the result is only needed NEXT turn, so it
- * must not add a synchronous DB round-trip to the prompt-submit hot path on top
- * of recall's own budget. Per-session hook invocations are serial (one prompt
- * at a time), so last-writer-wins replace is safe. Best-effort: caps defensively
- * and swallows all errors so the hook never breaks.
- */
-export function persistSurfacedIds(sessionId: string, ids: string[]): void {
-  if (!sessionId || !ids || ids.length === 0) return;
-  // Keep the most-recent tail if somehow over cap (matches unionCap semantics).
-  const capped = ids.length > SURFACED_ID_CAP ? ids.slice(-SURFACED_ID_CAP) : ids;
-  const pythonCode = `
-import asyncpg, json
-
-db_url = os.environ['CONTINUOUS_CLAUDE_DB_URL']
-session_id = sys.argv[1]
-ids = json.loads(sys.argv[2])
-
-async def main():
-    conn = await asyncpg.connect(db_url)
-    try:
-        await conn.execute(
-            "INSERT INTO sessions (id, project, claude_session_id, surfaced_learning_ids) "
-            "VALUES ($1, '', $1, $2::uuid[]) "
-            "ON CONFLICT (id) DO UPDATE SET surfaced_learning_ids = EXCLUDED.surfaced_learning_ids",
-            session_id,
-            ids,
-        )
-    finally:
-        await conn.close()
-
-asyncio.run(main())
-`;
-  try {
-    runPgQueryDetached(pythonCode, [sessionId, JSON.stringify(capped)]);
-  } catch {
-    // Best-effort: never break the hook on a persistence failure.
-  }
+export function surfacedSessionArgs(sessionId: string | undefined): string[] {
+  return sessionId ? ['--surfaced-session', sessionId] : [];
 }
 
 /**
@@ -354,7 +217,7 @@ asyncio.run(main())
 function checkMemoryRelevance(
   intent: string,
   projectDir: string,
-  excludeIds: string[] = []
+  sessionId?: string
 ): MemoryMatch | null {
   if (!intent || intent.length < 3) return null;
 
@@ -401,10 +264,11 @@ function checkMemoryRelevance(
     '--source', 'hook',
     ...tagArgs,
     ...projectArgs,
-    // Issue #228 item 2: drop already-surfaced learnings BEFORE rank so the
-    // hook stops re-surfacing the same top memories every turn. Appended to
-    // the argv array (not shell) so full UUIDs are passed safely.
-    ...buildExcludeArgs(excludeIds)
+    // Issue #228 item 2: recall drops learnings already surfaced this session
+    // BEFORE ranking (and upserts the updated set) so the hook stops
+    // re-surfacing the same top memories every turn. Passing the session id
+    // (not an id list) keeps this to a single in-recall DB round-trip.
+    ...surfacedSessionArgs(sessionId)
   ], {
     encoding: 'utf-8',
     cwd: opcDir,
@@ -452,10 +316,7 @@ function checkMemoryRelevance(
 
     return {
       count: data.results.length,
-      results,
-      // Capture the FULL untruncated ids (not the 8-char display slice above)
-      // for the per-session exclusion union (issue #228 item 2).
-      fullIds: extractFullIds(data.results)
+      results
     };
   } catch {
     return null;
@@ -496,22 +357,13 @@ async function main() {
     return;
   }
 
-  // Issue #228 item 2: read learnings already surfaced this session so recall
-  // can exclude them BEFORE ranking (stops re-surfacing the same top memories
-  // every turn). Best-effort — readSurfacedIds swallows all DB errors to [].
-  const priorSurfaced = readSurfacedIds(input.session_id);
-
-  // Check memory relevance using semantic search
-  const match = checkMemoryRelevance(intent, projectDir, priorSurfaced);
+  // Check memory relevance using semantic search. Issue #228 item 2: passing
+  // the session id lets recall exclude already-surfaced learnings BEFORE
+  // ranking and persist the updated set itself (in-process), so the hook stops
+  // re-surfacing the same top memories every turn without a second subprocess.
+  const match = checkMemoryRelevance(intent, projectDir, input.session_id);
 
   if (match) {
-    // Union the freshly surfaced full UUIDs into the session's surfaced set so
-    // next turn excludes them too. Best-effort; capped and error-swallowing.
-    persistSurfacedIds(
-      input.session_id,
-      unionCap(priorSurfaced, match.fullIds, SURFACED_ID_CAP)
-    );
-
     // Build structured context for Claude
     const resultLines = match.results.map((r, i) =>
       `${i + 1}. [${r.type}] ${r.content} (id: ${r.id})`

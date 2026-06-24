@@ -241,12 +241,31 @@ return nothing, even when fresh lower-ranked candidates exist. The bump is
 bounded by the hook's surfaced-id cap, so the extra fetch and rerank cost stays
 small.
 
-Primary consumer: the `memory-awareness` UserPromptSubmit hook, which tracks the
-learning ids it has surfaced per session (in `sessions.surfaced_learning_ids`)
-and passes them here so it stops re-surfacing the same top memories every turn.
-The hook reads and upserts that column keyed on the sessions PK `id` (which
-session-register sets equal to the Claude session id), so the per-prompt lookup
-is a primary-key read needing no extra index.
+Most callers do not pass `--exclude-ids` directly — the `memory-awareness` hook
+uses `--surfaced-session` (below), which assembles the exclusion set in-process.
+
+### `--surfaced-session` (default: none)
+
+Already-surfaced filtering for the `memory-awareness` UserPromptSubmit hook
+(issue #228 item 2). Takes a session id (the `sessions` PK `id`, which
+session-register sets equal to the Claude session id). When set, recall:
+
+1. **reads** that session's `sessions.surfaced_learning_ids` (a primary-key
+   read, no extra index) and unions them into the exclusion set alongside any
+   explicit `--exclude-ids`, applied with the same before-rerank / after-pool-size
+   semantics described above;
+2. after output, **upserts** `surfaced_learning_ids` to the prior set unioned
+   with the ids returned this run (deduped, capped at the most-recent 500),
+   keyed on the PK `id` via `ON CONFLICT (id) DO UPDATE` so a missing
+   SessionStart row does not silently drop the write.
+
+Both the read and the write run **in this recall process** — the hook passes a
+single session id instead of reading the column itself and passing a long
+`--exclude-ids` list, so the prompt hot path pays only one Python/uv startup per
+turn. Both are time-bounded and best-effort: on any DB error the read degrades
+to no exclusion and the write is skipped, so recall never breaks. The read also
+over-fetches by the exclude-set size (see the backfill note above) so a session
+that already surfaced the top of the pool still gets fresh results.
 
 ### `--provider` (default: local)
 

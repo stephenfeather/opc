@@ -14,6 +14,7 @@
 import { readFileSync, existsSync } from 'fs';
 import { spawnSync } from 'child_process';
 import { getOpcDir } from './shared/opc-path.js';
+import { isValidId } from './shared/db-utils-pg.js';
 
 interface UserPromptSubmitInput {
   session_id: string;
@@ -206,7 +207,11 @@ export function isConversationalTurn(prompt: string): boolean {
  * adds no separate DB subprocess to the prompt hot path.
  */
 export function surfacedSessionArgs(sessionId: string | undefined): string[] {
-  return sessionId ? ['--surfaced-session', sessionId] : [];
+  // Validate before forwarding (parity with session-register, defense-in-depth):
+  // a session id outside SAFE_ID_PATTERN omits the flag, so recall just runs
+  // without exclusion. The downstream lookup is parameterized, so this is belt-
+  // and-suspenders, not the only guard.
+  return sessionId && isValidId(sessionId) ? ['--surfaced-session', sessionId] : [];
 }
 
 /**

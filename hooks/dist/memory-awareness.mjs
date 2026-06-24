@@ -46,6 +46,12 @@ function getOpcDir() {
   return null;
 }
 
+// src/shared/pattern-router.ts
+var SAFE_ID_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
+function isValidId(id) {
+  return SAFE_ID_PATTERN.test(id);
+}
+
 // src/memory-awareness.ts
 /*!
  * Memory Awareness Hook (UserPromptSubmit)
@@ -262,7 +268,7 @@ function isConversationalTurn(prompt) {
   return PRONOUN_IMPERATIVE.test(body) || SELECTION_IMPERATIVE.test(body);
 }
 function surfacedSessionArgs(sessionId) {
-  return sessionId ? ["--surfaced-session", sessionId] : [];
+  return sessionId && isValidId(sessionId) ? ["--surfaced-session", sessionId] : [];
 }
 function checkMemoryRelevance(intent, projectDir, sessionId) {
   if (!intent || intent.length < 3) return null;

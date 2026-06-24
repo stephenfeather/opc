@@ -867,7 +867,9 @@ class TestLLMRerankIntegration:
             ) as mock_llm,
             patch(
                 "sys.argv",
-                ["recall", "-q", "test", "--k", "5", "--llm-rerank", "--json"],
+                # Contrast to the --source hook gate (FINDING 3): a non-hook
+                # source (cli) DOES reach the LLM selector.
+                ["recall", "-q", "test", "--k", "5", "--llm-rerank", "--source", "cli", "--json"],
             ),
         ):
             from scripts.core.recall_learnings import main
@@ -974,10 +976,11 @@ class TestLLMRerankIntegration:
 
     @pytest.mark.asyncio
     async def test_main_falls_back_to_rerank_when_config_resolution_raises(self):
-        # Codex round 1 / FINDING 1: the graceful-fallback contract must cover
-        # failures at the CALL SITE (config resolution / module import), not just
-        # exceptions raised inside llm_select. If get_config() blows up under
-        # --llm-rerank, main() must still fall back to rerank() and return 0.
+        # Codex round 1 / FINDING 1 + round 2 / FINDING 4: a config-resolution
+        # failure under --llm-rerank must fall back to rerank() AND return 0
+        # (no crash). Round 2 additionally requires a VISIBLE stderr warning so
+        # an operator's malformed opc.toml / bad model id is not silently
+        # swallowed. (Stderr-text assertions live in the dedicated F4 test.)
         fake_results = _make_llm_results(3)
         with (
             patch("scripts.core.recall_learnings.get_backend", return_value="postgres"),
@@ -1012,7 +1015,7 @@ class TestLLMRerankIntegration:
             ) as mock_llm,
             patch(
                 "sys.argv",
-                ["recall", "-q", "test", "--k", "3", "--llm-rerank", "--json"],
+                ["recall", "-q", "test", "--k", "3", "--llm-rerank", "--source", "cli", "--json"],
             ),
         ):
             from scripts.core.recall_learnings import main
@@ -1022,6 +1025,120 @@ class TestLLMRerankIntegration:
             # config blew up BEFORE llm_select; selector never reached.
             mock_llm.assert_not_called()
             # graceful fallback: rerank ran with the configured k.
+            mock_rerank.assert_called_once()
+            assert mock_rerank.call_args.kwargs.get("k") == 3
+
+    @pytest.mark.asyncio
+    async def test_main_warns_on_stderr_when_config_resolution_fails(self, capsys):
+        # Codex round 2 / FINDING 4: config/model-resolution failure must be
+        # OPERATOR-VISIBLE (a stderr warning), not a DEBUG-only silent fallback —
+        # get_config() is called only here on the recall path, so a malformed
+        # opc.toml / invalid recall.llm_selector_model surfaces nowhere else.
+        # The warning must NOT leak config values or secrets, and main() must
+        # still fall back to rerank() and return 0.
+        fake_results = _make_llm_results(3)
+        secret_value = "super-secret-model-id-xyz"
+        with (
+            patch("scripts.core.recall_learnings.get_backend", return_value="postgres"),
+            patch(
+                "scripts.core.recall_learnings.search_learnings_hybrid_rrf",
+                new_callable=AsyncMock,
+                return_value=fake_results,
+            ),
+            patch(
+                "scripts.core.recall_learnings.enrich_with_kg_context",
+                new_callable=AsyncMock,
+                side_effect=lambda rs: rs,
+            ),
+            patch(
+                "scripts.core.recall_learnings.enrich_with_pattern_strength",
+                new_callable=AsyncMock,
+                side_effect=lambda rs: rs,
+            ),
+            patch(
+                "scripts.core.recall_learnings.record_recall", new_callable=AsyncMock
+            ),
+            patch(
+                "scripts.core.config.handlers.get_config",
+                side_effect=ValueError(f"bad config: {secret_value}"),
+            ),
+            patch(
+                "scripts.core.reranker.rerank",
+                side_effect=lambda results, ctx, k=5: results[:k],
+            ) as mock_rerank,
+            patch(
+                "scripts.core.llm_selector.llm_select", new_callable=AsyncMock
+            ) as mock_llm,
+            patch(
+                "sys.argv",
+                ["recall", "-q", "test", "--k", "3", "--llm-rerank", "--source", "cli", "--json"],
+            ),
+        ):
+            from scripts.core.recall_learnings import main
+
+            exit_code = await main()
+
+        captured = capsys.readouterr()
+        # (a) operator-visible stderr warning naming the flag + cause class
+        assert "--llm-rerank" in captured.err
+        assert "config" in captured.err.lower()
+        # (b) fallback ran
+        mock_rerank.assert_called_once()
+        mock_llm.assert_not_called()
+        # (c) no crash
+        assert exit_code == 0
+        # (d) no config values / secrets leaked into the warning (only the
+        #     exception TYPE name is allowed, never the message/value).
+        assert secret_value not in captured.err
+
+    @pytest.mark.asyncio
+    async def test_llm_rerank_skipped_for_hook_source(self):
+        # Codex round 2 / FINDING 3: the memory-awareness hook invokes recall
+        # with --source hook and KILLS the process at 5s (spawnSync). The LLM
+        # stage must NEVER run on that 5s-killed path, else a mid-call kill skips
+        # the fallback and the user gets NO recall output. Hard-gate it off for
+        # --source hook (verified: hooks/src/memory-awareness.ts:269 passes
+        # exactly "hook").
+        fake_results = _make_llm_results(3)
+        with (
+            patch("scripts.core.recall_learnings.get_backend", return_value="postgres"),
+            patch(
+                "scripts.core.recall_learnings.search_learnings_hybrid_rrf",
+                new_callable=AsyncMock,
+                return_value=fake_results,
+            ),
+            patch(
+                "scripts.core.recall_learnings.enrich_with_kg_context",
+                new_callable=AsyncMock,
+                side_effect=lambda rs: rs,
+            ),
+            patch(
+                "scripts.core.recall_learnings.enrich_with_pattern_strength",
+                new_callable=AsyncMock,
+                side_effect=lambda rs: rs,
+            ),
+            patch(
+                "scripts.core.recall_learnings.record_recall", new_callable=AsyncMock
+            ),
+            patch(
+                "scripts.core.reranker.rerank",
+                side_effect=lambda results, ctx, k=5: results[:k],
+            ) as mock_rerank,
+            patch(
+                "scripts.core.llm_selector.llm_select", new_callable=AsyncMock
+            ) as mock_llm,
+            patch(
+                "sys.argv",
+                ["recall", "-q", "test", "--k", "3", "--llm-rerank", "--source", "hook", "--json"],
+            ),
+        ):
+            from scripts.core.recall_learnings import main
+
+            exit_code = await main()
+            assert exit_code == 0
+            # Hard gate: hook-sourced calls NEVER touch the LLM selector.
+            mock_llm.assert_not_called()
+            # rerank still runs with the configured k.
             mock_rerank.assert_called_once()
             assert mock_rerank.call_args.kwargs.get("k") == 3
 

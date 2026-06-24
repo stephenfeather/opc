@@ -173,6 +173,15 @@ trimmed to `--k`).
 - **`--no-rerank` interaction:** `--llm-rerank` lives *inside* the rerank gate,
   so `--no-rerank` suppresses it too. Passing both `--no-rerank --llm-rerank`
   runs neither stage (raw retrieval order is returned).
+- **Ignored for `--source hook` calls** (the memory-awareness hook) until
+  recall is deadline-aware. The hook kills recall at 5s via `spawnSync`, and an
+  LLM call inside that budget risks dropping recall output entirely if killed
+  mid-call; this flag is intended for CLI/benchmark use until a recall-wide
+  pre-output deadline lands.
+- **Config errors are operator-visible:** if `recall.llm_selector_model` cannot
+  be resolved (e.g. a malformed `opc.toml`), recall prints a warning to stderr
+  (without the config value) and falls back to the contextual reranker rather
+  than silently degrading.
 - **`--k` is an upper bound, not a floor:** if the LLM selects fewer than `k`
   valid ids, recall returns only those (it does not pad). Selected rows carry
   the reranker output contract (`final_score`, `rerank_details` with

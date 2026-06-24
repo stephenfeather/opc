@@ -1377,26 +1377,51 @@ async def main() -> int:
         # there is no regression. ctx is built unconditionally above so the
         # fallback always has it. --k is preserved as the upper bound for both.
         selected = None
-        if args.llm_rerank:
-            # The graceful-fallback guarantee must cover the WHOLE call site, not
-            # just exceptions raised inside llm_select: config resolution and the
-            # module import happen here and could also fail. Wrap everything so
-            # any failure leaves selected=None and the line below falls back to
-            # the pure rerank(). Mirrors the hot-path degrade pattern above
-            # (:1346). Log only the exception type/details at DEBUG, never values.
+        # FINDING 3 (Codex round 2): the memory-awareness hook invokes recall
+        # with --source hook and KILLS the process at 5s (spawnSync, see
+        # hooks/src/memory-awareness.ts:269). Worst-case surfaced-read (1s) +
+        # type-affinity (1.5s) + a 2.5s LLM call can hit the whole budget; if the
+        # process is killed mid-LLM-call the graceful fallback to rerank() never
+        # runs and the user gets NO recall output. Recall has no recall-wide
+        # pre-output deadline yet, so HARD-GATE the LLM stage off for hook-sourced
+        # calls. The flag is off-by-default and not hook-wired today; this closes
+        # the future risk. Enabling LLM selection on the hook path requires a
+        # recall-wide pre-output deadline first.
+        if args.llm_rerank and args.source != "hook":
+            # FINDING 4 (Codex round 2): split the two failure classes so an
+            # operator's config error is not silently swallowed. Resolve the
+            # model id FIRST with its own guard: get_config() is called only here
+            # on the recall path, so a malformed opc.toml / invalid
+            # recall.llm_selector_model surfaces nowhere else — emit a VISIBLE
+            # stderr warning (never the config value) and fall back. The import +
+            # network/API/timeout failures below stay DEBUG-only silent degrade
+            # (genuine optional-dependency / outage cases, not operator error).
+            model = None
             try:
                 from scripts.core.config.handlers import get_config
-                from scripts.core.llm_selector import llm_select
 
-                selected = await llm_select(
-                    results,
-                    query=args.query,
-                    model=get_config().recall.llm_selector_model,
-                    k=args.k,
+                model = get_config().recall.llm_selector_model
+            except Exception as exc:  # noqa: BLE001 - operator-visible, then fall back
+                print(
+                    f"--llm-rerank: config error resolving llm_selector_model "
+                    f"({type(exc).__name__}); falling back to reranker",
+                    file=sys.stderr,
                 )
-            except Exception:  # noqa: BLE001 - degrade to contextual rerank
-                logger.debug("llm-rerank stage failed; falling back", exc_info=True)
-                selected = None
+                model = None
+
+            if model is not None:
+                try:
+                    from scripts.core.llm_selector import llm_select
+
+                    selected = await llm_select(
+                        results,
+                        query=args.query,
+                        model=model,
+                        k=args.k,
+                    )
+                except Exception:  # noqa: BLE001 - optional dep / outage: silent degrade
+                    logger.debug("llm-rerank stage failed; falling back", exc_info=True)
+                    selected = None
         results = selected if selected is not None else rerank(results, ctx, k=args.k)
 
     # Output FIRST: best-effort recall logging must never delay user-visible

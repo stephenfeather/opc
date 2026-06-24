@@ -169,6 +169,10 @@ class RecallConfig:
     # the hybrid RRF vector leg. Keep generous — RRF fuses ranks and
     # truncating the candidate set shifts scores for rows outside it.
     vector_candidate_multiplier: int = 8
+    # Issue #228 item 3: model id for the optional --llm-rerank selector stage.
+    # Follows the DaemonConfig.extraction_model pattern (str field + default).
+    # An operator can drop to a cheaper model (e.g. Haiku) to cut per-call cost.
+    llm_selector_model: str = "claude-sonnet-4-6"
 
 
 @dataclass(frozen=True)

@@ -1,0 +1,411 @@
+"""Tests for the LLM-as-selector recall stage (issue #228 item 3).
+
+TDD discipline: error/fallback paths are tested and implemented before happy
+paths. The orchestrator (`llm_select`) must return ``None`` on EVERY failure
+mode and must NEVER raise to the caller — ``None`` is the sentinel that tells
+the recall call site to fall back to the existing pure ``rerank()``.
+
+Mocking: the single httpx I/O edge is patched at
+``scripts.core.llm_selector.httpx.AsyncClient.post`` as an ``AsyncMock``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, patch
+
+import httpx
+import pytest
+
+from scripts.core.llm_selector import (
+    LLM_SELECTOR_TIMEOUT,
+    MANIFEST_DESC_MAXLEN,
+    apply_selection,
+    build_manifest,
+    call_anthropic,
+    llm_select,
+    parse_selection,
+)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_candidate(
+    *,
+    id: str,
+    learning_type: str | None = None,
+    content: str = "test content",
+    created_at: datetime | None = None,
+    similarity: float = 0.5,
+    extra: dict | None = None,
+) -> dict:
+    """Build a candidate result dict with a REAL distinct id.
+
+    The reranker's ``_make_result`` (tests/test_reranker.py) hardcodes
+    ``id="test-id"``; selection-by-id needs distinct ids, so this local helper
+    takes a real ``id`` kwarg.
+    """
+    metadata: dict = {"type": "session_learning"}
+    if learning_type is not None:
+        metadata["learning_type"] = learning_type
+    result: dict = {
+        "id": id,
+        "session_id": "test-session",
+        "content": content,
+        "metadata": metadata,
+        "similarity": similarity,
+    }
+    if created_at is not None:
+        result["created_at"] = created_at
+    if extra:
+        result.update(extra)
+    return result
+
+
+def _tool_use_response(ids: list[str]) -> dict:
+    """An Anthropic Messages API response shape with a forced tool_use block."""
+    return {
+        "id": "msg_test",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "toolu_test",
+                "name": "select_memories",
+                "input": {"selected_memories": ids},
+            }
+        ],
+        "stop_reason": "tool_use",
+    }
+
+
+def _fake_post_response(ids: list[str]) -> AsyncMock:
+    """A fake httpx.Response: no-op raise_for_status + tool_use json()."""
+    resp = AsyncMock()
+    resp.raise_for_status = lambda: None
+    resp.json = lambda: _tool_use_response(ids)
+    return resp
+
+
+# ===========================================================================
+# Phase A — pure functions
+# ===========================================================================
+
+
+# --- Step 1: apply_selection empty/None fallback (ERROR FIRST) ---
+class TestApplySelectionFallback:
+    def test_apply_selection_returns_none_on_empty_ids(self):
+        pool = [_make_candidate(id="a"), _make_candidate(id="b")]
+        assert apply_selection([], pool, k=5) is None
+
+    def test_apply_selection_returns_none_when_no_ids_in_pool(self):
+        pool = [_make_candidate(id="a"), _make_candidate(id="b")]
+        assert apply_selection(["x", "y"], pool, k=5) is None
+
+
+# --- Step 2: filters unknown, dedupes, preserves order, trims k, stamps shape ---
+class TestApplySelectionCore:
+    def test_apply_selection_filters_unknown_ids(self):
+        pool = [_make_candidate(id="a"), _make_candidate(id="b")]
+        out = apply_selection(["a", "zzz", "b"], pool, k=5)
+        assert [r["id"] for r in out] == ["a", "b"]
+
+    def test_apply_selection_dedupes_preserving_order(self):
+        pool = [_make_candidate(id="a"), _make_candidate(id="b")]
+        out = apply_selection(["b", "a", "b", "a"], pool, k=5)
+        assert [r["id"] for r in out] == ["b", "a"]
+
+    def test_apply_selection_trims_to_k(self):
+        pool = [_make_candidate(id=c) for c in ("a", "b", "c", "d")]
+        out = apply_selection(["a", "b", "c", "d"], pool, k=2)
+        assert [r["id"] for r in out] == ["a", "b"]
+
+    def test_apply_selection_stamps_record_shape(self):
+        pool = [
+            _make_candidate(id="a", content="alpha"),
+            _make_candidate(id="b", content="beta"),
+        ]
+        out = apply_selection(["b", "a"], pool, k=5, model="claude-sonnet-4-6")
+        # descending synthetic final_score in selection order
+        assert out[0]["final_score"] > out[1]["final_score"]
+        # rerank_details contract
+        assert out[0]["rerank_details"]["source"] == "llm_selector"
+        assert out[0]["rerank_details"]["model"] == "claude-sonnet-4-6"
+        assert out[0]["rerank_details"]["rank"] == 0
+        assert out[1]["rerank_details"]["rank"] == 1
+        # original keys preserved
+        assert out[0]["id"] == "b"
+        assert out[0]["content"] == "beta"
+        assert out[0]["similarity"] == 0.5
+
+    def test_apply_selection_does_not_mutate_input(self):
+        pool = [_make_candidate(id="a"), _make_candidate(id="b")]
+        before = [dict(r) for r in pool]
+        apply_selection(["a", "b"], pool, k=5)
+        assert pool == before
+        assert "final_score" not in pool[0]
+        assert "rerank_details" not in pool[0]
+
+
+# --- Step 3: parse_selection (PURE; error first) ---
+class TestParseSelection:
+    def test_parse_selection_empty_on_missing_tool_use(self):
+        resp = {"content": [{"type": "text", "text": "no tool use here"}]}
+        assert parse_selection(resp) == []
+
+    def test_parse_selection_empty_on_malformed_input(self):
+        resp = {"content": [{"type": "tool_use", "name": "select_memories", "input": {}}]}
+        assert parse_selection(resp) == []
+
+    def test_parse_selection_empty_on_non_list(self):
+        resp = {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "name": "select_memories",
+                    "input": {"selected_memories": "not-a-list"},
+                }
+            ]
+        }
+        assert parse_selection(resp) == []
+
+    def test_parse_selection_empty_on_empty_dict(self):
+        assert parse_selection({}) == []
+
+    def test_parse_selection_skips_non_dict_content_blocks(self):
+        # Defensive: a non-dict block in content must be skipped, not crash.
+        resp = {
+            "content": [
+                "junk",
+                None,
+                {
+                    "type": "tool_use",
+                    "name": "select_memories",
+                    "input": {"selected_memories": ["id1"]},
+                },
+            ]
+        }
+        assert parse_selection(resp) == ["id1"]
+
+    def test_parse_selection_extracts_id_list(self):
+        resp = _tool_use_response(["id2", "id1"])
+        assert parse_selection(resp) == ["id2", "id1"]
+
+    def test_parse_selection_ignores_non_string_items(self):
+        # Intentionally mixed-type list to exercise structural robustness.
+        resp = _tool_use_response(["id1", 5, None, "id2"])  # type: ignore[list-item]
+        assert parse_selection(resp) == ["id1", "id2"]
+
+
+# --- Step 4: build_manifest (PURE) ---
+class TestBuildManifest:
+    def test_build_manifest_format(self):
+        ts = datetime(2026, 6, 24, 12, 0, 0, tzinfo=UTC)
+        pool = [
+            _make_candidate(
+                id="abc",
+                learning_type="WORKING_SOLUTION",
+                content="fix the bug",
+                created_at=ts,
+            )
+        ]
+        manifest = build_manifest(pool)
+        assert "[WORKING_SOLUTION]" in manifest
+        assert "abc" in manifest
+        assert "fix the bug" in manifest
+        assert manifest.startswith("[WORKING_SOLUTION] abc (")
+
+    def test_manifest_truncates_long_content(self):
+        long = "x" * (MANIFEST_DESC_MAXLEN + 100)
+        pool = [_make_candidate(id="a", content=long)]
+        manifest = build_manifest(pool)
+        # the desc portion must not exceed the bound
+        desc = manifest.split("): ", 1)[1]
+        assert len(desc) <= MANIFEST_DESC_MAXLEN
+
+    def test_manifest_handles_missing_type_and_ts(self):
+        pool = [_make_candidate(id="a", learning_type=None, created_at=None)]
+        manifest = build_manifest(pool)
+        assert "[UNKNOWN]" in manifest
+        assert "(?)" in manifest
+
+    def test_manifest_one_line_per_candidate(self):
+        pool = [_make_candidate(id="a"), _make_candidate(id="b"), _make_candidate(id="c")]
+        manifest = build_manifest(pool)
+        assert len(manifest.splitlines()) == 3
+
+
+# ===========================================================================
+# Phase B — orchestrator (network mocked)
+# ===========================================================================
+
+
+# --- Step 5a: empty pool short-circuits (T2 mitigation, ERROR FIRST) ---
+class TestLLMSelectEmptyPool:
+    async def test_llm_select_returns_none_on_empty_pool(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+        with patch(
+            "scripts.core.llm_selector.httpx.AsyncClient.post",
+            new_callable=AsyncMock,
+        ) as mock_post:
+            out = await llm_select([], query="q", model="claude-sonnet-4-6", k=5)
+        assert out is None
+        mock_post.assert_not_called()
+
+
+# --- Step 5: missing API key (ERROR FIRST) ---
+class TestLLMSelectNoKey:
+    async def test_llm_select_returns_none_without_api_key(self, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        pool = [_make_candidate(id="a")]
+        with patch(
+            "scripts.core.llm_selector.httpx.AsyncClient.post",
+            new_callable=AsyncMock,
+        ) as mock_post:
+            out = await llm_select(pool, query="q", model="claude-sonnet-4-6", k=5)
+        assert out is None
+        mock_post.assert_not_called()
+
+
+# --- Step 6: API / network error ---
+class TestLLMSelectApiErrors:
+    async def test_llm_select_returns_none_on_http_error(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+        pool = [_make_candidate(id="a")]
+        err = httpx.HTTPStatusError(
+            "boom",
+            request=httpx.Request("POST", "http://x"),
+            response=httpx.Response(500),
+        )
+        with patch(
+            "scripts.core.llm_selector.httpx.AsyncClient.post",
+            new_callable=AsyncMock,
+            side_effect=err,
+        ):
+            out = await llm_select(pool, query="q", model="m", k=5)
+        assert out is None
+
+    async def test_llm_select_returns_none_on_request_error(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+        pool = [_make_candidate(id="a")]
+        err = httpx.RequestError("net down", request=httpx.Request("POST", "http://x"))
+        with patch(
+            "scripts.core.llm_selector.httpx.AsyncClient.post",
+            new_callable=AsyncMock,
+            side_effect=err,
+        ):
+            out = await llm_select(pool, query="q", model="m", k=5)
+        assert out is None
+
+
+# --- Step 7: timeout ---
+class TestLLMSelectTimeout:
+    async def test_llm_select_returns_none_on_timeout(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+        pool = [_make_candidate(id="a")]
+
+        async def slow_post(*args, **kwargs):
+            await asyncio.sleep(LLM_SELECTOR_TIMEOUT + 1.0)
+            return _fake_post_response(["a"])
+
+        with patch(
+            "scripts.core.llm_selector.httpx.AsyncClient.post",
+            new=slow_post,
+        ):
+            out = await llm_select(pool, query="q", model="m", k=5, timeout=0.05)
+        assert out is None
+
+    async def test_call_anthropic_closes_client_on_timeout(self, monkeypatch):
+        """T1 mitigation: a timeout cancellation MUST close the httpx client."""
+        closed = {"value": False}
+        real_aclose = httpx.AsyncClient.aclose
+
+        async def spy_aclose(self):
+            closed["value"] = True
+            await real_aclose(self)
+
+        async def slow_post(*args, **kwargs):
+            await asyncio.sleep(5.0)
+            return _fake_post_response(["a"])
+
+        with (
+            patch("scripts.core.llm_selector.httpx.AsyncClient.post", new=slow_post),
+            patch("scripts.core.llm_selector.httpx.AsyncClient.aclose", new=spy_aclose),
+        ):
+            with pytest.raises((asyncio.TimeoutError, TimeoutError)):
+                await call_anthropic(
+                    "manifest", "q", model="m", api_key="sk-ant-test", timeout=0.05
+                )
+        assert closed["value"] is True
+
+
+# --- Step 8: empty selection / unknown-only ---
+class TestLLMSelectEmptySelection:
+    async def test_llm_select_returns_none_on_empty_selection(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+        pool = [_make_candidate(id="a"), _make_candidate(id="b")]
+        with patch(
+            "scripts.core.llm_selector.httpx.AsyncClient.post",
+            new_callable=AsyncMock,
+            return_value=_fake_post_response([]),
+        ):
+            out = await llm_select(pool, query="q", model="m", k=5)
+        assert out is None
+
+    async def test_llm_select_returns_none_when_all_ids_unknown(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+        pool = [_make_candidate(id="a"), _make_candidate(id="b")]
+        with patch(
+            "scripts.core.llm_selector.httpx.AsyncClient.post",
+            new_callable=AsyncMock,
+            return_value=_fake_post_response(["zzz", "qqq"]),
+        ):
+            out = await llm_select(pool, query="q", model="m", k=5)
+        assert out is None
+
+
+# --- Step 9: happy path (HAPPY LAST) ---
+class TestLLMSelectHappy:
+    async def test_llm_select_returns_reordered_subset(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+        pool = [
+            _make_candidate(id="id1", content="one"),
+            _make_candidate(id="id2", content="two"),
+            _make_candidate(id="id3", content="three"),
+        ]
+        with patch(
+            "scripts.core.llm_selector.httpx.AsyncClient.post",
+            new_callable=AsyncMock,
+            return_value=_fake_post_response(["id2", "id1"]),
+        ):
+            out = await llm_select(pool, query="q", model="claude-sonnet-4-6", k=5)
+        assert [r["id"] for r in out] == ["id2", "id1"]
+        assert out[0]["final_score"] > out[1]["final_score"]
+        assert out[0]["rerank_details"]["source"] == "llm_selector"
+
+    async def test_llm_select_trims_to_k(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+        pool = [_make_candidate(id=f"id{i}") for i in range(5)]
+        with patch(
+            "scripts.core.llm_selector.httpx.AsyncClient.post",
+            new_callable=AsyncMock,
+            return_value=_fake_post_response(["id0", "id1", "id2", "id3"]),
+        ):
+            out = await llm_select(pool, query="q", model="m", k=2)
+        assert [r["id"] for r in out] == ["id0", "id1"]
+
+    async def test_llm_select_does_not_log_api_key(self, monkeypatch, caplog):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-supersecret-123")
+        pool = [_make_candidate(id="id1")]
+        with caplog.at_level("DEBUG"):
+            with patch(
+                "scripts.core.llm_selector.httpx.AsyncClient.post",
+                new_callable=AsyncMock,
+                return_value=_fake_post_response(["id1"]),
+            ):
+                await llm_select(pool, query="q", model="m", k=5)
+        assert "sk-ant-supersecret-123" not in caplog.text

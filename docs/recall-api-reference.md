@@ -153,6 +153,42 @@ Hard-filter: only return results sharing at least one tag with `--tags`. Applied
 
 Bypass contextual re-ranking. Returns raw retrieval scores. When set, `score` equals `raw_score`.
 
+### `--llm-rerank` (issue #228 item 3)
+
+**OFF by default.** After candidate retrieval, exclusion filtering, and
+enrichment, use an LLM to select and reorder the top results instead of the
+deterministic contextual reranker. The candidates are rendered as a compact
+manifest (`[type] id (timestamp): description`) and sent to the Anthropic
+Messages API via a single forced tool-use call that returns
+`{"selected_memories": ["id", ...]}`. The returned ids are mapped back onto the
+candidate pool (unknown ids dropped, duplicates removed, order preserved, then
+trimmed to `--k`).
+
+- **Fallback semantics (no regression):** the selector returns nothing and
+  recall falls back to the standard contextual reranker on **every** failure
+  mode — empty candidate pool, missing `ANTHROPIC_API_KEY`, API/network error,
+  timeout (bounded at 2.5s), malformed output, or an empty / all-unknown
+  selection. Because the fallback is the existing reranker, enabling
+  `--llm-rerank` can never produce worse results than the default path.
+- **`--no-rerank` interaction:** `--llm-rerank` lives *inside* the rerank gate,
+  so `--no-rerank` suppresses it too. Passing both `--no-rerank --llm-rerank`
+  runs neither stage (raw retrieval order is returned).
+- **`--k` is an upper bound, not a floor:** if the LLM selects fewer than `k`
+  valid ids, recall returns only those (it does not pad). Selected rows carry
+  the reranker output contract (`final_score`, `rerank_details` with
+  `"source": "llm_selector"`), so JSON output and telemetry are unaffected.
+- **Requirements:** `ANTHROPIC_API_KEY` must be set in the environment. The
+  model is the `recall.llm_selector_model` config field (default
+  `claude-sonnet-4-6`); set it to a cheaper model (e.g. a Haiku) in `opc.toml`
+  to reduce per-call cost.
+- **Cost (issue #228 E3):** each `--llm-rerank` recall makes **one** Sonnet
+  Messages API call — a manifest of roughly 50 short candidate lines in, and a
+  small id list out (well under 1k output tokens). This is a per-recall cost
+  only when the flag is explicitly passed; the default recall path (and the
+  memory-awareness hook) make no LLM call. If the selector is ever enabled in a
+  hot path, weigh both the per-call token cost and the added latency, and
+  consider dropping `recall.llm_selector_model` to a cheaper model.
+
 ### `--project`
 
 Project context for re-ranking. Default: auto-detected from `CLAUDE_PROJECT_DIR`.

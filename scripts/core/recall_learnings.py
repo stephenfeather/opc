@@ -1057,6 +1057,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tags", nargs="+", help="Boost results matching these tags")
     parser.add_argument("--tags-strict", action="store_true", help="Hard-filter by tags")
     parser.add_argument("--no-rerank", action="store_true", help="Bypass re-ranking")
+    parser.add_argument(
+        "--llm-rerank",
+        action="store_true",
+        default=False,
+        help=(
+            "After candidate retrieval, use an LLM to select and reorder results "
+            "(issue #228 item 3). OFF by default. Falls back to the contextual "
+            "reranker on empty selection or any LLM failure. Ignored when "
+            "--no-rerank is set. Requires ANTHROPIC_API_KEY; model is the "
+            "recall.llm_selector_model config field (default claude-sonnet-4-6)."
+        ),
+    )
     parser.add_argument("--no-expand", action="store_true", help="Disable TF-IDF query expansion")
     parser.add_argument("--expand-terms", type=int, default=5, help="Expansion terms (default: 5)")
     parser.add_argument("--rebuild-idf", action="store_true", help="Force rebuild IDF index")
@@ -1357,7 +1369,25 @@ async def main() -> int:
         )
         from scripts.core.reranker import rerank
 
-        results = rerank(results, ctx, k=args.k)
+        # Issue #228 item 3: optional LLM-as-selector. OFF by default and sits
+        # INSIDE the --no-rerank gate, so --no-rerank suppresses it too. The
+        # selector returns None on EVERY failure mode (empty pool, missing key,
+        # API/timeout/network error, malformed output, empty/unknown-only
+        # selection); on None we fall back to the pure contextual rerank() so
+        # there is no regression. ctx is built unconditionally above so the
+        # fallback always has it. --k is preserved as the upper bound for both.
+        selected = None
+        if args.llm_rerank:
+            from scripts.core.config.handlers import get_config
+            from scripts.core.llm_selector import llm_select
+
+            selected = await llm_select(
+                results,
+                query=args.query,
+                model=get_config().recall.llm_selector_model,
+                k=args.k,
+            )
+        results = selected if selected is not None else rerank(results, ctx, k=args.k)
 
     # Output FIRST: best-effort recall logging must never delay user-visible
     # output under the memory-awareness hook's 5s spawn timeout (issue #140).

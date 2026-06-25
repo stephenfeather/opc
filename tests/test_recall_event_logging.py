@@ -191,10 +191,14 @@ class TestRecordRecallLogging:
         assert args[2] == ["opc", None]  # parallel array preserves NULL element
         assert args[3] == 2
         assert args[4] == "hook"
-        # Issue #228: INSERT is now 7 columns (pool_size/fetch_k appended).
-        assert len(args) == 7
+        # Feedback loop: INSERT is now 10 columns (session_id/query_hash/
+        # query_text appended after pool_size/fetch_k).
+        assert len(args) == 10
         assert args[5] is None  # pool_size unset here -> NULL
         assert args[6] is None  # fetch_k unset here -> NULL
+        assert args[7] is None  # session_id unset here -> NULL
+        assert args[8] is None  # query_hash (no query_text passed) -> NULL
+        assert args[9] is None  # query_text (gated off / unset) -> NULL
 
     async def test_insert_binds_pool_size_and_fetch_k(self, monkeypatch):
         # Issue #228: pool_size/fetch_k are bound as $6/$7 so selection rate
@@ -235,10 +239,10 @@ class TestRecordRecallLogging:
     async def test_pre_migration_columns_absent_falls_back_to_legacy_insert(
         self, monkeypatch
     ):
-        # Issue #228: recall_log exists but add_recall_log_pool_size.sql hasn't
-        # run, so pool_size/fetch_k are absent. The 7-col INSERT raises
-        # UndefinedColumnError; record_recall must fall back to the legacy
-        # 5-col INSERT so the #140 recall event is STILL logged. Must not raise.
+        # A DB missing pool_size/fetch_k also lacks the newer query-link columns,
+        # so both the 10-col (query-link) and 7-col (pool_size) INSERTs raise
+        # UndefinedColumnError; record_recall must walk down to the legacy 5-col
+        # INSERT so the #140 recall event is STILL logged. Must not raise.
         rid = str(uuid.uuid4())
         conn = _CapturingConn(
             fetch_rows=[_row(rid, "opc")], undefined_column="pool_size"
@@ -248,14 +252,20 @@ class TestRecordRecallLogging:
 
         await record_recall([rid], caller_project="opc", pool_size=50, fetch_k=50)
 
-        assert len(conn.execute_calls) == 2
-        first_sql, _first_args = conn.execute_calls[0]
-        second_sql, second_args = conn.execute_calls[1]
-        # First attempt was the 7-col INSERT (mentions pool_size) and failed.
+        # Three tiers attempted: 10-col query-link, 7-col pool_size, 5-col legacy.
+        assert len(conn.execute_calls) == 3
+        first_sql, _first = conn.execute_calls[0]
+        second_sql, _second = conn.execute_calls[1]
+        legacy_sql, legacy_args = conn.execute_calls[2]
+        # The first two tiers mention pool_size (and failed); the query-link tier
+        # additionally mentions session_id.
+        assert "session_id" in first_sql
         assert "pool_size" in first_sql
+        assert "pool_size" in second_sql
+        assert "session_id" not in second_sql
         # Fallback is the legacy 5-col INSERT: no pool_size, exactly 5 args.
-        assert "pool_size" not in second_sql
-        assert len(second_args) == 5
+        assert "pool_size" not in legacy_sql
+        assert len(legacy_args) == 5
 
     async def test_backward_compatible_pool_size_defaults_none(self, monkeypatch):
         # Issue #228: omitting pool_size/fetch_k binds them as NULL ("rate
@@ -546,11 +556,14 @@ class TestMainWiring:
         captured: dict = {}
 
         async def fake_record(
-            ids, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+            ids, *, caller_project=None, source=None, pool_size=None, fetch_k=None,
+            session_id=None, query_text=None
         ):
             captured["ids"] = ids
             captured["caller_project"] = caller_project
             captured["source"] = source
+            captured["session_id"] = session_id
+            captured["query_text"] = query_text
 
         monkeypatch.setattr(rl, "record_recall", fake_record)
 
@@ -558,6 +571,10 @@ class TestMainWiring:
         assert rc == 0
         assert captured["caller_project"] == "foo"  # canonicalized
         assert captured["source"] == "hook"
+        # Query linkage for the feedback loop: raw query is handed to
+        # record_recall, which applies the log_query_text privacy gate itself.
+        assert captured["query_text"] == "x"
+        assert captured["session_id"] is None  # no --surfaced-session in argv
 
     async def test_json_full_skips_record_recall(self, monkeypatch):
         import scripts.core.recall_learnings as rl
@@ -591,7 +608,8 @@ class TestMainWiring:
         called = {"record": False}
 
         async def fake_record(
-            ids, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+            ids, *, caller_project=None, source=None, pool_size=None, fetch_k=None,
+            session_id=None, query_text=None
         ):
             called["record"] = True
 
@@ -637,7 +655,8 @@ class TestMainWiring:
             return ""
 
         async def fake_record(
-            ids, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+            ids, *, caller_project=None, source=None, pool_size=None, fetch_k=None,
+            session_id=None, query_text=None
         ):
             order.append("record")
 
@@ -689,7 +708,8 @@ class TestMainWiring:
         monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(a[0] if a else ""))
 
         async def slow_record(
-            ids, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+            ids, *, caller_project=None, source=None, pool_size=None, fetch_k=None,
+            session_id=None, query_text=None
         ):
             await asyncio.sleep(5)  # far longer than the injected 0.05 bound
 
@@ -753,7 +773,8 @@ class TestMainWiring:
         captured: dict = {}
 
         async def fake_record(
-            ids, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+            ids, *, caller_project=None, source=None, pool_size=None, fetch_k=None,
+            session_id=None, query_text=None
         ):
             captured["ids"] = ids
             captured["pool_size"] = pool_size
@@ -804,7 +825,8 @@ class TestMainWiring:
         captured: dict = {}
 
         async def fake_record(
-            ids, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+            ids, *, caller_project=None, source=None, pool_size=None, fetch_k=None,
+            session_id=None, query_text=None
         ):
             captured["pool_size"] = pool_size
             captured["fetch_k"] = fetch_k
@@ -892,7 +914,8 @@ class TestExcludeIds:
         captured: dict = {}
 
         async def fake_record(
-            ids, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+            ids, *, caller_project=None, source=None, pool_size=None, fetch_k=None,
+            session_id=None, query_text=None
         ):
             captured["ids"] = list(ids)
 
@@ -932,7 +955,8 @@ class TestExcludeIds:
         captured: dict = {}
 
         async def fake_record(
-            ids_arg, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+            ids_arg, *, caller_project=None, source=None, pool_size=None, fetch_k=None,
+            session_id=None, query_text=None
         ):
             captured["pool_size"] = pool_size
             captured["ids"] = list(ids_arg)
@@ -968,7 +992,8 @@ class TestExcludeIds:
         captured: dict = {}
 
         async def fake_record(
-            ids_arg, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+            ids_arg, *, caller_project=None, source=None, pool_size=None, fetch_k=None,
+            session_id=None, query_text=None
         ):
             captured["fetch_k"] = fetch_k
 
@@ -1001,7 +1026,8 @@ class TestExcludeIds:
         self._wire(monkeypatch, rl, reranker_mod, results)
 
         async def fake_record(
-            ids_arg, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+            ids_arg, *, caller_project=None, source=None, pool_size=None, fetch_k=None,
+            session_id=None, query_text=None
         ):
             return None
 
@@ -1027,7 +1053,8 @@ class TestExcludeIds:
         captured: dict = {}
 
         async def fake_record(
-            ids_arg, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+            ids_arg, *, caller_project=None, source=None, pool_size=None, fetch_k=None,
+            session_id=None, query_text=None
         ):
             captured["ids"] = list(ids_arg)
             captured["pool_size"] = pool_size
@@ -1054,7 +1081,8 @@ class TestExcludeIds:
         self._wire(monkeypatch, rl, reranker_mod, results)
 
         async def fake_record(
-            ids_arg, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+            ids_arg, *, caller_project=None, source=None, pool_size=None, fetch_k=None,
+            session_id=None, query_text=None
         ):
             return None
 
@@ -1089,7 +1117,8 @@ class TestExcludeIds:
         captured: dict = {}
 
         async def fake_record(
-            ids_arg, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+            ids_arg, *, caller_project=None, source=None, pool_size=None, fetch_k=None,
+            session_id=None, query_text=None
         ):
             captured["ids"] = [str(i) for i in ids_arg]
 
@@ -1156,7 +1185,8 @@ class TestSurfacedSession:
             return res
 
         async def fake_record(
-            ids_arg, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+            ids_arg, *, caller_project=None, source=None, pool_size=None, fetch_k=None,
+            session_id=None, query_text=None
         ):
             return None
 
@@ -1297,7 +1327,8 @@ class TestSurfacedSession:
         captured: dict = {}
 
         async def fake_record(
-            ids_arg, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+            ids_arg, *, caller_project=None, source=None, pool_size=None, fetch_k=None,
+            session_id=None, query_text=None
         ):
             captured["fetch_k"] = fetch_k
 

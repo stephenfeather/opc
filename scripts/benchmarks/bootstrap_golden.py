@@ -19,6 +19,7 @@ import sys
 import textwrap
 from pathlib import Path
 
+from scripts.core.content_hash import content_hash
 
 FETCH_K = 20  # candidates shown per query
 
@@ -174,14 +175,23 @@ async def bootstrap(
             skipped += 1
             print("  Skipped.")
         else:
-            golden_ids = [
-                results[idx].get("id", "")
-                for idx in selection
-                if results[idx].get("id")
+            selected = [results[idx] for idx in selection]
+            golden_ids = [r.get("id", "") for r in selected if r.get("id")]
+            # Re-anchor: store content hashes alongside UUIDs so the golden set
+            # survives a fresh DB where ids differ (run_rerank_benchmark matches
+            # on these first). Same canonical hash used at memory-store time.
+            golden_hashes = [
+                content_hash(r["content"])
+                for r in selected
+                if r.get("content")
             ]
             q["golden_ids"] = golden_ids
+            q["golden_hashes"] = golden_hashes
             annotated += 1
-            print(f"  Marked {len(golden_ids)} results as relevant.")
+            print(
+                f"  Marked {len(golden_ids)} results as relevant "
+                f"({len(golden_hashes)} content-hash anchored)."
+            )
 
         print()
 

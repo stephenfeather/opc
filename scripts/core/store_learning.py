@@ -40,7 +40,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import faulthandler
-import hashlib
 import json
 import logging
 import os
@@ -96,6 +95,7 @@ LEARNING_TYPES = [
 CONFIDENCE_LEVELS = ["high", "medium", "low"]
 
 from scripts.core.config import get_config as _get_config  # noqa: E402
+from scripts.core.content_hash import content_hash as compute_content_hash  # noqa: E402
 from scripts.core.db.backend_resolution import (  # noqa: E402
     get_connection_url,
     resolve_backend,
@@ -760,8 +760,9 @@ async def store_learning_v2(
     try:
         memory = await create_memory_service(backend=backend, session_id=session_id)
 
-        # Compute content hash for deduplication
-        content_hash = hashlib.sha256(content.strip().encode()).hexdigest()
+        # Compute content hash for deduplication. Canonical definition lives in
+        # content_hash.py so the rerank benchmark's golden-set hashes stay in sync.
+        content_hash = compute_content_hash(content)
 
         # Generate embedding
         embed_provider = os.getenv("EMBEDDING_PROVIDER", "local")

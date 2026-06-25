@@ -29,6 +29,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from scripts.core.content_hash import content_hash
 from scripts.core.llm_selector import _parse_timeout
 from scripts.core.reranker import RecallContext, RerankerConfig, rerank
 
@@ -88,12 +89,26 @@ def is_relevant(
     content: str,
     golden_ids: list[str],
     golden_keywords: list[str],
+    *,
+    golden_hashes: list[str] | None = None,
+    golden_negatives: list[str] | None = None,
 ) -> bool:
-    """Check if a result is relevant based on golden IDs or keywords.
+    """Check if a result is relevant against the golden judgments.
 
-    When golden_ids are present they are authoritative — keyword matching
-    is only used as a fallback when no curated IDs exist.
+    Precedence (most robust first):
+      1. ``golden_negatives`` — a content-hash judged unhelpful is never relevant,
+         overriding any positive signal below.
+      2. ``golden_hashes`` — content-hash match (instance-independent; survives a
+         fresh DB where UUIDs differ). This is the re-anchored ground truth.
+      3. ``golden_ids`` — legacy UUID match (only meaningful on the same DB).
+      4. ``golden_keywords`` — substring fallback when no curated labels exist.
     """
+    if golden_negatives or golden_hashes:
+        h = content_hash(content)
+        if golden_negatives and h in golden_negatives:
+            return False
+        if golden_hashes:
+            return h in golden_hashes
     if golden_ids:
         return result_id in golden_ids
     if golden_keywords:
@@ -107,6 +122,9 @@ def compute_precision_at_k(
     result_contents: list[str],
     golden_ids: list[str],
     golden_keywords: list[str],
+    *,
+    golden_hashes: list[str] | None = None,
+    golden_negatives: list[str] | None = None,
 ) -> float:
     """Fraction of top-k results that match the golden set."""
     if not result_ids:
@@ -114,7 +132,10 @@ def compute_precision_at_k(
     relevant = sum(
         1
         for rid, content in zip(result_ids, result_contents)
-        if is_relevant(rid, content, golden_ids, golden_keywords)
+        if is_relevant(
+            rid, content, golden_ids, golden_keywords,
+            golden_hashes=golden_hashes, golden_negatives=golden_negatives,
+        )
     )
     return relevant / len(result_ids)
 
@@ -125,6 +146,9 @@ def compute_ndcg(
     golden_ids: list[str],
     golden_keywords: list[str],
     k: int,
+    *,
+    golden_hashes: list[str] | None = None,
+    golden_negatives: list[str] | None = None,
 ) -> float:
     """Normalized Discounted Cumulative Gain at k."""
     if not result_ids:
@@ -136,14 +160,17 @@ def compute_ndcg(
         zip(result_ids[:k], result_contents[:k])
     ):
         rel = 1.0 if is_relevant(
-            rid, content, golden_ids, golden_keywords
+            rid, content, golden_ids, golden_keywords,
+            golden_hashes=golden_hashes, golden_negatives=golden_negatives,
         ) else 0.0
         dcg += rel / math.log2(i + 2)  # i+2 because rank is 1-indexed
 
     # Compute ideal DCG (all relevant items at top).
     # Use the full golden set size, not just retrieved relevant items,
     # so IDCG reflects total judged positives.
-    if golden_ids:
+    if golden_hashes:
+        num_relevant = len(golden_hashes)
+    elif golden_ids:
         num_relevant = len(golden_ids)
     elif golden_keywords:
         # Keywords: count from retrieved results (no external ground truth)
@@ -166,12 +193,18 @@ def compute_mrr(
     result_contents: list[str],
     golden_ids: list[str],
     golden_keywords: list[str],
+    *,
+    golden_hashes: list[str] | None = None,
+    golden_negatives: list[str] | None = None,
 ) -> float:
     """Mean Reciprocal Rank of first relevant result."""
     for i, (rid, content) in enumerate(
         zip(result_ids, result_contents)
     ):
-        if is_relevant(rid, content, golden_ids, golden_keywords):
+        if is_relevant(
+            rid, content, golden_ids, golden_keywords,
+            golden_hashes=golden_hashes, golden_negatives=golden_negatives,
+        ):
             return 1.0 / (i + 1)
     return 0.0
 
@@ -441,6 +474,9 @@ def compute_comparison_metrics(
     golden_keywords: list[str],
     k: int,
     llm: QueryResult | None = None,
+    *,
+    golden_hashes: list[str] | None = None,
+    golden_negatives: list[str] | None = None,
 ) -> ComparisonMetrics:
     """Assemble per-query metrics from the reranked, raw, and optional LLM arms.
 
@@ -451,29 +487,33 @@ def compute_comparison_metrics(
     reranked vs raw (the LLM arm filters/reorders independently of the linear
     reranker's per-signal contributions, which it does not expose).
     """
+    labels = {
+        "golden_hashes": golden_hashes,
+        "golden_negatives": golden_negatives,
+    }
     p_reranked = compute_precision_at_k(
         reranked.result_ids, reranked.result_contents,
-        golden_ids, golden_keywords,
+        golden_ids, golden_keywords, **labels,
     )
     p_raw = compute_precision_at_k(
         raw.result_ids, raw.result_contents,
-        golden_ids, golden_keywords,
+        golden_ids, golden_keywords, **labels,
     )
     ndcg_reranked = compute_ndcg(
         reranked.result_ids, reranked.result_contents,
-        golden_ids, golden_keywords, k,
+        golden_ids, golden_keywords, k, **labels,
     )
     ndcg_raw = compute_ndcg(
         raw.result_ids, raw.result_contents,
-        golden_ids, golden_keywords, k,
+        golden_ids, golden_keywords, k, **labels,
     )
     mrr_reranked = compute_mrr(
         reranked.result_ids, reranked.result_contents,
-        golden_ids, golden_keywords,
+        golden_ids, golden_keywords, **labels,
     )
     mrr_raw = compute_mrr(
         raw.result_ids, raw.result_contents,
-        golden_ids, golden_keywords,
+        golden_ids, golden_keywords, **labels,
     )
     mean_disp, max_disp = compute_rank_displacement(
         reranked.result_ids, raw.result_ids,
@@ -487,15 +527,15 @@ def compute_comparison_metrics(
     if llm is not None:
         p_llm = compute_precision_at_k(
             llm.result_ids, llm.result_contents,
-            golden_ids, golden_keywords,
+            golden_ids, golden_keywords, **labels,
         )
         ndcg_llm = compute_ndcg(
             llm.result_ids, llm.result_contents,
-            golden_ids, golden_keywords, k,
+            golden_ids, golden_keywords, k, **labels,
         )
         mrr_llm = compute_mrr(
             llm.result_ids, llm.result_contents,
-            golden_ids, golden_keywords,
+            golden_ids, golden_keywords, **labels,
         )
         llm_elapsed = llm.elapsed_ms
 
@@ -578,6 +618,8 @@ async def run_benchmark(
         llm = all_results[base + 2] if with_llm else None
         golden_ids = q.get("golden_ids", [])
         golden_keywords = q.get("golden_keywords", [])
+        golden_hashes = q.get("golden_hashes", [])
+        golden_negatives = q.get("golden_negatives", [])
         k = q.get("k", 5)
 
         # Cross-arm evidence check (Finding 1, round 2): decided here where all
@@ -600,6 +642,7 @@ async def run_benchmark(
 
         metrics = compute_comparison_metrics(
             reranked, raw, golden_ids, golden_keywords, k, llm=llm,
+            golden_hashes=golden_hashes, golden_negatives=golden_negatives,
         )
         output.append((reranked, raw, metrics))
 
@@ -1055,6 +1098,8 @@ def sweep_rerank(
             k = q.get("k", 5)
             golden_ids = q.get("golden_ids", [])
             golden_keywords = q.get("golden_keywords", [])
+            golden_hashes = q.get("golden_hashes", [])
+            golden_negatives = q.get("golden_negatives", [])
             raw_items = cached_results.get(qid, [])
 
             ctx = RecallContext(
@@ -1071,14 +1116,18 @@ def sweep_rerank(
             rids = [r.get("id", "") for r in reranked]
             rcontents = [r.get("content", "") for r in reranked]
 
+            labels = {
+                "golden_hashes": golden_hashes,
+                "golden_negatives": golden_negatives,
+            }
             p_at_k_vals.append(compute_precision_at_k(
-                rids, rcontents, golden_ids, golden_keywords,
+                rids, rcontents, golden_ids, golden_keywords, **labels,
             ))
             ndcg_vals.append(compute_ndcg(
-                rids, rcontents, golden_ids, golden_keywords, k,
+                rids, rcontents, golden_ids, golden_keywords, k, **labels,
             ))
             mrr_vals.append(compute_mrr(
-                rids, rcontents, golden_ids, golden_keywords,
+                rids, rcontents, golden_ids, golden_keywords, **labels,
             ))
 
         n = len(queries)
@@ -1095,6 +1144,85 @@ def sweep_rerank(
         })
 
     return sweep_results
+
+
+def build_reranker_config(wc: dict) -> RerankerConfig:
+    """Construct a RerankerConfig from a WEIGHT_SWEEPS entry (name + 7 weights)."""
+    return RerankerConfig(
+        project_weight=wc["project_weight"],
+        recency_weight=wc["recency_weight"],
+        confidence_weight=wc["confidence_weight"],
+        recall_weight=wc["recall_weight"],
+        type_affinity_weight=wc["type_affinity_weight"],
+        tag_overlap_weight=wc["tag_overlap_weight"],
+        pattern_weight=wc["pattern_weight"],
+    )
+
+
+def _percentile(values: list[float], pct: float) -> float:
+    """Nearest-rank percentile (small-n friendly). Empty -> 0.0."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    # nearest-rank: ceil(pct/100 * n), 1-indexed
+    rank = max(1, math.ceil(pct / 100.0 * len(ordered)))
+    return ordered[rank - 1]
+
+
+def evaluate_config(
+    cached_results: dict[str, list[dict]],
+    queries: list[dict],
+    config: RerankerConfig,
+) -> dict:
+    """Score one RerankerConfig over cached candidate pools.
+
+    Returns mean NDCG@5 / P@k / MRR plus p95 in-process rerank latency — the
+    headline metric and its latency co-metric for the tuning loop's keep/discard
+    rule. Reuses the same metric functions and golden precedence as the A/B
+    benchmark, so a loop result is comparable to a hand-run benchmark.
+    """
+    ndcg_vals: list[float] = []
+    p_at_k_vals: list[float] = []
+    mrr_vals: list[float] = []
+    latencies_ms: list[float] = []
+
+    for q in queries:
+        qid = q["id"]
+        k = q.get("k", 5)
+        raw_items = cached_results.get(qid, [])
+        ctx = RecallContext(
+            project=q.get("project"),
+            tags_hint=q.get("tags") or None,
+            retrieval_mode="hybrid_rrf",
+        )
+
+        start = time.perf_counter()
+        if config.total_signal_weight > 0:
+            reranked = rerank(raw_items, ctx, config=config, k=k)
+        else:
+            reranked = raw_items[:k]
+        latencies_ms.append((time.perf_counter() - start) * 1000.0)
+
+        rids = [r.get("id", "") for r in reranked]
+        rcontents = [r.get("content", "") for r in reranked]
+        labels = {
+            "golden_hashes": q.get("golden_hashes", []),
+            "golden_negatives": q.get("golden_negatives", []),
+        }
+        gids = q.get("golden_ids", [])
+        gkw = q.get("golden_keywords", [])
+        p_at_k_vals.append(compute_precision_at_k(rids, rcontents, gids, gkw, **labels))
+        ndcg_vals.append(compute_ndcg(rids, rcontents, gids, gkw, k, **labels))
+        mrr_vals.append(compute_mrr(rids, rcontents, gids, gkw, **labels))
+
+    n = len(queries) or 1
+    return {
+        "ndcg_at_k": round(sum(ndcg_vals) / n, 4),
+        "precision_at_k": round(sum(p_at_k_vals) / n, 4),
+        "mrr": round(sum(mrr_vals) / n, 4),
+        "p95_latency_ms": round(_percentile(latencies_ms, 95), 3),
+        "n": len(queries),
+    }
 
 
 def print_sweep_summary(sweep_results: list[dict]) -> None:
@@ -1138,6 +1266,25 @@ def print_sweep_summary(sweep_results: list[dict]) -> None:
 # CLI
 # -------------------------------------------------------------------
 
+def filter_by_split(queries: list[dict], split: str) -> list[dict]:
+    """Return queries belonging to ``split`` ('train' | 'holdout' | 'all').
+
+    The held-out split exists so the tuning loop can decide keep/discard on
+    queries it never optimized against (report §6.1 — guards against tuning to
+    noise on a tiny set). A query with no ``split`` key is unlabeled; if the file
+    has no labels at all the filter is a no-op (back-compat) with a warning.
+    """
+    if split == "all":
+        return queries
+    if not any("split" in q for q in queries):
+        print(
+            f"  WARN: query file has no 'split' labels; --split {split} ignored",
+            file=sys.stderr,
+        )
+        return queries
+    return [q for q in queries if q.get("split") == split]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="A/B benchmark for reranker vs raw retrieval"
@@ -1165,6 +1312,15 @@ def parse_args() -> argparse.Namespace:
         help="Run weight sensitivity sweep across configurations",
     )
     parser.add_argument(
+        "--split",
+        choices=["train", "holdout", "all"],
+        default="all",
+        help=(
+            "Evaluate only queries tagged with this split (default: all). "
+            "'holdout' is the tuning loop's keep/discard decision set."
+        ),
+    )
+    parser.add_argument(
         "--llm-rerank",
         action="store_true",
         help=(
@@ -1181,8 +1337,11 @@ async def async_main() -> int:
 
     # Load queries
     query_data = json.loads(args.queries.read_text())
-    queries = query_data["queries"]
-    print(f"Loaded {len(queries)} benchmark queries from {args.queries}")
+    queries = filter_by_split(query_data["queries"], args.split)
+    print(
+        f"Loaded {len(queries)} benchmark queries from {args.queries} "
+        f"(split={args.split})"
+    )
 
     # Run benchmark
     if args.llm_rerank and not os.environ.get("ANTHROPIC_API_KEY"):

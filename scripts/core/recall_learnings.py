@@ -1057,6 +1057,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tags", nargs="+", help="Boost results matching these tags")
     parser.add_argument("--tags-strict", action="store_true", help="Hard-filter by tags")
     parser.add_argument("--no-rerank", action="store_true", help="Bypass re-ranking")
+    parser.add_argument(
+        "--llm-rerank",
+        action="store_true",
+        default=False,
+        help=(
+            "After candidate retrieval, use an LLM to select and reorder results "
+            "(issue #228 item 3). OFF by default. Falls back to the contextual "
+            "reranker on empty selection or any LLM failure. Ignored when "
+            "--no-rerank is set. Requires ANTHROPIC_API_KEY; model is the "
+            "recall.llm_selector_model config field (default claude-sonnet-4-6)."
+        ),
+    )
     parser.add_argument("--no-expand", action="store_true", help="Disable TF-IDF query expansion")
     parser.add_argument("--expand-terms", type=int, default=5, help="Expansion terms (default: 5)")
     parser.add_argument("--rebuild-idf", action="store_true", help="Force rebuild IDF index")
@@ -1357,7 +1369,64 @@ async def main() -> int:
         )
         from scripts.core.reranker import rerank
 
-        results = rerank(results, ctx, k=args.k)
+        # Issue #228 item 3: optional LLM-as-selector. OFF by default and sits
+        # INSIDE the --no-rerank gate, so --no-rerank suppresses it too. The
+        # selector returns None on EVERY failure mode (empty pool, missing key,
+        # API/timeout/network error, malformed output, empty/unknown-only
+        # selection); on None we fall back to the pure contextual rerank() so
+        # there is no regression. ctx is built unconditionally above so the
+        # fallback always has it. --k is preserved as the upper bound for both.
+        selected = None
+        # FINDING 3 (Codex round 2): the memory-awareness hook invokes recall
+        # with --source hook and KILLS the process at 5s (spawnSync, see
+        # hooks/src/memory-awareness.ts:269). The LLM call alone runs to a 10s
+        # deadline (LLM_SELECTOR_TIMEOUT; measured ~3s on a real 50-row pool) and
+        # sits on the pre-output path on top of surfaced-read + type-affinity, so
+        # it can easily exceed the hook's 5s budget; if the process is killed
+        # mid-LLM-call the graceful fallback to rerank() never runs and the user
+        # gets NO recall output. Recall has no recall-wide pre-output deadline
+        # yet, so HARD-GATE the LLM stage off for hook-sourced calls. The flag is
+        # off-by-default and not hook-wired today; this closes the future risk.
+        # Because the hook never reaches this code, LLM_SELECTOR_TIMEOUT is
+        # CLI/benchmark-scoped, not bounded by the 5s budget. Enabling LLM
+        # selection on the hook path requires a recall-wide pre-output deadline
+        # (and a much smaller timeout) first.
+        if args.llm_rerank and args.source != "hook":
+            # FINDING 4 (Codex round 2): split the two failure classes so an
+            # operator's config error is not silently swallowed. Resolve the
+            # model id FIRST with its own guard: get_config() is called only here
+            # on the recall path, so a malformed opc.toml / invalid
+            # recall.llm_selector_model surfaces nowhere else — emit a VISIBLE
+            # stderr warning (never the config value) and fall back. The import +
+            # network/API/timeout failures below stay DEBUG-only silent degrade
+            # (genuine optional-dependency / outage cases, not operator error).
+            model = None
+            try:
+                from scripts.core.config.handlers import get_config
+
+                model = get_config().recall.llm_selector_model
+            except Exception as exc:  # noqa: BLE001 - operator-visible, then fall back
+                print(
+                    f"--llm-rerank: config error resolving llm_selector_model "
+                    f"({type(exc).__name__}); falling back to reranker",
+                    file=sys.stderr,
+                )
+                model = None
+
+            if model is not None:
+                try:
+                    from scripts.core.llm_selector import llm_select
+
+                    selected = await llm_select(
+                        results,
+                        query=args.query,
+                        model=model,
+                        k=args.k,
+                    )
+                except Exception:  # noqa: BLE001 - optional dep / outage: silent degrade
+                    logger.debug("llm-rerank stage failed; falling back", exc_info=True)
+                    selected = None
+        results = selected if selected is not None else rerank(results, ctx, k=args.k)
 
     # Output FIRST: best-effort recall logging must never delay user-visible
     # output under the memory-awareness hook's 5s spawn timeout (issue #140).

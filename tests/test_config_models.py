@@ -133,6 +133,15 @@ class TestRecallConfig:
         cfg = RecallConfig(vector_candidate_multiplier=4)
         assert cfg.vector_candidate_multiplier == 4
 
+    def test_llm_selector_model_default(self):
+        # Issue #228 item 3: LLM-as-selector default model.
+        cfg = RecallConfig()
+        assert cfg.llm_selector_model == "claude-sonnet-4-6"
+
+    def test_llm_selector_model_override(self):
+        cfg = RecallConfig(llm_selector_model="claude-haiku-4")
+        assert cfg.llm_selector_model == "claude-haiku-4"
+
 
 class TestPatternsConfig:
     def test_defaults(self):

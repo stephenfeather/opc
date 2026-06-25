@@ -2,15 +2,46 @@
 
 from __future__ import annotations
 
+import pytest
+
 from scripts.benchmarks.run_rerank_benchmark import (
+    ComparisonMetrics,
+    QueryResult,
+    compute_comparison_metrics,
     compute_mrr,
     compute_ndcg,
     compute_precision_at_k,
     compute_rank_displacement,
+    generate_report,
     identify_dominant_signal,
     identify_promoted_demoted,
     is_relevant,
+    print_summary,
+    run_query,
 )
+
+
+def _make_query_result(
+    query_id: str,
+    mode: str,
+    ids: list[str],
+    *,
+    contents: list[str] | None = None,
+    scores: list[float] | None = None,
+    elapsed_ms: float = 1.0,
+) -> QueryResult:
+    """Build a QueryResult with sensible defaults for metric tests."""
+    n = len(ids)
+    return QueryResult(
+        query_id=query_id,
+        query="q",
+        mode=mode,
+        result_ids=ids,
+        result_scores=scores if scores is not None else [1.0] * n,
+        result_contents=contents if contents is not None else ["x"] * n,
+        rerank_details=None,
+        elapsed_ms=elapsed_ms,
+    )
 
 
 class TestIsRelevant:
@@ -175,6 +206,160 @@ class TestPromotedDemoted:
         )
         assert promoted == []
         assert demoted == []
+
+
+class TestComputeComparisonMetrics:
+    """Pure metric assembly for the two- and three-way arms (Phase E)."""
+
+    def test_two_way_leaves_llm_fields_none(self):
+        reranked = _make_query_result(
+            "q1", "reranked", ["a", "b", "c", "d", "e"]
+        )
+        raw = _make_query_result(
+            "q1", "raw", ["b", "d", "a", "c", "e"]
+        )
+        m = compute_comparison_metrics(
+            reranked, raw, ["a", "c", "e"], [], k=5,
+        )
+        assert m.precision_at_k_reranked == 3 / 5
+        assert m.precision_at_k_raw == 3 / 5
+        # No LLM arm supplied -> llm fields stay None
+        assert m.precision_at_k_llm is None
+        assert m.ndcg_at_k_llm is None
+        assert m.mrr_llm is None
+        assert m.llm_elapsed_ms is None
+
+    def test_three_way_computes_llm_arm(self):
+        reranked = _make_query_result(
+            "q1", "reranked", ["a", "b", "c", "d", "e"], elapsed_ms=12.0,
+        )
+        raw = _make_query_result(
+            "q1", "raw", ["b", "d", "a", "c", "e"], elapsed_ms=8.0,
+        )
+        # LLM filtered the pool down to only the relevant ids
+        llm = _make_query_result(
+            "q1", "llm", ["a", "c", "e"], elapsed_ms=3200.0,
+        )
+        m = compute_comparison_metrics(
+            reranked, raw, ["a", "c", "e"], [], k=5, llm=llm,
+        )
+        assert m.precision_at_k_reranked == 3 / 5
+        assert m.precision_at_k_raw == 3 / 5
+        # LLM precision is higher because it filtered to relevant-only
+        assert m.precision_at_k_llm == 1.0
+        assert m.mrr_llm == 1.0  # 'a' relevant at rank 1
+        assert m.ndcg_at_k_llm == 1.0  # all 3 relevant, ideal ordering
+        assert m.llm_elapsed_ms == 3200.0
+
+    def test_three_way_preserves_two_way_fields(self):
+        reranked = _make_query_result("q1", "reranked", ["a", "b"])
+        raw = _make_query_result("q1", "raw", ["b", "a"])
+        llm = _make_query_result("q1", "llm", ["a"])
+        m = compute_comparison_metrics(
+            reranked, raw, ["a"], [], k=5, llm=llm,
+        )
+        # Displacement / promotion still computed from reranked vs raw
+        assert m.query_id == "q1"
+        assert m.reranked_elapsed_ms == 1.0
+        assert m.raw_elapsed_ms == 1.0
+
+
+class TestGenerateReportThreeWay:
+    """generate_report surfaces the LLM arm when metrics carry it."""
+
+    def _metrics(self, llm: QueryResult | None) -> ComparisonMetrics:
+        reranked = _make_query_result(
+            "q1", "reranked", ["a", "b", "c", "d", "e"], elapsed_ms=12.0,
+        )
+        raw = _make_query_result(
+            "q1", "raw", ["b", "d", "a", "c", "e"], elapsed_ms=8.0,
+        )
+        return compute_comparison_metrics(
+            reranked, raw, ["a", "c", "e"], [], k=5, llm=llm,
+        )
+
+    def test_two_way_report_has_no_llm_keys(self):
+        m = self._metrics(llm=None)
+        reranked = _make_query_result("q1", "reranked", ["a"])
+        raw = _make_query_result("q1", "raw", ["a"])
+        report = generate_report([(reranked, raw, m)], [{"id": "q1", "k": 5}])
+        assert "llm" not in report["summary"]["precision_at_k"]
+
+    def test_three_way_report_surfaces_llm_and_delta(self):
+        llm = _make_query_result(
+            "q1", "llm", ["a", "c", "e"], elapsed_ms=3200.0,
+        )
+        m = self._metrics(llm=llm)
+        reranked = _make_query_result(
+            "q1", "reranked", ["a", "b", "c", "d", "e"]
+        )
+        raw = _make_query_result("q1", "raw", ["b", "d", "a", "c", "e"])
+        report = generate_report([(reranked, raw, m)], [{"id": "q1", "k": 5}])
+        p = report["summary"]["precision_at_k"]
+        assert p["llm"] == 1.0
+        assert p["reranked"] == round(3 / 5, 4)
+        # Acceptance signal: precision_at_k(llm) - precision_at_k(reranked)
+        assert p["llm_vs_reranked"] == round(1.0 - 3 / 5, 4)
+        assert "llm_avg" in report["summary"]["latency_ms"]
+
+
+class TestRunQueryLlmGuard:
+    """run_query rejects the impossible llm-without-rerank combination."""
+
+    async def test_llm_rerank_requires_rerank(self):
+        # The LLM stage lives on the rerank path; --no-rerank suppresses it,
+        # so this combination must fail fast before spawning a subprocess.
+        with pytest.raises(ValueError, match="rerank=True"):
+            await run_query("q1", "q", 5, rerank=False, llm_rerank=True)
+
+
+class TestPrintSummaryThreeWay:
+    """print_summary renders the LLM arm without crashing when present."""
+
+    def _three_way_report(self) -> dict:
+        llm = _make_query_result(
+            "q1", "llm", ["a", "c", "e"], elapsed_ms=3200.0,
+        )
+        reranked = _make_query_result(
+            "q1", "reranked", ["a", "b", "c", "d", "e"], elapsed_ms=12.0,
+        )
+        raw = _make_query_result(
+            "q1", "raw", ["b", "d", "a", "c", "e"], elapsed_ms=8.0,
+        )
+        m = compute_comparison_metrics(
+            reranked, raw, ["a", "c", "e"], [], k=5, llm=llm,
+        )
+        return generate_report([(reranked, raw, m)], [{"id": "q1", "k": 5}])
+
+    def test_renders_llm_section(self, capsys):
+        print_summary(self._three_way_report())
+        out = capsys.readouterr().out
+        assert "LLM-as-selector arm" in out
+        assert "LLM wins vs reranked" in out
+
+    def test_two_way_omits_llm_section(self, capsys):
+        reranked = _make_query_result("q1", "reranked", ["a"])
+        raw = _make_query_result("q1", "raw", ["a"])
+        m = compute_comparison_metrics(reranked, raw, ["a"], [], k=5)
+        report = generate_report([(reranked, raw, m)], [{"id": "q1", "k": 5}])
+        print_summary(report)
+        out = capsys.readouterr().out
+        assert "LLM-as-selector arm" not in out
+
+
+class TestGenerateReportWinners:
+    """Winner tallies for the reranked-vs-raw arm (existing two-way path)."""
+
+    def test_raw_beats_reranked_counts_raw_win(self):
+        # raw returns only the relevant id (precision 1.0); reranked dilutes it
+        # with an irrelevant row (precision 0.5) -> raw wins the tally.
+        reranked = _make_query_result("q1", "reranked", ["x", "a"])
+        raw = _make_query_result("q1", "raw", ["a"])
+        m = compute_comparison_metrics(reranked, raw, ["a"], [], k=5)
+        report = generate_report([(reranked, raw, m)], [{"id": "q1", "k": 5}])
+        assert report["summary"]["raw_wins"] == 1
+        assert report["summary"]["rerank_wins"] == 0
+        assert report["summary"]["ties"] == 0
 
 
 class TestDominantSignal:

@@ -1,13 +1,18 @@
 """A/B benchmark for --no-rerank flag.
 
 Runs benchmark queries with and without reranking, measures recall quality,
-and produces a comparison report.
+and produces a comparison report. With --llm-rerank, adds a third
+LLM-as-selector arm (Phase E, issue #228 item 3) and reports
+precision_at_k(llm) vs precision_at_k(reranked) plus per-query wall-clock
+latency.
 
 Usage:
     uv run python scripts/benchmarks/run_rerank_benchmark.py
     uv run python scripts/benchmarks/run_rerank_benchmark.py --queries custom.json
     uv run python scripts/benchmarks/run_rerank_benchmark.py --output results.json
     uv run python scripts/benchmarks/run_rerank_benchmark.py --verbose
+    # Three-way arm (live Anthropic API call per query; needs ANTHROPIC_API_KEY):
+    uv run python scripts/benchmarks/run_rerank_benchmark.py --llm-rerank
 """
 
 from __future__ import annotations
@@ -62,6 +67,13 @@ class ComparisonMetrics:
     dominant_signal: str
     reranked_elapsed_ms: float
     raw_elapsed_ms: float
+    # Optional third arm (Phase E): the LLM-as-selector (--llm-rerank). These
+    # stay None for the default two-way (reranked vs raw) benchmark and are
+    # populated only when the LLM arm is run.
+    precision_at_k_llm: float | None = None
+    ndcg_at_k_llm: float | None = None
+    mrr_llm: float | None = None
+    llm_elapsed_ms: float | None = None
 
 
 # -------------------------------------------------------------------
@@ -252,8 +264,23 @@ async def run_query(
     rerank: bool,
     project: str | None = None,
     tags: list[str] | None = None,
+    llm_rerank: bool = False,
 ) -> QueryResult:
-    """Run a single recall query via subprocess."""
+    """Run a single recall query via subprocess.
+
+    ``llm_rerank=True`` adds the optional ``--llm-rerank`` arm (Phase E): the
+    LLM-as-selector reorders/filters the over-fetched pool after the linear
+    reranker, so it requires ``rerank=True`` (the LLM stage lives on the rerank
+    path, not the ``--no-rerank`` path). The benchmark's default ``--source``
+    is CLI, so the gate that suppresses the LLM stage under ``--source hook``
+    does not apply here.
+    """
+    if llm_rerank and not rerank:
+        raise ValueError(
+            "llm_rerank requires rerank=True (the LLM stage runs on the "
+            "rerank path; --no-rerank suppresses it)"
+        )
+    mode = "llm" if llm_rerank else ("reranked" if rerank else "raw")
     cmd = [
         sys.executable,
         "scripts/core/recall_learnings.py",
@@ -263,6 +290,8 @@ async def run_query(
     ]
     if not rerank:
         cmd.append("--no-rerank")
+    if llm_rerank:
+        cmd.append("--llm-rerank")
     if project:
         cmd.extend(["--project", project])
     if tags:
@@ -281,8 +310,7 @@ async def run_query(
     if proc.returncode != 0:
         err = stderr.decode().strip()
         raise RuntimeError(
-            f"Query {query_id} "
-            f"({'reranked' if rerank else 'raw'}) failed "
+            f"Query {query_id} ({mode}) failed "
             f"with return code {proc.returncode}: {err}"
         )
 
@@ -293,7 +321,7 @@ async def run_query(
     return QueryResult(
         query_id=query_id,
         query=query,
-        mode="reranked" if rerank else "raw",
+        mode=mode,
         result_ids=[r.get("id", "") for r in results],
         result_scores=[r["score"] for r in results],
         result_contents=[r["content"] for r in results],
@@ -302,11 +330,109 @@ async def run_query(
     )
 
 
+def compute_comparison_metrics(
+    reranked: QueryResult,
+    raw: QueryResult,
+    golden_ids: list[str],
+    golden_keywords: list[str],
+    k: int,
+    llm: QueryResult | None = None,
+) -> ComparisonMetrics:
+    """Assemble per-query metrics from the reranked, raw, and optional LLM arms.
+
+    Pure: takes already-fetched arm results and returns a ComparisonMetrics.
+    The LLM arm (Phase E) is optional — when absent the ``*_llm`` fields stay
+    None and the result is the historical two-way (reranked vs raw) comparison.
+    Rank-displacement, promotion, and dominant-signal are always derived from
+    reranked vs raw (the LLM arm filters/reorders independently of the linear
+    reranker's per-signal contributions, which it does not expose).
+    """
+    p_reranked = compute_precision_at_k(
+        reranked.result_ids, reranked.result_contents,
+        golden_ids, golden_keywords,
+    )
+    p_raw = compute_precision_at_k(
+        raw.result_ids, raw.result_contents,
+        golden_ids, golden_keywords,
+    )
+    ndcg_reranked = compute_ndcg(
+        reranked.result_ids, reranked.result_contents,
+        golden_ids, golden_keywords, k,
+    )
+    ndcg_raw = compute_ndcg(
+        raw.result_ids, raw.result_contents,
+        golden_ids, golden_keywords, k,
+    )
+    mrr_reranked = compute_mrr(
+        reranked.result_ids, reranked.result_contents,
+        golden_ids, golden_keywords,
+    )
+    mrr_raw = compute_mrr(
+        raw.result_ids, raw.result_contents,
+        golden_ids, golden_keywords,
+    )
+    mean_disp, max_disp = compute_rank_displacement(
+        reranked.result_ids, raw.result_ids,
+    )
+    promoted, demoted = identify_promoted_demoted(
+        reranked.result_ids, raw.result_ids,
+    )
+    dominant = identify_dominant_signal(reranked.rerank_details)
+
+    p_llm = ndcg_llm = mrr_llm = llm_elapsed = None
+    if llm is not None:
+        p_llm = compute_precision_at_k(
+            llm.result_ids, llm.result_contents,
+            golden_ids, golden_keywords,
+        )
+        ndcg_llm = compute_ndcg(
+            llm.result_ids, llm.result_contents,
+            golden_ids, golden_keywords, k,
+        )
+        mrr_llm = compute_mrr(
+            llm.result_ids, llm.result_contents,
+            golden_ids, golden_keywords,
+        )
+        llm_elapsed = llm.elapsed_ms
+
+    return ComparisonMetrics(
+        query_id=reranked.query_id,
+        precision_at_k_reranked=p_reranked,
+        precision_at_k_raw=p_raw,
+        ndcg_at_k_reranked=ndcg_reranked,
+        ndcg_at_k_raw=ndcg_raw,
+        mrr_reranked=mrr_reranked,
+        mrr_raw=mrr_raw,
+        mean_rank_displacement=mean_disp,
+        max_rank_displacement=max_disp,
+        reranked_score_range=score_range(reranked.result_scores),
+        raw_score_range=score_range(raw.result_scores),
+        promoted_ids=promoted,
+        demoted_ids=demoted,
+        dominant_signal=dominant,
+        reranked_elapsed_ms=reranked.elapsed_ms,
+        raw_elapsed_ms=raw.elapsed_ms,
+        precision_at_k_llm=p_llm,
+        ndcg_at_k_llm=ndcg_llm,
+        mrr_llm=mrr_llm,
+        llm_elapsed_ms=llm_elapsed,
+    )
+
+
 async def run_benchmark(
     queries: list[dict],
+    with_llm: bool = False,
 ) -> list[tuple[QueryResult, QueryResult, ComparisonMetrics]]:
-    """Run all queries in both modes and compute metrics."""
-    tasks = []
+    """Run all queries in each mode and compute metrics.
+
+    With ``with_llm=True`` a third ``--llm-rerank`` arm is run per query and its
+    precision/ndcg/mrr/latency are folded into each ComparisonMetrics (Phase E).
+    """
+    # Each query runs reranked + raw, plus an optional LLM arm. Arms-per-query
+    # is fixed for the whole run so we can de-interleave the flat gather by a
+    # constant stride.
+    arms_per_query = 3 if with_llm else 2
+    coros = []
     for q in queries:
         qid = q["id"]
         query = q["query"]
@@ -314,81 +440,30 @@ async def run_benchmark(
         project = q.get("project")
         tags = q.get("tags", [])
 
-        tasks.append((
-            qid,
-            q,
-            run_query(qid, query, k, rerank=True,
-                      project=project, tags=tags or None),
-            run_query(qid, query, k, rerank=False,
-                      project=project, tags=tags or None),
-        ))
+        coros.append(run_query(qid, query, k, rerank=True,
+                               project=project, tags=tags or None))
+        coros.append(run_query(qid, query, k, rerank=False,
+                               project=project, tags=tags or None))
+        if with_llm:
+            coros.append(run_query(qid, query, k, rerank=True,
+                                   project=project, tags=tags or None,
+                                   llm_rerank=True))
 
-    # Gather all results
-    coros = []
-    for qid, q, reranked_coro, raw_coro in tasks:
-        coros.append(reranked_coro)
-        coros.append(raw_coro)
     all_results = await asyncio.gather(*coros)
 
-    # Pair up and compute metrics
+    # De-interleave by stride and compute metrics per query.
     output = []
-    for i in range(0, len(all_results), 2):
-        reranked = all_results[i]
-        raw = all_results[i + 1]
-        q = queries[i // 2]
+    for qi, q in enumerate(queries):
+        base = qi * arms_per_query
+        reranked = all_results[base]
+        raw = all_results[base + 1]
+        llm = all_results[base + 2] if with_llm else None
         golden_ids = q.get("golden_ids", [])
         golden_keywords = q.get("golden_keywords", [])
         k = q.get("k", 5)
 
-        p_reranked = compute_precision_at_k(
-            reranked.result_ids, reranked.result_contents,
-            golden_ids, golden_keywords,
-        )
-        p_raw = compute_precision_at_k(
-            raw.result_ids, raw.result_contents,
-            golden_ids, golden_keywords,
-        )
-        ndcg_reranked = compute_ndcg(
-            reranked.result_ids, reranked.result_contents,
-            golden_ids, golden_keywords, k,
-        )
-        ndcg_raw = compute_ndcg(
-            raw.result_ids, raw.result_contents,
-            golden_ids, golden_keywords, k,
-        )
-        mrr_reranked = compute_mrr(
-            reranked.result_ids, reranked.result_contents,
-            golden_ids, golden_keywords,
-        )
-        mrr_raw = compute_mrr(
-            raw.result_ids, raw.result_contents,
-            golden_ids, golden_keywords,
-        )
-        mean_disp, max_disp = compute_rank_displacement(
-            reranked.result_ids, raw.result_ids,
-        )
-        promoted, demoted = identify_promoted_demoted(
-            reranked.result_ids, raw.result_ids,
-        )
-        dominant = identify_dominant_signal(reranked.rerank_details)
-
-        metrics = ComparisonMetrics(
-            query_id=reranked.query_id,
-            precision_at_k_reranked=p_reranked,
-            precision_at_k_raw=p_raw,
-            ndcg_at_k_reranked=ndcg_reranked,
-            ndcg_at_k_raw=ndcg_raw,
-            mrr_reranked=mrr_reranked,
-            mrr_raw=mrr_raw,
-            mean_rank_displacement=mean_disp,
-            max_rank_displacement=max_disp,
-            reranked_score_range=score_range(reranked.result_scores),
-            raw_score_range=score_range(raw.result_scores),
-            promoted_ids=promoted,
-            demoted_ids=demoted,
-            dominant_signal=dominant,
-            reranked_elapsed_ms=reranked.elapsed_ms,
-            raw_elapsed_ms=raw.elapsed_ms,
+        metrics = compute_comparison_metrics(
+            reranked, raw, golden_ids, golden_keywords, k, llm=llm,
         )
         output.append((reranked, raw, metrics))
 
@@ -450,6 +525,12 @@ def generate_report(
         )
     default_k = ks.pop()
 
+    # Optional LLM arm (Phase E). Present only when the benchmark ran with
+    # --llm-rerank; every query in such a run carries the LLM metrics, so the
+    # averages are over the same n. The acceptance signal is precision_at_k(llm)
+    # vs precision_at_k(reranked) — the reranker is the bar to beat, not raw.
+    has_llm = any(m.precision_at_k_llm is not None for _, _, m in results)
+
     report = {
         "timestamp": datetime.now(UTC).isoformat(),
         "config": {
@@ -490,6 +571,53 @@ def generate_report(
         },
         "per_query": per_query,
     }
+
+    if has_llm:
+        # Aggregate only over queries whose LLM arm produced metrics. A
+        # with_llm run populates all four LLM fields together (or none), so the
+        # per-result None-guard both narrows the Optional types and tolerates a
+        # partial run without skewing the averages with zeros.
+        ln = 0
+        p_llm_sum = ndcg_llm_sum = mrr_llm_sum = lat_llm_sum = 0.0
+        llm_wins = reranked_wins = 0
+        for _, _, m in results:
+            pl, nl, ml, el = (
+                m.precision_at_k_llm,
+                m.ndcg_at_k_llm,
+                m.mrr_llm,
+                m.llm_elapsed_ms,
+            )
+            if pl is None or nl is None or ml is None or el is None:
+                continue
+            ln += 1
+            p_llm_sum += pl
+            ndcg_llm_sum += nl
+            mrr_llm_sum += ml
+            lat_llm_sum += el
+            if pl > m.precision_at_k_reranked:
+                llm_wins += 1
+            elif m.precision_at_k_reranked > pl:
+                reranked_wins += 1
+
+        if ln:
+            p_llm = p_llm_sum / ln
+            ndcg_llm = ndcg_llm_sum / ln
+            mrr_llm = mrr_llm_sum / ln
+            lat_llm = lat_llm_sum / ln
+            s = report["summary"]
+            s["precision_at_k"]["llm"] = round(p_llm, 4)
+            s["precision_at_k"]["llm_vs_reranked"] = round(p_llm - p_reranked, 4)
+            s["ndcg_at_k"]["llm"] = round(ndcg_llm, 4)
+            s["ndcg_at_k"]["llm_vs_reranked"] = round(ndcg_llm - ndcg_reranked, 4)
+            s["mrr"]["llm"] = round(mrr_llm, 4)
+            s["mrr"]["llm_vs_reranked"] = round(mrr_llm - mrr_reranked, 4)
+            s["latency_ms"]["llm_avg"] = round(lat_llm, 1)
+            s["latency_ms"]["llm_overhead_ms"] = round(lat_llm - lat_reranked, 1)
+            s["llm_arm_queries"] = ln
+            s["llm_wins_vs_reranked"] = llm_wins
+            s["reranked_wins_vs_llm"] = reranked_wins
+            s["llm_ties_vs_reranked"] = ln - llm_wins - reranked_wins
+
     return report
 
 
@@ -545,6 +673,47 @@ def print_summary(report: dict) -> None:
         f"vs raw {lat['raw_avg']:.0f}ms avg "
         f"({lat['overhead_ms']:+.0f}ms overhead)"
     )
+
+    # Optional LLM arm (Phase E): compared against the reranker (the bar to
+    # beat), not raw. Present only when the benchmark ran with --llm-rerank.
+    if "llm" in s.get("precision_at_k", {}):
+        print()
+        print("--- LLM-as-selector arm (--llm-rerank) ---")
+        print(
+            f"{'':15s} {'LLM':>10s} {'Reranked':>10s} "
+            f"{'vs Rerank':>12s}"
+        )
+        print("-" * 50)
+        for metric_name, key in [
+            ("Precision@k", "precision_at_k"),
+            ("NDCG@k", "ndcg_at_k"),
+            ("MRR", "mrr"),
+        ]:
+            m = s[key]
+            print(
+                f"{metric_name:15s} {m['llm']:10.4f} "
+                f"{m['reranked']:10.4f} {m['llm_vs_reranked']:+10.4f}"
+            )
+        lln = s.get("llm_arm_queries", 0)
+        print()
+        if lln:
+            print(
+                f"LLM wins vs reranked:  {s['llm_wins_vs_reranked']}/{lln} "
+                f"({s['llm_wins_vs_reranked'] / lln * 100:.0f}%)"
+            )
+            print(
+                f"Reranked wins vs LLM:  {s['reranked_wins_vs_llm']}/{lln} "
+                f"({s['reranked_wins_vs_llm'] / lln * 100:.0f}%)"
+            )
+            print(
+                f"Ties:                  {s['llm_ties_vs_reranked']}/{lln} "
+                f"({s['llm_ties_vs_reranked'] / lln * 100:.0f}%)"
+            )
+        print(
+            f"\nLLM latency: {lat['llm_avg']:.0f}ms avg "
+            f"({lat['llm_overhead_ms']:+.0f}ms vs reranked) "
+            f"— network round-trip per query"
+        )
 
     print("\nDominant signals driving reordering:")
     for signal, count in s["dominant_signals"].items():
@@ -853,6 +1022,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run weight sensitivity sweep across configurations",
     )
+    parser.add_argument(
+        "--llm-rerank",
+        action="store_true",
+        help=(
+            "Add a third LLM-as-selector arm per query (Phase E). Each query "
+            "makes a live Anthropic API call (network latency + token cost); "
+            "requires ANTHROPIC_API_KEY. Compared against the reranker arm."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -865,9 +1043,15 @@ async def async_main() -> int:
     print(f"Loaded {len(queries)} benchmark queries from {args.queries}")
 
     # Run benchmark
-    print("Running benchmark (reranked + raw for each query)...")
+    arms = "reranked + raw + llm" if args.llm_rerank else "reranked + raw"
+    print(f"Running benchmark ({arms} for each query)...")
+    if args.llm_rerank:
+        print(
+            "  NOTE: --llm-rerank makes a live Anthropic API call per query "
+            "(token cost + network latency); ANTHROPIC_API_KEY must be set."
+        )
     start = time.monotonic()
-    results = await run_benchmark(queries)
+    results = await run_benchmark(queries, with_llm=args.llm_rerank)
     total_ms = (time.monotonic() - start) * 1000
     print(f"Completed in {total_ms:.0f}ms")
 

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 
@@ -58,17 +59,33 @@ logger = logging.getLogger(__name__)
 _DEFAULT_LLM_SELECTOR_TIMEOUT: float = 30.0
 
 
+def _parse_timeout(raw: str | None) -> float | None:
+    """Parse a timeout override string to a POSITIVE FINITE float, else None.
+
+    Rejects blanks, unparseable values, non-positive values, and — critically —
+    infinity ('inf', 'Infinity', overflow like '1e309') and NaN: an infinite
+    deadline would defeat the bounded-deadline invariant (it drives both the
+    httpx client timeout and asyncio.wait_for, so a stalled call would never
+    fall back). Shared by the resolver and the benchmark's "is this a valid
+    explicit override?" check so both agree on what counts as valid.
+    """
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    if value > 0 and math.isfinite(value):
+        return value
+    return None
+
+
 def _resolve_llm_selector_timeout() -> float:
     """Resolve the selector deadline from the env (benchmark override) or default."""
-    raw = os.environ.get("LLM_SELECTOR_TIMEOUT")
-    if raw:
-        try:
-            value = float(raw)
-        except ValueError:
-            return _DEFAULT_LLM_SELECTOR_TIMEOUT
-        if value > 0:
-            return value
-    return _DEFAULT_LLM_SELECTOR_TIMEOUT
+    return (
+        _parse_timeout(os.environ.get("LLM_SELECTOR_TIMEOUT"))
+        or _DEFAULT_LLM_SELECTOR_TIMEOUT
+    )
 
 
 LLM_SELECTOR_TIMEOUT: float = _resolve_llm_selector_timeout()

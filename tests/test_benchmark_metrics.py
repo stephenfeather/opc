@@ -559,7 +559,7 @@ class TestRunQueryChildEnv:
         )
 
     async def test_llm_arm_respects_explicit_timeout(self, monkeypatch):
-        # A caller-set value must win — the benchmark does not clobber it.
+        # A caller-set VALID value must win — the benchmark does not clobber it.
         monkeypatch.setenv("LLM_SELECTOR_TIMEOUT", "45")
         captured = {}
 
@@ -570,6 +570,24 @@ class TestRunQueryChildEnv:
         monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
         await run_query("q1", "q", 5, rerank=True, llm_rerank=True)
         assert captured["env"] is None  # inherit parent env unchanged
+
+    async def test_llm_arm_overrides_invalid_inherited_timeout(self, monkeypatch):
+        # An INVALID inherited value (here 0) is not a valid override — the
+        # benchmark must inject its budget rather than let the child fall back to
+        # the 30s default and reintroduce spurious timeouts.
+        monkeypatch.setenv("LLM_SELECTOR_TIMEOUT", "0")
+        captured = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured["env"] = kwargs.get("env")
+            return _OkProc()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        await run_query("q1", "q", 5, rerank=True, llm_rerank=True)
+        assert captured["env"] is not None
+        assert captured["env"]["LLM_SELECTOR_TIMEOUT"] == str(
+            benchmark_module.BENCHMARK_LLM_TIMEOUT_S
+        )
 
     async def test_non_llm_arm_does_not_set_env(self, monkeypatch):
         monkeypatch.delenv("LLM_SELECTOR_TIMEOUT", raising=False)

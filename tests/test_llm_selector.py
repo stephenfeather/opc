@@ -23,6 +23,7 @@ from scripts.core.llm_selector import (
     LLM_SELECTOR_TIMEOUT,
     MANIFEST_DESC_MAXLEN,
     MANIFEST_RAW_SLICE,
+    _parse_timeout,
     _resolve_llm_selector_timeout,
     apply_selection,
     build_manifest,
@@ -478,6 +479,27 @@ class TestTimeoutConstant:
         # The exported constant is whatever the resolver returned at import time
         # (default in a normal test env, with no LLM_SELECTOR_TIMEOUT set).
         assert LLM_SELECTOR_TIMEOUT >= 20.0
+
+    def test_parse_timeout_accepts_valid_positive(self):
+        assert _parse_timeout("90") == 90.0
+        assert _parse_timeout("30.5") == 30.5
+
+    def test_parse_timeout_rejects_blank_and_none(self):
+        assert _parse_timeout(None) is None
+        assert _parse_timeout("") is None
+
+    def test_parse_timeout_rejects_unparseable(self):
+        assert _parse_timeout("not-a-number") is None
+
+    def test_parse_timeout_rejects_nonpositive(self):
+        assert _parse_timeout("0") is None
+        assert _parse_timeout("-5") is None
+
+    def test_parse_timeout_rejects_infinity_and_nan(self):
+        # An infinite/NaN deadline would defeat the bounded-deadline invariant —
+        # it drives both the httpx timeout and asyncio.wait_for.
+        for bad in ("inf", "Infinity", "-inf", "nan", "1e309"):
+            assert _parse_timeout(bad) is None, bad
 
 
 # --- Step 7: timeout ---

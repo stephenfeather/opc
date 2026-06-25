@@ -29,6 +29,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from scripts.core.llm_selector import _parse_timeout
 from scripts.core.reranker import RecallContext, RerankerConfig, rerank
 
 # -------------------------------------------------------------------
@@ -357,11 +358,13 @@ async def run_query(
 
     # For the LLM arm, give the selector a generous per-call deadline via the
     # child env so slow outliers under concurrency don't spuriously fall back to
-    # the reranker (which the fail-closed guard would turn into a hard error). An
-    # explicit caller-set LLM_SELECTOR_TIMEOUT is respected; otherwise inherit
-    # the parent env unchanged.
+    # the reranker (which the fail-closed guard would turn into a hard error).
+    # Respect a VALID explicit LLM_SELECTOR_TIMEOUT (same validity rule as the
+    # selector's resolver); otherwise — absent OR invalid (empty/0/negative/
+    # unparseable/infinite) — inject the benchmark budget so a junk inherited
+    # value can't silently drop us back to the 30s default.
     child_env = None
-    if llm_rerank and "LLM_SELECTOR_TIMEOUT" not in os.environ:
+    if llm_rerank and _parse_timeout(os.environ.get("LLM_SELECTOR_TIMEOUT")) is None:
         child_env = {**os.environ, "LLM_SELECTOR_TIMEOUT": str(BENCHMARK_LLM_TIMEOUT_S)}
 
     async with SEMAPHORE:

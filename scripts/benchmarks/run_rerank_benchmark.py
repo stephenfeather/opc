@@ -275,9 +275,16 @@ ARM_TIMEOUT_S = 120.0
 # (~22s in isolation) that inflate further under this harness's 4-way
 # concurrency, so the benchmark uses a more generous budget to avoid spurious
 # fallbacks (which the fail-closed guard would otherwise turn into hard errors).
-# Stays under ARM_TIMEOUT_S so the subprocess kill never pre-empts it. An
-# explicit LLM_SELECTOR_TIMEOUT already in the environment is respected.
+# Clamped under ARM_TIMEOUT_S (see margin below) so the subprocess kill never
+# pre-empts the selector's own deadline + graceful fallback. A VALID explicit
+# LLM_SELECTOR_TIMEOUT already in the environment is respected (also clamped).
 BENCHMARK_LLM_TIMEOUT_S = 90.0
+
+# Headroom reserved under ARM_TIMEOUT_S for the non-LLM part of a recall
+# subprocess (DB fetch, embedding load, manifest build) so the in-process LLM
+# fallback always completes before the parent kills the child. The effective
+# child LLM timeout is capped at ARM_TIMEOUT_S - this margin.
+_LLM_ARM_OVERHEAD_MARGIN_S = 15.0
 
 
 def _is_llm_selected(result: dict) -> bool:
@@ -356,16 +363,22 @@ async def run_query(
     if tags:
         cmd.extend(["--tags", *tags])
 
-    # For the LLM arm, give the selector a generous per-call deadline via the
-    # child env so slow outliers under concurrency don't spuriously fall back to
-    # the reranker (which the fail-closed guard would turn into a hard error).
-    # Respect a VALID explicit LLM_SELECTOR_TIMEOUT (same validity rule as the
-    # selector's resolver); otherwise — absent OR invalid (empty/0/negative/
-    # unparseable/infinite) — inject the benchmark budget so a junk inherited
-    # value can't silently drop us back to the 30s default.
+    # For the LLM arm, set the selector's per-call deadline in the child env so
+    # slow outliers under concurrency don't spuriously fall back to the reranker
+    # (which the fail-closed guard would turn into a hard error). A VALID
+    # explicit LLM_SELECTOR_TIMEOUT is respected; an absent/invalid one
+    # (empty/0/negative/unparseable/infinite) uses the benchmark budget so a junk
+    # inherited value can't silently drop the child to the 30s default. Either
+    # way the value is CLAMPED below ARM_TIMEOUT_S (minus overhead) so the parent
+    # subprocess kill can never pre-empt the selector's own timeout + fallback —
+    # otherwise a large override (e.g. 300) would be killed at 120s and recorded
+    # as a hard arm failure.
     child_env = None
-    if llm_rerank and _parse_timeout(os.environ.get("LLM_SELECTOR_TIMEOUT")) is None:
-        child_env = {**os.environ, "LLM_SELECTOR_TIMEOUT": str(BENCHMARK_LLM_TIMEOUT_S)}
+    if llm_rerank:
+        explicit = _parse_timeout(os.environ.get("LLM_SELECTOR_TIMEOUT"))
+        desired = explicit if explicit is not None else BENCHMARK_LLM_TIMEOUT_S
+        safe = min(desired, ARM_TIMEOUT_S - _LLM_ARM_OVERHEAD_MARGIN_S)
+        child_env = {**os.environ, "LLM_SELECTOR_TIMEOUT": str(safe)}
 
     async with SEMAPHORE:
         start = time.monotonic()

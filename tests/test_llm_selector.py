@@ -475,10 +475,12 @@ class TestTimeoutConstant:
         monkeypatch.setenv("LLM_SELECTOR_TIMEOUT", "-5")
         assert _resolve_llm_selector_timeout() == _DEFAULT_LLM_SELECTOR_TIMEOUT
 
-    def test_module_constant_matches_resolver(self):
-        # The exported constant is whatever the resolver returned at import time
-        # (default in a normal test env, with no LLM_SELECTOR_TIMEOUT set).
-        assert LLM_SELECTOR_TIMEOUT >= 20.0
+    def test_module_constant_is_positive_finite(self):
+        # The exported constant is resolved at import time and may reflect an
+        # ambient LLM_SELECTOR_TIMEOUT override, so assert only the env-
+        # independent invariant here (positive and finite). The >= 20 latency
+        # floor is guaranteed on the env-independent _DEFAULT above.
+        assert 0 < LLM_SELECTOR_TIMEOUT < float("inf")
 
     def test_parse_timeout_accepts_valid_positive(self):
         assert _parse_timeout("90") == 90.0

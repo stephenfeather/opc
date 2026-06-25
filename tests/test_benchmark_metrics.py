@@ -559,7 +559,7 @@ class TestRunQueryChildEnv:
         )
 
     async def test_llm_arm_respects_explicit_timeout(self, monkeypatch):
-        # A caller-set VALID value must win — the benchmark does not clobber it.
+        # A caller-set VALID value below the safe ceiling is passed through.
         monkeypatch.setenv("LLM_SELECTOR_TIMEOUT", "45")
         captured = {}
 
@@ -569,7 +569,27 @@ class TestRunQueryChildEnv:
 
         monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
         await run_query("q1", "q", 5, rerank=True, llm_rerank=True)
-        assert captured["env"] is None  # inherit parent env unchanged
+        assert captured["env"] is not None
+        assert captured["env"]["LLM_SELECTOR_TIMEOUT"] == str(45.0)
+
+    async def test_llm_arm_clamps_timeout_below_arm_budget(self, monkeypatch):
+        # A large explicit value must be clamped under ARM_TIMEOUT_S so the
+        # parent subprocess kill never pre-empts the selector's own fallback.
+        monkeypatch.setenv("LLM_SELECTOR_TIMEOUT", "300")
+        captured = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured["env"] = kwargs.get("env")
+            return _OkProc()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        await run_query("q1", "q", 5, rerank=True, llm_rerank=True)
+        ceiling = (
+            benchmark_module.ARM_TIMEOUT_S
+            - benchmark_module._LLM_ARM_OVERHEAD_MARGIN_S
+        )
+        assert captured["env"]["LLM_SELECTOR_TIMEOUT"] == str(ceiling)
+        assert float(captured["env"]["LLM_SELECTOR_TIMEOUT"]) < benchmark_module.ARM_TIMEOUT_S
 
     async def test_llm_arm_overrides_invalid_inherited_timeout(self, monkeypatch):
         # An INVALID inherited value (here 0) is not a valid override — the

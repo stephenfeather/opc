@@ -98,6 +98,48 @@ class TestAcquireSingletonLock:
 
         assert captured["flags"] & os.O_CREAT, "lock file must be created if absent"
         assert captured["mode"] == 0o600, "lock file must be owner-only"
+        # Symlink-TOCTOU hardening: must use O_NOFOLLOW where the platform
+        # defines it (mirrors _open_log_file_secure). getattr-guarded so the
+        # assertion is a no-op on platforms without the constant.
+        o_nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if o_nofollow:
+            assert captured["flags"] & o_nofollow, "lock open must use O_NOFOLLOW"
+
+    def test_refuses_when_lock_path_is_a_symlink(self, tmp_path):
+        """A pre-planted symlink at the lock path must NOT be followed: the
+        O_NOFOLLOW open raises OSError (ELOOP) and _acquire_singleton_lock
+        returns None (decline to start) rather than locking the link target.
+        """
+        from scripts.core.memory_daemon import _acquire_singleton_lock
+
+        if not hasattr(os, "O_NOFOLLOW"):
+            pytest.skip("O_NOFOLLOW unavailable on this platform")
+
+        target = tmp_path / "attacker_target"
+        target.write_text("")
+        link = tmp_path / "daemon.lock"
+        link.symlink_to(target)
+
+        # Real os.open with O_NOFOLLOW -> ELOOP on the symlink.
+        assert _acquire_singleton_lock(lock_path=link) is None
+
+    def test_returns_none_when_open_raises_oserror(self, tmp_path):
+        """An open-time OSError (symlink ELOOP, permission, fd exhaustion) is
+        fail-safe: return None so the caller declines to start."""
+        from scripts.core.memory_daemon import _acquire_singleton_lock
+
+        def raising_open(path, flags, mode=0o777):
+            raise OSError("ELOOP")
+
+        assert (
+            _acquire_singleton_lock(
+                lock_path=tmp_path / "daemon.lock",
+                os_open_fn=raising_open,
+                flock_fn=MagicMock(),
+                os_close_fn=MagicMock(),
+            )
+            is None
+        )
 
     def test_real_flock_is_mutually_exclusive(self, tmp_path):
         """End-to-end with the real flock_fn: the first acquire holds the lock,

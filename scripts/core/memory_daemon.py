@@ -1312,14 +1312,29 @@ def _acquire_singleton_lock(
     grandchild) must keep it open for the daemon's lifetime, since the flock is
     released when the last fd referencing the open file description is closed.
     Returns ``None`` if another process already holds the lock (a concurrent or
-    in-flight ``start``), in which case the fd we opened is closed first.
+    in-flight ``start``), or if the lock path cannot be opened safely — in either
+    case the caller declines to start, which is the fail-safe outcome.
+
+    ``O_NOFOLLOW`` mirrors the symlink-TOCTOU hardening already applied to
+    ``_open_log_file_secure`` for sibling files in the same ``~/.claude``
+    directory (aegis #99 LOW-1/LOW-2): a pre-planted symlink at the lock path
+    raises ``OSError`` (ELOOP) instead of being silently followed to an
+    attacker-chosen target. The constant is looked up via ``getattr`` so the
+    code still runs on platforms where it is undefined (Windows).
 
     The os.* functions and ``flock_fn`` are injected for testability, mirroring
     ``_setup_daemon_fds`` / ``_harden_daemon_environment``.
     """
     path = lock_path if lock_path is not None else LOCK_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os_open_fn(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+    o_nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os_open_fn(str(path), os.O_RDWR | os.O_CREAT | o_nofollow, 0o600)
+    except OSError:
+        # The lock path is a symlink (O_NOFOLLOW -> ELOOP) or otherwise cannot be
+        # opened. We cannot guarantee single-instance, so decline to acquire —
+        # the caller treats this exactly like a held lock and does not start.
+        return None
     try:
         flock_fn(fd)
     except BlockingIOError:

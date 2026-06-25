@@ -1333,9 +1333,16 @@ def _signal_ready(
     os_close_fn=os.close,
 ) -> None:
     """Tell the waiting parent the daemon initialized successfully, then close
-    the write end so the parent observes EOF if it ever reads again."""
+    the write end so the parent observes EOF if it ever reads again.
+
+    Tolerant of a parent that already gave up and closed its read end (e.g. on a
+    readiness timeout): a ``BrokenPipeError`` here must NOT propagate, or a slow
+    but healthy startup would be misclassified as init failure and have its PID
+    file unlinked (Issue #102 adversarial review R1)."""
     try:
         os_write_fn(write_fd, _READY_BYTE)
+    except OSError:
+        pass
     finally:
         try:
             os_close_fn(write_fd)
@@ -1371,20 +1378,27 @@ def _wait_for_ready(
     select_fn=select.select,
     os_read_fn=os.read,
     os_close_fn=os.close,
-) -> bool:
+) -> str:
     """Block until the grandchild signals readiness, with a bounded timeout.
 
-    Returns True only on an explicit ready byte. Returns False on the fail byte,
-    on a timeout, or on EOF (the grandchild died before signaling). Always
-    closes ``read_fd`` before returning so the parent leaks no fd.
+    Returns one of three statuses so the caller can report accurately:
+      - ``"ready"``   — explicit ready byte; the daemon reached a working DB.
+      - ``"failed"``  — explicit fail byte, or EOF (the grandchild died before
+                        signaling). The daemon is not running.
+      - ``"timeout"`` — no signal within the deadline. The daemon may still be
+                        coming up (slow first-run schema / sluggish DB), so this
+                        is distinct from a hard failure and must NOT imply the
+                        daemon is dead (Issue #102 adversarial review R1).
+
+    Always closes ``read_fd`` before returning so the parent leaks no fd.
     """
     wait = _ready_timeout() if timeout is None else timeout
     try:
         readable, _, _ = select_fn([read_fd], [], [], wait)
         if not readable:
-            return False  # timeout — daemon hung during init
+            return "timeout"  # no signal yet — daemon may still be initializing
         data = os_read_fn(read_fd, 1)
-        return data == _READY_BYTE
+        return "ready" if data == _READY_BYTE else "failed"
     finally:
         try:
             os_close_fn(read_fd)
@@ -1622,9 +1636,20 @@ def start_daemon():
                 os.close(lock_fd)
             except OSError:
                 pass
-            if _wait_for_ready(read_fd):
+            status = _wait_for_ready(read_fd)
+            if status == "ready":
                 print("Memory daemon started")
                 return 0
+            if status == "timeout":
+                # The daemon may still be initializing (slow first-run schema or
+                # a sluggish DB). It is NOT killed — report the unconfirmed state
+                # and point the operator at `status` rather than claiming death.
+                print(
+                    f"Memory daemon startup not confirmed within "
+                    f"{int(_ready_timeout())}s; it may still be starting — "
+                    f"check 'memory_daemon status'."
+                )
+                return 1
             print("Memory daemon failed to start (see ~/.claude/memory-daemon.log)")
             return 1
 

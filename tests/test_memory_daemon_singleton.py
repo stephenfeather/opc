@@ -163,37 +163,39 @@ class TestReadinessSignals:
         # Writing to a fully closed pipe fd must be swallowed.
         _signal_failed(write_fd)  # must not raise
 
-    def test_wait_for_ready_true_on_ready_byte(self):
+    def test_wait_for_ready_returns_ready_on_ready_byte(self):
         from scripts.core.memory_daemon import _wait_for_ready
 
         read_fd, write_fd = os.pipe()
         os.write(write_fd, b"R")
         os.close(write_fd)
-        assert _wait_for_ready(read_fd, timeout=1.0) is True
+        assert _wait_for_ready(read_fd, timeout=1.0) == "ready"
 
-    def test_wait_for_ready_false_on_fail_byte(self):
+    def test_wait_for_ready_returns_failed_on_fail_byte(self):
         from scripts.core.memory_daemon import _wait_for_ready
 
         read_fd, write_fd = os.pipe()
         os.write(write_fd, b"F")
         os.close(write_fd)
-        assert _wait_for_ready(read_fd, timeout=1.0) is False
+        assert _wait_for_ready(read_fd, timeout=1.0) == "failed"
 
-    def test_wait_for_ready_false_when_grandchild_dies_without_signaling(self):
-        """Closed pipe with no byte (grandchild crashed) → EOF → not ready."""
+    def test_wait_for_ready_returns_failed_when_grandchild_dies_without_signaling(self):
+        """Closed pipe with no byte (grandchild crashed) → EOF → failed."""
         from scripts.core.memory_daemon import _wait_for_ready
 
         read_fd, write_fd = os.pipe()
         os.close(write_fd)  # simulate grandchild death before signaling
-        assert _wait_for_ready(read_fd, timeout=1.0) is False
+        assert _wait_for_ready(read_fd, timeout=1.0) == "failed"
 
-    def test_wait_for_ready_false_on_timeout(self):
+    def test_wait_for_ready_returns_timeout_distinct_from_failure(self):
+        """A timeout must be reported as 'timeout', NOT 'failed' — the daemon may
+        still be initializing and must not be presumed dead (R1 finding)."""
         from scripts.core.memory_daemon import _wait_for_ready
 
         read_fd, write_fd = os.pipe()
         try:
             # Never write → select times out.
-            assert _wait_for_ready(read_fd, timeout=0.05) is False
+            assert _wait_for_ready(read_fd, timeout=0.05) == "timeout"
         finally:
             os.close(write_fd)
 
@@ -383,3 +385,44 @@ class TestRunAsDaemonReadiness:
                 os.close(lock_w)
         finally:
             os.close(lock_r)
+
+    def test_survives_parent_timeout_that_closed_the_pipe(self, monkeypatch, tmp_path):
+        """R1 regression: if the parent timed out and closed its read end before
+        the grandchild finished init, the readiness signal hits a broken pipe.
+        That BrokenPipeError must NOT be misclassified as init failure — the
+        daemon successfully initialized, so its PID must be written, it must NOT
+        be signaled as failed, and _run_as_daemon must not log an init error.
+        """
+        import scripts.core.memory_daemon as mod
+
+        self._patch_bootstrap(monkeypatch, mod)
+        logged: list[str] = []
+        monkeypatch.setattr(mod, "log", lambda m: logged.append(m))
+        pid_file = tmp_path / "daemon.pid"
+        monkeypatch.setattr(mod, "PID_FILE", pid_file)
+
+        # Parent already gave up: read end closed before on_ready fires.
+        read_fd, write_fd = os.pipe()
+        os.close(read_fd)
+
+        seen: dict = {}
+
+        def fake_loop(on_ready=None):
+            # Init succeeded; fire readiness against the closed pipe, then the
+            # daemon would proceed into its tick loop normally.
+            on_ready()
+            seen["pid_during_loop"] = pid_file.exists()
+            seen["pid_content"] = pid_file.read_text() if pid_file.exists() else None
+
+        monkeypatch.setattr(mod, "daemon_loop", fake_loop)
+
+        # Must not raise despite the broken readiness pipe.
+        mod._run_as_daemon(ready_write_fd=write_fd, lock_fd=None)
+
+        # The healthy daemon wrote its PID and ran the loop — not aborted.
+        assert seen["pid_during_loop"] is True
+        assert seen["pid_content"] == str(os.getpid())
+        # And it was NOT treated as an init failure.
+        assert not any(
+            "exited with error" in m.lower() for m in logged
+        ), f"broken readiness pipe must not be logged as a daemon error; got {logged}"

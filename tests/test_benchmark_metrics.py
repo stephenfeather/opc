@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from scripts.benchmarks import run_rerank_benchmark as benchmark_module
 from scripts.benchmarks.run_rerank_benchmark import (
     ComparisonMetrics,
     QueryResult,
@@ -18,6 +19,7 @@ from scripts.benchmarks.run_rerank_benchmark import (
     identify_promoted_demoted,
     is_relevant,
     print_summary,
+    run_benchmark,
     run_query,
 )
 
@@ -328,31 +330,26 @@ class TestGenerateReportThreeWay:
         assert entry["precision_at_k_llm"] == 1.0
         assert entry["llm_elapsed_ms"] == 3200.0
 
-    def test_llm_delta_uses_same_subset_baseline(self):
-        # One query has the LLM arm, one does not. The llm_vs_reranked delta
-        # must subtract the reranked baseline of ONLY the LLM-arm query, not the
-        # full-n reranked average (which would mix populations).
-        # Query 1: reranked precision 0.6, llm precision 1.0.
+    def test_partial_llm_arm_raises(self):
+        # The LLM arm is all-or-nothing. A report where one query has LLM
+        # metrics and another does not is a programming error — reject it rather
+        # than print an LLM average against a full-n reranked baseline (mixed
+        # populations -> internally inconsistent deltas).
         rr1 = _make_query_result("q1", "reranked", ["a", "b", "c", "d", "e"])
         raw1 = _make_query_result("q1", "raw", ["b", "d", "a", "c", "e"])
         llm1 = _make_query_result("q1", "llm", ["a", "c", "e"])
         m1 = compute_comparison_metrics(
             rr1, raw1, ["a", "c", "e"], [], k=5, llm=llm1,
         )
-        # Query 2: reranked precision 0.0, NO llm arm.
         rr2 = _make_query_result("q2", "reranked", ["x", "y"])
         raw2 = _make_query_result("q2", "raw", ["y", "x"])
         m2 = compute_comparison_metrics(rr2, raw2, ["z"], [], k=5)
 
-        report = generate_report(
-            [(rr1, raw1, m1), (rr2, raw2, m2)],
-            [{"id": "q1", "k": 5}, {"id": "q2", "k": 5}],
-        )
-        s = report["summary"]
-        assert s["llm_arm_queries"] == 1
-        # Subset baseline: 1.0 - 0.6 = 0.4 (NOT 1.0 - mean(0.6, 0.0) = 0.7).
-        assert s["precision_at_k"]["llm_vs_reranked"] == round(1.0 - 3 / 5, 4)
-        assert s["precision_at_k"]["llm"] == 1.0
+        with pytest.raises(ValueError, match="all-or-nothing"):
+            generate_report(
+                [(rr1, raw1, m1), (rr2, raw2, m2)],
+                [{"id": "q1", "k": 5}, {"id": "q2", "k": 5}],
+            )
 
 
 class TestRunQueryLlmGuard:
@@ -407,6 +404,67 @@ class TestAssertLlmArmRan:
         # An empty pool is ambiguous and shared by all arms; let the metric
         # layer record precision 0 instead of aborting the whole benchmark.
         assert_llm_arm_ran("q1", [])
+
+
+class TestRunBenchmarkArmIntegrity:
+    """run_benchmark fails loudly rather than recording misleading arms."""
+
+    async def test_empty_llm_arm_beside_nonempty_raises(self, monkeypatch):
+        # LLM arm returns nothing while reranked/raw return rows -> the selector
+        # never ran on the pool; fail closed at the three-arm assembly point.
+        async def fake_run_query(
+            qid, query, k, rerank, project=None, tags=None, llm_rerank=False,
+        ):
+            if llm_rerank:
+                return _make_query_result(qid, "llm", [])
+            return _make_query_result(
+                qid, "reranked" if rerank else "raw", ["a"],
+            )
+
+        monkeypatch.setattr(benchmark_module, "run_query", fake_run_query)
+        with pytest.raises(RuntimeError, match="empty LLM arm"):
+            await run_benchmark(
+                [{"id": "q1", "query": "q", "k": 5, "golden_ids": ["a"]}],
+                with_llm=True,
+            )
+
+    async def test_failed_arm_is_aggregated_not_swallowed(self, monkeypatch):
+        # A raised arm must surface via the aggregated error, not crash the
+        # de-interleave with a bare exception leaking the first failure only.
+        async def fake_run_query(
+            qid, query, k, rerank, project=None, tags=None, llm_rerank=False,
+        ):
+            if llm_rerank:
+                raise RuntimeError("selector blew up")
+            return _make_query_result(
+                qid, "reranked" if rerank else "raw", ["a"],
+            )
+
+        monkeypatch.setattr(benchmark_module, "run_query", fake_run_query)
+        with pytest.raises(RuntimeError, match="benchmark arm"):
+            await run_benchmark(
+                [{"id": "q1", "query": "q", "k": 5}],
+                with_llm=True,
+            )
+
+    async def test_all_arms_succeed_produces_metrics(self, monkeypatch):
+        async def fake_run_query(
+            qid, query, k, rerank, project=None, tags=None, llm_rerank=False,
+        ):
+            if llm_rerank:
+                return _make_query_result(qid, "llm", ["a"])
+            return _make_query_result(
+                qid, "reranked" if rerank else "raw", ["a", "b"],
+            )
+
+        monkeypatch.setattr(benchmark_module, "run_query", fake_run_query)
+        out = await run_benchmark(
+            [{"id": "q1", "query": "q", "k": 5, "golden_ids": ["a"]}],
+            with_llm=True,
+        )
+        assert len(out) == 1
+        _, _, m = out[0]
+        assert m.precision_at_k_llm == 1.0  # llm returned only the golden id
 
 
 class TestPrintSummaryThreeWay:

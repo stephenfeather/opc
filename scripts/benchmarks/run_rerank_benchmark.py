@@ -492,7 +492,21 @@ async def run_benchmark(
                                    project=project, tags=tags or None,
                                    llm_rerank=True))
 
-    all_results = await asyncio.gather(*coros)
+    # return_exceptions=True so a single failed/fallback-detected arm does not
+    # propagate immediately and leave sibling subprocesses running outside the
+    # benchmark's accounting (default gather cancels nothing on first raise, and
+    # asyncio.run's teardown can orphan in-flight children). Every arm completes,
+    # then we surface ALL failures at once for a usable diagnostic.
+    gathered = await asyncio.gather(*coros, return_exceptions=True)
+    errors = [r for r in gathered if isinstance(r, BaseException)]
+    if errors:
+        shown = "; ".join(f"{type(e).__name__}: {e}" for e in errors[:10])
+        suffix = f" (+{len(errors) - 10} more)" if len(errors) > 10 else ""
+        raise RuntimeError(
+            f"{len(errors)} of {len(coros)} benchmark arm(s) failed: "
+            f"{shown}{suffix}"
+        )
+    all_results: list[QueryResult] = gathered  # type: ignore[assignment]
 
     # De-interleave by stride and compute metrics per query.
     output = []
@@ -504,6 +518,24 @@ async def run_benchmark(
         golden_ids = q.get("golden_ids", [])
         golden_keywords = q.get("golden_keywords", [])
         k = q.get("k", 5)
+
+        # Cross-arm evidence check (Finding 1, round 2): decided here where all
+        # three arms are visible. An empty LLM arm beside a non-empty
+        # reranked/raw arm means the selector did not actually run on a real
+        # pool — fail closed rather than record a phantom precision-0 LLM row.
+        # (All-empty is a degenerate query shared by every arm; left to the
+        # metric layer as precision 0.)
+        if (
+            with_llm
+            and llm is not None
+            and not llm.result_ids
+            and (reranked.result_ids or raw.result_ids)
+        ):
+            raise RuntimeError(
+                f"Query {q['id']} (llm): LLM arm returned no results while the "
+                f"reranked/raw arms did — the LLM selector did not run on the "
+                f"candidate pool. Refusing to record an empty LLM arm."
+            )
 
         metrics = compute_comparison_metrics(
             reranked, raw, golden_ids, golden_keywords, k, llm=llm,
@@ -623,63 +655,49 @@ def generate_report(
     }
 
     if has_llm:
-        # Aggregate over queries whose LLM arm produced metrics. The benchmark
-        # fails closed when the LLM arm degrades (run_query.assert_llm_arm_ran),
-        # so in practice this is the full set; the per-result None-guard narrows
-        # the Optional types and keeps a hypothetical partial run honest. The
-        # reranked/latency baselines used for the llm deltas are recomputed over
-        # THE SAME subset (not the full-n averages), so the headline deltas and
-        # win rates always compare like populations even if ln < n.
-        ln = 0
-        p_llm_sum = ndcg_llm_sum = mrr_llm_sum = lat_llm_sum = 0.0
-        p_rr_sum = ndcg_rr_sum = mrr_rr_sum = lat_rr_sum = 0.0
-        llm_wins = reranked_wins = 0
-        for _, _, m in results:
-            pl, nl, ml, el = (
-                m.precision_at_k_llm,
-                m.ndcg_at_k_llm,
-                m.mrr_llm,
-                m.llm_elapsed_ms,
+        # The LLM arm is all-or-nothing: a real with_llm run assigns every query
+        # an LLM QueryResult, and run_benchmark fails closed on any degraded or
+        # empty arm — so every row carries LLM metrics. A mix means the metrics
+        # were assembled inconsistently (a programming error), and reporting an
+        # LLM average over a subset while the summary's `reranked` baseline is a
+        # full-n average would print internally inconsistent deltas. Reject it
+        # rather than emit misleading numbers; the baselines below are then the
+        # same full-n averages shown in the two-way summary (same population).
+        llm_count = sum(
+            1 for _, _, m in results if m.precision_at_k_llm is not None
+        )
+        if llm_count != n:
+            raise ValueError(
+                f"Partial LLM arm: {llm_count} of {n} queries carry LLM "
+                f"metrics. The LLM arm must be all-or-nothing."
             )
-            if pl is None or nl is None or ml is None or el is None:
-                continue
-            ln += 1
-            p_llm_sum += pl
-            ndcg_llm_sum += nl
-            mrr_llm_sum += ml
-            lat_llm_sum += el
-            p_rr_sum += m.precision_at_k_reranked
-            ndcg_rr_sum += m.ndcg_at_k_reranked
-            mrr_rr_sum += m.mrr_reranked
-            lat_rr_sum += m.reranked_elapsed_ms
-            if pl > m.precision_at_k_reranked:
-                llm_wins += 1
-            elif m.precision_at_k_reranked > pl:
-                reranked_wins += 1
 
-        if ln:
-            p_llm = p_llm_sum / ln
-            ndcg_llm = ndcg_llm_sum / ln
-            mrr_llm = mrr_llm_sum / ln
-            lat_llm = lat_llm_sum / ln
-            # Same-subset reranked baselines (== full-n averages when ln == n).
-            p_rr = p_rr_sum / ln
-            ndcg_rr = ndcg_rr_sum / ln
-            mrr_rr = mrr_rr_sum / ln
-            lat_rr = lat_rr_sum / ln
-            s = report["summary"]
-            s["precision_at_k"]["llm"] = round(p_llm, 4)
-            s["precision_at_k"]["llm_vs_reranked"] = round(p_llm - p_rr, 4)
-            s["ndcg_at_k"]["llm"] = round(ndcg_llm, 4)
-            s["ndcg_at_k"]["llm_vs_reranked"] = round(ndcg_llm - ndcg_rr, 4)
-            s["mrr"]["llm"] = round(mrr_llm, 4)
-            s["mrr"]["llm_vs_reranked"] = round(mrr_llm - mrr_rr, 4)
-            s["latency_ms"]["llm_avg"] = round(lat_llm, 1)
-            s["latency_ms"]["llm_overhead_ms"] = round(lat_llm - lat_rr, 1)
-            s["llm_arm_queries"] = ln
-            s["llm_wins_vs_reranked"] = llm_wins
-            s["reranked_wins_vs_llm"] = reranked_wins
-            s["llm_ties_vs_reranked"] = ln - llm_wins - reranked_wins
+        p_llm = avg([m.precision_at_k_llm for _, _, m in results])  # type: ignore[misc]
+        ndcg_llm = avg([m.ndcg_at_k_llm for _, _, m in results])  # type: ignore[misc]
+        mrr_llm = avg([m.mrr_llm for _, _, m in results])  # type: ignore[misc]
+        lat_llm = avg([m.llm_elapsed_ms for _, _, m in results])  # type: ignore[misc]
+        llm_wins = sum(
+            1 for _, _, m in results
+            if m.precision_at_k_llm > m.precision_at_k_reranked  # type: ignore[operator]
+        )
+        reranked_wins = sum(
+            1 for _, _, m in results
+            if m.precision_at_k_reranked > m.precision_at_k_llm  # type: ignore[operator]
+        )
+
+        s = report["summary"]
+        s["precision_at_k"]["llm"] = round(p_llm, 4)
+        s["precision_at_k"]["llm_vs_reranked"] = round(p_llm - p_reranked, 4)
+        s["ndcg_at_k"]["llm"] = round(ndcg_llm, 4)
+        s["ndcg_at_k"]["llm_vs_reranked"] = round(ndcg_llm - ndcg_reranked, 4)
+        s["mrr"]["llm"] = round(mrr_llm, 4)
+        s["mrr"]["llm_vs_reranked"] = round(mrr_llm - mrr_reranked, 4)
+        s["latency_ms"]["llm_avg"] = round(lat_llm, 1)
+        s["latency_ms"]["llm_overhead_ms"] = round(lat_llm - lat_reranked, 1)
+        s["llm_arm_queries"] = n
+        s["llm_wins_vs_reranked"] = llm_wins
+        s["reranked_wins_vs_llm"] = reranked_wins
+        s["llm_ties_vs_reranked"] = n - llm_wins - reranked_wins
 
     return report
 

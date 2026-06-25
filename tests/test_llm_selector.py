@@ -19,9 +19,12 @@ import httpx
 import pytest
 
 from scripts.core.llm_selector import (
+    _DEFAULT_LLM_SELECTOR_TIMEOUT,
     LLM_SELECTOR_TIMEOUT,
     MANIFEST_DESC_MAXLEN,
     MANIFEST_RAW_SLICE,
+    _parse_timeout,
+    _resolve_llm_selector_timeout,
     apply_selection,
     build_manifest,
     call_anthropic,
@@ -440,16 +443,65 @@ class TestLLMSelectApiErrors:
         assert out is None
 
 
-# --- Timeout constant tuning (E1 live finding) ---
+# --- Timeout constant tuning (Phase E live finding, issue #244) ---
 class TestTimeoutConstant:
-    def test_timeout_exceeds_real_pool_latency_floor(self):
-        # E1 live test: a realistic 50-candidate manifest (~13KB) takes ~3.2s
-        # end-to-end against the real Anthropic API. The LLM selector is gated
-        # OFF the 5s-killed hook path (F3 --source hook gate), so this timeout is
-        # CLI/benchmark-scoped and must comfortably exceed the measured ~3s
-        # latency — otherwise llm_select times out on every normal pool and the
-        # feature silently never produces an LLM selection.
-        assert LLM_SELECTOR_TIMEOUT >= 5.0
+    def test_default_timeout_exceeds_real_pool_latency_floor(self):
+        # Phase E live finding (issue #244): the original E1 ~3.2s measurement
+        # used short synthetic content. A realistic 50-candidate pool of
+        # real-length learnings measures ~12s end-to-end against the Anthropic
+        # API (slow outliers ~22s), so the shipped 10s deadline timed out on
+        # every normal pool and the selector silently fell back to the reranker.
+        # The LLM selector is gated OFF the 5s-killed hook path (F3 --source hook
+        # gate), so this timeout is CLI/benchmark-scoped and must comfortably
+        # exceed the measured ~12s latency. The floor is set above that latency
+        # (not at the configured value) so a future drop into the timeout zone is
+        # caught.
+        assert _DEFAULT_LLM_SELECTOR_TIMEOUT >= 20.0
+
+    def test_resolver_uses_default_without_env(self, monkeypatch):
+        monkeypatch.delenv("LLM_SELECTOR_TIMEOUT", raising=False)
+        assert _resolve_llm_selector_timeout() == _DEFAULT_LLM_SELECTOR_TIMEOUT
+
+    def test_resolver_honors_env_override(self, monkeypatch):
+        # The benchmark sets a higher value to absorb ~22s outliers under load.
+        monkeypatch.setenv("LLM_SELECTOR_TIMEOUT", "90")
+        assert _resolve_llm_selector_timeout() == 90.0
+
+    def test_resolver_rejects_unparseable_env(self, monkeypatch):
+        monkeypatch.setenv("LLM_SELECTOR_TIMEOUT", "not-a-number")
+        assert _resolve_llm_selector_timeout() == _DEFAULT_LLM_SELECTOR_TIMEOUT
+
+    def test_resolver_rejects_nonpositive_env(self, monkeypatch):
+        monkeypatch.setenv("LLM_SELECTOR_TIMEOUT", "-5")
+        assert _resolve_llm_selector_timeout() == _DEFAULT_LLM_SELECTOR_TIMEOUT
+
+    def test_module_constant_is_positive_finite(self):
+        # The exported constant is resolved at import time and may reflect an
+        # ambient LLM_SELECTOR_TIMEOUT override, so assert only the env-
+        # independent invariant here (positive and finite). The >= 20 latency
+        # floor is guaranteed on the env-independent _DEFAULT above.
+        assert 0 < LLM_SELECTOR_TIMEOUT < float("inf")
+
+    def test_parse_timeout_accepts_valid_positive(self):
+        assert _parse_timeout("90") == 90.0
+        assert _parse_timeout("30.5") == 30.5
+
+    def test_parse_timeout_rejects_blank_and_none(self):
+        assert _parse_timeout(None) is None
+        assert _parse_timeout("") is None
+
+    def test_parse_timeout_rejects_unparseable(self):
+        assert _parse_timeout("not-a-number") is None
+
+    def test_parse_timeout_rejects_nonpositive(self):
+        assert _parse_timeout("0") is None
+        assert _parse_timeout("-5") is None
+
+    def test_parse_timeout_rejects_infinity_and_nan(self):
+        # An infinite/NaN deadline would defeat the bounded-deadline invariant —
+        # it drives both the httpx timeout and asyncio.wait_for.
+        for bad in ("inf", "Infinity", "-inf", "nan", "1e309"):
+            assert _parse_timeout(bad) is None, bad
 
 
 # --- Step 7: timeout ---

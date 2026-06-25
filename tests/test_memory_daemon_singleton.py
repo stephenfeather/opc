@@ -407,22 +407,61 @@ class TestRunAsDaemonReadiness:
         finally:
             os.close(read_fd)
 
-    def test_closes_lock_fd_on_exit(self, monkeypatch, tmp_path):
+    def test_does_not_release_lock_fd_before_returning(self, monkeypatch, tmp_path):
+        """R3: _run_as_daemon must NOT close the singleton lock fd. Closing it
+        while the process is still alive (before the caller's os._exit) would
+        release the flock after the PID is already unlinked, opening a duplicate
+        -start window. The lock must stay held until the kernel closes the fd at
+        true process exit, so here the fd remains open after _run_as_daemon
+        returns (os.close succeeds rather than raising EBADF).
+        """
         import scripts.core.memory_daemon as mod
 
         self._patch_bootstrap(monkeypatch, mod)
-        monkeypatch.setattr(mod, "PID_FILE", tmp_path / "daemon.pid")
+        pid_file = tmp_path / "daemon.pid"
+        monkeypatch.setattr(mod, "PID_FILE", pid_file)
         monkeypatch.setattr(mod, "daemon_loop", lambda on_ready=None: None)
 
         # A real fd to stand in for the inherited lock fd.
         lock_r, lock_w = os.pipe()
         try:
             mod._run_as_daemon(ready_write_fd=None, lock_fd=lock_w)
-            # _run_as_daemon must have closed the lock fd on exit.
-            with pytest.raises(OSError):
-                os.close(lock_w)
+            # The PID is removed on exit, but the lock fd is deliberately left
+            # OPEN (held until the kernel reclaims it at process exit).
+            assert not pid_file.exists()
+            os.close(lock_w)  # must not raise — fd is still open
         finally:
             os.close(lock_r)
+
+    def test_propagates_failure_exit_code_on_post_readiness_crash(self, monkeypatch, tmp_path):
+        """R3: a daemon_loop escape after readiness must yield a non-zero exit
+        code so the grandchild os._exit's with failure rather than masking the
+        crash as success.
+        """
+        import scripts.core.memory_daemon as mod
+
+        self._patch_bootstrap(monkeypatch, mod)
+        monkeypatch.setattr(mod, "PID_FILE", tmp_path / "daemon.pid")
+
+        def fake_loop(on_ready=None):
+            if on_ready is not None:
+                on_ready()  # readiness reached
+            raise RuntimeError("loop escaped after readiness")
+
+        monkeypatch.setattr(mod, "daemon_loop", fake_loop)
+
+        rc = mod._run_as_daemon(ready_write_fd=None, lock_fd=None)
+        assert rc == 1, "post-readiness crash must surface a non-zero exit code"
+
+    def test_clean_return_yields_zero_exit_code(self, monkeypatch, tmp_path):
+        import scripts.core.memory_daemon as mod
+
+        self._patch_bootstrap(monkeypatch, mod)
+        monkeypatch.setattr(mod, "PID_FILE", tmp_path / "daemon.pid")
+        monkeypatch.setattr(mod, "daemon_loop", lambda on_ready=None: None)
+
+        rc = mod._run_as_daemon(ready_write_fd=None, lock_fd=None)
+        assert rc == 0
 
     def test_survives_parent_timeout_that_closed_the_pipe(self, monkeypatch, tmp_path):
         """R1 regression: if the parent timed out and closed its read end before

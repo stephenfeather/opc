@@ -1575,7 +1575,10 @@ def _run_as_daemon(*, ready_write_fd: int | None = None, lock_fd: int | None = N
             _signal_ready(ready_write_fd)
         signaled["ready"] = True
 
-    # Run daemon
+    # Run daemon. daemon_loop only returns by raising (its while-loop is
+    # infinite), so any return here means the daemon has terminated — the caller
+    # must treat it as a hard process exit, not resume other work.
+    exit_code = 0
     try:
         daemon_loop(on_ready=_on_ready)
     except Exception as e:
@@ -1585,13 +1588,18 @@ def _run_as_daemon(*, ready_write_fd: int | None = None, lock_fd: int | None = N
         if not signaled["ready"] and ready_write_fd is not None:
             _signal_failed(ready_write_fd)
         log(f"Daemon exited with error: {safe_exception(e)}")
+        exit_code = 1
     finally:
         PID_FILE.unlink(missing_ok=True)
-        if lock_fd is not None:
-            try:
-                os.close(lock_fd)
-            except OSError:
-                pass
+    # Deliberately DO NOT close ``lock_fd`` here (adversarial review R3). Closing
+    # it would release the singleton flock while this process is still alive (the
+    # caller has yet to os._exit), opening a window where a concurrent ``start``
+    # sees no PID (just unlinked) AND a free lock, and forks a duplicate daemon.
+    # Instead we hold the lock until the kernel closes the fd at true process
+    # exit — which happens strictly AFTER the PID removal above — so a racing
+    # ``start`` in that window still finds the lock held and backs off. The
+    # caller (grandchild / --daemon-subprocess) must exit the process promptly.
+    return exit_code
 
 
 def start_daemon():
@@ -1694,8 +1702,11 @@ def start_daemon():
         # Grandchild owns write_fd (readiness) and lock_fd (singleton lock) for
         # the daemon's lifetime; _run_as_daemon signals readiness and releases
         # the lock on exit.
-        _run_as_daemon(ready_write_fd=write_fd, lock_fd=lock_fd)
-        os._exit(0)
+        # _run_as_daemon returns only when the daemon has terminated; exit the
+        # grandchild immediately (this is what finally releases the held flock,
+        # via the kernel closing lock_fd) and preserve its failure status.
+        exit_code = _run_as_daemon(ready_write_fd=write_fd, lock_fd=lock_fd)
+        os._exit(exit_code)
 
 
 def stop_daemon():
@@ -1819,8 +1830,9 @@ def main():
 
     # Windows subprocess entry point
     if args.daemon_subprocess:
-        _run_as_daemon()
-        return 0
+        # Propagate the daemon's terminal status (non-zero on a post-readiness
+        # crash) instead of always claiming success.
+        return _run_as_daemon() or 0
 
     if not args.command:
         parser.print_help()

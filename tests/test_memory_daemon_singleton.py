@@ -247,9 +247,13 @@ class TestStartDaemonSingletonGuard:
 
 
 class TestDaemonLoopOnReady:
-    """daemon_loop(on_ready=...) fires the callback after basic init succeeds."""
+    """daemon_loop(on_ready=...) fires the callback after ALL setup succeeds."""
 
-    def test_on_ready_called_after_ensure_schema_and_recover(self, monkeypatch):
+    def test_on_ready_fires_after_all_setup_before_serving(self, monkeypatch):
+        """R2 Finding 3: readiness must fire only after every abort-capable
+        setup step — schema, recovery, AND _seed_last_pattern_run — so a failure
+        in the later steps is reported as failure, not a phantom success.
+        """
         import scripts.core.memory_daemon as mod
 
         order: list[str] = []
@@ -259,7 +263,12 @@ class TestDaemonLoopOnReady:
 
         monkeypatch.setattr(mod, "ensure_schema", lambda: order.append("schema"))
         monkeypatch.setattr(mod, "recover_stalled_extractions", lambda: order.append("recover"))
-        monkeypatch.setattr(mod, "_seed_last_pattern_run", lambda: 0.0)
+
+        def _seed():
+            order.append("seed")
+            return 0.0
+
+        monkeypatch.setattr(mod, "_seed_last_pattern_run", _seed)
         monkeypatch.setattr(mod, "use_postgres", lambda: False)
         monkeypatch.setattr(mod, "log", lambda _m: None)
         monkeypatch.setattr(mod, "daemon_tick", lambda: None)
@@ -276,10 +285,35 @@ class TestDaemonLoopOnReady:
         with pytest.raises(_BreakLoopError):
             mod.daemon_loop(on_ready=on_ready)
 
-        assert order == ["schema", "recover", "ready"], (
-            f"on_ready must fire after ensure_schema + recover, before the tick "
-            f"loop; got {order}"
+        assert order == ["schema", "recover", "seed", "ready"], (
+            f"on_ready must fire after ALL setup (incl. seed), immediately before "
+            f"the tick loop; got {order}"
         )
+
+    def test_on_ready_not_called_when_setup_after_recover_raises(self, monkeypatch):
+        """R2 Finding 3: if a setup step after recover (here, seed) raises,
+        on_ready must NOT fire — the exception propagates so the caller signals
+        failure rather than the daemon reporting a phantom success.
+        """
+        import scripts.core.memory_daemon as mod
+
+        called: list[str] = []
+
+        monkeypatch.setattr(mod, "ensure_schema", lambda: None)
+        monkeypatch.setattr(mod, "recover_stalled_extractions", lambda: None)
+
+        def _seed_boom():
+            raise RuntimeError("seed failed")
+
+        monkeypatch.setattr(mod, "_seed_last_pattern_run", _seed_boom)
+        monkeypatch.setattr(mod, "use_postgres", lambda: False)
+        monkeypatch.setattr(mod, "log", lambda _m: None)
+        monkeypatch.setattr(mod, "_daemon_state", mod.create_daemon_state(), raising=False)
+
+        with pytest.raises(RuntimeError, match="seed failed"):
+            mod.daemon_loop(on_ready=lambda: called.append("ready"))
+
+        assert called == [], "on_ready must not fire when post-recover setup raises"
 
     def test_default_on_ready_none_is_backward_compatible(self, monkeypatch):
         """daemon_loop() with no on_ready must still run init and the loop."""
@@ -320,7 +354,7 @@ class TestRunAsDaemonReadiness:
         monkeypatch.setattr(mod, "_logger", MagicMock(), raising=False)
         monkeypatch.setattr(mod, "log", lambda _m: None)
 
-    def test_writes_pid_and_signals_ready_on_success(self, monkeypatch, tmp_path):
+    def test_writes_pid_early_and_signals_ready_on_success(self, monkeypatch, tmp_path):
         import scripts.core.memory_daemon as mod
 
         self._patch_bootstrap(monkeypatch, mod)
@@ -330,11 +364,12 @@ class TestRunAsDaemonReadiness:
         seen: dict = {}
 
         def fake_loop(on_ready=None):
-            # Simulate successful init: invoke the readiness callback, then
-            # observe daemon state before _run_as_daemon's finally unlinks PID.
+            # R2: the PID is written EARLY, before daemon_loop runs, so it must
+            # already exist when the loop is entered — before readiness fires.
+            seen["pid_before_ready"] = pid_file.exists()
             if on_ready is not None:
                 on_ready()
-            seen["pid_exists"] = pid_file.exists()
+            seen["pid_after_ready"] = pid_file.exists()
             seen["pid_content"] = pid_file.read_text() if pid_file.exists() else None
 
         monkeypatch.setattr(mod, "daemon_loop", fake_loop)
@@ -342,13 +377,14 @@ class TestRunAsDaemonReadiness:
         read_fd, write_fd = os.pipe()
         try:
             mod._run_as_daemon(ready_write_fd=write_fd, lock_fd=None)
-            assert seen["pid_exists"] is True
+            assert seen["pid_before_ready"] is True, "PID must be written before init"
+            assert seen["pid_after_ready"] is True
             assert seen["pid_content"] == str(os.getpid())
             assert os.read(read_fd, 1) == b"R"
         finally:
             os.close(read_fd)
 
-    def test_signals_failed_and_skips_pid_when_init_raises(self, monkeypatch, tmp_path):
+    def test_signals_failed_and_cleans_up_pid_when_init_raises(self, monkeypatch, tmp_path):
         import scripts.core.memory_daemon as mod
 
         self._patch_bootstrap(monkeypatch, mod)
@@ -365,7 +401,9 @@ class TestRunAsDaemonReadiness:
             # Must swallow the init error (already reported via the pipe).
             mod._run_as_daemon(ready_write_fd=write_fd, lock_fd=None)
             assert os.read(read_fd, 1) == b"F"
-            assert not pid_file.exists(), "PID must not be written when init fails"
+            # The PID is written early but the finally-clause unlinks it when the
+            # daemon dies during init, so nothing lingers pointing at a corpse.
+            assert not pid_file.exists(), "PID must be cleaned up when init fails"
         finally:
             os.close(read_fd)
 
@@ -410,7 +448,8 @@ class TestRunAsDaemonReadiness:
         def fake_loop(on_ready=None):
             # Init succeeded; fire readiness against the closed pipe, then the
             # daemon would proceed into its tick loop normally.
-            on_ready()
+            if on_ready is not None:
+                on_ready()
             seen["pid_during_loop"] = pid_file.exists()
             seen["pid_content"] = pid_file.read_text() if pid_file.exists() else None
 

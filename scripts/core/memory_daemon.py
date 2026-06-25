@@ -1220,12 +1220,13 @@ def daemon_loop(on_ready=None):
     """Main daemon loop: init, then tick + sleep forever.
 
     ``on_ready`` (Issue #102): an optional zero-arg callback fired exactly once
-    after the failure-prone DB init (``ensure_schema`` + ``recover_stalled_extractions``)
-    has succeeded and before the tick loop begins. ``_run_as_daemon`` uses it to
-    write the PID file and signal the waiting parent, so the PID never points at
-    a daemon that died during init and "started" is only reported on real
-    readiness. If ``ensure_schema``/``recover`` raise, the callback never fires
-    and the exception propagates to the caller, which signals failure instead.
+    after ALL abort-capable setup (``ensure_schema`` + ``recover_stalled_extractions``
+    + daemon-state creation + ``_seed_last_pattern_run``) has succeeded and
+    immediately before the tick loop begins. ``_run_as_daemon`` uses it to signal
+    the waiting parent, so "started" is reported only when the daemon has actually
+    reached its serving loop — not merely when the DB is reachable. If any setup
+    step raises, the callback never fires and the exception propagates to the
+    caller, which signals failure instead (adversarial review R2 Finding 3).
     """
     global _daemon_state
 
@@ -1235,12 +1236,6 @@ def daemon_loop(on_ready=None):
         f"max_concurrent={_max_concurrent()})")
     ensure_schema()
     recover_stalled_extractions()
-
-    # Basic DB init succeeded — the daemon is now "ready". Signal the parent
-    # (and write the PID) before the long-running setup below so startup
-    # success reflects a daemon that actually reached a working DB.
-    if on_ready is not None:
-        on_ready()
 
     # Reuse existing DaemonState if lazily initialized, else create (D14).
     # Prior bug: daemon_loop() replaced a lazily-created state, losing
@@ -1259,6 +1254,14 @@ def daemon_loop(on_ready=None):
     if _daemon_state.last_pattern_run:
         log(f"Seeded last pattern run from DB: "
             f"{datetime.fromtimestamp(_daemon_state.last_pattern_run).isoformat()}")
+
+    # All abort-capable setup (schema, recovery, state, seed) has succeeded and
+    # the daemon is about to enter its serving loop — signal readiness now, so
+    # the readiness contract means "serving", not merely "DB reachable". Any
+    # exception above propagates without firing on_ready, so the caller signals
+    # failure instead of reporting a phantom success (adversarial review R2).
+    if on_ready is not None:
+        on_ready()
 
     while True:
         try:
@@ -1515,14 +1518,23 @@ def _run_as_daemon(*, ready_write_fd: int | None = None, lock_fd: int | None = N
     """Run the daemon loop (called by subprocess on Windows, directly after fork on Unix).
 
     Issue #102 — readiness handshake and singleton lock ownership:
-      - ``ready_write_fd``: the write end of the parent's readiness pipe. The PID
-        file is written and a ready byte is sent only after basic DB init
-        succeeds (via ``daemon_loop(on_ready=...)``). If init fails, a fail byte
-        is sent and the PID file is never written, so the parent reports the
-        failure instead of a phantom "started".
+      - ``ready_write_fd``: the write end of the parent's readiness pipe. A ready
+        byte is sent (via ``daemon_loop(on_ready=...)``) only once the daemon has
+        finished all abort-capable setup and is about to enter its serving loop,
+        so the parent reports "started" on real readiness, not just a fork. If
+        setup fails first, a fail byte is sent instead.
       - ``lock_fd``: the inherited singleton-lock fd. The grandchild owns it for
         the daemon's lifetime and closes it on exit, releasing the lock so a
         future ``start`` can succeed.
+
+    PID-file timing (adversarial review R2): the PID is written EARLY here, before
+    the long DB init, so ``status``/``stop`` can manage the live process for its
+    entire lifetime — including a slow init and the post-readiness-timeout window
+    where the parent has given up but the daemon is still coming up. The PID is
+    unlinked in ``finally`` (and on init failure the daemon exits, taking the PID
+    with it), and ``is_running()`` already prunes a stale PID, so an early PID
+    never lingers pointing at a dead process. Readiness is gated by the pipe, not
+    the PID, so a phantom "started" is still impossible.
     """
     # Standard daemon hardening (Issue #103): owner-only umask + detach from the
     # invoking shell's cwd. Done here — the common entry point for the Unix
@@ -1530,6 +1542,11 @@ def _run_as_daemon(*, ready_write_fd: int | None = None, lock_fd: int | None = N
     # all platforms are covered, and before the PID file write below so the PID
     # file itself is created under the 0o077 umask.
     _harden_daemon_environment()
+
+    # Write the PID file early so status/stop can manage the process throughout
+    # its life (including init). Readiness is signaled separately, below.
+    PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PID_FILE.write_text(str(os.getpid()))
 
     # Daemon bootstrap ordering is critical:
     #   1. _reserve_low_fds(): guards fd 0/1/2 with /dev/null so the logger
@@ -1551,11 +1568,9 @@ def _run_as_daemon(*, ready_write_fd: int | None = None, lock_fd: int | None = N
     signaled = {"ready": False}
 
     def _on_ready():
-        # Basic DB init succeeded. Write the PID file ONLY now (Issue #102), so
-        # the PID never references a daemon that died during init, then tell the
-        # waiting parent it is safe to report success.
-        PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-        PID_FILE.write_text(str(os.getpid()))
+        # All abort-capable setup succeeded and the daemon is about to serve —
+        # tell the waiting parent it is safe to report success. Tolerant of a
+        # parent that already timed out and closed its read end (R1).
         if ready_write_fd is not None:
             _signal_ready(ready_write_fd)
         signaled["ready"] = True
@@ -1564,7 +1579,7 @@ def _run_as_daemon(*, ready_write_fd: int | None = None, lock_fd: int | None = N
     try:
         daemon_loop(on_ready=_on_ready)
     except Exception as e:
-        # An exception before readiness means init failed: report failure to the
+        # An exception before readiness means setup failed: report failure to the
         # parent (which is still blocked) rather than letting it hang/timeout.
         # A crash after readiness is just logged — the parent already moved on.
         if not signaled["ready"] and ready_write_fd is not None:
@@ -1585,6 +1600,15 @@ def start_daemon():
     Cross-platform: Uses subprocess.DETACHED_PROCESS on Windows,
     double-fork on Unix (macOS/Linux).
     """
+    # Reserve fds 0/1/2 BEFORE opening the singleton lock or the readiness pipe
+    # (adversarial review R2 Finding 4). main() already does this, but a direct
+    # caller might not: if 0/1/2 are closed, the lock or pipe could land there
+    # and be clobbered by _setup_daemon_fds()'s dup2(/dev/null) in the grandchild
+    # — silently releasing the singleton lock or breaking the readiness pipe.
+    # _reserve_low_fds() is a no-op when 0/1/2 are already open, so this is safe
+    # to call redundantly.
+    _reserve_low_fds()
+
     running, pid = is_running()
     if running:
         print(f"Memory daemon already running (PID {pid})")

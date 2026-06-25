@@ -23,7 +23,7 @@ interface UserPromptSubmitInput {
   cwd: string;
 }
 
-interface LearningResult {
+export interface LearningResult {
   id: string;
   type: string;
   content: string;
@@ -33,6 +33,31 @@ interface LearningResult {
 interface MemoryMatch {
   count: number;
   results: LearningResult[];
+}
+
+/**
+ * Map a raw recall result into the structured LearningResult rendered in the
+ * MEMORY MATCH block. The id is kept in full: it is the machine-usable handle
+ * for store_feedback, and truncating it to 8 chars (issue #243) produced an
+ * invalid UUID that the feedback tool rejected. The 120-char cap applies only
+ * to the human-readable content preview.
+ */
+export function toLearningResult(r: any): LearningResult {
+  const content = r.content || '';
+  // Get first meaningful line up to 120 chars
+  const preview = content
+    .split('\n')
+    .filter((l: string) => l.trim().length > 0)
+    .map((l: string) => l.trim())
+    .join(' ')
+    .slice(0, 120);
+
+  return {
+    id: r.id || 'unknown',
+    type: r.learning_type || r.type || 'UNKNOWN',
+    content: preview + (content.length > 120 ? '...' : ''),
+    score: r.score || 0
+  };
 }
 
 function readStdin(): string {
@@ -301,23 +326,7 @@ function checkMemoryRelevance(
     // Any match from FTS is relevant enough to show
 
     // Extract structured results with better previews
-    const results: LearningResult[] = data.results.slice(0, 3).map((r: any) => {
-      const content = r.content || '';
-      // Get first meaningful line up to 120 chars
-      const preview = content
-        .split('\n')
-        .filter((l: string) => l.trim().length > 0)
-        .map((l: string) => l.trim())
-        .join(' ')
-        .slice(0, 120);
-
-      return {
-        id: (r.id || 'unknown').slice(0, 8),
-        type: r.learning_type || r.type || 'UNKNOWN',
-        content: preview + (content.length > 120 ? '...' : ''),
-        score: r.score || 0
-      };
-    });
+    const results: LearningResult[] = data.results.slice(0, 3).map(toLearningResult);
 
     return {
       count: data.results.length,

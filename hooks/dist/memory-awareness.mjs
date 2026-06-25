@@ -65,6 +65,16 @@ function isValidId(id) {
  * 3. If score > threshold, show visible hint with top learning preview
  * 4. Claude proactively discloses and acts on relevant memories
  */
+function toLearningResult(r) {
+  const content = r.content || "";
+  const preview = content.split("\n").filter((l) => l.trim().length > 0).map((l) => l.trim()).join(" ").slice(0, 120);
+  return {
+    id: r.id || "unknown",
+    type: r.learning_type || r.type || "UNKNOWN",
+    content: preview + (content.length > 120 ? "..." : ""),
+    score: r.score || 0
+  };
+}
 function readStdin() {
   return readFileSync2(0, "utf-8");
 }
@@ -320,16 +330,7 @@ function checkMemoryRelevance(intent, projectDir, sessionId) {
     if (!data.results || data.results.length === 0) {
       return null;
     }
-    const results = data.results.slice(0, 3).map((r) => {
-      const content = r.content || "";
-      const preview = content.split("\n").filter((l) => l.trim().length > 0).map((l) => l.trim()).join(" ").slice(0, 120);
-      return {
-        id: (r.id || "unknown").slice(0, 8),
-        type: r.learning_type || r.type || "UNKNOWN",
-        content: preview + (content.length > 120 ? "..." : ""),
-        score: r.score || 0
-      };
-    });
+    const results = data.results.slice(0, 3).map(toLearningResult);
     return {
       count: data.results.length,
       results
@@ -380,5 +381,6 @@ if (typeof process !== "undefined" && process.argv[1] && (process.argv[1].endsWi
 export {
   isConversationalTurn,
   sanitizeSearchTerm,
-  surfacedSessionArgs
+  surfacedSessionArgs,
+  toLearningResult
 };

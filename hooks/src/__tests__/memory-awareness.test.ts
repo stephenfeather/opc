@@ -12,7 +12,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { sanitizeSearchTerm, isConversationalTurn } from '../memory-awareness.js';
+import { sanitizeSearchTerm, isConversationalTurn, toLearningResult } from '../memory-awareness.js';
 
 describe('sanitizeSearchTerm', () => {
   it('preserves bare numbers (regression: "7" was stripped)', () => {
@@ -159,5 +159,34 @@ describe('isConversationalTurn', () => {
 
   it('treats empty/whitespace input as conversational (nothing to recall)', () => {
     expect(isConversationalTurn('   ')).toBe(true);
+  });
+});
+
+describe('toLearningResult', () => {
+  it('preserves the full learning UUID so the inline id is usable in store_feedback (issue #243)', () => {
+    const uuid = 'ea90abae-ddde-4862-97d9-d6f7f9a70822';
+    expect(toLearningResult({ id: uuid, content: 'x', learning_type: 'WORKING_SOLUTION' }).id).toBe(uuid);
+  });
+
+  it("falls back to 'unknown' (in full, untruncated) when the id is missing", () => {
+    expect(toLearningResult({ content: 'x' }).id).toBe('unknown');
+  });
+
+  it('maps type from learning_type, then type, then UNKNOWN', () => {
+    expect(toLearningResult({ id: '1', learning_type: 'ERROR_FIX' }).type).toBe('ERROR_FIX');
+    expect(toLearningResult({ id: '1', type: 'CODEBASE_PATTERN' }).type).toBe('CODEBASE_PATTERN');
+    expect(toLearningResult({ id: '1' }).type).toBe('UNKNOWN');
+  });
+
+  it('collapses content to a single line and caps the preview at 120 chars with an ellipsis', () => {
+    const long = 'a'.repeat(200);
+    const out = toLearningResult({ id: '1', content: `first line\n\n${long}` });
+    expect(out.content.endsWith('...')).toBe(true);
+    expect(out.content.length).toBe(123); // 120 chars + '...'
+  });
+
+  it('does not append an ellipsis when content fits within 120 chars', () => {
+    const out = toLearningResult({ id: '1', content: 'short content' });
+    expect(out.content).toBe('short content');
   });
 });

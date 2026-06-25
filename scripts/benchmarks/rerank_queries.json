@@ -1,5 +1,5 @@
 {
-  "description": "Benchmark queries for A/B testing reranker vs raw retrieval Each query carries split=train|holdout; the tuning loop decides keep/discard on the holdout split only. golden_hashes (content-hash anchored) take precedence over golden_ids; golden_negatives are content-hashes judged not relevant.",
+  "description": "Benchmark queries for A/B testing reranker vs raw retrieval. Each query carries split=train|holdout; the tuning loop decides keep/discard on the holdout split only. golden_hashes (content-hash anchored) take precedence over golden_ids; golden_negatives are content-hashes judged not relevant.",
   "version": 1,
   "queries": [
     {

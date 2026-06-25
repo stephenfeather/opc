@@ -25,10 +25,11 @@ import math
 import os
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
+from scripts.core.config import get_config
 from scripts.core.content_hash import content_hash
 from scripts.core.llm_selector import _parse_timeout
 from scripts.core.reranker import RecallContext, RerankerConfig, rerank
@@ -1073,21 +1074,18 @@ def sweep_rerank(
     cached_results: dict[str, list[dict]],
     queries: list[dict],
     weight_configs: list[dict],
+    base: RerankerConfig,
 ) -> list[dict]:
-    """Run reranker with each weight config on cached results."""
+    """Run reranker with each weight config on cached results.
+
+    Each candidate layers its swept weights onto ``base`` (the live opc.toml
+    config) so non-swept fields are inherited rather than reset to defaults.
+    """
     sweep_results = []
 
     for wc in weight_configs:
         name = wc["name"]
-        config = RerankerConfig(
-            project_weight=wc["project_weight"],
-            recency_weight=wc["recency_weight"],
-            confidence_weight=wc["confidence_weight"],
-            recall_weight=wc["recall_weight"],
-            type_affinity_weight=wc["type_affinity_weight"],
-            tag_overlap_weight=wc["tag_overlap_weight"],
-            pattern_weight=wc["pattern_weight"],
-        )
+        config = build_reranker_config(wc, base)
 
         p_at_k_vals = []
         ndcg_vals = []
@@ -1146,17 +1144,37 @@ def sweep_rerank(
     return sweep_results
 
 
-def build_reranker_config(wc: dict) -> RerankerConfig:
-    """Construct a RerankerConfig from a WEIGHT_SWEEPS entry (name + 7 weights)."""
-    return RerankerConfig(
-        project_weight=wc["project_weight"],
-        recency_weight=wc["recency_weight"],
-        confidence_weight=wc["confidence_weight"],
-        recall_weight=wc["recall_weight"],
-        type_affinity_weight=wc["type_affinity_weight"],
-        tag_overlap_weight=wc["tag_overlap_weight"],
-        pattern_weight=wc["pattern_weight"],
-    )
+# The seven reranker weight fields the sweep perturbs (the only surface a swept
+# config or --apply may touch). Other RerankerConfig fields are inherited from
+# the live base config, never reset.
+SWEEP_WEIGHT_KEYS = (
+    "project_weight",
+    "recency_weight",
+    "confidence_weight",
+    "recall_weight",
+    "type_affinity_weight",
+    "tag_overlap_weight",
+    "pattern_weight",
+)
+
+
+def build_reranker_config(wc: dict, base: RerankerConfig) -> RerankerConfig:
+    """Layer a WEIGHT_SWEEPS entry's weights onto a live ``base`` config.
+
+    Only the swept weight fields present in ``wc`` are overridden; every other
+    field (kg_weight, recency_half_life_days, the RRF params, ...) is inherited
+    from ``base`` — the live opc.toml reranker config. This is required, not
+    optional: constructing a fresh ``RerankerConfig`` from the swept weights
+    alone would silently reset all non-swept fields to dataclass defaults, so a
+    "kept" candidate could be measured with different KG/recency behaviour than
+    the incumbent and would not reproduce after ``--apply`` (which writes only
+    the swept weights). Anchoring to ``base`` makes each candidate a true
+    perturbation of the running config, and ``base``'s live ``kg_weight`` is what
+    lets RerankerConfig.__post_init__ enforce the ``total_signal_weight <= 1.0``
+    invariant on the resulting config.
+    """
+    overrides = {k: wc[k] for k in SWEEP_WEIGHT_KEYS if k in wc}
+    return replace(base, **overrides)
 
 
 def _percentile(values: list[float], pct: float) -> float:
@@ -1417,7 +1435,9 @@ async def async_main() -> int:
             f"Cached {len(cached)} query result sets. "
             f"Running {len(WEIGHT_SWEEPS)} configs..."
         )
-        sweep_results = sweep_rerank(cached, queries, WEIGHT_SWEEPS)
+        sweep_results = sweep_rerank(
+            cached, queries, WEIGHT_SWEEPS, get_config().reranker
+        )
         print_sweep_summary(sweep_results)
 
         # Save sweep results alongside the main report

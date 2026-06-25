@@ -54,11 +54,17 @@ class _CapturingConn:
         self._fetch_rows = fetch_rows if fetch_rows is not None else []
         self._fetch_error = fetch_error
         self._execute_error = execute_error
-        # Issue #228: simulate a pre-migration DB where a column is absent.
-        # When set, any execute() whose SQL mentions this column name is
-        # recorded (so the failed attempt is observable) THEN raises
-        # UndefinedColumnError, exercising the legacy-INSERT fallback.
-        self._undefined_column = undefined_column
+        # Issue #228 / feedback loop: simulate a pre-migration DB where one or
+        # more columns are absent. May be a single column name or an iterable of
+        # them. Any execute() whose SQL mentions ANY absent column is recorded
+        # (so the failed attempt is observable) THEN raises UndefinedColumnError,
+        # exercising the INSERT-tier fallback ladder (10 -> 8 -> 7 -> 5).
+        if isinstance(undefined_column, str):
+            self._undefined_columns: tuple[str, ...] = (undefined_column,)
+        elif undefined_column is None:
+            self._undefined_columns = ()
+        else:
+            self._undefined_columns = tuple(undefined_column)
 
     async def fetch(self, sql: str, *args):
         self.fetch_calls.append((sql, args))
@@ -68,12 +74,11 @@ class _CapturingConn:
 
     async def execute(self, sql: str, *args):
         self.execute_calls.append((sql, args))
-        if self._undefined_column is not None and self._undefined_column in sql:
+        missing = next((c for c in self._undefined_columns if c in sql), None)
+        if missing is not None:
             from asyncpg.exceptions import UndefinedColumnError
 
-            raise UndefinedColumnError(
-                f'column "{self._undefined_column}" does not exist'
-            )
+            raise UndefinedColumnError(f'column "{missing}" does not exist')
         if self._execute_error is not None:
             raise self._execute_error
         return "INSERT 0 1"
@@ -239,33 +244,72 @@ class TestRecordRecallLogging:
     async def test_pre_migration_columns_absent_falls_back_to_legacy_insert(
         self, monkeypatch
     ):
-        # A DB missing pool_size/fetch_k also lacks the newer query-link columns,
-        # so both the 10-col (query-link) and 7-col (pool_size) INSERTs raise
-        # UndefinedColumnError; record_recall must walk down to the legacy 5-col
-        # INSERT so the #140 recall event is STILL logged. Must not raise.
+        # A fully legacy DB lacks BOTH the query-link columns AND pool_size/
+        # fetch_k, so the 10-col, 8-col (query-link) and 7-col (pool_size) INSERTs
+        # all raise UndefinedColumnError; record_recall must walk all the way down
+        # to the legacy 5-col INSERT so the #140 recall event is STILL logged.
+        # Must not raise.
         rid = str(uuid.uuid4())
         conn = _CapturingConn(
-            fetch_rows=[_row(rid, "opc")], undefined_column="pool_size"
+            fetch_rows=[_row(rid, "opc")],
+            undefined_column=("pool_size", "session_id"),
         )
         _patch_postgres(monkeypatch)
         _patch_pool(monkeypatch, conn)
 
         await record_recall([rid], caller_project="opc", pool_size=50, fetch_k=50)
 
-        # Three tiers attempted: 10-col query-link, 7-col pool_size, 5-col legacy.
-        assert len(conn.execute_calls) == 3
-        first_sql, _first = conn.execute_calls[0]
-        second_sql, _second = conn.execute_calls[1]
-        legacy_sql, legacy_args = conn.execute_calls[2]
-        # The first two tiers mention pool_size (and failed); the query-link tier
-        # additionally mentions session_id.
-        assert "session_id" in first_sql
-        assert "pool_size" in first_sql
-        assert "pool_size" in second_sql
-        assert "session_id" not in second_sql
+        # Four tiers attempted: 10-col, 8-col query-link, 7-col pool_size, 5-col.
+        assert len(conn.execute_calls) == 4
+        tier10_sql, _a = conn.execute_calls[0]
+        tier8_sql, _b = conn.execute_calls[1]
+        tier7_sql, _c = conn.execute_calls[2]
+        legacy_sql, legacy_args = conn.execute_calls[3]
+        # 10-col has both column families; 8-col has query-link but not pool_size;
+        # 7-col has pool_size but not query-link.
+        assert "session_id" in tier10_sql and "pool_size" in tier10_sql
+        assert "session_id" in tier8_sql and "pool_size" not in tier8_sql
+        assert "pool_size" in tier7_sql and "session_id" not in tier7_sql
         # Fallback is the legacy 5-col INSERT: no pool_size, exactly 5 args.
         assert "pool_size" not in legacy_sql
         assert len(legacy_args) == 5
+
+    async def test_query_link_present_pool_size_absent_uses_8col_tier(
+        self, monkeypatch
+    ):
+        # The fix: a DB with the query-link migration but WITHOUT the pool_size
+        # migration must still record session_id/query_hash/query_text. The 10-col
+        # INSERT fails on the absent pool_size; the new 8-col query-link tier
+        # succeeds instead of degrading to the legacy 5-col INSERT (which would
+        # drop the linkage the feedback miner joins on).
+        from scripts.core.content_hash import content_hash
+
+        rid = str(uuid.uuid4())
+        conn = _CapturingConn(fetch_rows=[_row(rid, "opc")], undefined_column="pool_size")
+        _patch_postgres(monkeypatch)
+        _patch_pool(monkeypatch, conn)
+
+        await record_recall(
+            [rid],
+            caller_project="opc",
+            source="hook",
+            pool_size=50,
+            fetch_k=50,
+            session_id="sess-1",
+            query_text="do X",
+        )
+
+        # Exactly two tiers attempted: 10-col (failed on pool_size) then 8-col.
+        assert len(conn.execute_calls) == 2
+        tier10_sql, _ = conn.execute_calls[0]
+        tier8_sql, args = conn.execute_calls[1]
+        assert "pool_size" in tier10_sql  # the failed full-column tier
+        assert "session_id" in tier8_sql and "pool_size" not in tier8_sql
+        # 8-col bind order: caller_project, recalled_ids, recalled_projects,
+        # result_count, source, session_id, query_hash, query_text.
+        assert len(args) == 8
+        assert args[5] == "sess-1"  # session_id preserved (NOT dropped)
+        assert args[6] == content_hash("do X")  # query_hash always computed
 
     async def test_backward_compatible_pool_size_defaults_none(self, monkeypatch):
         # Issue #228: omitting pool_size/fetch_k binds them as NULL ("rate

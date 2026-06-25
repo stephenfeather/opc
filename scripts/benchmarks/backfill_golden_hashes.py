@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import json
 import sys
+import uuid
 from pathlib import Path
 
 from scripts.core.db.postgres_pool import get_pool
@@ -30,8 +31,22 @@ async def lookup_hashes(ids: list[str]) -> dict[str, str]:
     """Map archival_memory id -> content_hash for the given ids.
 
     Missing/NULL content_hash rows are simply absent from the result.
+
+    ``ids`` come from a user-curated JSON file, so they are parsed to
+    ``uuid.UUID`` defensively: asyncpg requires UUID objects (not raw strings)
+    for a ``uuid[]`` parameter, and any malformed id is skipped rather than
+    crashing the whole backfill. Keys in the returned dict are the canonical
+    string form (``id::text``), so callers still look up by their original id.
     """
     if not ids:
+        return {}
+    uuid_ids: list[uuid.UUID] = []
+    for uid in ids:
+        try:
+            uuid_ids.append(uuid.UUID(uid))
+        except (ValueError, TypeError):
+            print(f"  skipping non-UUID golden id: {uid!r}", file=sys.stderr)
+    if not uuid_ids:
         return {}
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -39,14 +54,14 @@ async def lookup_hashes(ids: list[str]) -> dict[str, str]:
             "SELECT id::text AS id, content_hash "
             "FROM archival_memory "
             "WHERE id = ANY($1::uuid[]) AND content_hash IS NOT NULL",
-            ids,
+            uuid_ids,
         )
     return {r["id"]: r["content_hash"] for r in rows}
 
 
 async def backfill(queries_path: Path, dry_run: bool = False) -> int:
     """Add golden_hashes to every query that has golden_ids. Returns exit code."""
-    query_data = json.loads(queries_path.read_text())
+    query_data = json.loads(queries_path.read_text(encoding="utf-8"))
     queries = query_data["queries"]
 
     # Gather every golden id across all queries, resolve in one round-trip.
@@ -82,7 +97,7 @@ async def backfill(queries_path: Path, dry_run: bool = False) -> int:
         print("Dry run — not writing.")
         return 0
 
-    queries_path.write_text(json.dumps(query_data, indent=2) + "\n")
+    queries_path.write_text(json.dumps(query_data, indent=2) + "\n", encoding="utf-8")
     print(f"Updated {queries_path}")
     return 0
 

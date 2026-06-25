@@ -1003,7 +1003,9 @@ class TestLLMRerankIntegration:
                 "scripts.core.recall_learnings.record_recall", new_callable=AsyncMock
             ),
             patch(
-                "scripts.core.config.handlers.get_config",
+                # recall_learnings imports get_config from the public scripts.core.config
+                # module; patch that binding so main()'s local import resolves here.
+                "scripts.core.config.get_config",
                 side_effect=RuntimeError("config explosion"),
             ),
             patch(
@@ -1059,7 +1061,9 @@ class TestLLMRerankIntegration:
                 "scripts.core.recall_learnings.record_recall", new_callable=AsyncMock
             ),
             patch(
-                "scripts.core.config.handlers.get_config",
+                # recall_learnings imports get_config from the public scripts.core.config
+                # module; patch that binding so main()'s local import resolves here.
+                "scripts.core.config.get_config",
                 side_effect=ValueError(f"bad config: {secret_value}"),
             ),
             patch(

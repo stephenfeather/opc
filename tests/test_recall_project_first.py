@@ -550,7 +550,8 @@ class TestMainDegradesWithWarning:
         monkeypatch.setattr(rl, "get_backend", lambda: "postgres")
 
         async def noop_record(
-            _ids, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+            _ids, *, caller_project=None, source=None, pool_size=None, fetch_k=None,
+            session_id=None, query_text=None
         ):
             return None
 
@@ -855,7 +856,8 @@ class TestProjectFirstThreadsCapture:
                             lambda r: _identity_async(r))
 
         async def noop_record(
-            _ids, *, caller_project=None, source=None, pool_size=None, fetch_k=None
+            _ids, *, caller_project=None, source=None, pool_size=None, fetch_k=None,
+            session_id=None, query_text=None
         ):
             return None
 

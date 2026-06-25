@@ -7,13 +7,16 @@ results, store_learning_v2) are exercised separately against a real Postgres.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import tempfile
+import uuid
 from pathlib import Path
 
-from scripts.benchmarks import journal, tune_loop
-from scripts.benchmarks.mine_feedback_labels import aggregate_candidates
+from scripts.benchmarks import backfill_golden_hashes, journal, tune_loop
+from scripts.benchmarks.mine_feedback_labels import JOIN_SQL, aggregate_candidates
 from scripts.benchmarks.run_rerank_benchmark import (
+    build_reranker_config,
     compute_mrr,
     compute_ndcg,
     compute_precision_at_k,
@@ -147,6 +150,79 @@ class TestMinerAggregation:
         assert len(cands) == 1 and cands[0]["query"] is None
 
 
+class TestMinerJoinDedup:
+    """The feedback↔recall join must attribute each judgment to ONE recall."""
+
+    def test_join_sql_dedupes_per_feedback_row(self):
+        # A single memory_feedback row can match many recall_log rows in the
+        # window; DISTINCT ON (mf.id) keeps only the nearest preceding recall so
+        # one judgment is not counted N times toward min_judgments (Codex/CodeRabbit).
+        assert "DISTINCT ON (mf.id)" in JOIN_SQL
+        assert "ORDER BY mf.id, rl.created_at DESC" in JOIN_SQL
+
+
+# ---------------------------------------------------------------------------
+# backfill lookup_hashes — defensive UUID parsing
+# ---------------------------------------------------------------------------
+
+
+class _FakeConn:
+    def __init__(self, captured: dict):
+        self._captured = captured
+
+    async def fetch(self, sql, ids):
+        self._captured["ids"] = ids
+        return []
+
+
+class _FakePool:
+    def __init__(self, captured: dict):
+        self._captured = captured
+
+    def acquire(self):
+        captured = self._captured
+
+        class _Acquire:
+            async def __aenter__(self):
+                return _FakeConn(captured)
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Acquire()
+
+
+class TestLookupHashes:
+    def test_all_invalid_short_circuits_without_db(self, monkeypatch):
+        # No valid UUID -> returns {} and never touches the pool (Gemini HIGH:
+        # raw strings would otherwise crash asyncpg's uuid[] bind).
+        called = {"pool": False}
+
+        async def boom():
+            called["pool"] = True
+            raise AssertionError("get_pool must not be called")
+
+        monkeypatch.setattr(backfill_golden_hashes, "get_pool", boom)
+        assert asyncio.run(backfill_golden_hashes.lookup_hashes(["not-a-uuid", ""])) == {}
+        assert called["pool"] is False
+
+    def test_parses_valid_uuids_and_skips_invalid(self, monkeypatch):
+        captured: dict = {}
+
+        async def fake_pool():
+            return _FakePool(captured)
+
+        monkeypatch.setattr(backfill_golden_hashes, "get_pool", fake_pool)
+        good = str(uuid.uuid4())
+        asyncio.run(backfill_golden_hashes.lookup_hashes([good, "bogus"]))
+        # Only the valid id is forwarded, parsed to a uuid.UUID object.
+        assert captured["ids"] == [uuid.UUID(good)]
+        assert all(isinstance(u, uuid.UUID) for u in captured["ids"])
+
+    def test_empty_input_returns_empty(self):
+        assert asyncio.run(backfill_golden_hashes.lookup_hashes([])) == {}
+
+
 # ---------------------------------------------------------------------------
 # journal
 # ---------------------------------------------------------------------------
@@ -243,7 +319,7 @@ class TestApplyWeightsToToml:
     def test_updates_only_reranker_weight_lines(self):
         path = self._toml()
         changed = tune_loop.apply_weights_to_toml(
-            path, {"project_weight": 0.30, "recall_weight": 0.05}
+            path, {"project_weight": 0.30, "recall_weight": 0.05}, RerankerConfig()
         )
         after = path.read_text()
         assert set(changed) == {"project_weight", "recall_weight"}
@@ -255,5 +331,74 @@ class TestApplyWeightsToToml:
 
     def test_idempotent_reapply(self):
         path = self._toml()
-        tune_loop.apply_weights_to_toml(path, {"project_weight": 0.30})
-        assert tune_loop.apply_weights_to_toml(path, {"project_weight": 0.30}) == []
+        tune_loop.apply_weights_to_toml(path, {"project_weight": 0.30}, RerankerConfig())
+        assert (
+            tune_loop.apply_weights_to_toml(
+                path, {"project_weight": 0.30}, RerankerConfig()
+            )
+            == []
+        )
+
+    def test_rejects_over_budget_config_before_writing(self):
+        # CodeRabbit: --apply must never emit an unloadable opc.toml. A swept
+        # combo that (with the live kg_weight) pushes total_signal_weight past
+        # 1.0 is rejected by RerankerConfig.__post_init__ BEFORE the file write.
+        path = self._toml()
+        before = path.read_text()
+        over = {k: 0.5 for k in (
+            "project_weight", "recency_weight", "confidence_weight",
+            "recall_weight", "type_affinity_weight", "tag_overlap_weight",
+            "pattern_weight",
+        )}  # 7 * 0.5 + kg 0.05 = 3.55 > 1.0
+        try:
+            tune_loop.apply_weights_to_toml(path, over, RerankerConfig())
+            raise AssertionError("expected ValueError for over-budget config")
+        except ValueError:
+            pass
+        # File is untouched on rejection.
+        assert path.read_text() == before
+
+    def test_preserves_crlf_line_endings(self):
+        # C4: a CRLF opc.toml must stay CRLF after a weight rewrite, not gain
+        # mixed endings.
+        text = "[reranker]\r\nproject_weight = 0.09\r\nrecall_weight = 0.02\r\n"
+        path = Path(tempfile.mkdtemp()) / "crlf.toml"
+        path.write_bytes(text.encode())
+        tune_loop.apply_weights_to_toml(
+            path, {"project_weight": 0.30}, RerankerConfig()
+        )
+        raw = path.read_bytes()
+        assert b"project_weight = 0.3\r\n" in raw
+        assert b"\r\n" in raw and b"\n\n" not in raw  # no LF-only line introduced
+
+
+# ---------------------------------------------------------------------------
+# build_reranker_config — perturb from the live incumbent, not defaults
+# ---------------------------------------------------------------------------
+
+
+class TestBuildRerankerConfig:
+    def test_inherits_non_swept_fields_from_base(self):
+        # A base with operator-tuned non-swept fields: the swept candidate must
+        # keep them, overriding ONLY the seven swept weights (Codex P2).
+        base = RerankerConfig(kg_weight=0.0, recency_half_life_days=90.0)
+        wc = {
+            "name": "heavy-project",
+            "project_weight": 0.30, "recency_weight": 0.05,
+            "confidence_weight": 0.05, "recall_weight": 0.05,
+            "type_affinity_weight": 0.05, "tag_overlap_weight": 0.05,
+            "pattern_weight": 0.05,
+        }
+        cfg = build_reranker_config(wc, base)
+        # Non-swept fields inherited from base, NOT reset to dataclass defaults.
+        assert cfg.kg_weight == 0.0
+        assert cfg.recency_half_life_days == 90.0
+        # Swept weights overridden.
+        assert cfg.project_weight == 0.30
+        assert cfg.recall_weight == 0.05
+
+    def test_partial_weight_dict_inherits_rest(self):
+        base = RerankerConfig()
+        cfg = build_reranker_config({"project_weight": 0.30}, base)
+        assert cfg.project_weight == 0.30
+        assert cfg.recall_weight == base.recall_weight  # untouched -> inherited

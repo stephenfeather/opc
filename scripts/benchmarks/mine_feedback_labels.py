@@ -42,8 +42,17 @@ DEFAULT_OUTPUT = Path("scripts/benchmarks/golden_mined.json")
 # Join feedback back to the query that surfaced the learning. A judgment is
 # attributed to a recall only when it happened in the same session, within a
 # bounded window AFTER the recall, on a learning that recall actually returned.
+#
+# DISTINCT ON (mf.id) collapses a feedback row to its single nearest preceding
+# recall: a session can recall the same learning many times before feedback is
+# given, and memory_feedback stores ONE judgment per row, so without this each
+# judgment would fan out to N recall_log rows and be counted N times toward
+# min_judgments (and could attach to an older, unrelated query that happened to
+# surface the same learning). ORDER BY mf.id, rl.created_at DESC keeps the most
+# recent recall at/under the feedback time.
 JOIN_SQL = """
-SELECT rl.query_hash       AS query_hash,
+SELECT DISTINCT ON (mf.id)
+       rl.query_hash       AS query_hash,
        rl.query_text       AS query_text,
        mf.helpful          AS helpful,
        am.content_hash     AS content_hash
@@ -57,6 +66,7 @@ JOIN archival_memory am ON am.id = mf.learning_id
 WHERE rl.session_id IS NOT NULL
   AND rl.query_hash IS NOT NULL
   AND am.content_hash IS NOT NULL
+ORDER BY mf.id, rl.created_at DESC
 """
 
 
@@ -130,7 +140,7 @@ def merge_into_queries(candidates: list[dict], queries_path: Path) -> int:
     warning. New queries default to the ``train`` split so they never silently
     enter the holdout decision set.
     """
-    query_data = json.loads(queries_path.read_text())
+    query_data = json.loads(queries_path.read_text(encoding="utf-8"))
     existing_hashes = {
         q.get("query_hash") for q in query_data["queries"] if q.get("query_hash")
     }
@@ -158,7 +168,7 @@ def merge_into_queries(candidates: list[dict], queries_path: Path) -> int:
         )
         added += 1
     if added:
-        queries_path.write_text(json.dumps(query_data, indent=2) + "\n")
+        queries_path.write_text(json.dumps(query_data, indent=2) + "\n", encoding="utf-8")
     return added
 
 
@@ -172,7 +182,7 @@ async def run(args: argparse.Namespace) -> int:
         "joined_rows": len(rows),
         "candidates": candidates,
     }
-    args.output.write_text(json.dumps(report, indent=2) + "\n")
+    args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(
         f"Mined {len(candidates)} candidate(s) from {len(rows)} judgment(s) "
         f"-> {args.output}"

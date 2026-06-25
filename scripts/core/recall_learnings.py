@@ -528,7 +528,7 @@ async def record_recall(
     stored_query_text = None
     if query_text:
         try:
-            from scripts.core.config.handlers import get_config
+            from scripts.core.config import get_config
 
             if get_config().recall.log_query_text:
                 stored_query_text = query_text
@@ -623,11 +623,16 @@ async def _insert_recall_log(
     CTE or transaction) so a pre-migration DB lacking ``recall_log`` fails here
     alone — the failure is swallowed (debug log) and the counter UPDATE stands.
 
-    Column tiers degrade gracefully so each migration is independently optional:
-    the 10-column INSERT adds the query-linkage columns (session_id, query_hash,
-    query_text — add_recall_log_query_link.sql); absent those it falls back to
-    the 7-column pool_size/fetch_k INSERT (#228), then the legacy 5-column INSERT
-    (#140). The recall event is logged at whatever tier the DB supports.
+    Column tiers degrade gracefully so each migration is independently optional
+    in either order — 10 -> 8 -> 7 -> 5:
+      * 10-column: query-linkage (session_id, query_hash, query_text —
+        add_recall_log_query_link.sql) AND pool_size/fetch_k (#228) both present.
+      * 8-column: query-linkage present but pool_size/fetch_k absent (query-link
+        migration applied, pool_size migration NOT) — still records the linkage
+        the feedback miner joins on, instead of dropping it to the legacy tier.
+      * 7-column: pool_size/fetch_k present but query-linkage absent (#228 only).
+      * 5-column: legacy, neither newer migration applied (#140).
+    The recall event is logged at the richest tier the DB supports.
     """
     from asyncpg.exceptions import UndefinedColumnError
 
@@ -648,6 +653,32 @@ async def _insert_recall_log(
             source,
             pool_size,
             fetch_k,
+            session_id,
+            query_hash,
+            query_text,
+        )
+        return
+    except UndefinedColumnError:
+        logger.debug("recall_log full-column insert failed; trying query-link tier")
+
+    # 8-column tier: query-linkage columns present but pool_size/fetch_k absent
+    # (the two migrations were applied out of order). Without this tier the
+    # query-link columns would be silently dropped to the legacy 5-column INSERT
+    # below, and the feedback miner could never join on session_id/query_hash.
+    try:
+        await conn.execute(
+            """
+            INSERT INTO recall_log (
+                caller_project, recalled_ids, recalled_projects,
+                result_count, source, session_id, query_hash, query_text
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            """,
+            caller_project,
+            recalled_ids,
+            recalled_projects,
+            len(recalled_ids),
+            source,
             session_id,
             query_hash,
             query_text,
@@ -1453,7 +1484,7 @@ async def main() -> int:
             # (genuine optional-dependency / outage cases, not operator error).
             model = None
             try:
-                from scripts.core.config.handlers import get_config
+                from scripts.core.config import get_config
 
                 model = get_config().recall.llm_selector_model
             except Exception as exc:  # noqa: BLE001 - operator-visible, then fall back

@@ -177,6 +177,25 @@ class TestParseSelection:
     def test_parse_selection_empty_on_empty_dict(self):
         assert parse_selection({}) == []
 
+    def test_parse_selection_empty_when_input_is_string(self):
+        # FIX B: a truthy non-dict input must not raise AttributeError on .get;
+        # parse_selection is total and returns [].
+        resp = {
+            "content": [
+                {"type": "tool_use", "name": "select_memories", "input": "not-a-dict"}
+            ]
+        }
+        assert parse_selection(resp) == []
+
+    def test_parse_selection_empty_when_input_is_list(self):
+        # FIX B: a truthy list input must also be handled without raising.
+        resp = {
+            "content": [
+                {"type": "tool_use", "name": "select_memories", "input": ["x", "y"]}
+            ]
+        }
+        assert parse_selection(resp) == []
+
     def test_parse_selection_skips_non_dict_content_blocks(self):
         # Defensive: a non-dict block in content must be skipped, not crash.
         resp = {
@@ -219,6 +238,30 @@ class TestBuildManifest:
         assert "abc" in manifest
         assert "fix the bug" in manifest
         assert manifest.startswith("[WORKING_SOLUTION] abc (")
+
+    def test_manifest_renders_datetime_timestamp_isoformat(self):
+        # FIX A: a datetime created_at must render its isoformat.
+        ts = datetime(2026, 6, 24, 18, 47, 50, tzinfo=UTC)
+        pool = [_make_candidate(id="a", created_at=ts)]
+        manifest = build_manifest(pool)
+        assert ts.isoformat() in manifest
+        assert "(?)" not in manifest
+
+    def test_manifest_renders_iso_string_timestamp(self):
+        # FIX A: in the REAL pipeline created_at arrives as an ISO STRING, not a
+        # datetime. It must render the string as-is, NOT "?".
+        iso = "2026-06-24T18:47:50.766281+00:00"
+        pool = [_make_candidate(id="a", extra={"created_at": iso})]
+        manifest = build_manifest(pool)
+        assert iso in manifest
+        assert "(?)" not in manifest
+
+    def test_manifest_renders_question_mark_for_missing_or_empty_timestamp(self):
+        # FIX A: None / missing / empty-string created_at renders "?".
+        pool_none = [_make_candidate(id="a", created_at=None)]
+        assert "(?)" in build_manifest(pool_none)
+        pool_empty = [_make_candidate(id="b", extra={"created_at": ""})]
+        assert "(?)" in build_manifest(pool_empty)
 
     def test_manifest_truncates_long_content(self):
         long = "x" * (MANIFEST_DESC_MAXLEN + 100)
@@ -337,6 +380,31 @@ class TestLLMSelectNoKey:
             new_callable=AsyncMock,
         ) as mock_post:
             out = await llm_select(pool, query="q", model="claude-sonnet-4-6", k=5)
+        assert out is None
+        mock_post.assert_not_called()
+
+
+# --- FIX C: empty/whitespace model => graceful fallback, no API call ---
+class TestLLMSelectEmptyModel:
+    async def test_llm_select_returns_none_on_empty_model(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+        pool = [_make_candidate(id="a")]
+        with patch(
+            "scripts.core.llm_selector.httpx.AsyncClient.post",
+            new_callable=AsyncMock,
+        ) as mock_post:
+            out = await llm_select(pool, query="q", model="", k=5)
+        assert out is None
+        mock_post.assert_not_called()
+
+    async def test_llm_select_returns_none_on_whitespace_model(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+        pool = [_make_candidate(id="a")]
+        with patch(
+            "scripts.core.llm_selector.httpx.AsyncClient.post",
+            new_callable=AsyncMock,
+        ) as mock_post:
+            out = await llm_select(pool, query="q", model="   ", k=5)
         assert out is None
         mock_post.assert_not_called()
 

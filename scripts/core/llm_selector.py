@@ -90,7 +90,15 @@ def build_manifest(candidates: list[dict]) -> str:
         ltype = meta.get("learning_type") or "UNKNOWN"
         cid = c.get("id", "?")
         created = c.get("created_at")
-        ts = created.isoformat() if hasattr(created, "isoformat") else "?"
+        # In the real recall pipeline created_at arrives as an ISO STRING, not a
+        # datetime, so handle both: a datetime renders its isoformat; a non-empty
+        # string is used as-is (bounded); anything else (None/empty) renders "?".
+        if hasattr(created, "isoformat"):
+            ts = created.isoformat()
+        elif isinstance(created, str) and created:
+            ts = created[:32]
+        else:
+            ts = "?"
         # Bound the work BEFORE normalizing (round 3): slice a generous prefix
         # so split/join is O(cap), not O(len(content)) for an oversized memory.
         # Then collapse all whitespace/control runs to single spaces so one
@@ -117,7 +125,12 @@ def parse_selection(api_response: dict) -> list[str]:
             continue
         if block.get("type") != "tool_use" or block.get("name") != _TOOL_NAME:
             continue
-        selected = (block.get("input") or {}).get("selected_memories")
+        inp = block.get("input")
+        if not isinstance(inp, dict):
+            # A truthy non-dict input (str/list) must not raise on .get; keep
+            # parse_selection total as its docstring promises.
+            return []
+        selected = inp.get("selected_memories")
         if not isinstance(selected, list):
             return []
         return [item for item in selected if isinstance(item, str)]
@@ -276,12 +289,22 @@ async def llm_select(
         logger.debug("llm_select: no ANTHROPIC_API_KEY; falling back")
         return None
 
+    # An empty/whitespace model id would make a doomed API call; treat it as "no
+    # usable model" and fall back without any network round-trip. Never log the
+    # model value.
+    if not model or not model.strip():
+        logger.debug("llm_select: empty/blank model; falling back")
+        return None
+
     manifest = build_manifest(candidates)
     started = time.monotonic()
     try:
-        response = await asyncio.wait_for(
-            call_anthropic(manifest, query, model=model, api_key=api_key, timeout=timeout),
-            timeout=timeout,
+        # call_anthropic already bounds itself (asyncio.wait_for around the POST
+        # PLUS an httpx client timeout, with try/finally aclose for T1 cleanup),
+        # so no outer wait_for is needed here — a TimeoutError it raises is caught
+        # by the except below and degrades to fallback.
+        response = await call_anthropic(
+            manifest, query, model=model, api_key=api_key, timeout=timeout
         )
     except Exception as exc:  # noqa: BLE001 - degrade to fallback on any failure
         # Covers TimeoutError, httpx.HTTPStatusError, httpx.RequestError, etc.

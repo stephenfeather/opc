@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -518,6 +519,69 @@ class TestRunQueryArmTimeout:
                 run_benchmark([{"id": "q1", "query": "q", "k": 5}], with_llm=True),
                 timeout=5.0,  # generous ceiling; the real bound is ARM_TIMEOUT_S
             )
+
+
+class _OkProc:
+    """A subprocess stand-in returning a valid one-row LLM-selected result."""
+
+    returncode = 0
+
+    async def communicate(self):
+        payload = {
+            "results": [
+                {
+                    "id": "a",
+                    "score": 1.0,
+                    "content": "x",
+                    "rerank_details": {"source": "llm_selector", "rank": 0},
+                }
+            ]
+        }
+        return json.dumps(payload).encode(), b""
+
+
+class TestRunQueryChildEnv:
+    """The LLM arm sets a generous LLM_SELECTOR_TIMEOUT in the child env."""
+
+    async def test_llm_arm_sets_selector_timeout_when_unset(self, monkeypatch):
+        monkeypatch.delenv("LLM_SELECTOR_TIMEOUT", raising=False)
+        captured = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured["env"] = kwargs.get("env")
+            return _OkProc()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        await run_query("q1", "q", 5, rerank=True, llm_rerank=True)
+        assert captured["env"] is not None
+        assert captured["env"]["LLM_SELECTOR_TIMEOUT"] == str(
+            benchmark_module.BENCHMARK_LLM_TIMEOUT_S
+        )
+
+    async def test_llm_arm_respects_explicit_timeout(self, monkeypatch):
+        # A caller-set value must win — the benchmark does not clobber it.
+        monkeypatch.setenv("LLM_SELECTOR_TIMEOUT", "45")
+        captured = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured["env"] = kwargs.get("env")
+            return _OkProc()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        await run_query("q1", "q", 5, rerank=True, llm_rerank=True)
+        assert captured["env"] is None  # inherit parent env unchanged
+
+    async def test_non_llm_arm_does_not_set_env(self, monkeypatch):
+        monkeypatch.delenv("LLM_SELECTOR_TIMEOUT", raising=False)
+        captured = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured["env"] = kwargs.get("env")
+            return _OkProc()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        await run_query("q1", "q", 5, rerank=True)  # reranked arm, no llm
+        assert captured["env"] is None
 
 
 class TestPrintSummaryThreeWay:

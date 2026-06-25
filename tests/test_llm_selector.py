@@ -19,9 +19,11 @@ import httpx
 import pytest
 
 from scripts.core.llm_selector import (
+    _DEFAULT_LLM_SELECTOR_TIMEOUT,
     LLM_SELECTOR_TIMEOUT,
     MANIFEST_DESC_MAXLEN,
     MANIFEST_RAW_SLICE,
+    _resolve_llm_selector_timeout,
     apply_selection,
     build_manifest,
     call_anthropic,
@@ -440,16 +442,42 @@ class TestLLMSelectApiErrors:
         assert out is None
 
 
-# --- Timeout constant tuning (E1 live finding) ---
+# --- Timeout constant tuning (Phase E live finding, issue #244) ---
 class TestTimeoutConstant:
-    def test_timeout_exceeds_real_pool_latency_floor(self):
-        # E1 live test: a realistic 50-candidate manifest (~13KB) takes ~3.2s
-        # end-to-end against the real Anthropic API. The LLM selector is gated
-        # OFF the 5s-killed hook path (F3 --source hook gate), so this timeout is
-        # CLI/benchmark-scoped and must comfortably exceed the measured ~3s
-        # latency — otherwise llm_select times out on every normal pool and the
-        # feature silently never produces an LLM selection.
-        assert LLM_SELECTOR_TIMEOUT >= 5.0
+    def test_default_timeout_exceeds_real_pool_latency_floor(self):
+        # Phase E live finding (issue #244): the original E1 ~3.2s measurement
+        # used short synthetic content. A realistic 50-candidate pool of
+        # real-length learnings measures ~12s end-to-end against the Anthropic
+        # API (slow outliers ~22s), so the shipped 10s deadline timed out on
+        # every normal pool and the selector silently fell back to the reranker.
+        # The LLM selector is gated OFF the 5s-killed hook path (F3 --source hook
+        # gate), so this timeout is CLI/benchmark-scoped and must comfortably
+        # exceed the measured ~12s latency. The floor is set above that latency
+        # (not at the configured value) so a future drop into the timeout zone is
+        # caught.
+        assert _DEFAULT_LLM_SELECTOR_TIMEOUT >= 20.0
+
+    def test_resolver_uses_default_without_env(self, monkeypatch):
+        monkeypatch.delenv("LLM_SELECTOR_TIMEOUT", raising=False)
+        assert _resolve_llm_selector_timeout() == _DEFAULT_LLM_SELECTOR_TIMEOUT
+
+    def test_resolver_honors_env_override(self, monkeypatch):
+        # The benchmark sets a higher value to absorb ~22s outliers under load.
+        monkeypatch.setenv("LLM_SELECTOR_TIMEOUT", "90")
+        assert _resolve_llm_selector_timeout() == 90.0
+
+    def test_resolver_rejects_unparseable_env(self, monkeypatch):
+        monkeypatch.setenv("LLM_SELECTOR_TIMEOUT", "not-a-number")
+        assert _resolve_llm_selector_timeout() == _DEFAULT_LLM_SELECTOR_TIMEOUT
+
+    def test_resolver_rejects_nonpositive_env(self, monkeypatch):
+        monkeypatch.setenv("LLM_SELECTOR_TIMEOUT", "-5")
+        assert _resolve_llm_selector_timeout() == _DEFAULT_LLM_SELECTOR_TIMEOUT
+
+    def test_module_constant_matches_resolver(self):
+        # The exported constant is whatever the resolver returned at import time
+        # (default in a normal test env, with no LLM_SELECTOR_TIMEOUT set).
+        assert LLM_SELECTOR_TIMEOUT >= 20.0
 
 
 # --- Step 7: timeout ---

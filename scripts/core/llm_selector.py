@@ -35,16 +35,43 @@ logger = logging.getLogger(__name__)
 # timeout and the asyncio.wait_for in call_anthropic (single source of truth);
 # on timeout we fall back to the sub-millisecond pure rerank().
 #
-# Tuning (E1 live finding): the selector is GATED OFF the 5s-killed
-# memory-awareness hook path (see the `--source hook` gate / F3 in
-# recall_learnings.py), so this is intentionally NOT bounded by the hook's 5s
-# spawn budget — the hook never reaches this code. It targets interactive CLI +
-# benchmark callers, which have no hard deadline. A realistic 50-candidate
-# manifest (~13KB; the default compute_fetch_k = max(3*k, 50) = 50 rows) measured
-# ~3.2s end-to-end against the real Anthropic API, so 2.5s timed out on EVERY
-# normal pool and the feature silently never produced an LLM selection. 10s gives
-# comfortable headroom over that measured ~3s latency.
-LLM_SELECTOR_TIMEOUT: float = 10.0
+# Tuning: the selector is GATED OFF the 5s-killed memory-awareness hook path
+# (see the `--source hook` gate / F3 in recall_learnings.py), so this is
+# intentionally NOT bounded by the hook's 5s spawn budget — the hook never
+# reaches this code. It targets interactive CLI + benchmark callers, which have
+# no hard deadline.
+#
+# Sizing (issue #244, Phase E live finding): the original E1 measurement of
+# ~3.2s used short synthetic content and was optimistic. A realistic 50-candidate
+# pool (compute_fetch_k = max(3*k, 50) = 50 rows) of REAL-length learnings
+# measures ~12s end-to-end against the Anthropic API, and slow outliers reach
+# ~22s (e.g. a query whose pool has long candidates). The shipped 10s deadline
+# therefore timed out on EVERY normal pool and the selector silently fell back to
+# the reranker — the same failure class E1 caught, re-surfaced by the Phase E
+# benchmark on real-length input. The default 30s is ~2.5x the typical ~12s
+# latency. Size network timeouts against realistic input, not short samples.
+#
+# Override: the LLM_SELECTOR_TIMEOUT env var overrides the default. The benchmark
+# (run_rerank_benchmark.py --llm-rerank) sets a higher value to absorb the ~22s
+# outliers under its concurrent load without changing the interactive CLI
+# default. A non-positive or unparseable value falls back to the default.
+_DEFAULT_LLM_SELECTOR_TIMEOUT: float = 30.0
+
+
+def _resolve_llm_selector_timeout() -> float:
+    """Resolve the selector deadline from the env (benchmark override) or default."""
+    raw = os.environ.get("LLM_SELECTOR_TIMEOUT")
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            return _DEFAULT_LLM_SELECTOR_TIMEOUT
+        if value > 0:
+            return value
+    return _DEFAULT_LLM_SELECTOR_TIMEOUT
+
+
+LLM_SELECTOR_TIMEOUT: float = _resolve_llm_selector_timeout()
 
 # Truncation bound for each candidate's description in the manifest.
 MANIFEST_DESC_MAXLEN: int = 200

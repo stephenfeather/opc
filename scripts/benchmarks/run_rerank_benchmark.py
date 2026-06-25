@@ -264,9 +264,19 @@ SEMAPHORE = asyncio.Semaphore(4)  # limit concurrent DB connections
 # otherwise hang the whole benchmark and withhold an already-detected failure.
 # This bounds each arm: on timeout the child is killed and the arm becomes a
 # contextual error, guaranteeing the aggregated result surfaces. The LLM arm's
-# own internal deadline (LLM_SELECTOR_TIMEOUT ~10s) plus DB fetch fit well under
-# this; raise it only if legitimate arms approach the ceiling.
+# internal deadline (BENCHMARK_LLM_TIMEOUT_S below) plus DB fetch fit under this;
+# raise it only if legitimate arms approach the ceiling.
 ARM_TIMEOUT_S = 120.0
+
+# The LLM selector's per-call deadline used for the --llm-rerank arm, set in the
+# child env (LLM_SELECTOR_TIMEOUT). The selector's interactive CLI default is 30s
+# (scripts/core/llm_selector.py), but a real benchmark pool has slow outliers
+# (~22s in isolation) that inflate further under this harness's 4-way
+# concurrency, so the benchmark uses a more generous budget to avoid spurious
+# fallbacks (which the fail-closed guard would otherwise turn into hard errors).
+# Stays under ARM_TIMEOUT_S so the subprocess kill never pre-empts it. An
+# explicit LLM_SELECTOR_TIMEOUT already in the environment is respected.
+BENCHMARK_LLM_TIMEOUT_S = 90.0
 
 
 def _is_llm_selected(result: dict) -> bool:
@@ -345,12 +355,22 @@ async def run_query(
     if tags:
         cmd.extend(["--tags", *tags])
 
+    # For the LLM arm, give the selector a generous per-call deadline via the
+    # child env so slow outliers under concurrency don't spuriously fall back to
+    # the reranker (which the fail-closed guard would turn into a hard error). An
+    # explicit caller-set LLM_SELECTOR_TIMEOUT is respected; otherwise inherit
+    # the parent env unchanged.
+    child_env = None
+    if llm_rerank and "LLM_SELECTOR_TIMEOUT" not in os.environ:
+        child_env = {**os.environ, "LLM_SELECTOR_TIMEOUT": str(BENCHMARK_LLM_TIMEOUT_S)}
+
     async with SEMAPHORE:
         start = time.monotonic()
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=child_env,
         )
         try:
             stdout, stderr = await asyncio.wait_for(

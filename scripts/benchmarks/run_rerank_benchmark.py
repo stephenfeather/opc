@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import math
 import os
@@ -257,6 +258,16 @@ def score_range(scores: list[float]) -> list[float]:
 
 SEMAPHORE = asyncio.Semaphore(4)  # limit concurrent DB connections
 
+# Per-arm wall-clock budget for a recall subprocess. run_benchmark gathers all
+# arms with return_exceptions=True and only reports after every arm settles, so
+# a single hung subprocess (stuck DB wait, stalled LLM round-trip) would
+# otherwise hang the whole benchmark and withhold an already-detected failure.
+# This bounds each arm: on timeout the child is killed and the arm becomes a
+# contextual error, guaranteeing the aggregated result surfaces. The LLM arm's
+# own internal deadline (LLM_SELECTOR_TIMEOUT ~10s) plus DB fetch fit well under
+# this; raise it only if legitimate arms approach the ceiling.
+ARM_TIMEOUT_S = 120.0
+
 
 def _is_llm_selected(result: dict) -> bool:
     """True iff a result row carries the LLM-selector stamp.
@@ -341,7 +352,21 @@ async def run_query(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=ARM_TIMEOUT_S
+            )
+        except TimeoutError as exc:
+            # Kill and reap the child so a hung arm can't outlive the benchmark
+            # or leak a zombie, then surface a contextual error that the
+            # return_exceptions=True gather aggregates within a bounded budget.
+            proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
+            raise RuntimeError(
+                f"Query {query_id} ({mode}) exceeded the {ARM_TIMEOUT_S:.0f}s "
+                f"per-arm timeout and was killed"
+            ) from exc
         elapsed_ms = (time.monotonic() - start) * 1000
 
     if proc.returncode != 0:

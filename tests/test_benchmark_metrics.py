@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from scripts.benchmarks import run_rerank_benchmark as benchmark_module
@@ -465,6 +467,57 @@ class TestRunBenchmarkArmIntegrity:
         assert len(out) == 1
         _, _, m = out[0]
         assert m.precision_at_k_llm == 1.0  # llm returned only the golden id
+
+
+class _HangingProc:
+    """A subprocess stand-in whose communicate() never returns in time."""
+
+    def __init__(self):
+        self.returncode = None
+        self.killed = False
+
+    async def communicate(self):
+        await asyncio.sleep(30)  # far longer than the test's arm timeout
+        return b"{}", b""
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self):
+        return self.returncode
+
+
+class TestRunQueryArmTimeout:
+    """A hung recall subprocess becomes a bounded, contextual error."""
+
+    async def test_run_query_kills_and_raises_on_timeout(self, monkeypatch):
+        proc = _HangingProc()
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(benchmark_module, "ARM_TIMEOUT_S", 0.05)
+
+        with pytest.raises(RuntimeError, match="per-arm timeout"):
+            await run_query("q1", "q", 5, rerank=True)
+        assert proc.killed  # the child was killed, not left hanging
+
+    async def test_run_benchmark_bounds_a_hung_arm(self, monkeypatch):
+        # All arms hang; run_benchmark must surface a bounded aggregated error
+        # rather than wait forever for the gather to settle.
+        async def fake_exec(*args, **kwargs):
+            return _HangingProc()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(benchmark_module, "ARM_TIMEOUT_S", 0.05)
+
+        with pytest.raises(RuntimeError, match="benchmark arm"):
+            await asyncio.wait_for(
+                run_benchmark([{"id": "q1", "query": "q", "k": 5}], with_llm=True),
+                timeout=5.0,  # generous ceiling; the real bound is ARM_TIMEOUT_S
+            )
 
 
 class TestPrintSummaryThreeWay:

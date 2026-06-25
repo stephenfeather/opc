@@ -21,6 +21,7 @@ import argparse
 import asyncio
 import json
 import math
+import os
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -257,6 +258,42 @@ def score_range(scores: list[float]) -> list[float]:
 SEMAPHORE = asyncio.Semaphore(4)  # limit concurrent DB connections
 
 
+def _is_llm_selected(result: dict) -> bool:
+    """True iff a result row carries the LLM-selector stamp.
+
+    apply_selection (scripts/core/llm_selector.py) stamps every LLM-selected
+    record with ``rerank_details = {"source": "llm_selector", ...}``; the
+    deterministic reranker's rerank_details carries per-signal scores and no
+    such source. This is the only reliable evidence that the LLM stage actually
+    ran rather than silently degrading to the reranker fallback.
+    """
+    rd = result.get("rerank_details")
+    return isinstance(rd, dict) and rd.get("source") == "llm_selector"
+
+
+def assert_llm_arm_ran(query_id: str, results: list[dict]) -> None:
+    """Raise if the --llm-rerank arm silently fell back to the reranker.
+
+    The recall path is best-effort: llm_select returns None (and recall falls
+    back to the deterministic reranker, exiting 0) on a missing/blank
+    ANTHROPIC_API_KEY or model, timeout, API/network error, malformed output,
+    or empty selection. Recording that fallback as the "llm" arm would compare
+    the reranker against itself and silently corrupt the Phase E acceptance
+    signal — so the benchmark fails closed instead. An empty result set is
+    left to the metric layer (precision 0), since an empty pool is ambiguous
+    and shared by all three arms of that query.
+    """
+    if results and not all(_is_llm_selected(r) for r in results):
+        raise RuntimeError(
+            f"Query {query_id} (llm): --llm-rerank fell back to the "
+            f"deterministic reranker — no result carries "
+            f"rerank_details.source == 'llm_selector'. The LLM selector did "
+            f"not run; check ANTHROPIC_API_KEY, recall.llm_selector_model, and "
+            f"API reachability. Refusing to record fallback output as LLM "
+            f"metrics."
+        )
+
+
 async def run_query(
     query_id: str,
     query: str,
@@ -316,6 +353,12 @@ async def run_query(
 
     data = json.loads(stdout)
     results = data.get("results", [])
+
+    # Fail closed if the LLM arm silently degraded to the reranker fallback;
+    # recording that as "llm" would corrupt the Phase E acceptance signal.
+    if llm_rerank:
+        assert_llm_arm_ran(query_id, results)
+
     details = [r.get("rerank_details") for r in results if "rerank_details" in r]
 
     return QueryResult(
@@ -479,6 +522,15 @@ def generate_report(
     queries: list[dict],
 ) -> dict:
     """Generate JSON report from benchmark results."""
+    # Present only when the benchmark ran with --llm-rerank. Computed up front
+    # so the default (two-way) per_query entries omit the LLM fields entirely
+    # rather than serializing them as null — keeping the two-way report shape
+    # byte-for-byte unchanged from before this feature.
+    has_llm = any(m.precision_at_k_llm is not None for _, _, m in results)
+    _llm_keys = (
+        "precision_at_k_llm", "ndcg_at_k_llm", "mrr_llm", "llm_elapsed_ms",
+    )
+
     per_query = []
     wins_rerank = 0
     wins_raw = 0
@@ -486,10 +538,14 @@ def generate_report(
     signal_counts: dict[str, int] = {}
 
     for reranked, raw, m in results:
+        metrics_dict = asdict(m)
+        if not has_llm:
+            for key in _llm_keys:
+                metrics_dict.pop(key, None)
         entry = {
             "query_id": m.query_id,
             "query": reranked.query,
-            **asdict(m),
+            **metrics_dict,
         }
         per_query.append(entry)
 
@@ -524,12 +580,6 @@ def generate_report(
             f"Mixed k values not supported: {sorted(ks)}"
         )
     default_k = ks.pop()
-
-    # Optional LLM arm (Phase E). Present only when the benchmark ran with
-    # --llm-rerank; every query in such a run carries the LLM metrics, so the
-    # averages are over the same n. The acceptance signal is precision_at_k(llm)
-    # vs precision_at_k(reranked) — the reranker is the bar to beat, not raw.
-    has_llm = any(m.precision_at_k_llm is not None for _, _, m in results)
 
     report = {
         "timestamp": datetime.now(UTC).isoformat(),
@@ -573,12 +623,16 @@ def generate_report(
     }
 
     if has_llm:
-        # Aggregate only over queries whose LLM arm produced metrics. A
-        # with_llm run populates all four LLM fields together (or none), so the
-        # per-result None-guard both narrows the Optional types and tolerates a
-        # partial run without skewing the averages with zeros.
+        # Aggregate over queries whose LLM arm produced metrics. The benchmark
+        # fails closed when the LLM arm degrades (run_query.assert_llm_arm_ran),
+        # so in practice this is the full set; the per-result None-guard narrows
+        # the Optional types and keeps a hypothetical partial run honest. The
+        # reranked/latency baselines used for the llm deltas are recomputed over
+        # THE SAME subset (not the full-n averages), so the headline deltas and
+        # win rates always compare like populations even if ln < n.
         ln = 0
         p_llm_sum = ndcg_llm_sum = mrr_llm_sum = lat_llm_sum = 0.0
+        p_rr_sum = ndcg_rr_sum = mrr_rr_sum = lat_rr_sum = 0.0
         llm_wins = reranked_wins = 0
         for _, _, m in results:
             pl, nl, ml, el = (
@@ -594,6 +648,10 @@ def generate_report(
             ndcg_llm_sum += nl
             mrr_llm_sum += ml
             lat_llm_sum += el
+            p_rr_sum += m.precision_at_k_reranked
+            ndcg_rr_sum += m.ndcg_at_k_reranked
+            mrr_rr_sum += m.mrr_reranked
+            lat_rr_sum += m.reranked_elapsed_ms
             if pl > m.precision_at_k_reranked:
                 llm_wins += 1
             elif m.precision_at_k_reranked > pl:
@@ -604,15 +662,20 @@ def generate_report(
             ndcg_llm = ndcg_llm_sum / ln
             mrr_llm = mrr_llm_sum / ln
             lat_llm = lat_llm_sum / ln
+            # Same-subset reranked baselines (== full-n averages when ln == n).
+            p_rr = p_rr_sum / ln
+            ndcg_rr = ndcg_rr_sum / ln
+            mrr_rr = mrr_rr_sum / ln
+            lat_rr = lat_rr_sum / ln
             s = report["summary"]
             s["precision_at_k"]["llm"] = round(p_llm, 4)
-            s["precision_at_k"]["llm_vs_reranked"] = round(p_llm - p_reranked, 4)
+            s["precision_at_k"]["llm_vs_reranked"] = round(p_llm - p_rr, 4)
             s["ndcg_at_k"]["llm"] = round(ndcg_llm, 4)
-            s["ndcg_at_k"]["llm_vs_reranked"] = round(ndcg_llm - ndcg_reranked, 4)
+            s["ndcg_at_k"]["llm_vs_reranked"] = round(ndcg_llm - ndcg_rr, 4)
             s["mrr"]["llm"] = round(mrr_llm, 4)
-            s["mrr"]["llm_vs_reranked"] = round(mrr_llm - mrr_reranked, 4)
+            s["mrr"]["llm_vs_reranked"] = round(mrr_llm - mrr_rr, 4)
             s["latency_ms"]["llm_avg"] = round(lat_llm, 1)
-            s["latency_ms"]["llm_overhead_ms"] = round(lat_llm - lat_reranked, 1)
+            s["latency_ms"]["llm_overhead_ms"] = round(lat_llm - lat_rr, 1)
             s["llm_arm_queries"] = ln
             s["llm_wins_vs_reranked"] = llm_wins
             s["reranked_wins_vs_llm"] = reranked_wins
@@ -1043,12 +1106,23 @@ async def async_main() -> int:
     print(f"Loaded {len(queries)} benchmark queries from {args.queries}")
 
     # Run benchmark
+    if args.llm_rerank and not os.environ.get("ANTHROPIC_API_KEY"):
+        # Fail fast: without a key the LLM arm degrades to the reranker on every
+        # query, and the benchmark would (correctly) abort mid-run on the first
+        # query. Surface the real cause up front instead.
+        print(
+            "ERROR: --llm-rerank requires ANTHROPIC_API_KEY to be set; "
+            "without it the LLM selector falls back to the reranker on every "
+            "query and the benchmark cannot measure the LLM arm.",
+            file=sys.stderr,
+        )
+        return 2
     arms = "reranked + raw + llm" if args.llm_rerank else "reranked + raw"
     print(f"Running benchmark ({arms} for each query)...")
     if args.llm_rerank:
         print(
             "  NOTE: --llm-rerank makes a live Anthropic API call per query "
-            "(token cost + network latency); ANTHROPIC_API_KEY must be set."
+            "(token cost + network latency)."
         )
     start = time.monotonic()
     results = await run_benchmark(queries, with_llm=args.llm_rerank)

@@ -7,6 +7,7 @@ import pytest
 from scripts.benchmarks.run_rerank_benchmark import (
     ComparisonMetrics,
     QueryResult,
+    assert_llm_arm_ran,
     compute_comparison_metrics,
     compute_mrr,
     compute_ndcg,
@@ -302,6 +303,57 @@ class TestGenerateReportThreeWay:
         assert p["llm_vs_reranked"] == round(1.0 - 3 / 5, 4)
         assert "llm_avg" in report["summary"]["latency_ms"]
 
+    def test_two_way_per_query_has_no_null_llm_keys(self):
+        # Default (no LLM arm) per_query entries must NOT carry the new llm
+        # fields as null — the two-way report shape stays byte-for-byte stable.
+        m = self._metrics(llm=None)
+        reranked = _make_query_result("q1", "reranked", ["a"])
+        raw = _make_query_result("q1", "raw", ["a"])
+        report = generate_report([(reranked, raw, m)], [{"id": "q1", "k": 5}])
+        entry = report["per_query"][0]
+        for key in (
+            "precision_at_k_llm", "ndcg_at_k_llm", "mrr_llm", "llm_elapsed_ms",
+        ):
+            assert key not in entry
+
+    def test_three_way_per_query_carries_llm_keys(self):
+        llm = _make_query_result("q1", "llm", ["a", "c", "e"], elapsed_ms=3200.0)
+        m = self._metrics(llm=llm)
+        reranked = _make_query_result(
+            "q1", "reranked", ["a", "b", "c", "d", "e"]
+        )
+        raw = _make_query_result("q1", "raw", ["b", "d", "a", "c", "e"])
+        report = generate_report([(reranked, raw, m)], [{"id": "q1", "k": 5}])
+        entry = report["per_query"][0]
+        assert entry["precision_at_k_llm"] == 1.0
+        assert entry["llm_elapsed_ms"] == 3200.0
+
+    def test_llm_delta_uses_same_subset_baseline(self):
+        # One query has the LLM arm, one does not. The llm_vs_reranked delta
+        # must subtract the reranked baseline of ONLY the LLM-arm query, not the
+        # full-n reranked average (which would mix populations).
+        # Query 1: reranked precision 0.6, llm precision 1.0.
+        rr1 = _make_query_result("q1", "reranked", ["a", "b", "c", "d", "e"])
+        raw1 = _make_query_result("q1", "raw", ["b", "d", "a", "c", "e"])
+        llm1 = _make_query_result("q1", "llm", ["a", "c", "e"])
+        m1 = compute_comparison_metrics(
+            rr1, raw1, ["a", "c", "e"], [], k=5, llm=llm1,
+        )
+        # Query 2: reranked precision 0.0, NO llm arm.
+        rr2 = _make_query_result("q2", "reranked", ["x", "y"])
+        raw2 = _make_query_result("q2", "raw", ["y", "x"])
+        m2 = compute_comparison_metrics(rr2, raw2, ["z"], [], k=5)
+
+        report = generate_report(
+            [(rr1, raw1, m1), (rr2, raw2, m2)],
+            [{"id": "q1", "k": 5}, {"id": "q2", "k": 5}],
+        )
+        s = report["summary"]
+        assert s["llm_arm_queries"] == 1
+        # Subset baseline: 1.0 - 0.6 = 0.4 (NOT 1.0 - mean(0.6, 0.0) = 0.7).
+        assert s["precision_at_k"]["llm_vs_reranked"] == round(1.0 - 3 / 5, 4)
+        assert s["precision_at_k"]["llm"] == 1.0
+
 
 class TestRunQueryLlmGuard:
     """run_query rejects the impossible llm-without-rerank combination."""
@@ -311,6 +363,50 @@ class TestRunQueryLlmGuard:
         # so this combination must fail fast before spawning a subprocess.
         with pytest.raises(ValueError, match="rerank=True"):
             await run_query("q1", "q", 5, rerank=False, llm_rerank=True)
+
+
+class TestAssertLlmArmRan:
+    """The LLM arm must fail closed on a silent reranker fallback."""
+
+    def _llm_row(self, rid: str) -> dict:
+        return {
+            "id": rid,
+            "rerank_details": {
+                "source": "llm_selector", "model": "claude-sonnet-4-6",
+                "rank": 0,
+            },
+        }
+
+    def _reranker_row(self, rid: str) -> dict:
+        # The deterministic reranker stamps per-signal scores, no "source".
+        return {
+            "id": rid,
+            "rerank_details": {
+                "project_match": 0.5, "recency": 0.1, "confidence": 0.2,
+            },
+        }
+
+    def test_passes_when_all_rows_llm_selected(self):
+        assert_llm_arm_ran("q1", [self._llm_row("a"), self._llm_row("b")])
+
+    def test_raises_on_reranker_fallback(self):
+        with pytest.raises(RuntimeError, match="fell back"):
+            assert_llm_arm_ran("q1", [self._reranker_row("a")])
+
+    def test_raises_on_mixed_rows(self):
+        with pytest.raises(RuntimeError, match="llm_selector"):
+            assert_llm_arm_ran(
+                "q1", [self._llm_row("a"), self._reranker_row("b")]
+            )
+
+    def test_raises_when_rerank_details_missing(self):
+        with pytest.raises(RuntimeError):
+            assert_llm_arm_ran("q1", [{"id": "a"}])
+
+    def test_empty_results_pass(self):
+        # An empty pool is ambiguous and shared by all arms; let the metric
+        # layer record precision 0 instead of aborting the whole benchmark.
+        assert_llm_arm_ran("q1", [])
 
 
 class TestPrintSummaryThreeWay:

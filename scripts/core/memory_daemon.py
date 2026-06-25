@@ -39,6 +39,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+try:
+    import fcntl  # POSIX-only; used for the singleton startup flock (Issue #102).
+except ImportError:  # pragma: no cover - Windows has no fcntl
+    fcntl = None
+
 from dotenv import load_dotenv
 
 # Ensure project root is on sys.path so `scripts.*` imports work
@@ -243,6 +248,35 @@ _daemon_cfg = _get_config().daemon
 
 PID_FILE = Path.home() / ".claude" / "memory-daemon.pid"
 LOG_FILE = Path.home() / ".claude" / "memory-daemon.log"
+
+# Singleton startup lock (Issue #102). An exclusive flock is taken on this file
+# BEFORE forking so two concurrent ``start`` calls cannot both pass is_running()
+# and fork duplicate daemons. The flock is per open-file-description and is
+# inherited across fork(), so the grandchild holds it for the daemon's lifetime.
+LOCK_FILE = Path.home() / ".claude" / "memory-daemon.lock"
+
+# Readiness-handshake wire protocol (Issue #102). The grandchild writes one of
+# these bytes to a pipe after basic init; the parent blocks on it before
+# reporting success, so a DB-init failure is no longer reported as "started".
+_READY_BYTE = b"R"
+_FAIL_BYTE = b"F"
+
+
+def _ready_timeout() -> float:
+    """Seconds the parent waits for the grandchild's readiness signal.
+
+    Overridable via ``MEMORY_DAEMON_READY_TIMEOUT`` so slow first-run schema
+    creation (or a sluggish DB) does not trip a false "failed to start".
+    Falls back to 30s on an unset/invalid value.
+    """
+    raw = os.environ.get("MEMORY_DAEMON_READY_TIMEOUT")
+    if raw is None:
+        return 30.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return 30.0
+    return value if value > 0 else 30.0
 
 
 # All config-derived values are read at call time via properties on _daemon_cfg.
@@ -1182,8 +1216,17 @@ def daemon_tick() -> None:
     _maybe_prune_recall_log()
 
 
-def daemon_loop():
-    """Main daemon loop: init, then tick + sleep forever."""
+def daemon_loop(on_ready=None):
+    """Main daemon loop: init, then tick + sleep forever.
+
+    ``on_ready`` (Issue #102): an optional zero-arg callback fired exactly once
+    after the failure-prone DB init (``ensure_schema`` + ``recover_stalled_extractions``)
+    has succeeded and before the tick loop begins. ``_run_as_daemon`` uses it to
+    write the PID file and signal the waiting parent, so the PID never points at
+    a daemon that died during init and "started" is only reported on real
+    readiness. If ``ensure_schema``/``recover`` raise, the callback never fires
+    and the exception propagates to the caller, which signals failure instead.
+    """
     global _daemon_state
 
     db_type = "PostgreSQL" if use_postgres() else "SQLite"
@@ -1192,6 +1235,12 @@ def daemon_loop():
         f"max_concurrent={_max_concurrent()})")
     ensure_schema()
     recover_stalled_extractions()
+
+    # Basic DB init succeeded — the daemon is now "ready". Signal the parent
+    # (and write the PID) before the long-running setup below so startup
+    # success reflects a daemon that actually reached a working DB.
+    if on_ready is not None:
+        on_ready()
 
     # Reuse existing DaemonState if lazily initialized, else create (D14).
     # Prior bug: daemon_loop() replaced a lazily-created state, losing
@@ -1233,6 +1282,114 @@ def daemon_loop():
                 frames = "".join(traceback.format_tb(e.__traceback__))
                 log(f"[DEBUG] {safe_exception(e)} | frames: {safe(frames, max_len=2000)}")
         time.sleep(_poll_interval())
+
+
+def _default_flock(fd: int) -> None:
+    """Take an exclusive, non-blocking advisory lock on ``fd``.
+
+    On a POSIX platform this is ``fcntl.flock(LOCK_EX | LOCK_NB)``, which raises
+    ``BlockingIOError`` if another process already holds the lock. On platforms
+    without ``fcntl`` (Windows) this is a best-effort no-op: the singleton
+    guarantee degrades to the ``is_running()`` PID check there.
+    """
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _acquire_singleton_lock(
+    *,
+    lock_path: Path | None = None,
+    os_open_fn=os.open,
+    flock_fn=_default_flock,
+    os_close_fn=os.close,
+) -> int | None:
+    """Acquire the exclusive startup lock, serializing concurrent ``start`` calls.
+
+    Returns the held lock fd on success — the caller (ultimately the daemon
+    grandchild) must keep it open for the daemon's lifetime, since the flock is
+    released when the last fd referencing the open file description is closed.
+    Returns ``None`` if another process already holds the lock (a concurrent or
+    in-flight ``start``), in which case the fd we opened is closed first.
+
+    The os.* functions and ``flock_fn`` are injected for testability, mirroring
+    ``_setup_daemon_fds`` / ``_harden_daemon_environment``.
+    """
+    path = lock_path if lock_path is not None else LOCK_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os_open_fn(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        flock_fn(fd)
+    except BlockingIOError:
+        # Lock is held by another process — release our fd and report contention.
+        os_close_fn(fd)
+        return None
+    return fd
+
+
+def _signal_ready(
+    write_fd: int,
+    *,
+    os_write_fn=os.write,
+    os_close_fn=os.close,
+) -> None:
+    """Tell the waiting parent the daemon initialized successfully, then close
+    the write end so the parent observes EOF if it ever reads again."""
+    try:
+        os_write_fn(write_fd, _READY_BYTE)
+    finally:
+        try:
+            os_close_fn(write_fd)
+        except OSError:
+            pass
+
+
+def _signal_failed(
+    write_fd: int,
+    *,
+    os_write_fn=os.write,
+    os_close_fn=os.close,
+) -> None:
+    """Tell the waiting parent the daemon failed to initialize.
+
+    Tolerant of a parent that already gave up and closed its read end (writing
+    to the broken/closed pipe must not raise out of the dying grandchild)."""
+    try:
+        os_write_fn(write_fd, _FAIL_BYTE)
+    except OSError:
+        pass
+    finally:
+        try:
+            os_close_fn(write_fd)
+        except OSError:
+            pass
+
+
+def _wait_for_ready(
+    read_fd: int,
+    *,
+    timeout: float | None = None,
+    select_fn=select.select,
+    os_read_fn=os.read,
+    os_close_fn=os.close,
+) -> bool:
+    """Block until the grandchild signals readiness, with a bounded timeout.
+
+    Returns True only on an explicit ready byte. Returns False on the fail byte,
+    on a timeout, or on EOF (the grandchild died before signaling). Always
+    closes ``read_fd`` before returning so the parent leaks no fd.
+    """
+    wait = _ready_timeout() if timeout is None else timeout
+    try:
+        readable, _, _ = select_fn([read_fd], [], [], wait)
+        if not readable:
+            return False  # timeout — daemon hung during init
+        data = os_read_fn(read_fd, 1)
+        return data == _READY_BYTE
+    finally:
+        try:
+            os_close_fn(read_fd)
+        except OSError:
+            pass
 
 
 def is_running() -> tuple[bool, int | None]:
@@ -1340,18 +1497,25 @@ def _harden_daemon_environment(
         pass
 
 
-def _run_as_daemon():
-    """Run the daemon loop (called by subprocess on Windows, directly after fork on Unix)."""
+def _run_as_daemon(*, ready_write_fd: int | None = None, lock_fd: int | None = None):
+    """Run the daemon loop (called by subprocess on Windows, directly after fork on Unix).
+
+    Issue #102 — readiness handshake and singleton lock ownership:
+      - ``ready_write_fd``: the write end of the parent's readiness pipe. The PID
+        file is written and a ready byte is sent only after basic DB init
+        succeeds (via ``daemon_loop(on_ready=...)``). If init fails, a fail byte
+        is sent and the PID file is never written, so the parent reports the
+        failure instead of a phantom "started".
+      - ``lock_fd``: the inherited singleton-lock fd. The grandchild owns it for
+        the daemon's lifetime and closes it on exit, releasing the lock so a
+        future ``start`` can succeed.
+    """
     # Standard daemon hardening (Issue #103): owner-only umask + detach from the
     # invoking shell's cwd. Done here — the common entry point for the Unix
     # double-fork, the Windows detached subprocess, and --daemon-subprocess — so
     # all platforms are covered, and before the PID file write below so the PID
     # file itself is created under the 0o077 umask.
     _harden_daemon_environment()
-
-    # Write PID file
-    PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-    PID_FILE.write_text(str(os.getpid()))
 
     # Daemon bootstrap ordering is critical:
     #   1. _reserve_low_fds(): guards fd 0/1/2 with /dev/null so the logger
@@ -1370,11 +1534,35 @@ def _run_as_daemon():
             pass  # daemon can still run, log() lazy-init may retry
     _setup_daemon_fds()
 
+    signaled = {"ready": False}
+
+    def _on_ready():
+        # Basic DB init succeeded. Write the PID file ONLY now (Issue #102), so
+        # the PID never references a daemon that died during init, then tell the
+        # waiting parent it is safe to report success.
+        PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PID_FILE.write_text(str(os.getpid()))
+        if ready_write_fd is not None:
+            _signal_ready(ready_write_fd)
+        signaled["ready"] = True
+
     # Run daemon
     try:
-        daemon_loop()
+        daemon_loop(on_ready=_on_ready)
+    except Exception as e:
+        # An exception before readiness means init failed: report failure to the
+        # parent (which is still blocked) rather than letting it hang/timeout.
+        # A crash after readiness is just logged — the parent already moved on.
+        if not signaled["ready"] and ready_write_fd is not None:
+            _signal_failed(ready_write_fd)
+        log(f"Daemon exited with error: {safe_exception(e)}")
     finally:
         PID_FILE.unlink(missing_ok=True)
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
 
 
 def start_daemon():
@@ -1388,8 +1576,18 @@ def start_daemon():
         print(f"Memory daemon already running (PID {pid})")
         return 0
 
+    # Singleton startup lock (Issue #102): taken BEFORE forking so two
+    # concurrent ``start`` calls cannot both pass is_running() and fork
+    # duplicate daemons. ``None`` means another start is already in flight.
+    lock_fd = _acquire_singleton_lock()
+    if lock_fd is None:
+        print("Memory daemon already starting (startup lock held)")
+        return 0
+
     if sys.platform == "win32":
-        # Windows: spawn as detached subprocess
+        # Windows: spawn as detached subprocess. flock is unavailable here, so
+        # the lock fd is a plain handle that cannot be cleanly inherited across a
+        # detached Popen — close it and fall back to the is_running() guard.
         detached_process = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
         try:
             with open(os.devnull, "r+b") as devnull:
@@ -1405,11 +1603,33 @@ def start_daemon():
         except Exception as e:
             print(f"Failed to start daemon: {e}")
             return 1
+        finally:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
     else:
-        # Unix (macOS/Linux): classic double-fork
+        # Unix (macOS/Linux): classic double-fork with a readiness handshake.
+        # The parent blocks on a pipe until the grandchild signals it reached a
+        # working DB (or failed), so "started" reflects real readiness, not just
+        # a successful fork.
+        read_fd, write_fd = os.pipe()
+
         if os.fork() > 0:
-            print("Memory daemon started")
-            return 0
+            # Parent: close the child-only fds and wait for the readiness signal.
+            os.close(write_fd)
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+            if _wait_for_ready(read_fd):
+                print("Memory daemon started")
+                return 0
+            print("Memory daemon failed to start (see ~/.claude/memory-daemon.log)")
+            return 1
+
+        # First child: drop the parent's read end before detaching.
+        os.close(read_fd)
 
         # Detach from terminal
         os.setsid()
@@ -1417,11 +1637,16 @@ def start_daemon():
         # umask/chdir hardening (Issue #103) runs in _run_as_daemon(), the
         # common entry point for all platforms, so it is not repeated here.
 
-        # Fork again to prevent zombie
+        # Fork again to prevent zombie. The intermediate child's copies of
+        # write_fd/lock_fd close on exit; only the grandchild retains them.
         if os.fork() > 0:
             sys.exit(0)
 
-        _run_as_daemon()
+        # Grandchild owns write_fd (readiness) and lock_fd (singleton lock) for
+        # the daemon's lifetime; _run_as_daemon signals readiness and releases
+        # the lock on exit.
+        _run_as_daemon(ready_write_fd=write_fd, lock_fd=lock_fd)
+        os._exit(0)
 
 
 def stop_daemon():

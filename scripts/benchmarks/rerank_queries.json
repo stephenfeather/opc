@@ -1,5 +1,5 @@
 {
-  "description": "Benchmark queries for A/B testing reranker vs raw retrieval",
+  "description": "Benchmark queries for A/B testing reranker vs raw retrieval. Each query carries split=train|holdout; the tuning loop decides keep/discard on the holdout split only. golden_hashes (content-hash anchored) take precedence over golden_ids; golden_negatives are content-hashes judged not relevant.",
   "version": 1,
   "queries": [
     {
@@ -18,7 +18,8 @@
         "PreToolUse",
         "PostToolUse",
         "hooks"
-      ]
+      ],
+      "split": "train"
     },
     {
       "id": "q002",
@@ -37,7 +38,8 @@
         "ALTER",
         "CREATE TABLE",
         "postgresql"
-      ]
+      ],
+      "split": "train"
     },
     {
       "id": "q003",
@@ -55,7 +57,8 @@
         "daemon",
         "memory",
         "pipeline"
-      ]
+      ],
+      "split": "train"
     },
     {
       "id": "q004",
@@ -70,7 +73,8 @@
         "bug",
         "error",
         "resolved"
-      ]
+      ],
+      "split": "holdout"
     },
     {
       "id": "q005",
@@ -85,7 +89,8 @@
         "didn't work",
         "avoid",
         "mistake"
-      ]
+      ],
+      "split": "train"
     },
     {
       "id": "q006",
@@ -103,7 +108,8 @@
         "tsc",
         "compile",
         "type error"
-      ]
+      ],
+      "split": "holdout"
     },
     {
       "id": "q007",
@@ -123,7 +129,8 @@
         "build",
         "compile",
         "npm"
-      ]
+      ],
+      "split": "train"
     },
     {
       "id": "q008",
@@ -142,7 +149,8 @@
         "signal",
         "weight",
         "contextual"
-      ]
+      ],
+      "split": "train"
     },
     {
       "id": "q009",
@@ -160,7 +168,8 @@
         "git worktree",
         "branch",
         "isolation"
-      ]
+      ],
+      "split": "train"
     },
     {
       "id": "q010",
@@ -175,7 +184,8 @@
         "exception",
         "failure",
         "traceback"
-      ]
+      ],
+      "split": "train"
     },
     {
       "id": "q011",
@@ -192,7 +202,8 @@
         "pattern",
         "idiom",
         "pythonic"
-      ]
+      ],
+      "split": "holdout"
     },
     {
       "id": "q012",
@@ -210,7 +221,8 @@
         "server",
         "tool",
         "handler"
-      ]
+      ],
+      "split": "train"
     },
     {
       "id": "q013",
@@ -229,7 +241,8 @@
         "fixture",
         "pytest",
         "assert"
-      ]
+      ],
+      "split": "train"
     },
     {
       "id": "q014",
@@ -247,7 +260,8 @@
         "Popen",
         "asyncio",
         "process"
-      ]
+      ],
+      "split": "holdout"
     },
     {
       "id": "q015",
@@ -267,7 +281,8 @@
         "terminal",
         "heartbeat",
         "claim"
-      ]
+      ],
+      "split": "train"
     },
     {
       "id": "q016",
@@ -286,7 +301,8 @@
         "cosine",
         "similarity",
         "bge"
-      ]
+      ],
+      "split": "holdout"
     },
     {
       "id": "q017",
@@ -304,7 +320,8 @@
         "config",
         "format",
         "handoff"
-      ]
+      ],
+      "split": "train"
     },
     {
       "id": "q018",
@@ -322,7 +339,8 @@
         "SKILL.md",
         "slash command",
         "workflow"
-      ]
+      ],
+      "split": "train"
     },
     {
       "id": "q019",
@@ -338,7 +356,8 @@
         "slow",
         "cache",
         "latency"
-      ]
+      ],
+      "split": "holdout"
     },
     {
       "id": "q020",
@@ -356,7 +375,8 @@
         "trace",
         "span",
         "logging"
-      ]
+      ],
+      "split": "train"
     },
     {
       "id": "q021",
@@ -375,7 +395,8 @@
         "start",
         "stop",
         "pid"
-      ]
+      ],
+      "split": "holdout"
     },
     {
       "id": "q022",
@@ -393,7 +414,8 @@
         "classification",
         "llm",
         "learning_type"
-      ]
+      ],
+      "split": "train"
     },
     {
       "id": "q023",
@@ -409,7 +431,8 @@
         "chose",
         "rationale",
         "design"
-      ]
+      ],
+      "split": "train"
     },
     {
       "id": "q024",
@@ -424,7 +447,8 @@
         "cold",
         "unused",
         "never"
-      ]
+      ],
+      "split": "holdout"
     },
     {
       "id": "q025",
@@ -441,7 +465,8 @@
         "serialize",
         "format",
         "output"
-      ]
+      ],
+      "split": "train"
     }
   ]
 }

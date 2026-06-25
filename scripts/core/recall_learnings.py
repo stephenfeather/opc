@@ -95,6 +95,7 @@ load_dotenv()
 project_dir = os.environ.get("CLAUDE_PROJECT_DIR", str(Path(__file__).parent.parent.parent))
 sys.path.insert(0, project_dir)
 
+from scripts.core.content_hash import content_hash  # noqa: E402
 from scripts.core.db.backend_resolution import resolve_backend  # noqa: E402
 
 # Re-export search backends for backward compatibility (tests import these directly)
@@ -480,6 +481,8 @@ async def record_recall(
     source: str | None = None,
     pool_size: int | None = None,
     fetch_k: int | None = None,
+    session_id: str | None = None,
+    query_text: str | None = None,
 ) -> None:
     """Update last_recalled/recall_count and log the recall event (issue #140).
 
@@ -517,6 +520,21 @@ async def record_recall(
 
     source = _sanitize_source(source)
 
+    # Query linkage for the recall-tuning feedback loop. query_hash is always
+    # safe to store (one-way digest, same canonical hash as memory content);
+    # raw query_text is stored ONLY when the operator opts in via
+    # recall.log_query_text, preserving the #139/#140 no-raw-text default.
+    query_hash = content_hash(query_text) if query_text else None
+    stored_query_text = None
+    if query_text:
+        try:
+            from scripts.core.config import get_config
+
+            if get_config().recall.log_query_text:
+                stored_query_text = query_text
+        except Exception:
+            logger.debug("log_query_text gate check failed; omitting query_text")
+
     try:
         from asyncpg.exceptions import UndefinedColumnError
 
@@ -528,7 +546,8 @@ async def record_recall(
             # over-restrictive scoping (#130) is visible.
             if not result_ids:
                 await _insert_recall_log(
-                    conn, caller_project, [], [], source, pool_size, fetch_k
+                    conn, caller_project, [], [], source, pool_size, fetch_k,
+                    session_id, query_hash, stored_query_text,
                 )
                 return
 
@@ -576,6 +595,9 @@ async def record_recall(
                 source,
                 pool_size,
                 fetch_k,
+                session_id,
+                query_hash,
+                stored_query_text,
             )
     except Exception:
         # Best-effort telemetry must never break recall, but failures (e.g.
@@ -591,19 +613,79 @@ async def _insert_recall_log(
     source: str | None,
     pool_size: int | None = None,
     fetch_k: int | None = None,
+    session_id: str | None = None,
+    query_hash: str | None = None,
+    query_text: str | None = None,
 ) -> None:
-    """Best-effort append one recall_log row (issue #140, #228).
+    """Best-effort append one recall_log row (issue #140, #228, feedback loop).
 
     Runs as a separate autocommitted statement after the counter UPDATE (NOT a
     CTE or transaction) so a pre-migration DB lacking ``recall_log`` fails here
     alone — the failure is swallowed (debug log) and the counter UPDATE stands.
 
-    ``pool_size``/``fetch_k`` (#228) are written via a 7-column INSERT. On a DB
-    where add_recall_log_pool_size.sql hasn't run those columns are absent, so
-    we fall back to the legacy 5-column INSERT — the #140 recall event is still
-    logged (the new telemetry is best-effort and must not regress logging).
+    Column tiers degrade gracefully so each migration is independently optional
+    in either order — 10 -> 8 -> 7 -> 5:
+      * 10-column: query-linkage (session_id, query_hash, query_text —
+        add_recall_log_query_link.sql) AND pool_size/fetch_k (#228) both present.
+      * 8-column: query-linkage present but pool_size/fetch_k absent (query-link
+        migration applied, pool_size migration NOT) — still records the linkage
+        the feedback miner joins on, instead of dropping it to the legacy tier.
+      * 7-column: pool_size/fetch_k present but query-linkage absent (#228 only).
+      * 5-column: legacy, neither newer migration applied (#140).
+    The recall event is logged at the richest tier the DB supports.
     """
     from asyncpg.exceptions import UndefinedColumnError
+
+    try:
+        await conn.execute(
+            """
+            INSERT INTO recall_log (
+                caller_project, recalled_ids, recalled_projects,
+                result_count, source, pool_size, fetch_k,
+                session_id, query_hash, query_text
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            """,
+            caller_project,
+            recalled_ids,
+            recalled_projects,
+            len(recalled_ids),
+            source,
+            pool_size,
+            fetch_k,
+            session_id,
+            query_hash,
+            query_text,
+        )
+        return
+    except UndefinedColumnError:
+        logger.debug("recall_log full-column insert failed; trying query-link tier")
+
+    # 8-column tier: query-linkage columns present but pool_size/fetch_k absent
+    # (the two migrations were applied out of order). Without this tier the
+    # query-link columns would be silently dropped to the legacy 5-column INSERT
+    # below, and the feedback miner could never join on session_id/query_hash.
+    try:
+        await conn.execute(
+            """
+            INSERT INTO recall_log (
+                caller_project, recalled_ids, recalled_projects,
+                result_count, source, session_id, query_hash, query_text
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            """,
+            caller_project,
+            recalled_ids,
+            recalled_projects,
+            len(recalled_ids),
+            source,
+            session_id,
+            query_hash,
+            query_text,
+        )
+        return
+    except UndefinedColumnError:
+        logger.debug("recall_log query-link columns absent; pool_size insert")
 
     try:
         await conn.execute(
@@ -1402,7 +1484,7 @@ async def main() -> int:
             # (genuine optional-dependency / outage cases, not operator error).
             model = None
             try:
-                from scripts.core.config.handlers import get_config
+                from scripts.core.config import get_config
 
                 model = get_config().recall.llm_selector_model
             except Exception as exc:  # noqa: BLE001 - operator-visible, then fall back
@@ -1449,6 +1531,8 @@ async def main() -> int:
                 source=args.source,
                 pool_size=pool_size,
                 fetch_k=fetch_k,
+                session_id=args.surfaced_session,
+                query_text=args.query,
             )
         ]
         # Persist prior UNION the ids returned this run (capped, most-recent

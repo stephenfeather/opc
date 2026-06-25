@@ -173,6 +173,12 @@ class RecallConfig:
     # Follows the DaemonConfig.extraction_model pattern (str field + default).
     # An operator can drop to a cheaper model (e.g. Haiku) to cut per-call cost.
     llm_selector_model: str = "claude-sonnet-4-6"
+    # Recall-tuning feedback loop: when True, recall_log stores the raw query
+    # text (in addition to the always-safe query_hash) so the feedback miner can
+    # materialize human-readable golden queries. DEFAULT FALSE — this reverses
+    # the deliberate "recall_log NEVER stores raw query text" privacy stance
+    # (issue #139/#140); enabling it is an explicit operator decision.
+    log_query_text: bool = False
 
 
 @dataclass(frozen=True)

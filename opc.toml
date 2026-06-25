@@ -159,6 +159,14 @@ bm25_normalization_divisor = 25.0
 # outside it, so keep this generous; lower only if EXPLAIN + recall quality hold.
 vector_candidate_multiplier = 8
 
+# Recall-tuning feedback loop. When true, recall_log stores the RAW query text
+# (alongside the always-recorded one-way query_hash) so the feedback miner can
+# materialize human-readable golden queries. DEFAULT false: this reverses the
+# deliberate "recall_log NEVER stores raw query text" privacy stance
+# (issue #139/#140). Enable only as an explicit operator decision, and only
+# after applying scripts/migrations/add_recall_log_query_link.sql.
+log_query_text = false
+
 
 [embedding]
 # Default Ollama model for local embeddings.

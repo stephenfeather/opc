@@ -45,3 +45,7 @@ thoughts/
 .vscode/
 
 .qlty/
+
+# Recall-tuning experiment journal (append-only, machine-local like
+# autoresearch's results.tsv — institutional memory, not source).
+scripts/benchmarks/results/journal.tsv

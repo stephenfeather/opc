@@ -790,66 +790,97 @@ def _drain_proc_stderr(proc, *, max_bytes: int = 65536, timeout: float = 0.0) ->
         return ""
 
 
+def _finalize_completed_extraction(
+    pid, session_id, proc, jsonl_path, project, start_time, exit_code
+):
+    """Run diagnostics + DB finalization for one exited extraction child.
+
+    Extracted from ``reap_completed_extractions`` so the caller can guarantee the
+    completed PID is removed from the active set regardless of whether any step
+    here raises (#207). This function MAY raise on DB-finalization failure
+    (``mark_extracted`` / ``mark_extraction_failed`` propagate ``pg_connect``
+    errors under a persistent DB outage); the caller logs and swallows so a dead
+    child can never replay on every poll.
+    """
+    elapsed = int(time.time() - start_time)
+    learnings_count = _count_session_learnings(session_id) if exit_code == 0 else None
+    learnings_info = f", learnings={learnings_count}" if learnings_count is not None else ""
+    rejections_count = _count_session_rejections(session_id) if exit_code == 0 else None
+    rejections_info = (
+        f", rejections={rejections_count}" if rejections_count is not None else ""
+    )
+    log(f"Extraction completed for {safe(session_id)} "
+        f"(pid={pid}, project={safe(project)}, "
+        f"exit={exit_code}, elapsed={elapsed}s{learnings_info}{rejections_info})")
+    # poll() returned, so the DIRECT child has exited — but a surviving
+    # descendant could still hold the stderr write end open, so EOF is
+    # not guaranteed. _drain_proc_stderr is non-blocking/time-bounded
+    # precisely so this read cannot deadlock regardless of the tree.
+    stderr_text = ""
+    if exit_code != 0:
+        # Small idle budget tolerates a post-exit flush race while
+        # keeping the rare-failure latency negligible.
+        stderr_text = _drain_proc_stderr(proc, timeout=0.25)
+        if stderr_text:
+            log(f"  stderr: {safe_secret(stderr_text)}")
+    else:
+        # Success: opportunistic (timeout=0) close — never wait on the
+        # hot path just to reclaim the fd.
+        _drain_proc_stderr(proc)
+
+    if exit_code == 0:
+        mark_extracted(session_id)
+        _timed_stage(
+            "calibrate",
+            lambda: _calibrate_session_confidence(session_id),
+        )
+        _timed_stage(
+            "workflows",
+            lambda: _extract_and_store_workflows(session_id, jsonl_path, project),
+        )
+        _timed_stage(
+            "handoff",
+            lambda: _generate_mini_handoff(session_id, jsonl_path, project),
+        )
+        _timed_stage(
+            "archive",
+            lambda: archive_session_jsonl(session_id, jsonl_path),
+        )
+    else:
+        # safe_secret() before persisting: stderr can carry env-derived
+        # credentials (VOYAGE/OPENAI/GH tokens) and is interpolated raw
+        # into a downstream log line, so redact secret-shaped tokens AND
+        # escape control chars here (#209 secret-at-rest + log-forgery).
+        mark_extraction_failed(
+            session_id, last_error=safe_secret(stderr_text) or None
+        )
+
+
 def reap_completed_extractions():
     """Check for completed extraction processes and remove from active set."""
     ae = get_active_extractions()
     completed = []
     for pid, (session_id, proc, jsonl_path, project, _start) in list(ae.items()):
         exit_code = proc.poll()
-        if exit_code is not None:
-            completed.append(pid)
-            elapsed = int(time.time() - _start)
-            learnings_count = _count_session_learnings(session_id) if exit_code == 0 else None
-            learnings_info = f", learnings={learnings_count}" if learnings_count is not None else ""
-            rejections_count = _count_session_rejections(session_id) if exit_code == 0 else None
-            rejections_info = (
-                f", rejections={rejections_count}" if rejections_count is not None else ""
+        if exit_code is None:
+            continue
+        # poll() returned a non-None exit code: the direct child has exited and
+        # been reaped (Popen.poll calls waitpid internally). Record the PID for
+        # removal NOW — before any DB finalization — so a raised finalization
+        # error (mark_extracted / mark_extraction_failed under a persistent DB
+        # outage) can neither leave the dead PID tracked nor propagate out of
+        # reap. Otherwise the same completed child replays on every poll: the
+        # diagnostic count queries flood the log (#97/#98) and pg_connect()
+        # retries storm indefinitely (#207).
+        completed.append(pid)
+        try:
+            _finalize_completed_extraction(
+                pid, session_id, proc, jsonl_path, project, _start, exit_code
             )
-            log(f"Extraction completed for {safe(session_id)} "
-                f"(pid={pid}, project={safe(project)}, "
-                f"exit={exit_code}, elapsed={elapsed}s{learnings_info}{rejections_info})")
-            # poll() returned, so the DIRECT child has exited — but a surviving
-            # descendant could still hold the stderr write end open, so EOF is
-            # not guaranteed. _drain_proc_stderr is non-blocking/time-bounded
-            # precisely so this read cannot deadlock regardless of the tree.
-            stderr_text = ""
-            if exit_code != 0:
-                # Small idle budget tolerates a post-exit flush race while
-                # keeping the rare-failure latency negligible.
-                stderr_text = _drain_proc_stderr(proc, timeout=0.25)
-                if stderr_text:
-                    log(f"  stderr: {safe_secret(stderr_text)}")
-            else:
-                # Success: opportunistic (timeout=0) close — never wait on the
-                # hot path just to reclaim the fd.
-                _drain_proc_stderr(proc)
-
-            if exit_code == 0:
-                mark_extracted(session_id)
-                _timed_stage(
-                    "calibrate",
-                    lambda: _calibrate_session_confidence(session_id),
-                )
-                _timed_stage(
-                    "workflows",
-                    lambda: _extract_and_store_workflows(session_id, jsonl_path, project),
-                )
-                _timed_stage(
-                    "handoff",
-                    lambda: _generate_mini_handoff(session_id, jsonl_path, project),
-                )
-                _timed_stage(
-                    "archive",
-                    lambda: archive_session_jsonl(session_id, jsonl_path),
-                )
-            else:
-                # safe_secret() before persisting: stderr can carry env-derived
-                # credentials (VOYAGE/OPENAI/GH tokens) and is interpolated raw
-                # into a downstream log line, so redact secret-shaped tokens AND
-                # escape control chars here (#209 secret-at-rest + log-forgery).
-                mark_extraction_failed(
-                    session_id, last_error=safe_secret(stderr_text) or None
-                )
+        except Exception as e:
+            log(f"Finalization failed for {safe(session_id)} "
+                f"(pid={pid}, exit={exit_code}); child reaped, "
+                f"session left for re-detection: {safe(e)}")
 
     for pid in completed:
         del ae[pid]

@@ -259,12 +259,22 @@ _SECRET_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     # Connection-string passwords: ``://user:PASSWORD@host`` — keep user+host.
     (re.compile(r"(://[^:/@\s]+:)[^@\s]+(@)"), rf"\1{_SECRET_MARKER}\2"),
     # Sensitive ``VAR=value`` / ``export VAR=value`` env assignments — keep the
-    # variable name (which names the leak), mask the value.
+    # variable name (which names the leak), mask the value. Deliberately narrow
+    # (#209 R2): the credential word (KEY/SECRET/TOKEN/PASSWORD/CREDENTIAL[S])
+    # must be the FINAL underscore-delimited segment of an UPPERCASE name,
+    # immediately before ``=`` — e.g. ``OPENAI_API_KEY=``, ``GH_TOKEN=``,
+    # ``DB_PASSWORD=``. Matching is case-sensitive and the marker is anchored at
+    # the end of the name, so non-secret diagnostics like ``monkey=banana``,
+    # ``TURKEY=...``, or ``KEYBOARD_LAYOUT=us`` (which merely *contain* "key")
+    # are NOT redacted — preserving the failure artifact this issue protects.
+    # The lookbehind keeps the match from starting mid-word (e.g. the ``KEY`` in
+    # ``MONKEY=``). Lowercase ``password=``-style values fall to the
+    # connection-string / bare-token rules instead.
     (
         re.compile(
-            r"((?:export\s+)?[A-Za-z0-9_]*"
-            r"(?:KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)[A-Za-z0-9_]*=)\S+",
-            re.IGNORECASE,
+            r"(?<![A-Za-z0-9_])"
+            r"((?:export\s+)?(?:[A-Z0-9]+_)*"
+            r"(?:KEY|SECRET|TOKEN|PASSWORD|CREDENTIALS?)=)\S+",
         ),
         rf"\1{_SECRET_MARKER}",
     ),

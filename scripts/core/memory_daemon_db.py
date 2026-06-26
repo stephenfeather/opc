@@ -11,7 +11,7 @@ import logging
 import time
 from pathlib import Path
 
-from scripts.core.log_safety import safe, safe_exception
+from scripts.core.log_safety import safe, safe_exception, safe_secret
 
 logger = logging.getLogger("memory-daemon")
 
@@ -323,16 +323,20 @@ def pg_mark_extraction_failed(
             max_retries,
         )
     else:
+        # The DB sink OWNS sessions.last_error, so it is the mandatory
+        # redaction boundary (issue #209): redact secret-shaped tokens AND
+        # escape control chars here, before BOTH the at-rest UPDATE and the log
+        # suffix. This guarantees no secret is stored or forged into the log
+        # regardless of which caller supplied last_error — the extraction paths'
+        # safe_secret() is then only defense-in-depth, not the boundary.
+        # safe_secret is idempotent, so the doubly-guarded path is harmless.
+        stored_last_error = safe_secret(last_error) if last_error else None
         cur.execute(
             "UPDATE sessions SET extraction_status = 'failed', "
             "last_error = %s WHERE id = %s",
-            (last_error, session_id),
+            (stored_last_error, session_id),
         )
-        # safe() the DB-sourced value at the sink (issue #209, Part 1):
-        # defense-in-depth so any writer of last_error — not just the
-        # safe_secret()-guarded extraction paths — cannot forge log lines via a
-        # \n/ANSI payload interpolated into this logger.info.
-        suffix = f" (last error: {safe(last_error)})" if last_error else ""
+        suffix = f" (last error: {stored_last_error})" if stored_last_error else ""
         logger.info(
             "Extraction permanently failed for %s after %d attempts%s",
             session_id,
@@ -471,16 +475,18 @@ def sqlite_mark_extraction_failed(
             (session_id,),
         )
     else:
+        # The DB sink OWNS sessions.last_error, so it is the mandatory
+        # redaction boundary (issue #209): redact secret-shaped tokens AND
+        # escape control chars here, before BOTH the at-rest UPDATE and the log
+        # suffix. Mirrors pg_mark_extraction_failed; safe_secret is idempotent
+        # so the extraction paths' own safe_secret() is harmless DiD.
+        stored_last_error = safe_secret(last_error) if last_error else None
         conn.execute(
             "UPDATE sessions SET extraction_status = 'failed', "
             "last_error = ? WHERE id = ?",
-            (last_error, session_id),
+            (stored_last_error, session_id),
         )
-        # safe() the DB-sourced value at the sink (issue #209, Part 1):
-        # defense-in-depth so any writer of last_error — not just the
-        # safe_secret()-guarded extraction paths — cannot forge log lines via a
-        # \n/ANSI payload interpolated into this logger.info.
-        suffix = f" (last error: {safe(last_error)})" if last_error else ""
+        suffix = f" (last error: {stored_last_error})" if stored_last_error else ""
         logger.info(
             "Extraction permanently failed for %s after %d attempts%s",
             session_id,

@@ -83,6 +83,35 @@ def test_export_prefixed_secret_assignment_redacted():
     )
 
 
+def test_bare_credential_name_assignment_redacted():
+    # The credential word may be the whole name: TOKEN=, SECRET=, PASSWORD=.
+    assert redact_secrets("GH_TOKEN=abcdef123456") == "GH_TOKEN=<redacted-secret>"
+    assert redact_secrets("DB_PASSWORD=hunter2value") == "DB_PASSWORD=<redacted-secret>"
+
+
+# ---------------------------------------------------------------------------
+# redact_secrets — env-assignment must NOT over-redact (#209 R2)
+# ---------------------------------------------------------------------------
+
+
+def test_word_merely_containing_key_not_redacted():
+    # "monkey", "TURKEY" embed "key" but are not credential vars.
+    assert redact_secrets("monkey=banana") == "monkey=banana"
+    assert redact_secrets("TURKEY=roasted") == "TURKEY=roasted"
+
+
+def test_compound_name_with_embedded_credential_word_not_redacted():
+    # "KEYBOARD_LAYOUT" contains "KEY" and "TOKENIZER" contains "TOKEN", but
+    # neither ENDS in a credential word, so neither is a secret assignment.
+    assert redact_secrets("KEYBOARD_LAYOUT=us") == "KEYBOARD_LAYOUT=us"
+    assert redact_secrets("TOKENIZER=bpe") == "TOKENIZER=bpe"
+
+
+def test_lowercase_keyish_assignment_not_redacted():
+    # Lowercase env-style names are not the uppercase env-token threat model.
+    assert redact_secrets("api_key=notmatched") == "api_key=notmatched"
+
+
 # ---------------------------------------------------------------------------
 # redact_secrets — no false positives / passthrough
 # ---------------------------------------------------------------------------

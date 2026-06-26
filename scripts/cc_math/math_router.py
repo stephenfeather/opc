@@ -25,13 +25,17 @@ from __future__ import annotations
 import argparse
 import faulthandler
 import json
+import os
 import re
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+faulthandler.enable(
+    file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"),
+    all_threads=True,
+)
 
 # =============================================================================
 # Route Configuration

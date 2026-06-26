@@ -285,8 +285,9 @@ _SECRET_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"), _SECRET_MARKER),
     # AWS access key IDs (long-term ``AKIA`` / temporary ``ASIA``).
     (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), _SECRET_MARKER),
-    # Bare Voyage AI keys (``pa-`` prefix).
-    (re.compile(r"\bpa-[A-Za-z0-9_-]{16,}"), _SECRET_MARKER),
+    # Bare Voyage AI keys: current keys use the ``pa-`` prefix; ``voy-`` is
+    # matched too (named in #209) to stay robust to a prefix change.
+    (re.compile(r"\b(?:pa|voy)-[A-Za-z0-9_-]{16,}"), _SECRET_MARKER),
 )
 
 

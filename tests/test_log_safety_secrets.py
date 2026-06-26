@@ -56,6 +56,12 @@ def test_voyage_pa_token_redacted():
     assert "pa-AbCdEf" not in out
 
 
+def test_voyage_voy_token_redacted():
+    out = redact_secrets("voyage rejected voy-AbCdEf0123456789abcdef")
+    assert _MARKER in out
+    assert "voy-AbCdEf" not in out
+
+
 # ---------------------------------------------------------------------------
 # redact_secrets — structured forms (keep context, mask value)
 # ---------------------------------------------------------------------------

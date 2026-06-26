@@ -24,6 +24,7 @@ class TestDaemonState:
         assert names == {
             "active_extractions",
             "pending_queue",
+            "pending_finalizations",
             "pattern_proc",
             "last_pattern_run",
             "recall_prune_due_at",
@@ -35,6 +36,7 @@ class TestDaemonState:
         state = create_daemon_state()
         assert state.active_extractions == {}
         assert state.pending_queue == []
+        assert state.pending_finalizations == []
         assert state.pattern_proc is None
         assert state.last_pattern_run == 0.0
 

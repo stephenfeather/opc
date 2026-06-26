@@ -332,6 +332,12 @@ class DaemonState:
 
     active_extractions: dict = field(default_factory=dict)
     pending_queue: list = field(default_factory=list)
+    # Completed-but-unfinalized extractions awaiting a DB-finalization retry
+    # (#207). A completed child is removed from active_extractions immediately
+    # (its proc is dead/reaped); only the cheap finalization write is retried,
+    # with backoff, so a transient DB outage cannot strand the session in
+    # 'extracting' until the next daemon restart.
+    pending_finalizations: list = field(default_factory=list)
     pattern_proc: subprocess.Popen | None = None
     last_pattern_run: float = 0.0
     # Monotonic (time.monotonic) deadline for the next recall_log prune; 0.0
@@ -370,6 +376,11 @@ def get_active_extractions() -> dict:
 def get_pending_queue() -> list:
     """Return the live pending_queue list from daemon state."""
     return _ensure_daemon_state().pending_queue
+
+
+def get_pending_finalizations() -> list:
+    """Return the live pending_finalizations list from daemon state (#207)."""
+    return _ensure_daemon_state().pending_finalizations
 
 
 
@@ -790,66 +801,214 @@ def _drain_proc_stderr(proc, *, max_bytes: int = 65536, timeout: float = 0.0) ->
         return ""
 
 
+# Retry policy for completed-but-unfinalized extractions (#207). A transient DB
+# outage during finalization must recover WITHOUT a daemon restart, so retries
+# continue indefinitely with a capped backoff (never giving up would otherwise
+# strand the session in 'extracting', which the stale-session query — pending
+# rows only — never re-detects). Memory is bounded instead by a global queue cap
+# plus backpressure on new extractions, not by an attempt cap. Each retry stays
+# cheap: only the mark_* write re-runs, never the diagnostic count queries.
+_FINALIZATION_BASE_BACKOFF = 5.0  # seconds; doubles each attempt
+_FINALIZATION_MAX_BACKOFF = 300.0  # seconds; cap on the exponential backoff
+_FINALIZATION_BACKOFF_MAX_EXP = 8  # clamp the doubling exponent (2**8 * base ≫ cap)
+# Global safety bound on the retry queue. While at/over this size,
+# process_pending_queue stops launching new extractions (backpressure) so the
+# queue cannot grow with the pending workload during a sustained outage. Reached
+# only in pathological cases; overflow beyond it is dropped to startup recovery.
+_FINALIZATION_QUEUE_MAX = 512
+_FINALIZATION_RETRY_BATCH = 32  # max finalizations applied per tick (smooth recovery)
+
+
+@dataclass
+class _PendingFinalization:
+    """A completed extraction whose DB finalization still needs to succeed.
+
+    Holds only the data the retry needs — never the dead ``proc`` (its stderr
+    was already drained and closed during diagnostics, so no fd is leaked while
+    queued). ``next_attempt_at`` is a ``time.monotonic`` deadline so wall-clock
+    corrections cannot defer a retry.
+    """
+
+    session_id: str
+    exit_code: int
+    jsonl_path: Path
+    project: str | None
+    last_error: str | None
+    attempts: int = 0
+    next_attempt_at: float = 0.0
+
+
+def _run_post_extraction_stages(
+    session_id: str, jsonl_path: Path, project: str | None
+) -> None:
+    """Run the best-effort post-extraction stages after a successful mark.
+
+    Each stage is isolated: a stage failure is logged and the rest still run.
+    Stages run exactly once (only after ``mark_extracted`` succeeds) and are
+    never retried, so a deterministically-failing stage cannot strand a session
+    or spin the finalization retry queue (#207).
+    """
+    stages = (
+        ("calibrate", lambda: _calibrate_session_confidence(session_id)),
+        ("workflows", lambda: _extract_and_store_workflows(session_id, jsonl_path, project)),
+        ("handoff", lambda: _generate_mini_handoff(session_id, jsonl_path, project)),
+        ("archive", lambda: archive_session_jsonl(session_id, jsonl_path)),
+    )
+    for name, fn in stages:
+        try:
+            _timed_stage(name, fn)
+        except Exception as e:
+            # safe_exception (not safe): these stages touch the DB, and
+            # psycopg/asyncpg messages can embed row values that regex redaction
+            # misses — render only the structured allowlist (#117 convention).
+            log(f"Post-extraction stage {name} failed for "
+                f"{safe(session_id)}: {safe_exception(e)}")
+
+
+def _apply_finalization(pf: "_PendingFinalization") -> None:
+    """Apply the critical DB finalization for a completed extraction.
+
+    The ONLY step here that may raise is the ``mark_extracted`` /
+    ``mark_extraction_failed`` write — that is exactly the operation the retry
+    queue re-attempts. On success the best-effort stages run once (success
+    branch only); they swallow their own errors so they never feed the retry
+    loop.
+    """
+    if pf.exit_code == 0:
+        mark_extracted(pf.session_id)
+        _run_post_extraction_stages(pf.session_id, pf.jsonl_path, pf.project)
+    else:
+        mark_extraction_failed(pf.session_id, last_error=pf.last_error)
+
+
+def _schedule_finalization_retry(
+    pf: "_PendingFinalization", error: Exception, *, first: bool
+) -> None:
+    """Record one failed finalization attempt and set its next backoff deadline.
+
+    Retries continue indefinitely (no give-up) with an exponential backoff capped
+    at ``_FINALIZATION_MAX_BACKOFF``; the doubling exponent is clamped so a very
+    long outage cannot build a huge shift. The first deferral logs at info; later
+    ones at debug so a sustained outage does not itself flood the log (#207).
+    """
+    pf.attempts += 1
+    exp = min(pf.attempts - 1, _FINALIZATION_BACKOFF_MAX_EXP)
+    backoff = min(_FINALIZATION_BASE_BACKOFF * (2**exp), _FINALIZATION_MAX_BACKOFF)
+    pf.next_attempt_at = time.monotonic() + backoff
+    # safe_exception (not safe): error is the mark_* DB write failure, whose
+    # psycopg/asyncpg message can embed row values (#117 convention).
+    msg = (f"Finalization failed for {safe(pf.session_id)} "
+           f"(exit={pf.exit_code}, attempt {pf.attempts}); "
+           f"retry in {int(backoff)}s: {safe_exception(error)}")
+    if first:
+        log(msg)
+    else:
+        debug(msg)
+
+
+def _enqueue_finalization_retry(pf: "_PendingFinalization", error: Exception) -> None:
+    """Queue a failed finalization for a backed-off retry (dedup + global cap).
+
+    Coalesces by ``session_id`` (a session already awaiting finalization keeps
+    its existing schedule) and enforces the global queue cap: at capacity the
+    overflow is dropped and left for startup recovery rather than growing the
+    queue without bound (#207 R2).
+    """
+    pq = get_pending_finalizations()
+    if any(existing.session_id == pf.session_id for existing in pq):
+        return
+    if len(pq) >= _FINALIZATION_QUEUE_MAX:
+        # safe_exception (not safe): error is the mark_* DB write failure (#117).
+        log(f"Finalization retry queue full ({len(pq)}); dropping "
+            f"{safe(pf.session_id)} (exit={pf.exit_code}), left in 'extracting' "
+            f"for startup recovery: {safe_exception(error)}")
+        return
+    _schedule_finalization_retry(pf, error, first=True)
+    pq.append(pf)
+
+
+def _finalize_completed_extraction(
+    pid: int,
+    session_id: str,
+    proc: subprocess.Popen,
+    jsonl_path: Path,
+    project: str | None,
+    start_time: float,
+    exit_code: int,
+) -> "_PendingFinalization":
+    """Run the run-once diagnostics for an exited child and return its outcome.
+
+    Does the work that must happen exactly once and that does NOT hit the DB in a
+    raising way: the "Extraction completed" log, the count queries (which swallow
+    their own errors and return ``None``), and draining/closing the child's
+    stderr. Returns a :class:`_PendingFinalization` capturing what the (possibly
+    retried) DB finalization needs — this function itself does not perform the
+    ``mark_*`` write, so it never raises from a DB outage (#207).
+    """
+    elapsed = int(time.time() - start_time)
+    learnings_count = _count_session_learnings(session_id) if exit_code == 0 else None
+    learnings_info = f", learnings={learnings_count}" if learnings_count is not None else ""
+    rejections_count = _count_session_rejections(session_id) if exit_code == 0 else None
+    rejections_info = (
+        f", rejections={rejections_count}" if rejections_count is not None else ""
+    )
+    log(f"Extraction completed for {safe(session_id)} "
+        f"(pid={pid}, project={safe(project)}, "
+        f"exit={exit_code}, elapsed={elapsed}s{learnings_info}{rejections_info})")
+    # poll() returned, so the DIRECT child has exited — but a surviving
+    # descendant could still hold the stderr write end open, so EOF is
+    # not guaranteed. _drain_proc_stderr is non-blocking/time-bounded
+    # precisely so this read cannot deadlock regardless of the tree.
+    stderr_text = ""
+    if exit_code != 0:
+        # Small idle budget tolerates a post-exit flush race while
+        # keeping the rare-failure latency negligible.
+        stderr_text = _drain_proc_stderr(proc, timeout=0.25)
+        if stderr_text:
+            log(f"  stderr: {safe_secret(stderr_text)}")
+    else:
+        # Success: opportunistic (timeout=0) close — never wait on the
+        # hot path just to reclaim the fd.
+        _drain_proc_stderr(proc)
+
+    # safe_secret() before persisting: stderr can carry env-derived credentials
+    # (VOYAGE/OPENAI/GH tokens) and is interpolated raw into a downstream log
+    # line, so redact secret-shaped tokens AND escape control chars here
+    # (#209 secret-at-rest + log-forgery).
+    last_error = safe_secret(stderr_text) or None if exit_code != 0 else None
+    return _PendingFinalization(
+        session_id=session_id,
+        exit_code=exit_code,
+        jsonl_path=jsonl_path,
+        project=project,
+        last_error=last_error,
+    )
+
+
 def reap_completed_extractions():
     """Check for completed extraction processes and remove from active set."""
     ae = get_active_extractions()
     completed = []
     for pid, (session_id, proc, jsonl_path, project, _start) in list(ae.items()):
         exit_code = proc.poll()
-        if exit_code is not None:
-            completed.append(pid)
-            elapsed = int(time.time() - _start)
-            learnings_count = _count_session_learnings(session_id) if exit_code == 0 else None
-            learnings_info = f", learnings={learnings_count}" if learnings_count is not None else ""
-            rejections_count = _count_session_rejections(session_id) if exit_code == 0 else None
-            rejections_info = (
-                f", rejections={rejections_count}" if rejections_count is not None else ""
-            )
-            log(f"Extraction completed for {safe(session_id)} "
-                f"(pid={pid}, project={safe(project)}, "
-                f"exit={exit_code}, elapsed={elapsed}s{learnings_info}{rejections_info})")
-            # poll() returned, so the DIRECT child has exited — but a surviving
-            # descendant could still hold the stderr write end open, so EOF is
-            # not guaranteed. _drain_proc_stderr is non-blocking/time-bounded
-            # precisely so this read cannot deadlock regardless of the tree.
-            stderr_text = ""
-            if exit_code != 0:
-                # Small idle budget tolerates a post-exit flush race while
-                # keeping the rare-failure latency negligible.
-                stderr_text = _drain_proc_stderr(proc, timeout=0.25)
-                if stderr_text:
-                    log(f"  stderr: {safe_secret(stderr_text)}")
-            else:
-                # Success: opportunistic (timeout=0) close — never wait on the
-                # hot path just to reclaim the fd.
-                _drain_proc_stderr(proc)
-
-            if exit_code == 0:
-                mark_extracted(session_id)
-                _timed_stage(
-                    "calibrate",
-                    lambda: _calibrate_session_confidence(session_id),
-                )
-                _timed_stage(
-                    "workflows",
-                    lambda: _extract_and_store_workflows(session_id, jsonl_path, project),
-                )
-                _timed_stage(
-                    "handoff",
-                    lambda: _generate_mini_handoff(session_id, jsonl_path, project),
-                )
-                _timed_stage(
-                    "archive",
-                    lambda: archive_session_jsonl(session_id, jsonl_path),
-                )
-            else:
-                # safe_secret() before persisting: stderr can carry env-derived
-                # credentials (VOYAGE/OPENAI/GH tokens) and is interpolated raw
-                # into a downstream log line, so redact secret-shaped tokens AND
-                # escape control chars here (#209 secret-at-rest + log-forgery).
-                mark_extraction_failed(
-                    session_id, last_error=safe_secret(stderr_text) or None
-                )
+        if exit_code is None:
+            continue
+        # poll() returned a non-None exit code: the direct child has exited and
+        # been reaped (Popen.poll calls waitpid internally). Remove the PID from
+        # the active set unconditionally below, so a raised DB finalization can
+        # neither leave the dead PID tracked nor replay its diagnostics every
+        # poll — the #207 log-flood / pg_connect() retry storm.
+        completed.append(pid)
+        pf = _finalize_completed_extraction(
+            pid, session_id, proc, jsonl_path, project, _start, exit_code
+        )
+        try:
+            _apply_finalization(pf)
+        except Exception as e:
+            # DB-finalization (mark_*) failed. Queue the cheap write for a
+            # backed-off retry so a transient outage recovers without a daemon
+            # restart; the dead child is still removed from ae below.
+            _enqueue_finalization_retry(pf, e)
 
     for pid in completed:
         del ae[pid]
@@ -857,6 +1016,50 @@ def reap_completed_extractions():
         # child is fully reaped. No explicit os.waitpid needed here.
 
     return len(completed)
+
+
+def retry_pending_finalizations() -> int:
+    """Retry due completed-extraction finalizations; return the number finalized.
+
+    Each entry whose backoff deadline has passed re-attempts only the critical
+    ``mark_*`` write (never the run-once diagnostics). Successful entries are
+    dropped; failures are re-scheduled with a capped backoff and kept (retries
+    are indefinite — see the policy constants).
+
+    The first failed attempt short-circuits the rest of the tick: ``mark_*`` goes
+    through ``pg_connect`` which sleeps ~6s of internal retries before raising on
+    a down DB, so attempting every due entry would block the loop for minutes.
+    Treat one failure as "DB still down" and defer the remaining due entries to a
+    later tick — during an outage a tick pays at most one ``pg_connect`` storm,
+    not one per backlog entry (#207 R3). On a healthy DB the ``mark_*`` writes do
+    not sleep, so a recovery batch (capped at ``_FINALIZATION_RETRY_BATCH`` per
+    tick to smooth bursts) runs cheaply.
+    """
+    pq = get_pending_finalizations()
+    if not pq:
+        return 0
+    now = time.monotonic()
+    finalized = 0
+    applied = 0
+    db_down = False
+    keep = []
+    for pf in pq:
+        if db_down or pf.next_attempt_at > now or applied >= _FINALIZATION_RETRY_BATCH:
+            keep.append(pf)
+            continue
+        applied += 1
+        try:
+            _apply_finalization(pf)
+            finalized += 1
+        except Exception as e:
+            _schedule_finalization_retry(pf, e, first=False)
+            keep.append(pf)
+            # A failure means the DB is (still) unreachable; don't pay another
+            # multi-second pg_connect retry storm for every remaining due entry
+            # this tick — defer them and try again next tick.
+            db_down = True
+    pq[:] = keep
+    return finalized
 
 
 def watchdog_stuck_extractions():
@@ -909,10 +1112,26 @@ def watchdog_stuck_extractions():
     return len(killed)
 
 
+def _finalization_backpressure_active() -> bool:
+    """True when the finalization retry backlog is at its global cap (#207).
+
+    While active, NO new extraction is launched — both ``process_pending_queue``
+    (in-memory queue) and ``queue_or_extract`` (stale-session discovery in
+    ``daemon_tick``) back off. Otherwise stale sessions discovered later in the
+    same tick would keep launching, complete, and have their finalization dropped
+    at the cap — stranding them until restart and defeating the backpressure
+    (PR #253 review). A skipped stale session stays ``pending`` in the DB and is
+    simply re-detected on a later tick once the backlog drains.
+    """
+    return len(get_pending_finalizations()) >= _FINALIZATION_QUEUE_MAX
+
+
 def process_pending_queue():
     """Spawn extractions from queue if under concurrency limit."""
     ae = get_active_extractions()
     pq = get_pending_queue()
+    if _finalization_backpressure_active():
+        return 0
     spawned = 0
     while pq and len(ae) < _max_concurrent():
         session_id, project, transcript_path = pq.pop(0)
@@ -940,6 +1159,12 @@ def queue_or_extract(
     queued_ids = {item[0] for item in pq}
     active_ids = {ex[0] for ex in ae.values()}
     if session_id in queued_ids or session_id in active_ids:
+        return
+
+    # Backpressure: do not launch (or even queue) new work while the
+    # finalization backlog is at its cap. The session stays 'pending' in the DB
+    # and is re-detected once the backlog drains (PR #253 review).
+    if _finalization_backpressure_active():
         return
 
     if len(ae) >= _max_concurrent():
@@ -1175,10 +1400,16 @@ def daemon_tick() -> None:
     Reads/writes _daemon_state (the single source of truth).
     try/except and time.sleep stay in daemon_loop, NOT here.
     """
-    # Reap completed, kill stuck, then process pending queue
+    # Reap completed, kill stuck, process pending queue, THEN retry deferred
+    # finalizations. retry runs after watchdog/queue maintenance so a slow
+    # finalization attempt during a DB outage cannot starve them (#207 R3), but
+    # still before get_stale_sessions() below — that is the first tick step that
+    # raises on a DB outage and aborts the tick, and retry must get a chance to
+    # recover the backlog when the DB comes back.
     reap_completed_extractions()
     watchdog_stuck_extractions()
     process_pending_queue()
+    retry_pending_finalizations()
 
     # Find stale sessions (SQL excludes those within grace period)
     stale_rows = get_stale_sessions()

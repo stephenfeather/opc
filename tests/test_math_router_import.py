@@ -24,6 +24,11 @@ def _raise_unsupported(*args, **kwargs):
     raise io.UnsupportedOperation("fileno")
 
 
+def _raise_attributeerror(*args, **kwargs):
+    """Simulate a stderr replacement with no ``fileno`` attribute at all."""
+    raise AttributeError("'object' has no attribute 'fileno'")
+
+
 @pytest.fixture
 def math_router(monkeypatch, tmp_path):
     """Import math_router under a hermetic HOME (temp dir, never the real one)."""
@@ -66,12 +71,17 @@ def test_crash_logging_degrades_to_noop_when_stderr_unusable(
     math_router, monkeypatch
 ):
     """If both the log path and the stderr fallback are unusable, setup degrades
-    to a no-op rather than letting module import fail."""
-    monkeypatch.setattr(math_router.os, "makedirs", _raise_oserror)
-    monkeypatch.setattr(math_router.faulthandler, "enable", _raise_unsupported)
+    to a no-op rather than letting module import fail.
 
-    # Every diagnostic channel fails; the helper must still swallow and return.
-    math_router._enable_crash_logging()
+    Covers both stderr failure shapes: a stream whose ``fileno()`` raises
+    (``UnsupportedOperation``) and one missing ``fileno`` entirely
+    (``AttributeError``)."""
+    monkeypatch.setattr(math_router.os, "makedirs", _raise_oserror)
+
+    for raiser in (_raise_unsupported, _raise_attributeerror):
+        monkeypatch.setattr(math_router.faulthandler, "enable", raiser)
+        # Every diagnostic channel fails; the helper must still swallow and return.
+        math_router._enable_crash_logging()
 
 
 def test_crash_logging_falls_back_when_home_unresolvable(

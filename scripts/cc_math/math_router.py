@@ -63,8 +63,10 @@ def _enable_crash_logging() -> None:
         pass
     try:
         faulthandler.enable(all_threads=True)  # default target: sys.stderr
-    except (OSError, ValueError, RuntimeError):
-        pass  # No usable diagnostic channel; degrade to a no-op.
+    except Exception:  # noqa: BLE001 - terminal best-effort path; import must never fail
+        # sys.stderr may be a replaced/non-fd stream (no usable fileno, etc.);
+        # whatever it raises, degrade to a no-op rather than breaking import.
+        pass
 
 
 _enable_crash_logging()

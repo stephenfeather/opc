@@ -1010,9 +1010,16 @@ def retry_pending_finalizations() -> int:
     Each entry whose backoff deadline has passed re-attempts only the critical
     ``mark_*`` write (never the run-once diagnostics). Successful entries are
     dropped; failures are re-scheduled with a capped backoff and kept (retries
-    are indefinite — see the policy constants). At most ``_FINALIZATION_RETRY_BATCH``
-    finalizations run per tick so a recovery burst cannot stall watchdog/queue
-    work; the remainder stay queued for the next tick (#207).
+    are indefinite — see the policy constants).
+
+    The first failed attempt short-circuits the rest of the tick: ``mark_*`` goes
+    through ``pg_connect`` which sleeps ~6s of internal retries before raising on
+    a down DB, so attempting every due entry would block the loop for minutes.
+    Treat one failure as "DB still down" and defer the remaining due entries to a
+    later tick — during an outage a tick pays at most one ``pg_connect`` storm,
+    not one per backlog entry (#207 R3). On a healthy DB the ``mark_*`` writes do
+    not sleep, so a recovery batch (capped at ``_FINALIZATION_RETRY_BATCH`` per
+    tick to smooth bursts) runs cheaply.
     """
     pq = get_pending_finalizations()
     if not pq:
@@ -1020,9 +1027,10 @@ def retry_pending_finalizations() -> int:
     now = time.monotonic()
     finalized = 0
     applied = 0
+    db_down = False
     keep = []
     for pf in pq:
-        if pf.next_attempt_at > now or applied >= _FINALIZATION_RETRY_BATCH:
+        if db_down or pf.next_attempt_at > now or applied >= _FINALIZATION_RETRY_BATCH:
             keep.append(pf)
             continue
         applied += 1
@@ -1032,6 +1040,10 @@ def retry_pending_finalizations() -> int:
         except Exception as e:
             _schedule_finalization_retry(pf, e, first=False)
             keep.append(pf)
+            # A failure means the DB is (still) unreachable; don't pay another
+            # multi-second pg_connect retry storm for every remaining due entry
+            # this tick — defer them and try again next tick.
+            db_down = True
     pq[:] = keep
     return finalized
 
@@ -1358,14 +1370,16 @@ def daemon_tick() -> None:
     Reads/writes _daemon_state (the single source of truth).
     try/except and time.sleep stay in daemon_loop, NOT here.
     """
-    # Reap completed, retry any deferred finalizations, kill stuck, then
-    # process pending queue. retry_pending_finalizations runs right after reap
-    # so a transient DB outage during finalization recovers on a later tick
-    # without a daemon restart (#207).
+    # Reap completed, kill stuck, process pending queue, THEN retry deferred
+    # finalizations. retry runs after watchdog/queue maintenance so a slow
+    # finalization attempt during a DB outage cannot starve them (#207 R3), but
+    # still before get_stale_sessions() below — that is the first tick step that
+    # raises on a DB outage and aborts the tick, and retry must get a chance to
+    # recover the backlog when the DB comes back.
     reap_completed_extractions()
-    retry_pending_finalizations()
     watchdog_stuck_extractions()
     process_pending_queue()
+    retry_pending_finalizations()
 
     # Find stale sessions (SQL excludes those within grace period)
     stale_rows = get_stale_sessions()

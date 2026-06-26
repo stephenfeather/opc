@@ -413,3 +413,70 @@ def test_best_effort_stage_failure_does_not_enqueue_retry(tmp_jsonl):
     assert (
         len(get_pending_finalizations()) == 0
     ), "a best-effort stage failure must not enqueue a finalization retry"
+
+
+def test_retry_short_circuits_on_first_failure(tmp_jsonl):
+    """One failed mark_* defers the rest of the due batch (no pg_connect storm × N, #207 R3).
+
+    Under a DB outage each mark_* sleeps several seconds inside pg_connect before
+    raising, so attempting every due entry would block the daemon tick for
+    minutes. Only one attempt should run per tick when the DB is down.
+    """
+    from scripts.core.memory_daemon import (
+        _PendingFinalization,
+        get_pending_finalizations,
+        retry_pending_finalizations,
+    )
+
+    pq = get_pending_finalizations()
+    for i in range(10):
+        pq.append(
+            _PendingFinalization(
+                session_id=f"sess-down-{i}",
+                exit_code=0,
+                jsonl_path=tmp_jsonl,
+                project="/tmp/proj",
+                last_error=None,
+                next_attempt_at=0.0,  # all due
+            )
+        )
+
+    with patch(
+        "scripts.core.memory_daemon.mark_extracted",
+        side_effect=RuntimeError("db down"),
+    ) as mock_mark:
+        finalized = retry_pending_finalizations()
+
+    assert finalized == 0
+    assert (
+        mock_mark.call_count == 1
+    ), "only one finalization should be attempted per tick while the DB is down"
+    assert len(get_pending_finalizations()) == 10, "all entries stay queued for retry"
+
+
+def test_daemon_tick_runs_watchdog_and_queue_before_retry():
+    """daemon_tick must not let a blocking retry batch starve watchdog/queue (#207 R3)."""
+    from unittest.mock import call
+
+    import scripts.core.memory_daemon as mod
+
+    manager = MagicMock()
+    with (
+        patch.object(mod, "reap_completed_extractions", manager.reap),
+        patch.object(mod, "watchdog_stuck_extractions", manager.watchdog),
+        patch.object(mod, "process_pending_queue", manager.queue),
+        patch.object(mod, "retry_pending_finalizations", manager.retry),
+        patch.object(mod, "get_stale_sessions", return_value=[]),
+        patch.object(mod, "_check_pattern_detection"),
+        patch.object(mod, "_maybe_prune_recall_log"),
+        patch.object(mod, "use_postgres", return_value=False),
+    ):
+        mod.daemon_tick()
+
+    order = [
+        c
+        for c in manager.mock_calls
+        if c in (call.reap(), call.watchdog(), call.queue(), call.retry())
+    ]
+    assert order.index(call.watchdog()) < order.index(call.retry())
+    assert order.index(call.queue()) < order.index(call.retry())

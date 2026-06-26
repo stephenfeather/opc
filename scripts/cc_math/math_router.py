@@ -47,12 +47,15 @@ def _enable_crash_logging() -> None:
     valid for later fatal-signal output without a module-level handle.
     """
     try:
-        log_path = os.path.expanduser("~/.claude/logs/opc_crash.log")
-        # expanduser returns the input unchanged when HOME is unresolvable; a
-        # still-unexpanded (non-absolute) path would otherwise create a literal
-        # "~" tree under the cwd. Skip the file branch and fall back to stderr.
-        if not os.path.isabs(log_path):
+        # Validate the home directory itself, not the final path: expanduser
+        # leaves "~" unchanged when HOME is unresolvable, and an empty HOME would
+        # expand "~" to "" (making the log path "/.claude/...", rooted at the
+        # filesystem root). Reject anything that isn't a real absolute home so the
+        # helper degrades to stderr instead of writing in the wrong location.
+        home = os.path.expanduser("~")
+        if home in ("", "~") or not os.path.isabs(home):
             raise OSError("home directory could not be resolved")
+        log_path = os.path.join(home, ".claude", "logs", "opc_crash.log")
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         faulthandler.enable(file=open(log_path, "a"), all_threads=True)  # noqa: SIM115
         return

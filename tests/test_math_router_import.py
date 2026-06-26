@@ -77,10 +77,10 @@ def test_crash_logging_degrades_to_noop_when_stderr_unusable(
 def test_crash_logging_falls_back_when_home_unresolvable(
     math_router, monkeypatch, tmp_path
 ):
-    """In a home-less environment, `expanduser` returns the literal `~/...`
-    path. The helper must not create a stray `~` tree in the cwd; it must skip
-    the file branch and fall back to stderr."""
-    # Simulate an unresolvable home: expanduser leaves the path unchanged.
+    """When HOME is unresolvable, `expanduser("~")` returns the literal `~`. The
+    helper must reject it, create no stray `~` tree in the cwd, and fall back to
+    stderr."""
+    # Simulate an unresolvable home: expanduser leaves the input unchanged.
     monkeypatch.setattr(math_router.os.path, "expanduser", lambda p: p)
     calls = []
     monkeypatch.setattr(
@@ -90,7 +90,31 @@ def test_crash_logging_falls_back_when_home_unresolvable(
 
     math_router._enable_crash_logging()  # must not raise
 
-    # File branch skipped (path not absolute); only the stderr fallback ran.
+    # File branch skipped (home is "~"); only the stderr fallback ran.
     assert calls == [{"all_threads": True}]
     # No literal "~" directory leaked into the working directory.
     assert not (tmp_path / "~").exists()
+
+
+def test_crash_logging_falls_back_when_home_empty(math_router, monkeypatch):
+    """An empty HOME expands `~` to ``""``, which would root the log at
+    ``/.claude``. The helper must reject it and never touch the filesystem root,
+    falling back to stderr instead."""
+    # Simulate HOME="": expanduser("~") returns "".
+    monkeypatch.setattr(
+        math_router.os.path, "expanduser", lambda p: "" if p == "~" else p
+    )
+    makedirs_targets = []
+    monkeypatch.setattr(
+        math_router.os, "makedirs", lambda path, **k: makedirs_targets.append(path)
+    )
+    calls = []
+    monkeypatch.setattr(
+        math_router.faulthandler, "enable", lambda *a, **k: calls.append(k)
+    )
+
+    math_router._enable_crash_logging()  # must not raise
+
+    # File branch skipped before any makedirs; only the stderr fallback ran.
+    assert makedirs_targets == []
+    assert calls == [{"all_threads": True}]

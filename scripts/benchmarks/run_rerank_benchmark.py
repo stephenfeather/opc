@@ -50,6 +50,11 @@ class QueryResult:
     result_contents: list[str]
     rerank_details: list[dict] | None = None
     elapsed_ms: float = 0.0
+    # True iff this is an LLM arm (--llm-rerank) that silently fell back to the
+    # deterministic reranker (issue #246): the subprocess exited 0 but no row
+    # carries the llm_selector stamp. A fallback is tolerated, flagged here,
+    # counted, and excluded from LLM metrics — never recorded as the LLM arm.
+    llm_fell_back: bool = False
 
 
 @dataclass
@@ -334,27 +339,25 @@ def _is_llm_selected(result: dict) -> bool:
     return isinstance(rd, dict) and rd.get("source") == "llm_selector"
 
 
-def assert_llm_arm_ran(query_id: str, results: list[dict]) -> None:
-    """Raise if the --llm-rerank arm silently fell back to the reranker.
+def _llm_arm_fell_back(results: list[dict]) -> bool:
+    """True iff the --llm-rerank arm silently degraded to the reranker.
 
     The recall path is best-effort: llm_select returns None (and recall falls
     back to the deterministic reranker, exiting 0) on a missing/blank
     ANTHROPIC_API_KEY or model, timeout, API/network error, malformed output,
-    or empty selection. Recording that fallback as the "llm" arm would compare
-    the reranker against itself and silently corrupt the Phase E acceptance
-    signal — so the benchmark fails closed instead. An empty result set is
-    left to the metric layer (precision 0), since an empty pool is ambiguous
-    and shared by all three arms of that query.
+    or — the common, legitimate case (issue #246) — an empty/all-unknown
+    selection where the model judged no candidate relevant. The fallback yields
+    the reranker's (non-empty) rows, none of which carry the llm_selector stamp.
+
+    Recording that fallback as the "llm" arm would compare the reranker against
+    itself and corrupt the Phase E acceptance signal, so the caller excludes and
+    counts it instead (rather than hard-aborting the whole run). An empty result
+    set is NOT a fallback: an empty pool is ambiguous and shared by all three
+    arms of that query, so it is left to the metric layer (precision 0); a
+    genuinely empty LLM arm beside non-empty sibling arms is caught separately
+    by the cross-arm guard in run_benchmark.
     """
-    if results and not all(_is_llm_selected(r) for r in results):
-        raise RuntimeError(
-            f"Query {query_id} (llm): --llm-rerank fell back to the "
-            f"deterministic reranker — no result carries "
-            f"rerank_details.source == 'llm_selector'. The LLM selector did "
-            f"not run; check ANTHROPIC_API_KEY, recall.llm_selector_model, and "
-            f"API reachability. Refusing to record fallback output as LLM "
-            f"metrics."
-        )
+    return bool(results) and not all(_is_llm_selected(r) for r in results)
 
 
 async def run_query(
@@ -449,10 +452,12 @@ async def run_query(
     data = json.loads(stdout)
     results = data.get("results", [])
 
-    # Fail closed if the LLM arm silently degraded to the reranker fallback;
-    # recording that as "llm" would corrupt the Phase E acceptance signal.
-    if llm_rerank:
-        assert_llm_arm_ran(query_id, results)
+    # Detect (don't abort on) a silent LLM->reranker fallback. The subprocess
+    # exited 0, so this is NOT an infra failure (those raise above on non-zero
+    # exit / timeout); it is the legitimate #246 case where the model judged no
+    # candidate relevant and recall degraded to the reranker. The caller counts
+    # it and excludes it from LLM metrics — never records it as the LLM arm.
+    fell_back = llm_rerank and _llm_arm_fell_back(results)
 
     details = [r.get("rerank_details") for r in results if "rerank_details" in r]
 
@@ -465,6 +470,7 @@ async def run_query(
         result_contents=[r["content"] for r in results],
         rerank_details=details if details else None,
         elapsed_ms=elapsed_ms,
+        llm_fell_back=fell_back,
     )
 
 
@@ -623,26 +629,33 @@ async def run_benchmark(
         golden_negatives = q.get("golden_negatives", [])
         k = q.get("k", 5)
 
-        # Cross-arm evidence check (Finding 1, round 2): decided here where all
-        # three arms are visible. An empty LLM arm beside a non-empty
-        # reranked/raw arm means the selector did not actually run on a real
-        # pool — fail closed rather than record a phantom precision-0 LLM row.
-        # (All-empty is a degenerate query shared by every arm; left to the
-        # metric layer as precision 0.)
-        if (
-            with_llm
-            and llm is not None
-            and not llm.result_ids
-            and (reranked.result_ids or raw.result_ids)
-        ):
-            raise RuntimeError(
-                f"Query {q['id']} (llm): LLM arm returned no results while the "
-                f"reranked/raw arms did — the LLM selector did not run on the "
-                f"candidate pool. Refusing to record an empty LLM arm."
-            )
+        # Resolve which LLM arm (if any) feeds the metric layer. A silent
+        # fallback (issue #246) is a legitimate per-query outcome — the model
+        # judged no candidate relevant and recall degraded to the reranker — so
+        # exclude it (llm_arm=None) instead of aborting the whole run; the report
+        # counts it via the surviving subset. Genuine infra failures already
+        # raised in run_query (non-zero exit / timeout) and never reach here.
+        llm_arm = llm
+        if with_llm and llm is not None:
+            if llm.llm_fell_back:
+                llm_arm = None
+            elif not llm.result_ids and (reranked.result_ids or raw.result_ids):
+                # Cross-arm evidence check (Finding 1, round 2): an EMPTY,
+                # NOT-flagged LLM arm beside non-empty sibling arms means the
+                # selector produced no rows AND recall did not fall back to the
+                # reranker (which would have yielded the pool's rows). That is an
+                # impossible state under recall's fallback contract, so it is a
+                # real infra inconsistency — fail closed rather than record a
+                # phantom precision-0 LLM row. (All-empty is a degenerate query
+                # shared by every arm; left to the metric layer as precision 0.)
+                raise RuntimeError(
+                    f"Query {q['id']} (llm): LLM arm returned no results while "
+                    f"the reranked/raw arms did — the LLM selector did not run "
+                    f"on the candidate pool. Refusing to record an empty LLM arm."
+                )
 
         metrics = compute_comparison_metrics(
-            reranked, raw, golden_ids, golden_keywords, k, llm=llm,
+            reranked, raw, golden_ids, golden_keywords, k, llm=llm_arm,
             golden_hashes=golden_hashes, golden_negatives=golden_negatives,
         )
         output.append((reranked, raw, metrics))
@@ -657,13 +670,22 @@ async def run_benchmark(
 def generate_report(
     results: list[tuple[QueryResult, QueryResult, ComparisonMetrics]],
     queries: list[dict],
+    with_llm: bool = False,
 ) -> dict:
-    """Generate JSON report from benchmark results."""
-    # Present only when the benchmark ran with --llm-rerank. Computed up front
-    # so the default (two-way) per_query entries omit the LLM fields entirely
+    """Generate JSON report from benchmark results.
+
+    ``with_llm`` records the run's INTENT (the benchmark ran with --llm-rerank),
+    which matters when the LLM arm fell back on EVERY query (issue #246): without
+    it such a run would be indistinguishable from a two-way run and silently hide
+    the fallbacks. The LLM section is also surfaced whenever any per-query LLM
+    metric survived, so callers that build three-way metrics directly (tests)
+    still get the section without passing the flag.
+    """
+    # The LLM section is shown when the run intended it OR any query's LLM arm
+    # survived. Default (two-way) runs omit the LLM per_query fields entirely
     # rather than serializing them as null — keeping the two-way report shape
     # byte-for-byte unchanged from before this feature.
-    has_llm = any(m.precision_at_k_llm is not None for _, _, m in results)
+    show_llm = with_llm or any(m.precision_at_k_llm is not None for _, _, m in results)
     _llm_keys = (
         "precision_at_k_llm", "ndcg_at_k_llm", "mrr_llm", "llm_elapsed_ms",
     )
@@ -676,7 +698,7 @@ def generate_report(
 
     for reranked, raw, m in results:
         metrics_dict = asdict(m)
-        if not has_llm:
+        if not show_llm:
             for key in _llm_keys:
                 metrics_dict.pop(key, None)
         entry = {
@@ -759,50 +781,63 @@ def generate_report(
         "per_query": per_query,
     }
 
-    if has_llm:
-        # The LLM arm is all-or-nothing: a real with_llm run assigns every query
-        # an LLM QueryResult, and run_benchmark fails closed on any degraded or
-        # empty arm — so every row carries LLM metrics. A mix means the metrics
-        # were assembled inconsistently (a programming error), and reporting an
-        # LLM average over a subset while the summary's `reranked` baseline is a
-        # full-n average would print internally inconsistent deltas. Reject it
-        # rather than emit misleading numbers; the baselines below are then the
-        # same full-n averages shown in the two-way summary (same population).
-        llm_count = sum(
-            1 for _, _, m in results if m.precision_at_k_llm is not None
-        )
-        if llm_count != n:
-            raise ValueError(
-                f"Partial LLM arm: {llm_count} of {n} queries carry LLM "
-                f"metrics. The LLM arm must be all-or-nothing."
+    if show_llm:
+        # Issue #246: the LLM arm may legitimately fall back on individual
+        # queries — the model judged no candidate relevant and recall degraded to
+        # the reranker. Those queries carry precision_at_k_llm is None and are
+        # EXCLUDED from the LLM metrics and COUNTED, instead of aborting the run.
+        # The LLM arm is aggregated over the SURVIVING subset, and every
+        # llm_vs_reranked delta is computed against the SAME-subset reranked
+        # baseline so the comparison spans one population (a subset LLM average
+        # against a full-n reranked baseline would print inconsistent deltas).
+        s = report["summary"]
+        llm_subset = [m for _, _, m in results if m.precision_at_k_llm is not None]
+        fallback_ids = [m.query_id for _, _, m in results if m.precision_at_k_llm is None]
+        llm_n = len(llm_subset)
+        s["llm_arm_queries"] = llm_n
+        s["llm_fallback_queries"] = len(fallback_ids)
+        s["llm_fallback_query_ids"] = fallback_ids
+
+        if llm_n:
+            def savg(vals: list[float]) -> float:
+                return sum(vals) / llm_n
+
+            p_llm = savg([m.precision_at_k_llm for m in llm_subset])  # type: ignore[misc]
+            ndcg_llm = savg([m.ndcg_at_k_llm for m in llm_subset])  # type: ignore[misc]
+            mrr_llm = savg([m.mrr_llm for m in llm_subset])  # type: ignore[misc]
+            lat_llm = savg([m.llm_elapsed_ms for m in llm_subset])  # type: ignore[misc]
+            # Same-subset reranked baselines — the bar the LLM arm must beat,
+            # measured over exactly the queries the LLM arm actually ran on.
+            p_rerank_sub = savg([m.precision_at_k_reranked for m in llm_subset])
+            ndcg_rerank_sub = savg([m.ndcg_at_k_reranked for m in llm_subset])
+            mrr_rerank_sub = savg([m.mrr_reranked for m in llm_subset])
+            lat_rerank_sub = savg([m.reranked_elapsed_ms for m in llm_subset])
+            llm_wins = sum(
+                1
+                for m in llm_subset
+                if m.precision_at_k_llm > m.precision_at_k_reranked  # type: ignore[operator]
+            )
+            reranked_wins = sum(
+                1
+                for m in llm_subset
+                if m.precision_at_k_reranked > m.precision_at_k_llm  # type: ignore[operator]
             )
 
-        p_llm = avg([m.precision_at_k_llm for _, _, m in results])  # type: ignore[misc]
-        ndcg_llm = avg([m.ndcg_at_k_llm for _, _, m in results])  # type: ignore[misc]
-        mrr_llm = avg([m.mrr_llm for _, _, m in results])  # type: ignore[misc]
-        lat_llm = avg([m.llm_elapsed_ms for _, _, m in results])  # type: ignore[misc]
-        llm_wins = sum(
-            1 for _, _, m in results
-            if m.precision_at_k_llm > m.precision_at_k_reranked  # type: ignore[operator]
-        )
-        reranked_wins = sum(
-            1 for _, _, m in results
-            if m.precision_at_k_reranked > m.precision_at_k_llm  # type: ignore[operator]
-        )
-
-        s = report["summary"]
-        s["precision_at_k"]["llm"] = round(p_llm, 4)
-        s["precision_at_k"]["llm_vs_reranked"] = round(p_llm - p_reranked, 4)
-        s["ndcg_at_k"]["llm"] = round(ndcg_llm, 4)
-        s["ndcg_at_k"]["llm_vs_reranked"] = round(ndcg_llm - ndcg_reranked, 4)
-        s["mrr"]["llm"] = round(mrr_llm, 4)
-        s["mrr"]["llm_vs_reranked"] = round(mrr_llm - mrr_reranked, 4)
-        s["latency_ms"]["llm_avg"] = round(lat_llm, 1)
-        s["latency_ms"]["llm_overhead_ms"] = round(lat_llm - lat_reranked, 1)
-        s["llm_arm_queries"] = n
-        s["llm_wins_vs_reranked"] = llm_wins
-        s["reranked_wins_vs_llm"] = reranked_wins
-        s["llm_ties_vs_reranked"] = n - llm_wins - reranked_wins
+            s["precision_at_k"]["llm"] = round(p_llm, 4)
+            s["precision_at_k"]["reranked_on_llm_subset"] = round(p_rerank_sub, 4)
+            s["precision_at_k"]["llm_vs_reranked"] = round(p_llm - p_rerank_sub, 4)
+            s["ndcg_at_k"]["llm"] = round(ndcg_llm, 4)
+            s["ndcg_at_k"]["reranked_on_llm_subset"] = round(ndcg_rerank_sub, 4)
+            s["ndcg_at_k"]["llm_vs_reranked"] = round(ndcg_llm - ndcg_rerank_sub, 4)
+            s["mrr"]["llm"] = round(mrr_llm, 4)
+            s["mrr"]["reranked_on_llm_subset"] = round(mrr_rerank_sub, 4)
+            s["mrr"]["llm_vs_reranked"] = round(mrr_llm - mrr_rerank_sub, 4)
+            s["latency_ms"]["llm_avg"] = round(lat_llm, 1)
+            s["latency_ms"]["reranked_on_llm_subset_avg"] = round(lat_rerank_sub, 1)
+            s["latency_ms"]["llm_overhead_ms"] = round(lat_llm - lat_rerank_sub, 1)
+            s["llm_wins_vs_reranked"] = llm_wins
+            s["reranked_wins_vs_llm"] = reranked_wins
+            s["llm_ties_vs_reranked"] = llm_n - llm_wins - reranked_wins
 
     return report
 
@@ -861,28 +896,33 @@ def print_summary(report: dict) -> None:
     )
 
     # Optional LLM arm (Phase E): compared against the reranker (the bar to
-    # beat), not raw. Present only when the benchmark ran with --llm-rerank.
-    if "llm" in s.get("precision_at_k", {}):
+    # beat), not raw. Present whenever the benchmark ran with --llm-rerank, even
+    # if every query fell back (issue #246) — llm_arm_queries is then 0 and only
+    # the fallback notice prints. The "Reranked" column uses the SAME-subset
+    # baseline so the LLM table is internally consistent with the printed delta.
+    if "llm_arm_queries" in s:
         print()
         print("--- LLM-as-selector arm (--llm-rerank) ---")
-        print(
-            f"{'':15s} {'LLM':>10s} {'Reranked':>10s} "
-            f"{'vs Rerank':>12s}"
-        )
-        print("-" * 50)
-        for metric_name, key in [
-            ("Precision@k", "precision_at_k"),
-            ("NDCG@k", "ndcg_at_k"),
-            ("MRR", "mrr"),
-        ]:
-            m = s[key]
-            print(
-                f"{metric_name:15s} {m['llm']:10.4f} "
-                f"{m['reranked']:10.4f} {m['llm_vs_reranked']:+10.4f}"
-            )
-        lln = s.get("llm_arm_queries", 0)
-        print()
+        lln = s["llm_arm_queries"]
+        fallback = s.get("llm_fallback_queries", 0)
         if lln:
+            print(
+                f"{'':15s} {'LLM':>10s} {'Reranked':>10s} "
+                f"{'vs Rerank':>12s}"
+            )
+            print("-" * 50)
+            for metric_name, key in [
+                ("Precision@k", "precision_at_k"),
+                ("NDCG@k", "ndcg_at_k"),
+                ("MRR", "mrr"),
+            ]:
+                m = s[key]
+                reranked_baseline = m.get("reranked_on_llm_subset", m["reranked"])
+                print(
+                    f"{metric_name:15s} {m['llm']:10.4f} "
+                    f"{reranked_baseline:10.4f} {m['llm_vs_reranked']:+10.4f}"
+                )
+            print()
             print(
                 f"LLM wins vs reranked:  {s['llm_wins_vs_reranked']}/{lln} "
                 f"({s['llm_wins_vs_reranked'] / lln * 100:.0f}%)"
@@ -895,11 +935,22 @@ def print_summary(report: dict) -> None:
                 f"Ties:                  {s['llm_ties_vs_reranked']}/{lln} "
                 f"({s['llm_ties_vs_reranked'] / lln * 100:.0f}%)"
             )
-        print(
-            f"\nLLM latency: {lat['llm_avg']:.0f}ms avg "
-            f"({lat['llm_overhead_ms']:+.0f}ms vs reranked) "
-            f"— network round-trip per query"
-        )
+            print(
+                f"\nLLM latency: {lat['llm_avg']:.0f}ms avg "
+                f"({lat['llm_overhead_ms']:+.0f}ms vs reranked) "
+                f"— network round-trip per query"
+            )
+        if fallback:
+            # The LLM selector judged no candidate relevant on these queries, so
+            # recall fell back to the deterministic reranker. They are excluded
+            # from the LLM metrics above and reported here (a useful rate in its
+            # own right). With lln == 0, every query fell back.
+            ids = s.get("llm_fallback_query_ids", [])
+            id_note = f": {', '.join(ids)}" if ids else ""
+            print(
+                f"\nLLM fallback: {fallback}/{n} query(ies) fell back to the "
+                f"reranker (excluded from LLM metrics){id_note}"
+            )
 
     print("\nDominant signals driving reordering:")
     for signal, count in s["dominant_signals"].items():
@@ -1386,7 +1437,7 @@ async def async_main() -> int:
     print(f"Completed in {total_ms:.0f}ms")
 
     # Generate report
-    report = generate_report(results, queries)
+    report = generate_report(results, queries, with_llm=args.llm_rerank)
     print_summary(report)
 
     if args.verbose:

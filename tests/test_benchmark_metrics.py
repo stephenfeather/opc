@@ -11,7 +11,6 @@ from scripts.benchmarks import run_rerank_benchmark as benchmark_module
 from scripts.benchmarks.run_rerank_benchmark import (
     ComparisonMetrics,
     QueryResult,
-    assert_llm_arm_ran,
     compute_comparison_metrics,
     compute_mrr,
     compute_ndcg,
@@ -35,6 +34,7 @@ def _make_query_result(
     contents: list[str] | None = None,
     scores: list[float] | None = None,
     elapsed_ms: float = 1.0,
+    llm_fell_back: bool = False,
 ) -> QueryResult:
     """Build a QueryResult with sensible defaults for metric tests."""
     n = len(ids)
@@ -47,6 +47,7 @@ def _make_query_result(
         result_contents=contents if contents is not None else ["x"] * n,
         rerank_details=None,
         elapsed_ms=elapsed_ms,
+        llm_fell_back=llm_fell_back,
     )
 
 
@@ -333,26 +334,76 @@ class TestGenerateReportThreeWay:
         assert entry["precision_at_k_llm"] == 1.0
         assert entry["llm_elapsed_ms"] == 3200.0
 
-    def test_partial_llm_arm_raises(self):
-        # The LLM arm is all-or-nothing. A report where one query has LLM
-        # metrics and another does not is a programming error — reject it rather
-        # than print an LLM average against a full-n reranked baseline (mixed
-        # populations -> internally inconsistent deltas).
+    def test_partial_llm_arm_is_tolerated_and_accounted(self):
+        # Issue #246: a partial LLM arm is a LEGITIMATE runtime state (the LLM
+        # occasionally judges no candidate relevant -> recall falls back to the
+        # reranker on that one query). generate_report must NOT abort; it
+        # aggregates the LLM arm over the surviving subset, computes the
+        # llm_vs_reranked delta against the SAME-subset reranked baseline, and
+        # reports the fallback count + ids.
         rr1 = _make_query_result("q1", "reranked", ["a", "b", "c", "d", "e"])
         raw1 = _make_query_result("q1", "raw", ["b", "d", "a", "c", "e"])
         llm1 = _make_query_result("q1", "llm", ["a", "c", "e"])
         m1 = compute_comparison_metrics(
             rr1, raw1, ["a", "c", "e"], [], k=5, llm=llm1,
         )
+        # q2 fell back: no LLM arm -> precision_at_k_llm stays None.
         rr2 = _make_query_result("q2", "reranked", ["x", "y"])
         raw2 = _make_query_result("q2", "raw", ["y", "x"])
         m2 = compute_comparison_metrics(rr2, raw2, ["z"], [], k=5)
 
-        with pytest.raises(ValueError, match="all-or-nothing"):
-            generate_report(
-                [(rr1, raw1, m1), (rr2, raw2, m2)],
-                [{"id": "q1", "k": 5}, {"id": "q2", "k": 5}],
-            )
+        report = generate_report(
+            [(rr1, raw1, m1), (rr2, raw2, m2)],
+            [{"id": "q1", "k": 5}, {"id": "q2", "k": 5}],
+            with_llm=True,
+        )
+        s = report["summary"]
+        assert s["llm_arm_queries"] == 1
+        assert s["llm_fallback_queries"] == 1
+        assert s["llm_fallback_query_ids"] == ["q2"]
+        # The surviving query q1: precision_at_k_llm = 3/3 selected all golden = 1.0;
+        # same-subset reranked baseline is q1's reranked precision (3/5).
+        p = s["precision_at_k"]
+        assert p["llm"] == 1.0
+        assert p["reranked_on_llm_subset"] == round(3 / 5, 4)
+        assert p["llm_vs_reranked"] == round(1.0 - 3 / 5, 4)
+
+    def test_all_queries_fell_back_reports_zero_arm(self):
+        # Every query fell back: the report must still record that the LLM arm
+        # was ATTEMPTED (with_llm=True) and fell back on all of them, rather than
+        # silently looking like a two-way run.
+        rr = _make_query_result("q1", "reranked", ["a", "b"])
+        raw = _make_query_result("q1", "raw", ["b", "a"])
+        m = compute_comparison_metrics(rr, raw, ["a"], [], k=5)  # no llm arm
+        report = generate_report(
+            [(rr, raw, m)],
+            [{"id": "q1", "k": 5}],
+            with_llm=True,
+        )
+        s = report["summary"]
+        assert s["llm_arm_queries"] == 0
+        assert s["llm_fallback_queries"] == 1
+        assert s["llm_fallback_query_ids"] == ["q1"]
+        # No LLM metrics to report when the whole arm fell back.
+        assert "llm" not in s["precision_at_k"]
+
+    def test_no_fallback_report_has_zero_fallback_count(self):
+        # The common case (no fallbacks) must still produce the full three-way
+        # report, now additively carrying llm_fallback_queries == 0.
+        rr = _make_query_result("q1", "reranked", ["a", "b", "c", "d", "e"])
+        raw = _make_query_result("q1", "raw", ["b", "d", "a", "c", "e"])
+        llm = _make_query_result("q1", "llm", ["a", "c", "e"])
+        m = compute_comparison_metrics(rr, raw, ["a", "c", "e"], [], k=5, llm=llm)
+        report = generate_report(
+            [(rr, raw, m)],
+            [{"id": "q1", "k": 5}],
+            with_llm=True,
+        )
+        s = report["summary"]
+        assert s["llm_arm_queries"] == 1
+        assert s["llm_fallback_queries"] == 0
+        assert s["llm_fallback_query_ids"] == []
+        assert s["precision_at_k"]["llm"] == 1.0
 
 
 class TestRunQueryLlmGuard:
@@ -365,8 +416,12 @@ class TestRunQueryLlmGuard:
             await run_query("q1", "q", 5, rerank=False, llm_rerank=True)
 
 
-class TestAssertLlmArmRan:
-    """The LLM arm must fail closed on a silent reranker fallback."""
+class TestLlmArmFellBack:
+    """The predicate that detects a silent reranker fallback (issue #246).
+
+    A fallback is no longer fatal — it is detected, flagged on the QueryResult,
+    counted, and excluded from LLM metrics. This predicate is the detector.
+    """
 
     def _llm_row(self, rid: str) -> dict:
         return {
@@ -386,27 +441,81 @@ class TestAssertLlmArmRan:
             },
         }
 
-    def test_passes_when_all_rows_llm_selected(self):
-        assert_llm_arm_ran("q1", [self._llm_row("a"), self._llm_row("b")])
+    def test_false_when_all_rows_llm_selected(self):
+        assert not benchmark_module._llm_arm_fell_back(
+            [self._llm_row("a"), self._llm_row("b")]
+        )
 
-    def test_raises_on_reranker_fallback(self):
-        with pytest.raises(RuntimeError, match="fell back"):
-            assert_llm_arm_ran("q1", [self._reranker_row("a")])
+    def test_true_on_reranker_fallback(self):
+        assert benchmark_module._llm_arm_fell_back([self._reranker_row("a")])
 
-    def test_raises_on_mixed_rows(self):
-        with pytest.raises(RuntimeError, match="llm_selector"):
-            assert_llm_arm_ran(
-                "q1", [self._llm_row("a"), self._reranker_row("b")]
-            )
+    def test_true_on_mixed_rows(self):
+        assert benchmark_module._llm_arm_fell_back(
+            [self._llm_row("a"), self._reranker_row("b")]
+        )
 
-    def test_raises_when_rerank_details_missing(self):
-        with pytest.raises(RuntimeError):
-            assert_llm_arm_ran("q1", [{"id": "a"}])
+    def test_true_when_rerank_details_missing(self):
+        assert benchmark_module._llm_arm_fell_back([{"id": "a"}])
 
-    def test_empty_results_pass(self):
-        # An empty pool is ambiguous and shared by all arms; let the metric
-        # layer record precision 0 instead of aborting the whole benchmark.
-        assert_llm_arm_ran("q1", [])
+    def test_false_on_empty_results(self):
+        # An empty pool is ambiguous and shared by all arms — NOT a fallback.
+        # The cross-arm guard in run_benchmark handles a genuinely empty arm.
+        assert not benchmark_module._llm_arm_fell_back([])
+
+
+class TestRunQueryFallbackFlag:
+    """run_query flags a silent fallback instead of raising (issue #246)."""
+
+    def _proc(self, rows: list[dict], returncode: int = 0):
+        payload = json.dumps({"results": rows}).encode()
+
+        class _P:
+            def __init__(self):
+                self.returncode = returncode
+
+            async def communicate(self):
+                return payload, b""
+
+        return _P()
+
+    async def test_llm_selected_rows_not_flagged(self, monkeypatch):
+        rows = [{
+            "id": "a", "score": 1.0, "content": "x",
+            "rerank_details": {"source": "llm_selector", "rank": 0},
+        }]
+
+        async def fake_exec(*args, **kwargs):
+            return self._proc(rows)
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        out = await run_query("q1", "q", 5, rerank=True, llm_rerank=True)
+        assert out.llm_fell_back is False
+        assert out.result_ids == ["a"]
+
+    async def test_reranker_fallback_is_flagged_not_raised(self, monkeypatch):
+        # recall fell back to the deterministic reranker (rows carry per-signal
+        # scores, no llm_selector stamp) and exited 0. Tolerate + flag.
+        rows = [{
+            "id": "a", "score": 1.0, "content": "x",
+            "rerank_details": {"project_match": 0.5, "recency": 0.1},
+        }]
+
+        async def fake_exec(*args, **kwargs):
+            return self._proc(rows)
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        out = await run_query("q1", "q", 5, rerank=True, llm_rerank=True)
+        assert out.llm_fell_back is True
+        assert out.result_ids == ["a"]
+
+    async def test_nonzero_exit_still_raises(self, monkeypatch):
+        # A genuine infra failure (subprocess crash) must still abort the arm.
+        async def fake_exec(*args, **kwargs):
+            return self._proc([], returncode=1)
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        with pytest.raises(RuntimeError, match="return code"):
+            await run_query("q1", "q", 5, rerank=True, llm_rerank=True)
 
 
 class TestRunBenchmarkArmIntegrity:
@@ -468,6 +577,36 @@ class TestRunBenchmarkArmIntegrity:
         assert len(out) == 1
         _, _, m = out[0]
         assert m.precision_at_k_llm == 1.0  # llm returned only the golden id
+
+    async def test_fell_back_llm_arm_is_tolerated_and_excluded(self, monkeypatch):
+        # Issue #246: one query's LLM arm fell back (flagged) — run_benchmark
+        # must NOT raise, and must exclude that query from LLM metrics (leave
+        # precision_at_k_llm None) while the other query keeps its LLM metrics.
+        async def fake_run_query(
+            qid, query, k, rerank, project=None, tags=None, llm_rerank=False,
+        ):
+            if llm_rerank:
+                fell = qid == "q2"
+                # A real fallback carries the reranker's (non-empty) rows.
+                return _make_query_result(
+                    qid, "llm", ["a"], llm_fell_back=fell,
+                )
+            return _make_query_result(
+                qid, "reranked" if rerank else "raw", ["a"],
+            )
+
+        monkeypatch.setattr(benchmark_module, "run_query", fake_run_query)
+        out = await run_benchmark(
+            [
+                {"id": "q1", "query": "q", "k": 5, "golden_ids": ["a"]},
+                {"id": "q2", "query": "q", "k": 5, "golden_ids": ["a"]},
+            ],
+            with_llm=True,
+        )
+        assert len(out) == 2
+        by_id = {m.query_id: m for _, _, m in out}
+        assert by_id["q1"].precision_at_k_llm == 1.0  # survived
+        assert by_id["q2"].precision_at_k_llm is None  # fell back -> excluded
 
 
 class _HangingProc:
@@ -654,6 +793,41 @@ class TestPrintSummaryThreeWay:
         print_summary(report)
         out = capsys.readouterr().out
         assert "LLM-as-selector arm" not in out
+
+    def test_partial_fallback_renders_metrics_and_fallback_line(self, capsys):
+        # One query survives, one fell back: print the LLM metrics for the
+        # survivor AND a visible fallback line naming the excluded query.
+        rr1 = _make_query_result("q1", "reranked", ["a", "b", "c", "d", "e"])
+        raw1 = _make_query_result("q1", "raw", ["b", "d", "a", "c", "e"])
+        llm1 = _make_query_result("q1", "llm", ["a", "c", "e"])
+        m1 = compute_comparison_metrics(rr1, raw1, ["a", "c", "e"], [], k=5, llm=llm1)
+        rr2 = _make_query_result("q2", "reranked", ["x", "y"])
+        raw2 = _make_query_result("q2", "raw", ["y", "x"])
+        m2 = compute_comparison_metrics(rr2, raw2, ["z"], [], k=5)
+        report = generate_report(
+            [(rr1, raw1, m1), (rr2, raw2, m2)],
+            [{"id": "q1", "k": 5}, {"id": "q2", "k": 5}],
+            with_llm=True,
+        )
+        print_summary(report)
+        out = capsys.readouterr().out
+        assert "LLM-as-selector arm" in out
+        assert "fell back" in out
+        assert "q2" in out  # the excluded query id is surfaced
+
+    def test_all_fell_back_renders_notice_without_crashing(self, capsys):
+        # The whole LLM arm fell back: no metric table, but a clear notice.
+        rr = _make_query_result("q1", "reranked", ["a", "b"])
+        raw = _make_query_result("q1", "raw", ["b", "a"])
+        m = compute_comparison_metrics(rr, raw, ["a"], [], k=5)
+        report = generate_report(
+            [(rr, raw, m)],
+            [{"id": "q1", "k": 5}],
+            with_llm=True,
+        )
+        print_summary(report)  # must not raise
+        out = capsys.readouterr().out
+        assert "fell back" in out
 
 
 class TestGenerateReportWinners:

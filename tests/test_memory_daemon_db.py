@@ -592,6 +592,58 @@ class TestSqliteMarkExtractionFailedDb:
         assert row[0] == "failed"
 
 
+class TestMarkExtractionFailedLogSanitization:
+    """The db.py log sink runs last_error through safe() (issue #209, Part 1).
+
+    Defense-in-depth: even if some other writer stores an unsanitized
+    last_error, interpolating it into the "permanently failed" log line must
+    not allow a \\n/ANSI payload to forge log lines. The write sites already
+    safe_secret() the value, but the sink itself must also be safe().
+    """
+
+    def test_sqlite_sink_escapes_control_chars(self, tmp_path, caplog):
+        db_path = tmp_path / "sessions.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, extraction_status TEXT,
+                extraction_attempts INTEGER DEFAULT 0, last_error TEXT
+            )
+        """)
+        conn.execute("INSERT INTO sessions VALUES ('s1', 'extracting', 3, NULL)")
+        conn.commit()
+        conn.close()
+
+        with patch("scripts.core.memory_daemon_db.get_sqlite_path", return_value=db_path):
+            from scripts.core.memory_daemon_db import sqlite_mark_extraction_failed
+
+            with caplog.at_level("INFO", logger="memory-daemon"):
+                sqlite_mark_extraction_failed(
+                    "s1", max_retries=3, last_error="boom\nFAKE: forged line"
+                )
+
+        msg = caplog.text
+        assert "boom\\x0aFAKE: forged line" in msg
+        assert "boom\nFAKE: forged line" not in msg
+
+    @patch("scripts.core.memory_daemon_db.pg_connect")
+    def test_pg_sink_escapes_control_chars(self, mock_pg_connect, caplog):
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_cur.fetchone.return_value = (3,)  # at max → permanent failure path
+        mock_conn.cursor.return_value = mock_cur
+        mock_pg_connect.return_value = mock_conn
+
+        from scripts.core.memory_daemon_db import pg_mark_extraction_failed
+
+        with caplog.at_level("INFO", logger="memory-daemon"):
+            pg_mark_extraction_failed("s1", max_retries=3, last_error="boom\nFAKE: forged line")
+
+        msg = caplog.text
+        assert "boom\\x0aFAKE: forged line" in msg
+        assert "boom\nFAKE: forged line" not in msg
+
+
 class TestSqliteMarkSessionExitedDb:
     """sqlite_mark_session_exited stamps exited_at."""
 

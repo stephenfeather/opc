@@ -328,7 +328,11 @@ def pg_mark_extraction_failed(
             "last_error = %s WHERE id = %s",
             (last_error, session_id),
         )
-        suffix = f" (last error: {last_error})" if last_error else ""
+        # safe() the DB-sourced value at the sink (issue #209, Part 1):
+        # defense-in-depth so any writer of last_error — not just the
+        # safe_secret()-guarded extraction paths — cannot forge log lines via a
+        # \n/ANSI payload interpolated into this logger.info.
+        suffix = f" (last error: {safe(last_error)})" if last_error else ""
         logger.info(
             "Extraction permanently failed for %s after %d attempts%s",
             session_id,
@@ -472,7 +476,11 @@ def sqlite_mark_extraction_failed(
             "last_error = ? WHERE id = ?",
             (last_error, session_id),
         )
-        suffix = f" (last error: {last_error})" if last_error else ""
+        # safe() the DB-sourced value at the sink (issue #209, Part 1):
+        # defense-in-depth so any writer of last_error — not just the
+        # safe_secret()-guarded extraction paths — cannot forge log lines via a
+        # \n/ANSI payload interpolated into this logger.info.
+        suffix = f" (last error: {safe(last_error)})" if last_error else ""
         logger.info(
             "Extraction permanently failed for %s after %d attempts%s",
             session_id,

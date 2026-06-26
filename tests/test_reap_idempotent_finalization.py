@@ -346,6 +346,41 @@ def test_process_pending_queue_backpressure_when_finalization_full(tmp_jsonl):
     assert len(get_pending_queue()) == 1, "the queued work must be left intact"
 
 
+def test_queue_or_extract_backpressure_when_finalization_full(tmp_jsonl):
+    """Stale-session launches also back off at the finalization cap (PR #253 review).
+
+    process_pending_queue is not the only launch path: daemon_tick's stale-session
+    discovery calls queue_or_extract() directly, which must honour the same
+    backpressure or new sessions would launch, complete, and have their
+    finalization dropped at the cap — stranding them until restart.
+    """
+    from scripts.core.memory_daemon import (
+        _FINALIZATION_QUEUE_MAX,
+        _PendingFinalization,
+        get_pending_finalizations,
+        get_pending_queue,
+        queue_or_extract,
+    )
+
+    pf_queue = get_pending_finalizations()
+    for i in range(_FINALIZATION_QUEUE_MAX):
+        pf_queue.append(
+            _PendingFinalization(
+                session_id=f"sess-{i}",
+                exit_code=0,
+                jsonl_path=tmp_jsonl,
+                project="/tmp/proj",
+                last_error=None,
+            )
+        )
+
+    with patch("scripts.core.memory_daemon.extract_memories") as mock_extract:
+        queue_or_extract("sess-stale", "/tmp/proj", str(tmp_jsonl))
+
+    mock_extract.assert_not_called()
+    assert len(get_pending_queue()) == 0, "must not queue new work under backpressure"
+
+
 def test_retry_pending_finalizations_batches_per_tick(tmp_jsonl):
     """At most _FINALIZATION_RETRY_BATCH finalizations are applied per tick (#207 R2)."""
     from scripts.core.memory_daemon import (

@@ -831,14 +831,16 @@ class _PendingFinalization:
 
     session_id: str
     exit_code: int
-    jsonl_path: object
-    project: object
+    jsonl_path: Path
+    project: str | None
     last_error: str | None
     attempts: int = 0
     next_attempt_at: float = 0.0
 
 
-def _run_post_extraction_stages(session_id, jsonl_path, project):
+def _run_post_extraction_stages(
+    session_id: str, jsonl_path: Path, project: str | None
+) -> None:
     """Run the best-effort post-extraction stages after a successful mark.
 
     Each stage is isolated: a stage failure is logged and the rest still run.
@@ -926,7 +928,13 @@ def _enqueue_finalization_retry(pf: "_PendingFinalization", error: Exception) ->
 
 
 def _finalize_completed_extraction(
-    pid, session_id, proc, jsonl_path, project, start_time, exit_code
+    pid: int,
+    session_id: str,
+    proc: subprocess.Popen,
+    jsonl_path: Path,
+    project: str | None,
+    start_time: float,
+    exit_code: int,
 ) -> "_PendingFinalization":
     """Run the run-once diagnostics for an exited child and return its outcome.
 
@@ -1104,15 +1112,25 @@ def watchdog_stuck_extractions():
     return len(killed)
 
 
+def _finalization_backpressure_active() -> bool:
+    """True when the finalization retry backlog is at its global cap (#207).
+
+    While active, NO new extraction is launched — both ``process_pending_queue``
+    (in-memory queue) and ``queue_or_extract`` (stale-session discovery in
+    ``daemon_tick``) back off. Otherwise stale sessions discovered later in the
+    same tick would keep launching, complete, and have their finalization dropped
+    at the cap — stranding them until restart and defeating the backpressure
+    (PR #253 review). A skipped stale session stays ``pending`` in the DB and is
+    simply re-detected on a later tick once the backlog drains.
+    """
+    return len(get_pending_finalizations()) >= _FINALIZATION_QUEUE_MAX
+
+
 def process_pending_queue():
     """Spawn extractions from queue if under concurrency limit."""
     ae = get_active_extractions()
     pq = get_pending_queue()
-    # Backpressure (#207 R2): when the DB-finalization backlog is at its global
-    # cap, stop launching new extractions the DB cannot finalize. This bounds the
-    # pending_finalizations queue — without it, every newly-launched extraction
-    # that completes during a sustained outage would add another entry.
-    if len(get_pending_finalizations()) >= _FINALIZATION_QUEUE_MAX:
+    if _finalization_backpressure_active():
         return 0
     spawned = 0
     while pq and len(ae) < _max_concurrent():
@@ -1141,6 +1159,12 @@ def queue_or_extract(
     queued_ids = {item[0] for item in pq}
     active_ids = {ex[0] for ex in ae.values()}
     if session_id in queued_ids or session_id in active_ids:
+        return
+
+    # Backpressure: do not launch (or even queue) new work while the
+    # finalization backlog is at its cap. The session stays 'pending' in the DB
+    # and is re-detected once the backlog drains (PR #253 review).
+    if _finalization_backpressure_active():
         return
 
     if len(ae) >= _max_concurrent():

@@ -856,8 +856,11 @@ def _run_post_extraction_stages(session_id, jsonl_path, project):
         try:
             _timed_stage(name, fn)
         except Exception as e:
+            # safe_exception (not safe): these stages touch the DB, and
+            # psycopg/asyncpg messages can embed row values that regex redaction
+            # misses — render only the structured allowlist (#117 convention).
             log(f"Post-extraction stage {name} failed for "
-                f"{safe(session_id)}: {safe(e)}")
+                f"{safe(session_id)}: {safe_exception(e)}")
 
 
 def _apply_finalization(pf: "_PendingFinalization") -> None:
@@ -890,9 +893,11 @@ def _schedule_finalization_retry(
     exp = min(pf.attempts - 1, _FINALIZATION_BACKOFF_MAX_EXP)
     backoff = min(_FINALIZATION_BASE_BACKOFF * (2**exp), _FINALIZATION_MAX_BACKOFF)
     pf.next_attempt_at = time.monotonic() + backoff
+    # safe_exception (not safe): error is the mark_* DB write failure, whose
+    # psycopg/asyncpg message can embed row values (#117 convention).
     msg = (f"Finalization failed for {safe(pf.session_id)} "
            f"(exit={pf.exit_code}, attempt {pf.attempts}); "
-           f"retry in {int(backoff)}s: {safe(error)}")
+           f"retry in {int(backoff)}s: {safe_exception(error)}")
     if first:
         log(msg)
     else:
@@ -911,9 +916,10 @@ def _enqueue_finalization_retry(pf: "_PendingFinalization", error: Exception) ->
     if any(existing.session_id == pf.session_id for existing in pq):
         return
     if len(pq) >= _FINALIZATION_QUEUE_MAX:
+        # safe_exception (not safe): error is the mark_* DB write failure (#117).
         log(f"Finalization retry queue full ({len(pq)}); dropping "
             f"{safe(pf.session_id)} (exit={pf.exit_code}), left in 'extracting' "
-            f"for startup recovery: {safe(error)}")
+            f"for startup recovery: {safe_exception(error)}")
         return
     _schedule_finalization_retry(pf, error, first=True)
     pq.append(pf)

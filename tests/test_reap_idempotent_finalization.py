@@ -166,3 +166,126 @@ def test_reap_logs_finalization_failure(tmp_jsonl):
     assert (
         "pg_connect failed" in log_messages or "finaliz" in log_messages.lower()
     ), "Finalization failure must be logged"
+
+
+# ---------------------------------------------------------------------------
+# Bounded finalization retry (recover from a *transient* DB outage without a
+# daemon restart). reap removes the dead PID immediately, but the completed
+# outcome is queued and retried with backoff so the session does not strand in
+# 'extracting' forever (adversarial-review R1 finding).
+# ---------------------------------------------------------------------------
+
+
+def test_finalization_retried_after_transient_db_recovery(tmp_jsonl):
+    """A finalization that fails once is retried and succeeds after DB recovery."""
+    from scripts.core.memory_daemon import (
+        get_active_extractions,
+        get_pending_finalizations,
+        reap_completed_extractions,
+        retry_pending_finalizations,
+    )
+
+    proc = _make_mock_proc(pid=801, exit_code=0)
+    ae = get_active_extractions()
+    ae[801] = ("sess-transient", proc, tmp_jsonl, "/tmp/proj", time.time() - 30)
+
+    calls = {"n": 0}
+
+    def flaky_mark(_sid):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("pg_connect failed after max_retries")
+
+    with (
+        patch("scripts.core.memory_daemon.mark_extracted", side_effect=flaky_mark),
+        patch(
+            "scripts.core.memory_daemon._count_session_learnings", return_value=2
+        ) as count_learnings,
+        patch("scripts.core.memory_daemon._count_session_rejections", return_value=0),
+        patch("scripts.core.memory_daemon._calibrate_session_confidence"),
+        patch("scripts.core.memory_daemon._extract_and_store_workflows"),
+        patch("scripts.core.memory_daemon._generate_mini_handoff"),
+        patch("scripts.core.memory_daemon.archive_session_jsonl"),
+    ):
+        reap_completed_extractions()  # tick 1: mark_extracted raises -> enqueued
+        assert 801 not in ae, "dead PID removed immediately"
+
+        pq = get_pending_finalizations()
+        assert len(pq) == 1, "failed finalization must be queued for retry"
+
+        # Force the backoff deadline due so the retry fires this tick.
+        pq[0].next_attempt_at = 0.0
+        finalized = retry_pending_finalizations()  # tick 2: DB recovered
+
+    assert finalized == 1
+    assert calls["n"] == 2, "mark_extracted retried exactly once after the failure"
+    assert count_learnings.call_count == 1, "diagnostics must not re-run on retry"
+    assert len(get_pending_finalizations()) == 0, "queue drains after success"
+
+
+def test_finalization_gives_up_after_max_attempts(tmp_jsonl):
+    """A persistent DB outage drains the queue after the bounded attempt cap."""
+    from scripts.core.memory_daemon import (
+        _FINALIZATION_MAX_ATTEMPTS,
+        get_active_extractions,
+        get_pending_finalizations,
+        reap_completed_extractions,
+        retry_pending_finalizations,
+    )
+
+    proc = _make_mock_proc(pid=802, exit_code=0)
+    ae = get_active_extractions()
+    ae[802] = ("sess-persist", proc, tmp_jsonl, "/tmp/proj", time.time() - 30)
+
+    with (
+        patch(
+            "scripts.core.memory_daemon.mark_extracted",
+            side_effect=RuntimeError("db down"),
+        ),
+        patch("scripts.core.memory_daemon._count_session_learnings", return_value=0),
+        patch("scripts.core.memory_daemon._count_session_rejections", return_value=0),
+    ):
+        reap_completed_extractions()  # attempt 1, enqueued
+        pq = get_pending_finalizations()
+        # Drive every remaining attempt to exhaustion.
+        for _ in range(_FINALIZATION_MAX_ATTEMPTS + 1):
+            for pf in pq:
+                pf.next_attempt_at = 0.0
+            retry_pending_finalizations()
+
+    assert (
+        len(get_pending_finalizations()) == 0
+    ), "queue must drain (bounded) after giving up on a persistent outage"
+
+
+def test_best_effort_stage_failure_does_not_enqueue_retry(tmp_jsonl):
+    """A post-extraction stage failure must not strand or re-queue finalization."""
+    from scripts.core.memory_daemon import (
+        get_active_extractions,
+        get_pending_finalizations,
+        reap_completed_extractions,
+    )
+
+    proc = _make_mock_proc(pid=803, exit_code=0)
+    ae = get_active_extractions()
+    ae[803] = ("sess-stage-fail", proc, tmp_jsonl, "/tmp/proj", time.time() - 30)
+
+    with (
+        patch("scripts.core.memory_daemon.mark_extracted"),  # critical op succeeds
+        patch(
+            "scripts.core.memory_daemon._calibrate_session_confidence",
+            side_effect=RuntimeError("stage boom"),
+        ),
+        patch("scripts.core.memory_daemon._extract_and_store_workflows"),
+        patch("scripts.core.memory_daemon._generate_mini_handoff"),
+        patch("scripts.core.memory_daemon.archive_session_jsonl"),
+        patch("scripts.core.memory_daemon._count_session_learnings", return_value=0),
+        patch("scripts.core.memory_daemon._count_session_rejections", return_value=0),
+    ):
+        reaped = reap_completed_extractions()
+
+    assert reaped == 1
+    assert 803 not in ae
+    assert (
+        len(get_pending_finalizations()) == 0
+    ), "a best-effort stage failure must not enqueue a finalization retry"

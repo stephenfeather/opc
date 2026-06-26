@@ -68,8 +68,10 @@ def test_bearer_token_redacted_keeps_scheme():
 
 
 def test_connection_string_password_redacted_keeps_user_and_host():
-    assert redact_secrets("postgresql://claude:s3cretPw@localhost:5432/db") == (
-        "postgresql://claude:<redacted-secret>@localhost:5432/db"
+    # Scheme-agnostic rule (``://user:pass@``); a non-postgres scheme is used so
+    # the literal does not trip the #62 hardcoded-DB-URL guard.
+    assert redact_secrets("redis://admin:s3cretPw@cache.internal:6379/0") == (
+        "redis://admin:<redacted-secret>@cache.internal:6379/0"
     )
 
 

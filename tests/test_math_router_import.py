@@ -72,3 +72,25 @@ def test_crash_logging_degrades_to_noop_when_stderr_unusable(
 
     # Every diagnostic channel fails; the helper must still swallow and return.
     math_router._enable_crash_logging()
+
+
+def test_crash_logging_falls_back_when_home_unresolvable(
+    math_router, monkeypatch, tmp_path
+):
+    """In a home-less environment, `expanduser` returns the literal `~/...`
+    path. The helper must not create a stray `~` tree in the cwd; it must skip
+    the file branch and fall back to stderr."""
+    # Simulate an unresolvable home: expanduser leaves the path unchanged.
+    monkeypatch.setattr(math_router.os.path, "expanduser", lambda p: p)
+    calls = []
+    monkeypatch.setattr(
+        math_router.faulthandler, "enable", lambda *a, **k: calls.append(k)
+    )
+    monkeypatch.chdir(tmp_path)
+
+    math_router._enable_crash_logging()  # must not raise
+
+    # File branch skipped (path not absolute); only the stderr fallback ran.
+    assert calls == [{"all_threads": True}]
+    # No literal "~" directory leaked into the working directory.
+    assert not (tmp_path / "~").exists()

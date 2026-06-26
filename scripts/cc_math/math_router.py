@@ -32,10 +32,23 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-faulthandler.enable(
-    file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"),
-    all_threads=True,
-)
+
+def _enable_crash_logging() -> None:
+    """Best-effort faulthandler setup.
+
+    Routes fatal-signal tracebacks to ``~/.claude/logs/opc_crash.log``, falling
+    back to stderr if that path is not writable. This keeps importing the module
+    from failing in read-only or otherwise restricted environments.
+    """
+    try:
+        log_path = os.path.expanduser("~/.claude/logs/opc_crash.log")
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        faulthandler.enable(file=open(log_path, "a"), all_threads=True)  # noqa: SIM115
+    except OSError:
+        faulthandler.enable(all_threads=True)
+
+
+_enable_crash_logging()
 
 # =============================================================================
 # Route Configuration

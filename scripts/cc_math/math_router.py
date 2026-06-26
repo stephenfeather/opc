@@ -37,15 +37,26 @@ def _enable_crash_logging() -> None:
     """Best-effort faulthandler setup.
 
     Routes fatal-signal tracebacks to ``~/.claude/logs/opc_crash.log``, falling
-    back to stderr if that path is not writable. This keeps importing the module
-    from failing in read-only or otherwise restricted environments.
+    back to stderr if that path is not writable, and degrading to a no-op if even
+    stderr is unusable (e.g. replaced with a non-fd stream). Importing this module
+    must never raise from crash-log setup, even in read-only, sandboxed, or
+    otherwise restricted environments.
+
+    The log file is opened anonymously on purpose: ``faulthandler`` keeps its own
+    reference to the file object for the process lifetime, so the descriptor stays
+    valid for later fatal-signal output without a module-level handle.
     """
     try:
         log_path = os.path.expanduser("~/.claude/logs/opc_crash.log")
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         faulthandler.enable(file=open(log_path, "a"), all_threads=True)  # noqa: SIM115
+        return
     except OSError:
-        faulthandler.enable(all_threads=True)
+        pass
+    try:
+        faulthandler.enable(all_threads=True)  # default target: sys.stderr
+    except (OSError, ValueError, RuntimeError):
+        pass  # No usable diagnostic channel; degrade to a no-op.
 
 
 _enable_crash_logging()

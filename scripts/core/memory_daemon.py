@@ -174,7 +174,12 @@ except Exception:
 from scripts.core.config import get_config as _get_config
 
 # Log-field sanitizer for DB-sourced / subprocess-sourced strings (#104).
-from scripts.core.log_safety import safe, safe_exception  # noqa: E402
+from scripts.core.log_safety import (  # noqa: E402
+    redact_secrets,
+    safe,
+    safe_exception,
+    safe_secret,
+)
 
 # Re-exports from memory_daemon_core (D12: shims per step)
 from scripts.core.memory_daemon_core import (  # noqa: E402
@@ -681,7 +686,9 @@ def _drain_proc_stderr(proc, *, max_bytes: int = 65536, timeout: float = 0.0) ->
     (and non-fd streams such as ``io.BytesIO`` in tests) fall back to a single
     bounded ``read`` only when a budget is given (``timeout > 0``); a 0.0
     budget never blocks. Always closes the stream; returns the last 500 chars
-    of the captured text, or ``""`` when there is nothing to read.
+    of the captured text after secret redaction (``redact_secrets`` runs on the
+    full decoded buffer before the tail slice, #209), or ``""`` when there is
+    nothing to read.
     """
     stream = getattr(proc, "stderr", None)
     if not stream:
@@ -770,7 +777,15 @@ def _drain_proc_stderr(proc, *, max_bytes: int = 65536, timeout: float = 0.0) ->
 
     raw = b"".join(chunks)
     try:
-        return raw.decode("utf-8", errors="replace").strip()[-500:]
+        decoded = raw.decode("utf-8", errors="replace").strip()
+        # Redact secrets on the FULL decoded buffer BEFORE slicing the tail
+        # (#209): the prefix-anchored rules in redact_secrets need to see a
+        # token's leading marker (sk-/ghp_/AKIA/...). Slicing first could cut
+        # the 500-char window inside a long token, dropping the prefix so the
+        # suffix would survive unredacted into last_error. Redact-then-slice
+        # guarantees no credential fragment reaches the log or the DB even when
+        # the diagnostic tail begins mid-token.
+        return redact_secrets(decoded)[-500:]
     except Exception:
         return ""
 
@@ -803,7 +818,7 @@ def reap_completed_extractions():
                 # keeping the rare-failure latency negligible.
                 stderr_text = _drain_proc_stderr(proc, timeout=0.25)
                 if stderr_text:
-                    log(f"  stderr: {safe(stderr_text)}")
+                    log(f"  stderr: {safe_secret(stderr_text)}")
             else:
                 # Success: opportunistic (timeout=0) close — never wait on the
                 # hot path just to reclaim the fd.
@@ -828,10 +843,12 @@ def reap_completed_extractions():
                     lambda: archive_session_jsonl(session_id, jsonl_path),
                 )
             else:
-                # safe() before persisting: last_error is interpolated raw
-                # into a downstream log line, so escape control chars here.
+                # safe_secret() before persisting: stderr can carry env-derived
+                # credentials (VOYAGE/OPENAI/GH tokens) and is interpolated raw
+                # into a downstream log line, so redact secret-shaped tokens AND
+                # escape control chars here (#209 secret-at-rest + log-forgery).
                 mark_extraction_failed(
-                    session_id, last_error=safe(stderr_text) or None
+                    session_id, last_error=safe_secret(stderr_text) or None
                 )
 
     for pid in completed:
@@ -876,11 +893,13 @@ def watchdog_stuck_extractions():
             # a PIPE whose write end a surviving descendant still holds open.
             stderr_text = _drain_proc_stderr(proc, timeout=0.25)
             if stderr_text:
-                log(f"  stderr: {safe(stderr_text)}")
+                log(f"  stderr: {safe_secret(stderr_text)}")
             killed.append(pid)
-            # safe() before persisting: last_error is interpolated raw into a
-            # downstream log line, so escape control chars here (log-forgery).
-            mark_extraction_failed(session_id, last_error=safe(stderr_text) or None)
+            # safe_secret() before persisting: stderr can carry env-derived
+            # credentials and is interpolated raw into a downstream log line, so
+            # redact secret-shaped tokens AND escape control chars here
+            # (#209 secret-at-rest + log-forgery).
+            mark_extraction_failed(session_id, last_error=safe_secret(stderr_text) or None)
 
     for pid in killed:
         del ae[pid]

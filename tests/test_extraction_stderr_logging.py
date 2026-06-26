@@ -167,6 +167,42 @@ def test_reap_truncates_stderr_to_500_chars(tmp_jsonl):
     )
 
 
+def test_reap_redacts_secret_split_by_500_boundary(tmp_jsonl):
+    """A credential whose prefix falls outside the 500-char tail must NOT leak.
+
+    Regression for issue #209 round-1 finding: redaction once ran AFTER
+    _drain_proc_stderr sliced the last 500 chars, so a long token at the head
+    of stderr lost its prefix to truncation and the prefix-anchored rules left
+    the suffix unredacted in last_error. Redaction now runs on the full decoded
+    buffer before the tail slice, so no token fragment survives.
+    """
+    from scripts.core.memory_daemon import (
+        get_active_extractions,
+        reap_completed_extractions,
+    )
+
+    # Token (208 chars) then 400 trailing chars → the [-500:] tail begins
+    # ~108 chars inside the token, dropping the "sk-proj-" prefix.
+    token = "sk-proj-" + "A" * 200
+    stderr_text = token + "B" * 400
+    proc = _make_mock_proc(pid=555, exit_code=1, stderr_text=stderr_text)
+
+    ae = get_active_extractions()
+    ae[555] = ("sess-split", proc, tmp_jsonl, "/tmp/proj", time.time() - 60)
+
+    with (
+        patch("scripts.core.memory_daemon.mark_extraction_failed") as mock_fail,
+        patch("scripts.core.memory_daemon.log"),
+    ):
+        reap_completed_extractions()
+
+    mock_fail.assert_called_once()
+    last_error = mock_fail.call_args[1]["last_error"]
+    assert "<redacted-secret>" in last_error
+    # No fragment of the token's body may survive into the persisted value.
+    assert "AAAA" not in last_error
+
+
 def test_reap_closes_stderr_on_success(tmp_jsonl):
     """On successful extraction (exit 0), stderr fd must be closed."""
     from scripts.core.memory_daemon import (

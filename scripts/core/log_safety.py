@@ -16,7 +16,13 @@ from __future__ import annotations
 
 import re
 
-__all__ = ["safe", "redact_db_values", "safe_exception"]
+__all__ = [
+    "safe",
+    "redact_db_values",
+    "safe_exception",
+    "redact_secrets",
+    "safe_secret",
+]
 
 _DEFAULT_MAX_LEN = 500
 
@@ -228,6 +234,112 @@ def redact_db_values(text: object) -> str:
     coerced = _SINGLE_QUOTED_LITERAL.sub("'<redacted>'", coerced)
     coerced = _DETAIL_KEY_VALUE.sub(")=(<redacted>)", coerced)
     return coerced
+
+
+_SECRET_MARKER = "<redacted-secret>"
+
+# Credential-shaped tokens that can appear bare in arbitrary subprocess stderr
+# (issue #209). Each entry is ``(compiled pattern, replacement)`` and the rules
+# are applied in order. Structured forms (Bearer / connection-string password /
+# sensitive ``VAR=value`` assignment) keep their surrounding context via ``\1``/
+# ``\2`` backrefs and mask only the secret; bare prefixed tokens are replaced
+# whole. The replacement marker contains no regex-replacement metacharacters
+# (``\`` / ``\g<>``), so it is substituted literally.
+#
+# Matching is conservative and prefix-anchored (the audit's explicit
+# recommendation): only known credential prefixes are masked, so a leaked
+# OPENAI/VOYAGE/GitHub/AWS token is caught while UUIDs, hashes, and ordinary
+# hyphenated words pass through unchanged. ``\b`` guards keep ``sk-`` from
+# matching inside words like ``task-``/``disk-``. This complements ``safe()``
+# (which escapes control chars) — it does NOT replace it; use ``safe_secret``
+# to get both.
+_SECRET_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
+    # Bearer / Authorization tokens — keep the scheme, mask the credential.
+    (re.compile(r"(Bearer\s+)\S+", re.IGNORECASE), rf"\1{_SECRET_MARKER}"),
+    # Connection-string passwords: ``://user:PASSWORD@host`` — keep user+host.
+    (re.compile(r"(://[^:/@\s]+:)[^@\s]+(@)"), rf"\1{_SECRET_MARKER}\2"),
+    # Sensitive ``VAR=value`` / ``export VAR=value`` env assignments — keep the
+    # variable name (which names the leak), mask the value. Deliberately narrow
+    # (#209 R2): the credential word (KEY/SECRET/TOKEN/PASSWORD/CREDENTIAL[S])
+    # must be the FINAL underscore-delimited segment of an UPPERCASE name,
+    # immediately before ``=`` — e.g. ``OPENAI_API_KEY=``, ``GH_TOKEN=``,
+    # ``DB_PASSWORD=``. Matching is case-sensitive and the marker is anchored at
+    # the end of the name, so non-secret diagnostics like ``monkey=banana``,
+    # ``TURKEY=...``, or ``KEYBOARD_LAYOUT=us`` (which merely *contain* "key")
+    # are NOT redacted — preserving the failure artifact this issue protects.
+    # The lookbehind keeps the match from starting mid-word (e.g. the ``KEY`` in
+    # ``MONKEY=``). Lowercase ``password=``-style values fall to the
+    # connection-string / bare-token rules instead.
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9_])"
+            r"((?:export\s+)?(?:[A-Z0-9]+_)*"
+            r"(?:KEY|SECRET|TOKEN|PASSWORD|CREDENTIALS?)=)\S+",
+        ),
+        rf"\1{_SECRET_MARKER}",
+    ),
+    # Bare ``sk-*`` tokens (OpenAI, Anthropic ``sk-ant-``, Stripe, …).
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{8,}"), _SECRET_MARKER),
+    # Bare GitHub tokens: classic ``ghp_/gho_/ghu_/ghs_/ghr_`` + fine-grained.
+    (re.compile(r"\bgh[opusr]_[A-Za-z0-9]{20,}"), _SECRET_MARKER),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"), _SECRET_MARKER),
+    # AWS access key IDs (long-term ``AKIA`` / temporary ``ASIA``).
+    (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), _SECRET_MARKER),
+    # Bare Voyage AI keys: current keys use the ``pa-`` prefix; ``voy-`` is
+    # matched too (named in #209) to stay robust to a prefix change.
+    (re.compile(r"\b(?:pa|voy)-[A-Za-z0-9_-]{16,}"), _SECRET_MARKER),
+)
+
+
+def redact_secrets(text: object) -> str:
+    """Mask credential-shaped tokens in free text (e.g. subprocess stderr).
+
+    Addresses GitHub issue #209: the ``claude -p`` extraction child runs with
+    the full daemon environment (VOYAGE/OPENAI/GH tokens). On a crash a token
+    can appear in its stderr, which is captured and persisted to
+    ``sessions.last_error``. ``safe()`` escapes control chars but does NOT
+    redact secret-shaped tokens, so a leaked credential would otherwise be
+    stored at rest. This helper masks known credential shapes with
+    ``"<redacted-secret>"`` so the secret never reaches the log or the DB.
+
+    Matching is conservative and prefix-anchored (see ``_SECRET_RULES``):
+    bare ``sk-*``/GitHub/AWS/Voyage tokens, ``Bearer`` credentials,
+    connection-string passwords, and sensitive ``VAR=value`` env assignments.
+    Structured forms keep their context (scheme / host / variable name) and
+    mask only the value. UUIDs, hashes, and ordinary hyphenated words are not
+    matched, so over-redaction is avoided.
+
+    Control characters are **not** escaped here — that is ``safe()``'s job.
+    Callers that log or store the result should wrap it with ``safe()`` (or
+    use ``safe_secret()``, which composes the two). The substitution is global
+    and idempotent (the marker matches none of the rules), so it is safe to
+    run on already-redacted text.
+
+    Never raises a non-system Exception: non-``str`` input is coerced via the
+    same never-raises path ``safe()`` uses (``_coerce``).
+    """
+    coerced = _coerce(text)
+    for pattern, replacement in _SECRET_RULES:
+        coerced = pattern.sub(replacement, coerced)
+    return coerced
+
+
+def safe_secret(value: object, *, max_len: int = _DEFAULT_MAX_LEN) -> str:
+    """Redact credential-shaped tokens, then render as a safe log field.
+
+    Composes :func:`redact_secrets` (mask secrets) with :func:`safe` (escape
+    control chars + bound length), in that order: redaction runs on the full
+    raw string BEFORE ``safe()`` escapes and truncates, so a secret in the
+    truncated tail cannot survive and a control char smuggled alongside a token
+    is still escaped. The output therefore satisfies the full ``safe()``
+    contract — only ``\\t`` or printable ASCII (``0x20``–``0x7e``) — with any
+    known credential shape replaced by ``"<redacted-secret>"``.
+
+    Use this at the boundary where untrusted child-process stderr is logged or
+    persisted to ``last_error`` (issue #209). Never raises a non-system
+    Exception.
+    """
+    return safe(redact_secrets(value), max_len=max_len)
 
 
 def _safe_getattr(obj: object, name: str) -> object:

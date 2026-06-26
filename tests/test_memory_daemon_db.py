@@ -592,6 +592,109 @@ class TestSqliteMarkExtractionFailedDb:
         assert row[0] == "failed"
 
 
+class TestMarkExtractionFailedLogSanitization:
+    """The db.py sink is the mandatory redaction boundary (issue #209).
+
+    The sink OWNS sessions.last_error, so it runs the value through
+    safe_secret() before both the at-rest UPDATE and the log suffix. A
+    \\n/ANSI payload from any caller therefore cannot forge the "permanently
+    failed" log line, regardless of whether the caller pre-sanitized.
+    """
+
+    def test_sqlite_sink_escapes_control_chars(self, tmp_path, caplog):
+        db_path = tmp_path / "sessions.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, extraction_status TEXT,
+                extraction_attempts INTEGER DEFAULT 0, last_error TEXT
+            )
+        """)
+        conn.execute("INSERT INTO sessions VALUES ('s1', 'extracting', 3, NULL)")
+        conn.commit()
+        conn.close()
+
+        with patch("scripts.core.memory_daemon_db.get_sqlite_path", return_value=db_path):
+            from scripts.core.memory_daemon_db import sqlite_mark_extraction_failed
+
+            with caplog.at_level("INFO", logger="memory-daemon"):
+                sqlite_mark_extraction_failed(
+                    "s1", max_retries=3, last_error="boom\nFAKE: forged line"
+                )
+
+        msg = caplog.text
+        assert "boom\\x0aFAKE: forged line" in msg
+        assert "boom\nFAKE: forged line" not in msg
+
+    @patch("scripts.core.memory_daemon_db.pg_connect")
+    def test_pg_sink_escapes_control_chars(self, mock_pg_connect, caplog):
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_cur.fetchone.return_value = (3,)  # at max → permanent failure path
+        mock_conn.cursor.return_value = mock_cur
+        mock_pg_connect.return_value = mock_conn
+
+        from scripts.core.memory_daemon_db import pg_mark_extraction_failed
+
+        with caplog.at_level("INFO", logger="memory-daemon"):
+            pg_mark_extraction_failed("s1", max_retries=3, last_error="boom\nFAKE: forged line")
+
+        msg = caplog.text
+        assert "boom\\x0aFAKE: forged line" in msg
+        assert "boom\nFAKE: forged line" not in msg
+
+    def test_sqlite_sink_redacts_secret_at_rest(self, tmp_path):
+        """A secret passed directly to the sink must NOT be stored raw."""
+        db_path = tmp_path / "sessions.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, extraction_status TEXT,
+                extraction_attempts INTEGER DEFAULT 0, last_error TEXT
+            )
+        """)
+        conn.execute("INSERT INTO sessions VALUES ('s1', 'extracting', 3, NULL)")
+        conn.commit()
+        conn.close()
+
+        with patch("scripts.core.memory_daemon_db.get_sqlite_path", return_value=db_path):
+            from scripts.core.memory_daemon_db import sqlite_mark_extraction_failed
+
+            # Bypasses the extraction-path safe_secret entirely — the DB layer
+            # is the boundary that must redact.
+            sqlite_mark_extraction_failed(
+                "s1", max_retries=3, last_error="leaked sk-abcdEFGH1234 token"
+            )
+
+        conn = sqlite3.connect(db_path)
+        stored = conn.execute("SELECT last_error FROM sessions WHERE id='s1'").fetchone()[0]
+        conn.close()
+        assert "<redacted-secret>" in stored
+        assert "sk-abcdEFGH1234" not in stored
+
+    @patch("scripts.core.memory_daemon_db.pg_connect")
+    def test_pg_sink_redacts_secret_at_rest(self, mock_pg_connect):
+        """The PG UPDATE must bind a redacted value, not the raw secret."""
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_cur.fetchone.return_value = (3,)  # at max → permanent failure path
+        mock_conn.cursor.return_value = mock_cur
+        mock_pg_connect.return_value = mock_conn
+
+        from scripts.core.memory_daemon_db import pg_mark_extraction_failed
+
+        pg_mark_extraction_failed("s1", max_retries=3, last_error="key sk-abcdEFGH1234 here")
+
+        # Find the UPDATE ... last_error = %s call and inspect its bound value.
+        update_calls = [
+            c for c in mock_cur.execute.call_args_list if "last_error = %s" in c[0][0]
+        ]
+        assert update_calls, "expected an UPDATE that sets last_error"
+        bound_value = update_calls[0][0][1][0]
+        assert "<redacted-secret>" in bound_value
+        assert "sk-abcdEFGH1234" not in bound_value
+
+
 class TestSqliteMarkSessionExitedDb:
     """sqlite_mark_session_exited stamps exited_at."""
 

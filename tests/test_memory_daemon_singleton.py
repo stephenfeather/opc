@@ -16,10 +16,11 @@ The fix adds:
     and held for the daemon's lifetime (``flock`` is per open-file-description
     and survives ``fork``).
   - A readiness handshake over ``os.pipe()``: the parent blocks until the
-    grandchild signals ready (after basic DB init succeeds) or failed.
-  - The PID file is written only AFTER basic init succeeds (via the
-    ``daemon_loop(on_ready=...)`` callback), so the PID never points at a
-    daemon that died during init.
+    grandchild signals ready (after all setup succeeds), failed, or times out.
+  - The PID file is written EARLY in ``_run_as_daemon`` (before the long init)
+    so ``status``/``stop`` can manage the process throughout its life, and it is
+    unlinked on exit; readiness is gated by the pipe, not by the PID, so a
+    phantom "started" is still impossible.
 
 Mirrors the dependency-injection test style used throughout
 test_memory_daemon_startup.py: os.* syscalls are injected so the syscall
@@ -37,14 +38,14 @@ import pytest
 class TestAcquireSingletonLock:
     """_acquire_singleton_lock() serializes daemon startup via flock(LOCK_EX|LOCK_NB)."""
 
-    def test_returns_fd_on_successful_lock(self, tmp_path):
+    def test_returns_fd_acquired_on_successful_lock(self, tmp_path):
         from scripts.core.memory_daemon import _acquire_singleton_lock
 
         fake_open = MagicMock(return_value=7)
         fake_flock = MagicMock()
         fake_close = MagicMock()
 
-        fd = _acquire_singleton_lock(
+        fd, reason = _acquire_singleton_lock(
             lock_path=tmp_path / "daemon.lock",
             os_open_fn=fake_open,
             flock_fn=fake_flock,
@@ -52,13 +53,14 @@ class TestAcquireSingletonLock:
         )
 
         assert fd == 7
+        assert reason == "acquired"
         fake_flock.assert_called_once_with(7)
         # On success the fd is RETAINED (held for the daemon lifetime).
         fake_close.assert_not_called()
 
-    def test_returns_none_and_closes_fd_when_lock_held(self, tmp_path):
-        """A second concurrent start sees BlockingIOError (EWOULDBLOCK) and
-        must return None after releasing the fd it opened.
+    def test_returns_contended_and_closes_fd_when_lock_held(self, tmp_path):
+        """A second concurrent start sees BlockingIOError (EWOULDBLOCK) and must
+        report 'contended' (benign) after releasing the fd it opened.
         """
         from scripts.core.memory_daemon import _acquire_singleton_lock
 
@@ -68,7 +70,7 @@ class TestAcquireSingletonLock:
         def held_flock(_fd):
             raise BlockingIOError("lock held")
 
-        fd = _acquire_singleton_lock(
+        fd, reason = _acquire_singleton_lock(
             lock_path=tmp_path / "daemon.lock",
             os_open_fn=fake_open,
             flock_fn=held_flock,
@@ -76,6 +78,30 @@ class TestAcquireSingletonLock:
         )
 
         assert fd is None
+        assert reason == "contended"
+        fake_close.assert_called_once_with(7)
+
+    def test_returns_error_and_closes_fd_when_flock_raises_oserror(self, tmp_path):
+        """A non-BlockingIOError from flock (e.g. ENOLCK on a no-lock filesystem)
+        must be reported as 'error' (not contention) and must NOT leak the fd.
+        """
+        from scripts.core.memory_daemon import _acquire_singleton_lock
+
+        fake_open = MagicMock(return_value=7)
+        fake_close = MagicMock()
+
+        def broken_flock(_fd):
+            raise OSError("ENOLCK: no locks available")
+
+        fd, reason = _acquire_singleton_lock(
+            lock_path=tmp_path / "daemon.lock",
+            os_open_fn=fake_open,
+            flock_fn=broken_flock,
+            os_close_fn=fake_close,
+        )
+
+        assert fd is None
+        assert reason == "error"
         fake_close.assert_called_once_with(7)
 
     def test_opens_lock_file_with_create_and_owner_only_mode(self, tmp_path):
@@ -108,7 +134,7 @@ class TestAcquireSingletonLock:
     def test_refuses_when_lock_path_is_a_symlink(self, tmp_path):
         """A pre-planted symlink at the lock path must NOT be followed: the
         O_NOFOLLOW open raises OSError (ELOOP) and _acquire_singleton_lock
-        returns None (decline to start) rather than locking the link target.
+        reports 'error' (decline to start) rather than locking the link target.
         """
         from scripts.core.memory_daemon import _acquire_singleton_lock
 
@@ -121,46 +147,49 @@ class TestAcquireSingletonLock:
         link.symlink_to(target)
 
         # Real os.open with O_NOFOLLOW -> ELOOP on the symlink.
-        assert _acquire_singleton_lock(lock_path=link) is None
+        fd, reason = _acquire_singleton_lock(lock_path=link)
+        assert fd is None
+        assert reason == "error"
 
-    def test_returns_none_when_open_raises_oserror(self, tmp_path):
+    def test_reports_error_when_open_raises_oserror(self, tmp_path):
         """An open-time OSError (symlink ELOOP, permission, fd exhaustion) is
-        fail-safe: return None so the caller declines to start."""
+        fail-safe: report 'error' (not 'contended') so the caller surfaces a
+        failure instead of a phantom 'already starting'."""
         from scripts.core.memory_daemon import _acquire_singleton_lock
 
         def raising_open(path, flags, mode=0o777):
             raise OSError("ELOOP")
 
-        assert (
-            _acquire_singleton_lock(
-                lock_path=tmp_path / "daemon.lock",
-                os_open_fn=raising_open,
-                flock_fn=MagicMock(),
-                os_close_fn=MagicMock(),
-            )
-            is None
+        fd, reason = _acquire_singleton_lock(
+            lock_path=tmp_path / "daemon.lock",
+            os_open_fn=raising_open,
+            flock_fn=MagicMock(),
+            os_close_fn=MagicMock(),
         )
+        assert fd is None
+        assert reason == "error"
 
     def test_real_flock_is_mutually_exclusive(self, tmp_path):
         """End-to-end with the real flock_fn: the first acquire holds the lock,
-        a second acquire on the same path returns None.
+        a second acquire on the same path is contended.
         """
         from scripts.core.memory_daemon import _acquire_singleton_lock
 
         lock_path = tmp_path / "daemon.lock"
 
-        first = _acquire_singleton_lock(lock_path=lock_path)
-        assert first is not None, "first acquire should succeed"
+        first_fd, first_reason = _acquire_singleton_lock(lock_path=lock_path)
+        assert first_fd is not None and first_reason == "acquired"
         try:
-            second = _acquire_singleton_lock(lock_path=lock_path)
-            assert second is None, "second acquire must fail while first holds the lock"
+            second_fd, second_reason = _acquire_singleton_lock(lock_path=lock_path)
+            assert second_fd is None
+            assert second_reason == "contended", "held lock must read as contention"
         finally:
-            os.close(first)
+            os.close(first_fd)
 
         # After the first lock is released, a fresh acquire succeeds again.
-        third = _acquire_singleton_lock(lock_path=lock_path)
-        assert third is not None
-        os.close(third)
+        third_fd, third_reason = _acquire_singleton_lock(lock_path=lock_path)
+        assert third_fd is not None and third_reason == "acquired"
+        os.close(third_fd)
 
 
 class TestReadinessSignals:
@@ -256,11 +285,13 @@ class TestReadinessSignals:
 class TestStartDaemonSingletonGuard:
     """start_daemon acquires the lock BEFORE forking; a held lock aborts startup."""
 
-    def test_refuses_to_fork_when_lock_held(self, monkeypatch, capsys):
+    def test_refuses_to_fork_when_lock_contended(self, monkeypatch, capsys):
+        """A contended lock is benign: report 'already starting' and exit 0
+        without forking."""
         import scripts.core.memory_daemon as mod
 
         monkeypatch.setattr(mod, "is_running", lambda: (False, None))
-        monkeypatch.setattr(mod, "_acquire_singleton_lock", lambda: None)
+        monkeypatch.setattr(mod, "_acquire_singleton_lock", lambda: (None, "contended"))
 
         fork_calls: list = []
         monkeypatch.setattr(mod.os, "fork", lambda: fork_calls.append(1))
@@ -270,7 +301,27 @@ class TestStartDaemonSingletonGuard:
         assert rc == 0
         assert fork_calls == [], "start_daemon must not fork when the lock is held"
         out = capsys.readouterr().out.lower()
-        assert "already" in out, f"expected an 'already starting/running' message, got: {out!r}"
+        assert "already starting" in out, f"expected 'already starting', got: {out!r}"
+
+    def test_reports_failure_when_lock_open_errors(self, monkeypatch, capsys):
+        """A lock-OPEN error (symlink/permission/ENOLCK) means NO daemon is
+        starting — start_daemon must surface a non-zero failure, not a phantom
+        'already starting' success (codex P2 finding on PR #251)."""
+        import scripts.core.memory_daemon as mod
+
+        monkeypatch.setattr(mod, "is_running", lambda: (False, None))
+        monkeypatch.setattr(mod, "_acquire_singleton_lock", lambda: (None, "error"))
+
+        fork_calls: list = []
+        monkeypatch.setattr(mod.os, "fork", lambda: fork_calls.append(1))
+
+        rc = mod.start_daemon()
+
+        assert rc == 1, "lock-open error must be reported as failure (rc 1)"
+        assert fork_calls == []
+        out = capsys.readouterr().out.lower()
+        assert "failed to start" in out
+        assert "already starting" not in out, "must not claim a phantom startup"
 
     def test_still_reports_already_running_via_pid_check(self, monkeypatch, capsys):
         """The fast-path is_running() check is preserved for a friendly message."""
@@ -278,7 +329,9 @@ class TestStartDaemonSingletonGuard:
 
         monkeypatch.setattr(mod, "is_running", lambda: (True, 4242))
         lock_calls: list = []
-        monkeypatch.setattr(mod, "_acquire_singleton_lock", lambda: lock_calls.append(1))
+        monkeypatch.setattr(
+            mod, "_acquire_singleton_lock", lambda: lock_calls.append(1) or (None, "error")
+        )
 
         rc = mod.start_daemon()
 

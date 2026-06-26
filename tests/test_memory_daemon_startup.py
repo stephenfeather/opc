@@ -1351,10 +1351,10 @@ class TestHardenDaemonEnvironment:
         (world-readable) umask. This is the ordering that actually matters and
         the reason the hardening call lives at the top of _run_as_daemon.
 
-        Since Issue #102 the PID file is written inside the ``on_ready`` callback
-        (after basic DB init succeeds), so this test drives a fake ``daemon_loop``
-        that invokes ``on_ready`` to exercise that path. Hardening must still
-        precede the PID write so the file is created under the 0o077 umask.
+        Since Issue #102 the PID file is written EARLY in _run_as_daemon (before
+        daemon_loop runs), so hardening must precede that write for the file to be
+        created under the 0o077 umask. This test stubs daemon_loop entirely and
+        asserts the harden→pid_write ordering.
 
         _run_as_daemon is the common entry point for the Unix double-fork, the
         Windows detached subprocess, and --daemon-subprocess, so hardening here
@@ -1379,16 +1379,12 @@ class TestHardenDaemonEnvironment:
         monkeypatch.setattr(mod, "PID_FILE", pid_file)
         monkeypatch.setattr(type(pid_file), "write_text", _tracking_write_text)
 
-        # Stub out the rest of the bootstrap. The fake loop fires on_ready so the
-        # PID write (now inside on_ready) actually happens.
+        # Stub out the rest of the bootstrap and the loop entirely — the PID is
+        # written before daemon_loop runs, so the loop need not do anything.
         monkeypatch.setattr(mod, "_reserve_low_fds", MagicMock())
         monkeypatch.setattr(mod, "_setup_logging", MagicMock(return_value=MagicMock()))
         monkeypatch.setattr(mod, "_setup_daemon_fds", MagicMock())
-        monkeypatch.setattr(
-            mod,
-            "daemon_loop",
-            lambda on_ready=None: on_ready() if on_ready is not None else None,
-        )
+        monkeypatch.setattr(mod, "daemon_loop", lambda on_ready=None: None)
         monkeypatch.setattr(mod, "_logger", None)
 
         mod._run_as_daemon()

@@ -1305,15 +1305,23 @@ def _acquire_singleton_lock(
     os_open_fn=os.open,
     flock_fn=_default_flock,
     os_close_fn=os.close,
-) -> int | None:
+) -> tuple[int | None, str]:
     """Acquire the exclusive startup lock, serializing concurrent ``start`` calls.
 
-    Returns the held lock fd on success — the caller (ultimately the daemon
-    grandchild) must keep it open for the daemon's lifetime, since the flock is
-    released when the last fd referencing the open file description is closed.
-    Returns ``None`` if another process already holds the lock (a concurrent or
-    in-flight ``start``), or if the lock path cannot be opened safely — in either
-    case the caller declines to start, which is the fail-safe outcome.
+    Returns ``(fd, reason)`` so the caller can distinguish three outcomes — this
+    matters because they warrant DIFFERENT operator messages and exit codes
+    (adversarial review of PR #251):
+
+      - ``(fd, "acquired")``  — lock taken. The caller (ultimately the daemon
+        grandchild) must keep the fd open for the daemon's lifetime, since the
+        flock releases when the last fd on the open file description closes.
+      - ``(None, "contended")`` — another process already holds the lock (a
+        concurrent / in-flight ``start``). Benign; the caller should report
+        "already starting" and exit 0.
+      - ``(None, "error")`` — the lock path could not be opened or locked
+        (symlink, permission, ``ENOLCK`` on a no-lock filesystem, fd
+        exhaustion). NO daemon is starting, so the caller MUST report a failure
+        (non-zero) rather than a phantom success.
 
     ``O_NOFOLLOW`` mirrors the symlink-TOCTOU hardening already applied to
     ``_open_log_file_secure`` for sibling files in the same ``~/.claude``
@@ -1332,16 +1340,25 @@ def _acquire_singleton_lock(
         fd = os_open_fn(str(path), os.O_RDWR | os.O_CREAT | o_nofollow, 0o600)
     except OSError:
         # The lock path is a symlink (O_NOFOLLOW -> ELOOP) or otherwise cannot be
-        # opened. We cannot guarantee single-instance, so decline to acquire —
-        # the caller treats this exactly like a held lock and does not start.
-        return None
+        # opened — we cannot guarantee single-instance. This is an error, NOT
+        # contention: the caller must surface a failure, not "already starting".
+        return None, "error"
     try:
         flock_fn(fd)
     except BlockingIOError:
         # Lock is held by another process — release our fd and report contention.
         os_close_fn(fd)
-        return None
-    return fd
+        return None, "contended"
+    except OSError:
+        # flock itself failed (e.g. ENOLCK on a filesystem without lock support).
+        # Close the fd to avoid a leak and report an error so the caller does not
+        # claim success when single-instance cannot be guaranteed.
+        try:
+            os_close_fn(fd)
+        except OSError:
+            pass
+        return None, "error"
+    return fd, "acquired"
 
 
 def _signal_ready(
@@ -1412,11 +1429,16 @@ def _wait_for_ready(
     """
     wait = _ready_timeout() if timeout is None else timeout
     try:
-        readable, _, _ = select_fn([read_fd], [], [], wait)
-        if not readable:
-            return "timeout"  # no signal yet — daemon may still be initializing
-        data = os_read_fn(read_fd, 1)
-        return "ready" if data == _READY_BYTE else "failed"
+        try:
+            readable, _, _ = select_fn([read_fd], [], [], wait)
+            if not readable:
+                return "timeout"  # no signal yet — daemon may still be initializing
+            data = os_read_fn(read_fd, 1)
+            return "ready" if data == _READY_BYTE else "failed"
+        except OSError:
+            # select/read failed (EBADF, etc.). We cannot confirm readiness, so
+            # report failure rather than letting the OSError crash the parent.
+            return "failed"
     finally:
         try:
             os_close_fn(read_fd)
@@ -1605,7 +1627,12 @@ def _run_as_daemon(*, ready_write_fd: int | None = None, lock_fd: int | None = N
         log(f"Daemon exited with error: {safe_exception(e)}")
         exit_code = 1
     finally:
-        PID_FILE.unlink(missing_ok=True)
+        # Best-effort PID cleanup — an OSError here (read-only fs, perms) must not
+        # prevent the caller from reaching its os._exit (which releases the lock).
+        try:
+            PID_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
     # Deliberately DO NOT close ``lock_fd`` here (adversarial review R3). Closing
     # it would release the singleton flock while this process is still alive (the
     # caller has yet to os._exit), opening a window where a concurrent ``start``
@@ -1639,11 +1666,18 @@ def start_daemon():
 
     # Singleton startup lock (Issue #102): taken BEFORE forking so two
     # concurrent ``start`` calls cannot both pass is_running() and fork
-    # duplicate daemons. ``None`` means another start is already in flight.
-    lock_fd = _acquire_singleton_lock()
+    # duplicate daemons. Distinguish contention (benign) from a lock-open/lock
+    # error (no daemon is starting → must report failure, not a phantom success).
+    lock_fd, lock_reason = _acquire_singleton_lock()
     if lock_fd is None:
-        print("Memory daemon already starting (startup lock held)")
-        return 0
+        if lock_reason == "contended":
+            print("Memory daemon already starting (startup lock held)")
+            return 0
+        print(
+            "Memory daemon failed to start: could not acquire startup lock "
+            f"({LOCK_FILE}). Check the path is not a symlink and is writable."
+        )
+        return 1
 
     if sys.platform == "win32":
         # Windows: spawn as detached subprocess. flock is unavailable here, so

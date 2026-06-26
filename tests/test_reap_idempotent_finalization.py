@@ -223,10 +223,9 @@ def test_finalization_retried_after_transient_db_recovery(tmp_jsonl):
     assert len(get_pending_finalizations()) == 0, "queue drains after success"
 
 
-def test_finalization_gives_up_after_max_attempts(tmp_jsonl):
-    """A persistent DB outage drains the queue after the bounded attempt cap."""
+def test_finalization_retries_indefinitely_under_persistent_failure(tmp_jsonl):
+    """A persistent outage must keep one entry queued (no give-up stranding)."""
     from scripts.core.memory_daemon import (
-        _FINALIZATION_MAX_ATTEMPTS,
         get_active_extractions,
         get_pending_finalizations,
         reap_completed_extractions,
@@ -247,15 +246,140 @@ def test_finalization_gives_up_after_max_attempts(tmp_jsonl):
     ):
         reap_completed_extractions()  # attempt 1, enqueued
         pq = get_pending_finalizations()
-        # Drive every remaining attempt to exhaustion.
-        for _ in range(_FINALIZATION_MAX_ATTEMPTS + 1):
+        for _ in range(20):
             for pf in pq:
                 pf.next_attempt_at = 0.0
             retry_pending_finalizations()
 
-    assert (
-        len(get_pending_finalizations()) == 0
-    ), "queue must drain (bounded) after giving up on a persistent outage"
+    pq = get_pending_finalizations()
+    assert len(pq) == 1, "the session must stay queued, not be dropped (no stranding)"
+    assert pq[0].attempts >= 21, "every due tick must re-attempt the finalization"
+
+
+def test_finalization_queue_coalesces_by_session(tmp_jsonl):
+    """A session already queued for finalization is not enqueued twice (#207 R2)."""
+    from scripts.core.memory_daemon import (
+        _enqueue_finalization_retry,
+        _PendingFinalization,
+        get_pending_finalizations,
+    )
+
+    def make_pf():
+        return _PendingFinalization(
+            session_id="sess-dup",
+            exit_code=0,
+            jsonl_path=tmp_jsonl,
+            project="/tmp/proj",
+            last_error=None,
+        )
+
+    _enqueue_finalization_retry(make_pf(), RuntimeError("db down"))
+    _enqueue_finalization_retry(make_pf(), RuntimeError("db down again"))
+
+    assert len(get_pending_finalizations()) == 1, "duplicate session must coalesce"
+
+
+def test_finalization_queue_globally_capped(tmp_jsonl):
+    """Overflow past the global cap is dropped, never grown unbounded (#207 R2)."""
+    from scripts.core.memory_daemon import (
+        _FINALIZATION_QUEUE_MAX,
+        _enqueue_finalization_retry,
+        _PendingFinalization,
+        get_pending_finalizations,
+    )
+
+    pq = get_pending_finalizations()
+    # Pre-fill to the cap with distinct sessions.
+    for i in range(_FINALIZATION_QUEUE_MAX):
+        pq.append(
+            _PendingFinalization(
+                session_id=f"sess-{i}",
+                exit_code=0,
+                jsonl_path=tmp_jsonl,
+                project="/tmp/proj",
+                last_error=None,
+            )
+        )
+
+    overflow = _PendingFinalization(
+        session_id="sess-overflow",
+        exit_code=0,
+        jsonl_path=tmp_jsonl,
+        project="/tmp/proj",
+        last_error=None,
+    )
+    _enqueue_finalization_retry(overflow, RuntimeError("db down"))
+
+    assert len(pq) == _FINALIZATION_QUEUE_MAX, "queue must not grow past the cap"
+    assert all(p.session_id != "sess-overflow" for p in pq), "overflow must be dropped"
+
+
+def test_process_pending_queue_backpressure_when_finalization_full(tmp_jsonl):
+    """A full finalization queue pauses new extractions (backpressure, #207 R2)."""
+    from scripts.core.memory_daemon import (
+        _FINALIZATION_QUEUE_MAX,
+        _PendingFinalization,
+        get_pending_finalizations,
+        get_pending_queue,
+        process_pending_queue,
+    )
+
+    pf_queue = get_pending_finalizations()
+    for i in range(_FINALIZATION_QUEUE_MAX):
+        pf_queue.append(
+            _PendingFinalization(
+                session_id=f"sess-{i}",
+                exit_code=0,
+                jsonl_path=tmp_jsonl,
+                project="/tmp/proj",
+                last_error=None,
+            )
+        )
+
+    get_pending_queue().append(("sess-new", "/tmp/proj", str(tmp_jsonl)))
+
+    with patch("scripts.core.memory_daemon.extract_memories") as mock_extract:
+        spawned = process_pending_queue()
+
+    assert spawned == 0
+    mock_extract.assert_not_called()
+    assert len(get_pending_queue()) == 1, "the queued work must be left intact"
+
+
+def test_retry_pending_finalizations_batches_per_tick(tmp_jsonl):
+    """At most _FINALIZATION_RETRY_BATCH finalizations are applied per tick (#207 R2)."""
+    from scripts.core.memory_daemon import (
+        _FINALIZATION_RETRY_BATCH,
+        _PendingFinalization,
+        get_pending_finalizations,
+        retry_pending_finalizations,
+    )
+
+    pq = get_pending_finalizations()
+    for i in range(_FINALIZATION_RETRY_BATCH + 5):
+        pq.append(
+            _PendingFinalization(
+                session_id=f"sess-{i}",
+                exit_code=0,
+                jsonl_path=tmp_jsonl,
+                project="/tmp/proj",
+                last_error=None,
+                next_attempt_at=0.0,  # all due
+            )
+        )
+
+    with (
+        patch("scripts.core.memory_daemon.mark_extracted") as mock_mark,
+        patch("scripts.core.memory_daemon._calibrate_session_confidence"),
+        patch("scripts.core.memory_daemon._extract_and_store_workflows"),
+        patch("scripts.core.memory_daemon._generate_mini_handoff"),
+        patch("scripts.core.memory_daemon.archive_session_jsonl"),
+    ):
+        finalized = retry_pending_finalizations()
+
+    assert finalized == _FINALIZATION_RETRY_BATCH, "one tick processes at most a batch"
+    assert mock_mark.call_count == _FINALIZATION_RETRY_BATCH
+    assert len(get_pending_finalizations()) == 5, "the remainder waits for the next tick"
 
 
 def test_best_effort_stage_failure_does_not_enqueue_retry(tmp_jsonl):

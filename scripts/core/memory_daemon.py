@@ -801,15 +801,22 @@ def _drain_proc_stderr(proc, *, max_bytes: int = 65536, timeout: float = 0.0) ->
         return ""
 
 
-# Bounded retry policy for completed-but-unfinalized extractions (#207). A
-# transient DB outage during finalization must recover without a daemon restart,
-# but the retry must stay cheap (one mark_* write per due entry per backoff
-# window — never the diagnostic count queries) and bounded (give up after a cap
-# so the in-memory queue cannot grow without limit during a long outage; startup
-# recovery remains the backstop for the give-up case).
-_FINALIZATION_MAX_ATTEMPTS = 10
+# Retry policy for completed-but-unfinalized extractions (#207). A transient DB
+# outage during finalization must recover WITHOUT a daemon restart, so retries
+# continue indefinitely with a capped backoff (never giving up would otherwise
+# strand the session in 'extracting', which the stale-session query — pending
+# rows only — never re-detects). Memory is bounded instead by a global queue cap
+# plus backpressure on new extractions, not by an attempt cap. Each retry stays
+# cheap: only the mark_* write re-runs, never the diagnostic count queries.
 _FINALIZATION_BASE_BACKOFF = 5.0  # seconds; doubles each attempt
 _FINALIZATION_MAX_BACKOFF = 300.0  # seconds; cap on the exponential backoff
+_FINALIZATION_BACKOFF_MAX_EXP = 8  # clamp the doubling exponent (2**8 * base ≫ cap)
+# Global safety bound on the retry queue. While at/over this size,
+# process_pending_queue stops launching new extractions (backpressure) so the
+# queue cannot grow with the pending workload during a sustained outage. Reached
+# only in pathological cases; overflow beyond it is dropped to startup recovery.
+_FINALIZATION_QUEUE_MAX = 512
+_FINALIZATION_RETRY_BATCH = 32  # max finalizations applied per tick (smooth recovery)
 
 
 @dataclass
@@ -869,28 +876,47 @@ def _apply_finalization(pf: "_PendingFinalization") -> None:
         mark_extraction_failed(pf.session_id, last_error=pf.last_error)
 
 
-def _schedule_finalization_retry(pf: "_PendingFinalization", error: Exception) -> bool:
-    """Record one failed finalization attempt; return True to keep retrying.
+def _schedule_finalization_retry(
+    pf: "_PendingFinalization", error: Exception, *, first: bool
+) -> None:
+    """Record one failed finalization attempt and set its next backoff deadline.
 
-    Increments ``attempts`` and sets the next backoff deadline. Returns False
-    once the bounded attempt cap is reached (caller drops the entry, logging the
-    give-up), True while more attempts remain.
+    Retries continue indefinitely (no give-up) with an exponential backoff capped
+    at ``_FINALIZATION_MAX_BACKOFF``; the doubling exponent is clamped so a very
+    long outage cannot build a huge shift. The first deferral logs at info; later
+    ones at debug so a sustained outage does not itself flood the log (#207).
     """
     pf.attempts += 1
-    if pf.attempts >= _FINALIZATION_MAX_ATTEMPTS:
-        log(f"Finalization gave up for {safe(pf.session_id)} "
-            f"(exit={pf.exit_code}) after {pf.attempts} attempts; session left "
-            f"in 'extracting' for startup recovery: {safe(error)}")
-        return False
-    backoff = min(
-        _FINALIZATION_BASE_BACKOFF * (2 ** (pf.attempts - 1)),
-        _FINALIZATION_MAX_BACKOFF,
-    )
+    exp = min(pf.attempts - 1, _FINALIZATION_BACKOFF_MAX_EXP)
+    backoff = min(_FINALIZATION_BASE_BACKOFF * (2**exp), _FINALIZATION_MAX_BACKOFF)
     pf.next_attempt_at = time.monotonic() + backoff
-    log(f"Finalization failed for {safe(pf.session_id)} "
-        f"(exit={pf.exit_code}, attempt {pf.attempts}/{_FINALIZATION_MAX_ATTEMPTS}); "
-        f"retry in {int(backoff)}s: {safe(error)}")
-    return True
+    msg = (f"Finalization failed for {safe(pf.session_id)} "
+           f"(exit={pf.exit_code}, attempt {pf.attempts}); "
+           f"retry in {int(backoff)}s: {safe(error)}")
+    if first:
+        log(msg)
+    else:
+        debug(msg)
+
+
+def _enqueue_finalization_retry(pf: "_PendingFinalization", error: Exception) -> None:
+    """Queue a failed finalization for a backed-off retry (dedup + global cap).
+
+    Coalesces by ``session_id`` (a session already awaiting finalization keeps
+    its existing schedule) and enforces the global queue cap: at capacity the
+    overflow is dropped and left for startup recovery rather than growing the
+    queue without bound (#207 R2).
+    """
+    pq = get_pending_finalizations()
+    if any(existing.session_id == pf.session_id for existing in pq):
+        return
+    if len(pq) >= _FINALIZATION_QUEUE_MAX:
+        log(f"Finalization retry queue full ({len(pq)}); dropping "
+            f"{safe(pf.session_id)} (exit={pf.exit_code}), left in 'extracting' "
+            f"for startup recovery: {safe(error)}")
+        return
+    _schedule_finalization_retry(pf, error, first=True)
+    pq.append(pf)
 
 
 def _finalize_completed_extraction(
@@ -966,10 +992,9 @@ def reap_completed_extractions():
             _apply_finalization(pf)
         except Exception as e:
             # DB-finalization (mark_*) failed. Queue the cheap write for a
-            # bounded, backed-off retry so a transient outage recovers without a
-            # daemon restart; the dead child is still removed from ae.
-            if _schedule_finalization_retry(pf, e):
-                get_pending_finalizations().append(pf)
+            # backed-off retry so a transient outage recovers without a daemon
+            # restart; the dead child is still removed from ae below.
+            _enqueue_finalization_retry(pf, e)
 
     for pid in completed:
         del ae[pid]
@@ -984,25 +1009,29 @@ def retry_pending_finalizations() -> int:
 
     Each entry whose backoff deadline has passed re-attempts only the critical
     ``mark_*`` write (never the run-once diagnostics). Successful entries are
-    dropped; failures are re-scheduled with backoff or dropped once the bounded
-    attempt cap is hit (#207).
+    dropped; failures are re-scheduled with a capped backoff and kept (retries
+    are indefinite — see the policy constants). At most ``_FINALIZATION_RETRY_BATCH``
+    finalizations run per tick so a recovery burst cannot stall watchdog/queue
+    work; the remainder stay queued for the next tick (#207).
     """
     pq = get_pending_finalizations()
     if not pq:
         return 0
     now = time.monotonic()
     finalized = 0
+    applied = 0
     keep = []
     for pf in pq:
-        if pf.next_attempt_at > now:
+        if pf.next_attempt_at > now or applied >= _FINALIZATION_RETRY_BATCH:
             keep.append(pf)
             continue
+        applied += 1
         try:
             _apply_finalization(pf)
             finalized += 1
         except Exception as e:
-            if _schedule_finalization_retry(pf, e):
-                keep.append(pf)
+            _schedule_finalization_retry(pf, e, first=False)
+            keep.append(pf)
     pq[:] = keep
     return finalized
 
@@ -1061,6 +1090,12 @@ def process_pending_queue():
     """Spawn extractions from queue if under concurrency limit."""
     ae = get_active_extractions()
     pq = get_pending_queue()
+    # Backpressure (#207 R2): when the DB-finalization backlog is at its global
+    # cap, stop launching new extractions the DB cannot finalize. This bounds the
+    # pending_finalizations queue — without it, every newly-launched extraction
+    # that completes during a sustained outage would add another entry.
+    if len(get_pending_finalizations()) >= _FINALIZATION_QUEUE_MAX:
+        return 0
     spawned = 0
     while pq and len(ae) < _max_concurrent():
         session_id, project, transcript_path = pq.pop(0)

@@ -5,9 +5,9 @@ This script tests SymPy's accuracy on a curated test set to determine
 if a Math Verification Pipeline is worth building.
 
 USAGE:
-    uv run python scripts/sympy_baseline_validation.py
-    uv run python scripts/sympy_baseline_validation.py --json
-    uv run python scripts/sympy_baseline_validation.py --verbose
+    uv run python scripts/cc_math/sympy_baseline_validation.py
+    uv run python scripts/cc_math/sympy_baseline_validation.py --json
+    uv run python scripts/cc_math/sympy_baseline_validation.py --verbose
 
 Results:
     As of 2025-12-31 with SymPy 1.14.0:
@@ -17,22 +17,27 @@ Results:
 """
 
 import argparse
+import faulthandler
 import json
+import os
 import sys
 from dataclasses import dataclass, field
 from typing import Any
 
-# Import from sympy_compute
-sys.path.insert(0, ".")
-import faulthandler  # noqa: E402
-import os  # noqa: E402
+# Ensure the project root is importable whether this script is run as a file or
+# as a module (``-m``) before importing from sympy_compute. Issue #255.
+_PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
-faulthandler.enable(  # noqa: E501, E402
+faulthandler.enable(  # noqa: E501
     file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"),
     all_threads=True,
 )
 
-from scripts.sympy_compute import (  # noqa: E402
+from scripts.cc_math.sympy_compute import (  # noqa: E402
     binomial_coeff,
     catalan_number,
     det_matrix,

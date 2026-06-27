@@ -1,15 +1,15 @@
 """NumPy computation CLI - 160 functions across 10 categories (linalg, array_math, fft, polynomial, stats, sorting, reduction, math, set, logic).
 
 USAGE:
-    uv run python scripts/numpy_compute.py <command> [args]
+    uv run python scripts/cc_math/numpy_compute.py <command> [args]
 
     # Linear algebra examples
-    uv run python scripts/numpy_compute.py det "[[1,2],[3,4]]"
-    uv run python scripts/numpy_compute.py inv "[[1,2],[3,4]]"
-    uv run python scripts/numpy_compute.py eig "[[1,2],[3,4]]"
-    uv run python scripts/numpy_compute.py svd "[[1,2,3],[4,5,6]]"
-    uv run python scripts/numpy_compute.py solve "[[3,1],[1,2]]" "[9,8]"
-    uv run python scripts/numpy_compute.py lstsq "[[1,1],[1,2],[1,3]]" "[1,2,2]"
+    uv run python scripts/cc_math/numpy_compute.py det "[[1,2],[3,4]]"
+    uv run python scripts/cc_math/numpy_compute.py inv "[[1,2],[3,4]]"
+    uv run python scripts/cc_math/numpy_compute.py eig "[[1,2],[3,4]]"
+    uv run python scripts/cc_math/numpy_compute.py svd "[[1,2,3],[4,5,6]]"
+    uv run python scripts/cc_math/numpy_compute.py solve "[[3,1],[1,2]]" "[9,8]"
+    uv run python scripts/cc_math/numpy_compute.py lstsq "[[1,1],[1,2],[1,3]]" "[1,2,2]"
 """
 
 import faulthandler
@@ -21,7 +21,16 @@ faulthandler.enable(
     all_threads=True,
 )
 
-from scripts.math_base import (
+# Ensure the project root is importable whether this module is run as a file
+# (``uv run python scripts/cc_math/numpy_compute.py`` — how the router invokes
+# it) or as a module (``-m scripts.cc_math.numpy_compute``). Issue #255.
+_PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from scripts.cc_math.math_base import (  # noqa: E402
     create_main_parser,
     format_latex_matrix,
     get_array_info,

@@ -59,7 +59,10 @@ def _enable_crash_logging() -> None:
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         faulthandler.enable(file=open(log_path, "a"), all_threads=True)  # noqa: SIM115
         return
-    except OSError:
+    except Exception:  # noqa: BLE001 - any failure here must fall through to stderr
+        # faulthandler.enable can raise ValueError/RuntimeError (not just the
+        # OSError from path setup); whatever the cause, drop to the stderr branch
+        # rather than letting it propagate and break import.
         pass
     try:
         faulthandler.enable(all_threads=True)  # default target: sys.stderr

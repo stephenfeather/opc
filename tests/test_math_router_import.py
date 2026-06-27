@@ -67,6 +67,30 @@ def test_crash_logging_falls_back_to_stderr_when_path_unwritable(
     assert calls == [{"all_threads": True}]
 
 
+def test_crash_logging_file_branch_nonoserror_falls_back(
+    math_router, monkeypatch, tmp_path
+):
+    """If the file branch raises a non-OSError (e.g. faulthandler.enable raising
+    ValueError/RuntimeError on a real file), setup must still fall through to the
+    stderr branch rather than letting it propagate and break import."""
+    monkeypatch.setenv("HOME", str(tmp_path))  # valid absolute home
+    calls = []
+
+    def fake_enable(*args, **kwargs):
+        calls.append(kwargs)
+        if "file" in kwargs:
+            raise ValueError("invalid file")  # non-OSError from the file branch
+
+    monkeypatch.setattr(math_router.faulthandler, "enable", fake_enable)
+
+    math_router._enable_crash_logging()  # must not raise
+
+    # File branch attempted (with file kwarg), then stderr fallback ran.
+    assert len(calls) == 2
+    assert "file" in calls[0]
+    assert calls[1] == {"all_threads": True}
+
+
 def test_crash_logging_degrades_to_noop_when_stderr_unusable(
     math_router, monkeypatch
 ):

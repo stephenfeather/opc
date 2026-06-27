@@ -21,12 +21,24 @@ Requires: matplotlib, plotly, sympy, numpy
 """
 
 import argparse
-import faulthandler
 import json
 import os
 import sys
 
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
+# Ensure the project root is importable whether this module is run as a file
+# (``uv run python scripts/cc_math/math_plot.py`` — how the router invokes it)
+# or as a module. Must precede the first-party import below. Issue #255.
+_PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from scripts.cc_math.math_base import enable_crash_logging  # noqa: E402
+
+# Best-effort crash logging; runs after the bootstrap so the import resolves,
+# and never raises even in a clean/sandboxed environment (issue #255).
+enable_crash_logging()
 
 
 def get_numpy():

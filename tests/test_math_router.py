@@ -26,6 +26,20 @@ from scripts.cc_math import math_router
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
+# Every distinct script the router can target, as an importable module path.
+# Derived from ROUTES so a newly-added route is covered automatically.
+_ROUTED_MODULES = sorted(
+    {f"scripts.cc_math.{r.script[:-3]}" for r in math_router.ROUTES}
+)
+# Modules the fix touched that are not themselves routed.
+_ALL_MATH_MODULES = sorted(
+    set(_ROUTED_MODULES)
+    | {
+        "scripts.cc_math.math_base",
+        "scripts.cc_math.sympy_baseline_validation",
+    }
+)
+
 
 @pytest.mark.parametrize(
     "module_name",
@@ -113,25 +127,17 @@ def _clean_home_env(tmp_home: Path) -> dict[str, str]:
     }
 
 
-@pytest.mark.parametrize(
-    "module_name",
-    [
-        "scripts.cc_math.math_base",
-        "scripts.cc_math.numpy_compute",
-        "scripts.cc_math.scipy_compute",
-        "scripts.cc_math.mpmath_compute",
-        "scripts.cc_math.sympy_compute",
-        "scripts.cc_math.sympy_baseline_validation",
-    ],
-)
+@pytest.mark.parametrize("module_name", _ALL_MATH_MODULES)
 def test_modules_import_under_clean_home(
     module_name: str, tmp_path: Path
 ) -> None:
-    """Modules must import even when ``~/.claude/logs`` does not exist.
+    """Every routed (and touched) module must import with no ``~/.claude/logs``.
 
     Before the crash-logging hardening, the module-level
     ``faulthandler.enable(open("~/.claude/logs/opc_crash.log"))`` raised
-    ``FileNotFoundError`` at import in a clean HOME, defeating the path fix.
+    ``FileNotFoundError`` at import in a clean HOME, so the router could emit a
+    command whose target dies before argument parsing. Deriving the list from
+    ``ROUTES`` keeps every routable script covered.
     """
     result = subprocess.run(
         [sys.executable, "-c", f"import {module_name}"],

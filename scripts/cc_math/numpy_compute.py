@@ -12,18 +12,13 @@ USAGE:
     uv run python scripts/cc_math/numpy_compute.py lstsq "[[1,1],[1,2],[1,3]]" "[1,2,2]"
 """
 
-import faulthandler
 import os
 import sys
 
-faulthandler.enable(
-    file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"),
-    all_threads=True,
-)
-
 # Ensure the project root is importable whether this module is run as a file
 # (``uv run python scripts/cc_math/numpy_compute.py`` — how the router invokes
-# it) or as a module (``-m scripts.cc_math.numpy_compute``). Issue #255.
+# it) or as a module (``-m scripts.cc_math.numpy_compute``). Must precede the
+# first-party import below. Issue #255.
 _PROJECT_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
@@ -32,6 +27,7 @@ if _PROJECT_ROOT not in sys.path:
 
 from scripts.cc_math.math_base import (  # noqa: E402
     create_main_parser,
+    enable_crash_logging,
     format_latex_matrix,
     get_array_info,
     get_registry,
@@ -41,6 +37,10 @@ from scripts.cc_math.math_base import (  # noqa: E402
     parse_matrix,
     validate_square,
 )
+
+# Best-effort crash logging; runs after the bootstrap so the import resolves,
+# and never raises even in a clean/sandboxed environment (issue #255).
+enable_crash_logging()
 
 # Lazy numpy import
 _np = None

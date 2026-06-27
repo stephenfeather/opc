@@ -17,7 +17,6 @@ Results:
 """
 
 import argparse
-import faulthandler
 import json
 import os
 import sys
@@ -25,17 +24,17 @@ from dataclasses import dataclass, field
 from typing import Any
 
 # Ensure the project root is importable whether this script is run as a file or
-# as a module (``-m``) before importing from sympy_compute. Issue #255.
+# as a module (``-m``) before importing first-party modules. Issue #255.
 _PROJECT_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-faulthandler.enable(  # noqa: E501
-    file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"),
-    all_threads=True,
-)
+from scripts.cc_math.math_base import enable_crash_logging  # noqa: E402
+
+# Best-effort crash logging; never raises even in a clean/sandboxed env (issue #255).
+enable_crash_logging()
 
 from scripts.cc_math.sympy_compute import (  # noqa: E402
     binomial_coeff,

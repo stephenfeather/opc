@@ -181,18 +181,13 @@ USAGE:
     uv run python -m scripts.cc_math.mpmath_compute mp_isqrt 1000
 """
 
-import faulthandler  # noqa: E402
 import os  # noqa: E402
 import sys
 
-faulthandler.enable(  # noqa: E501, E402
-    file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"),
-    all_threads=True,
-)
-
 # Ensure the project root is importable whether this module is run as a file
 # (``uv run python scripts/cc_math/mpmath_compute.py`` — how the router invokes
-# it) or as a module (``-m scripts.cc_math.mpmath_compute``). Issue #255.
+# it) or as a module (``-m scripts.cc_math.mpmath_compute``). Must precede the
+# first-party import below. Issue #255.
 _PROJECT_ROOT = os.path.dirname(  # noqa: E402
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
@@ -201,6 +196,7 @@ if _PROJECT_ROOT not in sys.path:
 
 from scripts.cc_math.math_base import (  # noqa: E402
     create_main_parser,
+    enable_crash_logging,
     get_registry,
     main_cli,
     math_command,
@@ -209,6 +205,10 @@ from scripts.cc_math.math_base import (  # noqa: E402
     parse_complex,
     parse_matrix,
 )
+
+# Best-effort crash logging; runs after the bootstrap so the import resolves,
+# and never raises even in a clean/sandboxed environment (issue #255).
+enable_crash_logging()
 
 # =============================================================================
 # PRECISION (4 functions)

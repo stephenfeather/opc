@@ -28,6 +28,8 @@ from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any, TypeVar
 
+_crash_logging_enabled = False
+
 
 def enable_crash_logging() -> None:
     """Best-effort faulthandler setup shared by the math compute CLIs.
@@ -38,10 +40,20 @@ def enable_crash_logging() -> None:
     (or any module that calls this) must never raise from crash-log setup, even in
     read-only, sandboxed, or otherwise restricted environments (issue #255).
 
+    Idempotent: this runs once at module import and again explicitly from each
+    compute module after its sys.path bootstrap. The guard makes every call after
+    the first a no-op, so faulthandler is registered once and only one log file
+    descriptor is ever opened.
+
     The log file is opened anonymously on purpose: ``faulthandler`` keeps its own
     reference to the file object for the process lifetime, so the descriptor stays
     valid for later fatal-signal output without a module-level handle.
     """
+    global _crash_logging_enabled
+    if _crash_logging_enabled:
+        return
+    _crash_logging_enabled = True
+
     try:
         # Validate the home directory itself, not the final path: expanduser
         # leaves "~" unchanged when HOME is unresolvable, and an empty HOME would
@@ -53,7 +65,18 @@ def enable_crash_logging() -> None:
             raise OSError("home directory could not be resolved")
         log_path = os.path.join(home, ".claude", "logs", "opc_crash.log")
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        faulthandler.enable(file=open(log_path, "a"), all_threads=True)  # noqa: SIM115
+        log_file = open(log_path, "a")  # noqa: SIM115
+        try:
+            faulthandler.enable(file=log_file, all_threads=True)
+        except Exception:
+            # enable() can still reject the fd (e.g. it lacks a usable fileno);
+            # close the handle we opened so it does not leak, then fall through
+            # to the stderr branch below.
+            try:
+                log_file.close()
+            except (OSError, ValueError):
+                pass
+            raise
         return
     except Exception:  # noqa: BLE001 - any failure here must fall through to stderr
         # faulthandler.enable can raise ValueError/RuntimeError (not just the

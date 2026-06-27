@@ -59,6 +59,23 @@ def test_compute_modules_importable(module_name: str) -> None:
     assert module is not None
 
 
+def test_enable_crash_logging_is_idempotent() -> None:
+    """Crash logging is set up exactly once across repeated calls.
+
+    ``math_base`` calls ``enable_crash_logging`` at import and every compute
+    module calls it again after its bootstrap; the guard must make all calls
+    after the first a no-op so only one log descriptor is ever opened.
+    """
+    from scripts.cc_math import math_base
+
+    # The module-level call at import must have run.
+    assert math_base._crash_logging_enabled is True
+    # Further calls short-circuit and never raise.
+    math_base.enable_crash_logging()
+    math_base.enable_crash_logging()
+    assert math_base._crash_logging_enabled is True
+
+
 def test_build_command_emits_existing_path() -> None:
     """build_command must reference a script path that exists on disk."""
     command = math_router.build_command(

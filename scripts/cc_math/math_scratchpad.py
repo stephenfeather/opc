@@ -50,23 +50,22 @@ import re
 import sys
 from typing import Any
 
-# Ensure both the project root (for ``scripts.cc_math.*``) and this module's own
-# directory (for the bare sibling imports below) are importable, whether this
+# Ensure the project root is importable (for ``scripts.cc_math.*``) whether this
 # module is run as a file (``uv run python scripts/cc_math/math_scratchpad.py`` —
-# how the router invokes it) or as a module. Must precede the imports. #255.
+# how the router invokes it) or as a module. Must precede the imports below. #255.
 _PROJECT_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-if _THIS_DIR not in sys.path:
-    sys.path.insert(0, _THIS_DIR)
-
-from sympy_compute import get_sympy, safe_parse, validate_expression  # noqa: E402
-from z3_solve import get_z3, prove_theorem  # noqa: E402
 
 from scripts.cc_math.math_base import enable_crash_logging  # noqa: E402
+from scripts.cc_math.sympy_compute import (  # noqa: E402
+    get_sympy,
+    safe_parse,
+    validate_expression,
+)
+from scripts.cc_math.z3_solve import get_z3, prove_theorem  # noqa: E402
 
 # Best-effort crash logging; runs after the bootstrap so the import resolves,
 # and never raises even in a clean/sandboxed environment (issue #255).

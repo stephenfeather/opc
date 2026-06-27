@@ -3,23 +3,23 @@
 
 USAGE:
     # Parse a quantity
-    uv run python -m runtime.harness scripts/pint_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/pint_compute.py \
         parse "100 km/h"
 
     # Convert between units
-    uv run python -m runtime.harness scripts/pint_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/pint_compute.py \
         convert "5 meters" --to feet
 
     # Unit-aware calculation
-    uv run python -m runtime.harness scripts/pint_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/pint_compute.py \
         calc "5 m * 3 s"
 
     # Check dimensional compatibility
-    uv run python -m runtime.harness scripts/pint_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/pint_compute.py \
         check newton --against "kg * m / s^2"
 
     # Simplify compound units
-    uv run python -m runtime.harness scripts/pint_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/pint_compute.py \
         simplify "1 kg*m/s^2"
 
 Requires: pint (pip install pint)
@@ -27,14 +27,26 @@ Requires: pint (pip install pint)
 
 import argparse
 import asyncio
-import faulthandler
 import json
 import os
 import re
 import sys
 from typing import Any
 
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+# Ensure the project root is importable whether this module is run as a file
+# (``uv run python scripts/cc_math/pint_compute.py`` — how the router invokes it)
+# or via the runtime harness. Must precede the first-party import below. #255.
+_PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from scripts.cc_math.math_base import enable_crash_logging  # noqa: E402
+
+# Best-effort crash logging; runs after the bootstrap so the import resolves,
+# and never raises even in a clean/sandboxed environment (issue #255).
+enable_crash_logging()
 
 # =============================================================================
 # Lazy Import

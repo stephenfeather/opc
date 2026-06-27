@@ -6,18 +6,18 @@ needing to read skill documentation at runtime.
 
 USAGE:
     # Route a math request
-    uv run python scripts/math_router.py route "integrate sin(x)"
-    uv run python scripts/math_router.py route "convert 5 meters to feet"
-    uv run python scripts/math_router.py route "prove x + y == y + x"
+    uv run python scripts/cc_math/math_router.py route "integrate sin(x)"
+    uv run python scripts/cc_math/math_router.py route "convert 5 meters to feet"
+    uv run python scripts/cc_math/math_router.py route "prove x + y == y + x"
 
     # List all available commands
-    uv run python scripts/math_router.py list
+    uv run python scripts/cc_math/math_router.py list
 
     # List commands for a category
-    uv run python scripts/math_router.py list --category sympy
+    uv run python scripts/cc_math/math_router.py list --category sympy
 
     # Show route confidence details
-    uv run python scripts/math_router.py route "differentiate x^3" --verbose
+    uv run python scripts/cc_math/math_router.py route "differentiate x^3" --verbose
 """
 
 from __future__ import annotations
@@ -2311,7 +2311,7 @@ def build_command(script: str, subcommand: str, args: dict[str, Any]) -> str:
     Uses dispatch table pattern to route to script-specific builders,
     keeping complexity low and logic modular.
     """
-    cmd_parts = ["uv", "run", "python", f"scripts/{script}", subcommand]
+    cmd_parts = ["uv", "run", "python", f"scripts/cc_math/{script}", subcommand]
 
     # Dispatch to script-specific builder if available
     builder = COMMAND_BUILDERS.get(script)

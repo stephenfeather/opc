@@ -3,15 +3,15 @@
 
 USAGE:
     # Check satisfiability
-    uv run python -m runtime.harness scripts/z3_solve.py \
+    uv run python -m runtime.harness scripts/cc_math/z3_solve.py \
         sat "x > 0, x < 10, x*x == 49" --type int
 
     # Prove theorem
-    uv run python -m runtime.harness scripts/z3_solve.py \
+    uv run python -m runtime.harness scripts/cc_math/z3_solve.py \
         prove "x + y == y + x" --vars x y --type int
 
     # Optimize
-    uv run python -m runtime.harness scripts/z3_solve.py \
+    uv run python -m runtime.harness scripts/cc_math/z3_solve.py \
         optimize "x + y" --constraints "x >= 0, y >= 0, x + y <= 100" \
         --direction maximize --type real
 
@@ -20,14 +20,26 @@ Requires: z3-solver (pip install z3-solver)
 
 import argparse
 import asyncio
-import faulthandler
 import json
 import os
 import re
 import sys
 from typing import Any
 
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
+# Ensure the project root is importable whether this module is run as a file
+# (``uv run python scripts/cc_math/z3_solve.py`` — how the router invokes it) or
+# via the runtime harness. Must precede the first-party import below. #255.
+_PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from scripts.cc_math.math_base import enable_crash_logging  # noqa: E402
+
+# Best-effort crash logging; runs after the bootstrap so the import resolves,
+# and never raises even in a clean/sandboxed environment (issue #255).
+enable_crash_logging()
 
 
 def get_z3():

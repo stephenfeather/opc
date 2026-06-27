@@ -3,30 +3,42 @@
 
 USAGE:
     # 2D plot
-    uv run python scripts/math_plot.py plot2d "sin(x)" \\
+    uv run python scripts/cc_math/math_plot.py plot2d "sin(x)" \\
         --var x --range -10 10 --output plot.png
 
     # 3D surface
-    uv run python scripts/math_plot.py plot3d "x**2 + y**2" \\
+    uv run python scripts/cc_math/math_plot.py plot3d "x**2 + y**2" \\
         --xvar x --yvar y --range 5 --output surface.html
 
     # LaTeX to PNG
-    uv run python scripts/math_plot.py latex "\\int e^{-x^2} dx" --output equation.png
+    uv run python scripts/cc_math/math_plot.py latex "\\int e^{-x^2} dx" --output equation.png
 
     # Multiple 2D functions
-    uv run python scripts/math_plot.py plot2d-multi "sin(x),cos(x)" \\
+    uv run python scripts/cc_math/math_plot.py plot2d-multi "sin(x),cos(x)" \\
         --var x --range -6.28 6.28 --output multi.png
 
 Requires: matplotlib, plotly, sympy, numpy
 """
 
 import argparse
-import faulthandler
 import json
 import os
 import sys
 
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
+# Ensure the project root is importable whether this module is run as a file
+# (``uv run python scripts/cc_math/math_plot.py`` — how the router invokes it)
+# or as a module. Must precede the first-party import below. Issue #255.
+_PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from scripts.cc_math.math_base import enable_crash_logging  # noqa: E402
+
+# Best-effort crash logging; runs after the bootstrap so the import resolves,
+# and never raises even in a clean/sandboxed environment (issue #255).
+enable_crash_logging()
 
 
 def get_numpy():

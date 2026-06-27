@@ -3,35 +3,35 @@
 
 USAGE:
     # Verify a single step (JSON output, default)
-    uv run python -m runtime.harness scripts/math_scratchpad.py \
+    uv run python -m runtime.harness scripts/cc_math/math_scratchpad.py \
         verify "x = 2 implies x^2 = 4"
 
     # Verify with human-readable text output
-    uv run python -m runtime.harness scripts/math_scratchpad.py \
+    uv run python -m runtime.harness scripts/cc_math/math_scratchpad.py \
         verify "x = 2 implies x^2 = 4" --format text
 
     # Verify with markdown output
-    uv run python -m runtime.harness scripts/math_scratchpad.py \
+    uv run python -m runtime.harness scripts/cc_math/math_scratchpad.py \
         verify "x = 2 implies x^2 = 4" --format markdown
 
     # Verify with context
-    uv run python -m runtime.harness scripts/math_scratchpad.py \
+    uv run python -m runtime.harness scripts/cc_math/math_scratchpad.py \
         verify "x^2 = 4" --context '{"x": 2}'
 
     # Verify a chain of reasoning
-    uv run python -m runtime.harness scripts/math_scratchpad.py \
+    uv run python -m runtime.harness scripts/cc_math/math_scratchpad.py \
         chain --steps '["x^2 - 4 = 0", "(x-2)(x+2) = 0", "x = 2 or x = -2"]'
 
     # Verify chain with text output (step-by-step results)
-    uv run python -m runtime.harness scripts/math_scratchpad.py \
+    uv run python -m runtime.harness scripts/cc_math/math_scratchpad.py \
         chain --steps '["x = 2", "x^2 = 4"]' --format text
 
     # Explain a step
-    uv run python -m runtime.harness scripts/math_scratchpad.py \
+    uv run python -m runtime.harness scripts/cc_math/math_scratchpad.py \
         explain "d/dx(x^3) = 3*x^2"
 
     # Explain with text output
-    uv run python -m runtime.harness scripts/math_scratchpad.py \
+    uv run python -m runtime.harness scripts/cc_math/math_scratchpad.py \
         explain "d/dx(x^3) = 3*x^2" --format text
 
 OUTPUT FORMATS:
@@ -50,14 +50,26 @@ import re
 import sys
 from typing import Any
 
-# Import from existing scripts
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import faulthandler
+# Ensure the project root is importable (for ``scripts.cc_math.*``) whether this
+# module is run as a file (``uv run python scripts/cc_math/math_scratchpad.py`` —
+# how the router invokes it) or as a module. Must precede the imports below. #255.
+_PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
-from sympy_compute import get_sympy, safe_parse, validate_expression
-from z3_solve import get_z3, prove_theorem
+from scripts.cc_math.math_base import enable_crash_logging  # noqa: E402
+from scripts.cc_math.sympy_compute import (  # noqa: E402
+    get_sympy,
+    safe_parse,
+    validate_expression,
+)
+from scripts.cc_math.z3_solve import get_z3, prove_theorem  # noqa: E402
 
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+# Best-effort crash logging; runs after the bootstrap so the import resolves,
+# and never raises even in a clean/sandboxed environment (issue #255).
+enable_crash_logging()
 
 # ============================================================================
 # Helper Functions

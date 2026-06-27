@@ -3,48 +3,48 @@
 
 USAGE:
     # Create geometries
-    uv run python -m runtime.harness scripts/shapely_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/shapely_compute.py \
         create point --coords "1,2"
 
-    uv run python -m runtime.harness scripts/shapely_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/shapely_compute.py \
         create line --coords "0,0 1,1 2,0"
 
-    uv run python -m runtime.harness scripts/shapely_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/shapely_compute.py \
         create polygon --coords "0,0 1,0 1,1 0,1"
 
     # Geometric operations
-    uv run python -m runtime.harness scripts/shapely_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/shapely_compute.py \
         op intersection --g1 "POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0))" \
                         --g2 "POLYGON ((1 1, 3 1, 3 3, 1 3, 1 1))"
 
-    uv run python -m runtime.harness scripts/shapely_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/shapely_compute.py \
         op buffer --g1 "POINT (0 0)" --g2 "1.5"
 
     # Predicates
-    uv run python -m runtime.harness scripts/shapely_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/shapely_compute.py \
         pred contains --g1 "POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0))" \
                       --g2 "POINT (1 1)"
 
     # Measurements
-    uv run python -m runtime.harness scripts/shapely_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/shapely_compute.py \
         measure area --geom "POLYGON ((0 0, 1 0, 1 1, 0 1, 0 0))"
 
-    uv run python -m runtime.harness scripts/shapely_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/shapely_compute.py \
         measure centroid --geom "POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0))"
 
     # Transformations
-    uv run python -m runtime.harness scripts/shapely_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/shapely_compute.py \
         transform translate --geom "POINT (0 0)" --params "1,2"
 
-    uv run python -m runtime.harness scripts/shapely_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/shapely_compute.py \
         transform rotate --geom "POINT (1 0)" --params "90"
 
     # Validation
-    uv run python -m runtime.harness scripts/shapely_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/shapely_compute.py \
         validate --geom "POLYGON ((0 0, 1 0, 1 1, 0 1, 0 0))"
 
     # Distance
-    uv run python -m runtime.harness scripts/shapely_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/shapely_compute.py \
         distance --g1 "POINT (0 0)" --g2 "POINT (3 4)"
 
 Requires: shapely (pip install shapely)
@@ -52,13 +52,25 @@ Requires: shapely (pip install shapely)
 
 import argparse
 import asyncio
-import faulthandler
 import json
 import os
 import sys
 from typing import Any
 
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
+# Ensure the project root is importable whether this module is run as a file
+# (``uv run python scripts/cc_math/shapely_compute.py`` — how the router invokes
+# it) or via the runtime harness. Must precede the first-party import. #255.
+_PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from scripts.cc_math.math_base import enable_crash_logging  # noqa: E402
+
+# Best-effort crash logging; runs after the bootstrap so the import resolves,
+# and never raises even in a clean/sandboxed environment (issue #255).
+enable_crash_logging()
 
 
 def get_shapely():

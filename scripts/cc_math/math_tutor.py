@@ -3,13 +3,13 @@
 
 USAGE:
     # Generate step-by-step solution
-    uv run python scripts/math_tutor.py steps "x**2 - 5*x + 6 = 0" --operation solve
+    uv run python scripts/cc_math/math_tutor.py steps "x**2 - 5*x + 6 = 0" --operation solve
 
     # Get progressive hint
-    uv run python scripts/math_tutor.py hint "Solve x**2 - 4 = 0" --level 2
+    uv run python scripts/cc_math/math_tutor.py hint "Solve x**2 - 4 = 0" --level 2
 
     # Generate practice problem
-    uv run python scripts/math_tutor.py generate --topic algebra --difficulty 2
+    uv run python scripts/cc_math/math_tutor.py generate --topic algebra --difficulty 2
 
 Features:
 - Step-by-step solutions with rule justifications
@@ -27,7 +27,6 @@ Requires: sympy (pip install sympy)
 from __future__ import annotations
 
 import argparse
-import faulthandler
 import json
 import os
 import random
@@ -38,7 +37,20 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Any
 
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)  # noqa: E501
+# Ensure the project root is importable whether this module is run as a file
+# (``uv run python scripts/cc_math/math_tutor.py`` — how the router invokes it)
+# or as a module. Must precede the first-party import below. Issue #255.
+_PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from scripts.cc_math.math_base import enable_crash_logging  # noqa: E402
+
+# Best-effort crash logging; runs after the bootstrap so the import resolves,
+# and never raises even in a clean/sandboxed environment (issue #255).
+enable_crash_logging()
 
 # Import sympy lazily
 _sympy = None

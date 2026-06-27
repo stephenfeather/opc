@@ -3,47 +3,47 @@
 
 USAGE:
     # Solve equations
-    uv run python -m runtime.harness scripts/sympy_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/sympy_compute.py \
         solve "x**2 - 4 = 0" --var x --domain real
 
     # Integrate
-    uv run python -m runtime.harness scripts/sympy_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/sympy_compute.py \
         integrate "sin(x)" --var x
 
     # Definite integral
-    uv run python -m runtime.harness scripts/sympy_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/sympy_compute.py \
         integrate "x" --var x --bounds 0 1
 
     # Differentiate
-    uv run python -m runtime.harness scripts/sympy_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/sympy_compute.py \
         diff "x**3" --var x --order 2
 
     # Simplify
-    uv run python -m runtime.harness scripts/sympy_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/sympy_compute.py \
         simplify "sin(x)**2 + cos(x)**2" --strategy trig
 
     # Compute limit
-    uv run python -m runtime.harness scripts/sympy_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/sympy_compute.py \
         limit "sin(x)/x" --var x --to 0
 
     # Limit at infinity
-    uv run python -m runtime.harness scripts/sympy_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/sympy_compute.py \
         limit "1/x" --var x --to oo
 
     # One-sided limit (from the right)
-    uv run python -m runtime.harness scripts/sympy_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/sympy_compute.py \
         limit "1/x" --var x --to 0 --dir +
 
     # Matrix determinant
-    uv run python -m runtime.harness scripts/sympy_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/sympy_compute.py \
         det "[[1,2],[3,4]]"
 
     # Eigenvalues
-    uv run python -m runtime.harness scripts/sympy_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/sympy_compute.py \
         eigenvalues "[[1,2],[3,4]]"
 
     # Characteristic polynomial
-    uv run python -m runtime.harness scripts/sympy_compute.py \
+    uv run python -m runtime.harness scripts/cc_math/sympy_compute.py \
         charpoly "[[1,2],[3,4]]" --var lambda
 
 Requires: sympy (pip install sympy)
@@ -51,7 +51,6 @@ Requires: sympy (pip install sympy)
 
 import argparse
 import asyncio
-import faulthandler
 import json
 import os
 import sys
@@ -59,7 +58,21 @@ from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from typing import Any
 
-faulthandler.enable(file=open(os.path.expanduser("~/.claude/logs/opc_crash.log"), "a"), all_threads=True)
+# Ensure the project root is importable whether this module is run as a file
+# (``uv run python scripts/cc_math/sympy_compute.py`` — how the router invokes
+# it) or as a module (``-m scripts.cc_math.sympy_compute``). Must precede the
+# first-party import below. Issue #255.
+_PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from scripts.cc_math.math_base import enable_crash_logging  # noqa: E402
+
+# Best-effort crash logging; runs after the bootstrap so the import resolves,
+# and never raises even in a clean/sandboxed environment (issue #255).
+enable_crash_logging()
 
 
 def get_sympy():

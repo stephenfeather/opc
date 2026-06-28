@@ -27,6 +27,7 @@ import faulthandler
 import json
 import os
 import re
+import shlex
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -1728,51 +1729,65 @@ def _is_math_command_decorator(decorator) -> bool:
     return isinstance(func, ast.Name) and func.id == "math_command"
 
 
-def _extract_arg_names_from_args_kwarg(args_value) -> list[str]:
-    """Extract argument names from the 'args' keyword argument value."""
+def _extract_arg_specs_from_args_kwarg(args_value) -> list[dict[str, Any]]:
+    """Extract arg specs ``[{"name": str, "flag": bool}]`` from the 'args' kwarg.
+
+    ``name`` keeps any leading ``--`` so positionals (``n``) stay distinguishable
+    from options (``--dps``); consumers that need the bare name strip it. ``flag``
+    is True for ``store_true``/``store_false`` options, which take NO value on the
+    command line and so must be emitted as a bare ``--name``.
+    """
     import ast
-    arg_names: list[str] = []
+    specs: list[dict[str, Any]] = []
     if not isinstance(args_value, ast.List):
-        return arg_names
+        return specs
 
     for elt in args_value.elts:
         if not isinstance(elt, ast.Dict):
             continue
+        name: str | None = None
+        is_flag = False
         for key, val in zip(elt.keys, elt.values):
-            if (key is not None
-                and isinstance(key, ast.Constant)
-                and key.value == "name"
-                and isinstance(val, ast.Constant)):
-                arg_name = val.value.lstrip("-")
-                arg_names.append(arg_name)
-                break
+            if not (key is not None and isinstance(key, ast.Constant)):
+                continue
+            if (key.value == "name"
+                    and isinstance(val, ast.Constant)
+                    and isinstance(val.value, str)):
+                name = val.value
+            elif key.value == "action" and isinstance(val, ast.Constant):
+                is_flag = val.value in ("store_true", "store_false")
+        if name is not None:
+            specs.append({"name": name, "flag": is_flag})
 
-    return arg_names
+    return specs
 
 
-def _extract_schema_from_decorator(decorator) -> tuple[str | None, list[str]]:
-    """Extract command name and argument names from a math_command decorator."""
+def _extract_schema_from_decorator(decorator) -> tuple[str | None, list[dict[str, Any]]]:
+    """Extract command name and argument specs from a math_command decorator."""
     import ast
-    cmd_name = None
-    arg_names: list[str] = []
+    cmd_name: str | None = None
+    arg_specs: list[dict[str, Any]] = []
 
     for kw in decorator.keywords:
-        if kw.arg == "name" and isinstance(kw.value, ast.Constant):
+        if (kw.arg == "name"
+                and isinstance(kw.value, ast.Constant)
+                and isinstance(kw.value.value, str)):
             cmd_name = kw.value.value
         elif kw.arg == "args":
-            arg_names = _extract_arg_names_from_args_kwarg(kw.value)
+            arg_specs = _extract_arg_specs_from_args_kwarg(kw.value)
 
-    return cmd_name, arg_names
+    return cmd_name, arg_specs
 
 
-def _extract_command_schemas_from_file(filepath: str) -> dict[str, list[str]]:
+def _extract_command_schemas_from_file(filepath: str) -> dict[str, list[dict[str, Any]]]:
     """Extract command argument schemas from a script using AST parsing.
 
     Args:
         filepath: Path to the script file
 
     Returns:
-        Dictionary mapping command names to list of argument names
+        Dictionary mapping command names to a list of arg specs
+        (``{"name": str, "flag": bool}``)
     """
     import ast
     import os
@@ -1787,7 +1802,7 @@ def _extract_command_schemas_from_file(filepath: str) -> dict[str, list[str]]:
     except (SyntaxError, FileNotFoundError):
         return {}
 
-    schemas: dict[str, list[str]] = {}
+    schemas: dict[str, list[dict[str, Any]]] = {}
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.FunctionDef):
@@ -1797,23 +1812,23 @@ def _extract_command_schemas_from_file(filepath: str) -> dict[str, list[str]]:
             if not _is_math_command_decorator(decorator):
                 continue
 
-            cmd_name, arg_names = _extract_schema_from_decorator(decorator)
+            cmd_name, arg_specs = _extract_schema_from_decorator(decorator)
             if cmd_name:
-                schemas[cmd_name] = arg_names
+                schemas[cmd_name] = arg_specs
 
     return schemas
 
 
-def _load_command_schemas() -> dict[str, dict[str, list[str]]]:
+def _load_command_schemas() -> dict[str, dict[str, list[dict[str, Any]]]]:
     """Load command schemas from all math scripts at module load time.
 
     Returns:
-        Dictionary mapping script names to {command_name: [arg_names]}
+        Dictionary mapping script names to {command_name: [arg specs]}
     """
     import os
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    all_schemas: dict[str, dict[str, list[str]]] = {}
+    all_schemas: dict[str, dict[str, list[dict[str, Any]]]] = {}
 
     for script_name in SCRIPT_CATEGORIES:
         script_path = os.path.join(script_dir, script_name)
@@ -1825,10 +1840,10 @@ def _load_command_schemas() -> dict[str, dict[str, list[str]]]:
 
 
 # Load schemas at module load time (cached)
-_COMMAND_SCHEMAS: dict[str, dict[str, list[str]]] | None = None
+_COMMAND_SCHEMAS: dict[str, dict[str, list[dict[str, Any]]]] | None = None
 
 
-def _get_command_schemas() -> dict[str, dict[str, list[str]]]:
+def _get_command_schemas() -> dict[str, dict[str, list[dict[str, Any]]]]:
     """Get cached command schemas, loading if needed."""
     global _COMMAND_SCHEMAS
     if _COMMAND_SCHEMAS is None:
@@ -1996,12 +2011,16 @@ def generate_fallback_routes() -> list[Route]:
         # Generate routes for missing commands
         for cmd in all_subcommands:
             if cmd not in routed:
-                # Get expected args for this command from schema
-                arg_names = script_schema.get(cmd, [])
+                # Get expected arg specs for this command from schema
+                arg_specs = script_schema.get(cmd, [])
 
-                # Use smart extractor if we have schema info, otherwise generic
-                if arg_names:
-                    extractor = create_smart_extractor(arg_names)
+                # Use smart extractor if we have schema info, otherwise generic.
+                # Spec names keep their leading ``--``; smart_extract wants the
+                # bare names (``dps``, not ``--dps``).
+                if arg_specs:
+                    extractor = create_smart_extractor(
+                        [s["name"].lstrip("-") for s in arg_specs]
+                    )
                 else:
                     extractor = extract_generic
 
@@ -2126,11 +2145,94 @@ def _build_z3_command(
             cmd_parts.append(f"--type {args['var_type']}")
 
 
+def _parse_json_chain_steps(payload: str) -> str | None:
+    """Validate an explicit ``[...]``/``{...}`` chain payload, or fail closed.
+
+    An explicit structured payload is authoritative: if it does not parse to a
+    non-empty JSON list whose every element is a non-blank string, return None
+    rather than synthesizing a step out of the malformed syntax. This prevents
+    inputs like ``[]``, ``["x=2",]``, ``{"a":1}``, ``["", " "]`` or ``[true]``
+    from becoming a fabricated step the user never requested.
+    """
+    try:
+        parsed = json.loads(payload)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(parsed, list):
+        return None
+    steps = [s.strip() for s in parsed if isinstance(s, str) and s.strip()]
+    # Reject if empty or if any element was blank/non-string (dropped above).
+    if not steps or len(steps) != len(parsed):
+        return None
+    return json.dumps(steps)
+
+
+def _extract_chain_steps(intent: str) -> str | None:
+    """Derive a JSON list of chain steps from the user's intent.
+
+    Returns a ``json.dumps`` list string built only from what the user typed,
+    or None when nothing usable is present. It never fabricates steps, so the
+    chain route can only emit a command verifying the user's own chain.
+
+    Recognized forms:
+      1. An explicit structured payload (``[...]``/``{...}``) right after the
+         ``chain`` keyword is authoritative — parsed strictly or failed closed.
+      2. Otherwise, free text after a leading ``chain`` (optionally
+         ``verify``/``check``) keyword, split on ``;`` or newlines, one step
+         per non-blank part.
+    """
+    if not intent or not intent.strip():
+        return None
+
+    remainder = re.sub(
+        r"^\s*(?:verify\s+|check\s+)?chain\b",
+        "",
+        intent,
+        count=1,
+        flags=re.IGNORECASE,
+    ).strip()
+    if not remainder:
+        return None
+
+    # An explicit list/object payload is authoritative — never synthesize a
+    # step from its raw syntax.
+    if remainder[0] in "[{":
+        return _parse_json_chain_steps(remainder)
+
+    # Free text: one step per ``;``/newline-delimited, non-blank part.
+    parts = [p.strip() for p in re.split(r"[;\n]+", remainder) if p.strip()]
+    if parts:
+        return json.dumps(parts)
+
+    return None
+
+
 def _build_scratchpad_command(
     cmd_parts: list[str], subcommand: str, args: dict[str, Any]
 ) -> None:
-    """Build Math Scratchpad command arguments."""
-    cmd_parts.append(f'"{args.get("step", "")}"')
+    """Build Math Scratchpad command arguments.
+
+    The ``chain`` subcommand takes a required ``--steps`` JSON list, not a
+    positional ``step`` like ``verify``/``explain``. Emitting a bare ``step``
+    for ``chain`` produced an unrunnable command (argparse: --steps required).
+
+    Chain steps are derived from the user's own intent — never a hardcoded
+    list — so the emitted command can only ever verify the chain the user
+    actually asked about. When no steps can be parsed the builder appends
+    nothing (fail closed); the command stays non-runnable rather than reporting
+    a successful verification of a chain the user did not request.
+    """
+    if subcommand == "chain":
+        steps = args.get("steps") or _extract_chain_steps(args.get("input", ""))
+        if steps:
+            # shlex.quote so a single quote in a user step cannot break out of
+            # the shell quoting and inject ``$(...)``/``;`` into the command.
+            cmd_parts.append(f"--steps {shlex.quote(steps)}")
+            # NOTE: chain also accepts an optional ``--context`` JSON dict, but no
+            # extractor populates it, so it is intentionally not emitted here.
+            # Wire it up with a real extractor + tests if/when it is needed.
+    else:
+        cmd_parts.append(f'"{args.get("step", "")}"')
 
 
 def _build_tutor_command(
@@ -2271,33 +2373,111 @@ COMMAND_BUILDERS: dict[str, Callable[[list[str], str, dict[str, Any]], None]] = 
 }
 
 
+def _append_schema_option_args(
+    cmd_parts: list[str], options: list[dict[str, Any]], args: dict[str, Any]
+) -> None:
+    """Append any extracted schema options (e.g. ``--k 1``) after positionals.
+
+    Only options the extractor actually populated are emitted, so a command runs
+    with the option the user asked for instead of silently using the default
+    (e.g. ``mp_lambertw 1 k=1`` would otherwise drop ``--k`` and run branch 0).
+    A ``store_true``/``store_false`` flag is emitted as a bare ``--name`` (it
+    takes no value); value options are emitted as ``--name <value>``.
+    """
+    for spec in options:
+        name = spec["name"]
+        val = args.get(name.lstrip("-"))
+        if val is None or val == "":
+            continue
+        if spec["flag"]:
+            cmd_parts.append(name)
+        else:
+            cmd_parts.append(f"{name} {shlex.quote(str(val))}")
+
+
+def _apply_schema_positional_args(
+    cmd_parts: list[str], script: str, subcommand: str, args: dict[str, Any]
+) -> str:
+    """Append positional (and any extracted option) args mapped from the schema.
+
+    For autogenerated schema-backed routes (e.g. ``mp_bernoulli n``), the
+    extractor pulls the typed value (``n``) but no script-specific builder
+    covers the subcommand. Without this, the generic fallback re-passed the
+    whole raw intent, which then failed at argparse. Extracted options (e.g.
+    ``--k`` for ``mp_lambertw``) are appended after the positionals.
+
+    Returns one of three states so the caller can fail closed correctly:
+      - ``"applied"``: every required positional was present and appended.
+      - ``"incomplete"``: the command is schema-backed but a required
+        positional could not be extracted. The caller must NOT fall back to the
+        raw-input heuristics (doing so would re-pass the whole intent — the very
+        bug this helper exists to prevent); it emits no positional instead.
+      - ``"no_schema"``: no schema/positionals for this command; the caller runs
+        its existing heuristics unchanged.
+    """
+    arg_specs = _get_command_schemas().get(script, {}).get(subcommand)
+    if not arg_specs:
+        return "no_schema"
+
+    # Options keep their leading ``--`` in the schema; positionals do not.
+    positionals = [s for s in arg_specs if not s["name"].startswith("-")]
+    if not positionals:
+        return "no_schema"
+
+    values: list[str] = []
+    for spec in positionals:
+        val = args.get(spec["name"])
+        if val is None or val == "":
+            return "incomplete"  # Schema-backed but extraction incomplete.
+        values.append(str(val))
+
+    for val in values:
+        # shlex.quote so a special character in an extracted value cannot break
+        # the shell quoting (consistent with the chain --steps path).
+        cmd_parts.append(shlex.quote(val))
+
+    options = [s for s in arg_specs if s["name"].startswith("-")]
+    _append_schema_option_args(cmd_parts, options, args)
+    return "applied"
+
+
 def _apply_fallback_args(
-    cmd_parts: list[str], script: str, args: dict[str, Any]
+    cmd_parts: list[str], script: str, subcommand: str, args: dict[str, Any]
 ) -> None:
     """Apply fallback argument handling for unhandled scripts/subcommands."""
     if len(cmd_parts) != 5:  # Only apply if no args were added
         return
 
-    # Check if we have useful extracted data
-    if args.get("matrix"):
-        cmd_parts.append(f'"{args["matrix"]}"')
-    elif args.get("array"):
-        cmd_parts.append(f'"{args["array"]}"')
-    elif args.get("expression"):
-        cmd_parts.append(f'"{args["expression"]}"')
-    elif args.get("input") and args["input"] != "":
-        # For generic routes, pass input as quoted argument
-        # But only if it looks like a value, not a full sentence
-        input_val = args["input"]
-        # Don't pass long sentences as arguments
-        if len(input_val) < 100 and not re.search(
-            r"\b(what|how|can|please|help|the)\b", input_val, re.IGNORECASE
-        ):
-            cmd_parts.append(f'"{input_val}"')
+    # Prefer schema-mapped positional args (typed values by name) over the
+    # raw-input heuristics, which only work for matrix/array/expression shapes.
+    # Only "no_schema" permits the heuristics; "applied"/"incomplete" both fail
+    # closed (a schema-backed command never re-passes the raw intent).
+    status = _apply_schema_positional_args(cmd_parts, script, subcommand, args)
+    if status == "no_schema":
+        # The scratchpad builder fully handles its subcommands (verify/explain
+        # append a step, chain emits --steps or fails closed); never re-pass the
+        # raw intent as a bogus positional for it.
+        if script != "math_scratchpad.py":
+            if args.get("matrix"):
+                cmd_parts.append(f'"{args["matrix"]}"')
+            elif args.get("array"):
+                cmd_parts.append(f'"{args["array"]}"')
+            elif args.get("expression"):
+                cmd_parts.append(f'"{args["expression"]}"')
+            elif args.get("input") and args["input"] != "":
+                # For generic routes, pass input as quoted argument
+                # But only if it looks like a value, not a full sentence
+                input_val = args["input"]
+                # Don't pass long sentences as arguments
+                if len(input_val) < 100 and not re.search(
+                    r"\b(what|how|can|please|help|the)\b", input_val, re.IGNORECASE
+                ):
+                    cmd_parts.append(f'"{input_val}"')
 
-    # Add dps if present for mpmath commands (but not default value)
-    if args.get("dps") and script == "mpmath_compute.py" and args["dps"] != 50:
-        cmd_parts.append(f"--dps {args['dps']}")
+        # Legacy --dps for the non-schema mpmath fallback (skip the default).
+        # Schema-backed routes emit --dps via the option handler above instead.
+        if args.get("dps") and script == "mpmath_compute.py" and args["dps"] != 50:
+            cmd_parts.append(f"--dps {args['dps']}")
 
 
 # =============================================================================
@@ -2319,7 +2499,7 @@ def build_command(script: str, subcommand: str, args: dict[str, Any]) -> str:
         builder(cmd_parts, subcommand, args)
 
     # Apply fallback for unhandled cases
-    _apply_fallback_args(cmd_parts, script, args)
+    _apply_fallback_args(cmd_parts, script, subcommand, args)
 
     return " ".join(cmd_parts)
 

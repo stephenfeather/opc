@@ -170,6 +170,25 @@ def test_scratchpad_chain_route_fails_closed_on_unusable_steps(intent: str) -> N
     assert match.command.rstrip().endswith("chain")
 
 
+def test_scratchpad_chain_route_quotes_steps_against_shell_breakout() -> None:
+    """A single quote in a chain step must not break out of the shell quoting.
+
+    Without shlex.quote, ``chain x'$(id)' = y`` would emit
+    ``--steps '["x'$(id)'..."]'`` where ``$(id)`` lands unquoted and would run
+    if the command string were executed by a shell.
+    """
+    match = math_router.route("chain x'$(id)' = y; z = 1")
+
+    assert match.subcommand == "chain"
+    # The emitted command parses as a single safe argv — the payload survives
+    # intact as literal data inside one --steps token (no extra/expanded args).
+    parts = shlex.split(match.command)
+    assert "--steps" in parts
+    steps_value = parts[parts.index("--steps") + 1]
+    assert "$(id)" in steps_value  # carried as inert text, not a shell token
+    assert "$(id)" not in [p for p in parts if p != steps_value]
+
+
 def test_schema_route_with_missing_positional_does_not_repass_raw_intent() -> None:
     """An incomplete schema-backed route must fail closed, not echo the intent."""
     match = math_router.route("mp_bernoulli")

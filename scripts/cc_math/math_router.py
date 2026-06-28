@@ -27,6 +27,7 @@ import faulthandler
 import json
 import os
 import re
+import shlex
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -2211,9 +2212,11 @@ def _build_scratchpad_command(
     if subcommand == "chain":
         steps = args.get("steps") or _extract_chain_steps(args.get("input", ""))
         if steps:
-            cmd_parts.append(f"--steps '{steps}'")
+            # shlex.quote so a single quote in a user step cannot break out of
+            # the shell quoting and inject ``$(...)``/``;`` into the command.
+            cmd_parts.append(f"--steps {shlex.quote(steps)}")
             if args.get("context"):
-                cmd_parts.append(f"--context '{args['context']}'")
+                cmd_parts.append(f"--context {shlex.quote(str(args['context']))}")
     else:
         cmd_parts.append(f'"{args.get("step", "")}"')
 

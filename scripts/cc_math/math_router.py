@@ -2131,6 +2131,46 @@ def _build_z3_command(
             cmd_parts.append(f"--type {args['var_type']}")
 
 
+def _extract_chain_steps(intent: str) -> str | None:
+    """Derive a JSON list of chain steps from the user's intent.
+
+    Returns a ``json.dumps`` list string built only from what the user typed,
+    or None when nothing usable is present. It never fabricates steps, so the
+    chain route can only emit a command verifying the user's own chain.
+
+    Recognized forms (in order):
+      1. An explicit JSON list anywhere in the intent: ``["x = 2", "x^2 = 4"]``.
+      2. The text after a leading ``chain`` (optionally ``verify``/``check``)
+         keyword, split on ``;`` or newlines into one step per part.
+    """
+    if not intent:
+        return None
+
+    # 1) Explicit JSON list.
+    bracket = re.search(r"\[.*\]", intent, re.DOTALL)
+    if bracket:
+        try:
+            parsed = json.loads(bracket.group(0))
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, list) and parsed:
+            return json.dumps([str(step) for step in parsed])
+
+    # 2) Delimited steps after the leading chain keyword.
+    remainder = re.sub(
+        r"^\s*(?:verify\s+|check\s+)?chain\b",
+        "",
+        intent,
+        count=1,
+        flags=re.IGNORECASE,
+    ).strip()
+    parts = [p.strip() for p in re.split(r"[;\n]+", remainder) if p.strip()]
+    if parts:
+        return json.dumps(parts)
+
+    return None
+
+
 def _build_scratchpad_command(
     cmd_parts: list[str], subcommand: str, args: dict[str, Any]
 ) -> None:
@@ -2139,14 +2179,19 @@ def _build_scratchpad_command(
     The ``chain`` subcommand takes a required ``--steps`` JSON list, not a
     positional ``step`` like ``verify``/``explain``. Emitting a bare ``step``
     for ``chain`` produced an unrunnable command (argparse: --steps required).
+
+    Chain steps are derived from the user's own intent — never a hardcoded
+    list — so the emitted command can only ever verify the chain the user
+    actually asked about. When no steps can be parsed the builder appends
+    nothing (fail closed); the command stays non-runnable rather than reporting
+    a successful verification of a chain the user did not request.
     """
     if subcommand == "chain":
-        # ``--steps`` is required; use an extracted value when present, else a
-        # valid placeholder list so the emitted command runs as-is.
-        steps = args.get("steps") or '["x = 2", "x^2 = 4"]'
-        cmd_parts.append(f"--steps '{steps}'")
-        if args.get("context"):
-            cmd_parts.append(f"--context '{args['context']}'")
+        steps = args.get("steps") or _extract_chain_steps(args.get("input", ""))
+        if steps:
+            cmd_parts.append(f"--steps '{steps}'")
+            if args.get("context"):
+                cmd_parts.append(f"--context '{args['context']}'")
     else:
         cmd_parts.append(f'"{args.get("step", "")}"')
 

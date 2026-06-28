@@ -2215,8 +2215,9 @@ def _build_scratchpad_command(
             # shlex.quote so a single quote in a user step cannot break out of
             # the shell quoting and inject ``$(...)``/``;`` into the command.
             cmd_parts.append(f"--steps {shlex.quote(steps)}")
-            if args.get("context"):
-                cmd_parts.append(f"--context {shlex.quote(str(args['context']))}")
+            # NOTE: chain also accepts an optional ``--context`` JSON dict, but no
+            # extractor populates it, so it is intentionally not emitted here.
+            # Wire it up with a real extractor + tests if/when it is needed.
     else:
         cmd_parts.append(f'"{args.get("step", "")}"')
 
@@ -2395,7 +2396,9 @@ def _apply_schema_positional_args(
         values.append(str(val))
 
     for val in values:
-        cmd_parts.append(f'"{val}"')
+        # shlex.quote so a special character in an extracted value cannot break
+        # the shell quoting (consistent with the chain --steps path).
+        cmd_parts.append(shlex.quote(val))
     return "applied"
 
 

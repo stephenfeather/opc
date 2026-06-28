@@ -111,6 +111,21 @@ def test_scratchpad_chain_route_reflects_distinct_user_steps() -> None:
     assert "x = 2" not in match.command
 
 
+def test_scratchpad_chain_route_accepts_explicit_json_list() -> None:
+    """An explicit, valid JSON list of steps is used verbatim (normalized)."""
+    match = math_router.route('chain ["x = 1", "x + 1 = 2"]')
+
+    assert match.subcommand == "chain"
+    assert "--steps" in match.command
+    assert "x = 1" in match.command
+    assert "x + 1 = 2" in match.command
+
+    result = _execute_routed_command(match.command)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert [s.get("step") for s in payload.get("steps", [])] == ["x = 1", "x + 1 = 2"]
+
+
 def test_scratchpad_chain_route_executes() -> None:
     """The emitted chain command runs and verifies the user's actual chain."""
     match = math_router.route("chain x = 2; x^2 = 4")

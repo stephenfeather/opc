@@ -20,6 +20,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from scripts.cc_math import math_router
 
 # Repo root: tests/ lives directly under it.
@@ -120,6 +122,47 @@ def test_scratchpad_chain_route_executes() -> None:
     assert payload.get("all_valid") is True
     steps = payload.get("steps", [])
     assert [s.get("step") for s in steps] == ["x = 2", "x^2 = 4"]
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed guards — never fabricate a chain or re-pass the raw intent
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "intent",
+    [
+        "chain",  # no steps at all
+        "chain []",  # empty JSON list
+        'chain ["x=2",]',  # malformed JSON (trailing comma)
+        'chain {"a":1}',  # non-list JSON
+        'chain ["", "   "]',  # blank string elements
+        "chain [true, null]",  # non-string elements
+    ],
+)
+def test_scratchpad_chain_route_fails_closed_on_unusable_steps(intent: str) -> None:
+    """Unusable/malformed step payloads must not synthesize or fabricate a chain.
+
+    A fabricated chain is worse than no command: it could report a passing
+    verification of a chain the user never requested. So no ``--steps`` is
+    emitted and the raw intent is not re-passed as a bogus positional.
+    """
+    match = math_router.route(intent)
+
+    assert match.subcommand == "chain"
+    assert "--steps" not in match.command
+    # The command ends at the bare subcommand — no fabricated/echoed positional.
+    assert match.command.rstrip().endswith("chain")
+
+
+def test_schema_route_with_missing_positional_does_not_repass_raw_intent() -> None:
+    """An incomplete schema-backed route must fail closed, not echo the intent."""
+    match = math_router.route("mp_bernoulli")
+
+    assert match.subcommand == "mp_bernoulli"
+    # The bug would emit ``mp_bernoulli "mp_bernoulli"``; fail closed instead.
+    assert '"mp_bernoulli"' not in match.command
+    assert match.command.rstrip().endswith("mp_bernoulli")
 
 
 # ---------------------------------------------------------------------------

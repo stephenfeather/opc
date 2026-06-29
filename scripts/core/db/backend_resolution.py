@@ -24,7 +24,9 @@ Precedence (documented once, here):
 * **Backend** (:func:`resolve_backend`):
   1. ``AGENTICA_MEMORY_BACKEND`` when it explicitly names a valid backend
      (``"sqlite"``/``"postgres"``, case-insensitive) — an operator override
-     always wins.
+     always wins. A *non-empty* override that is invalid, or ``postgres`` with
+     no connection URL, raises ``ValueError`` (fail-fast, issue #214) rather
+     than silently falling through.
   2. Otherwise, the presence of *any* connection URL implies ``"postgres"``.
   3. Otherwise the supplied ``default`` (``"sqlite"`` unless overridden).
 
@@ -76,10 +78,39 @@ def resolve_backend(env: Mapping[str, str], *, default: str | None = "sqlite") -
       3. ``default`` (``"sqlite"`` by default; pass ``None`` to signal
          "undetermined" so the caller can apply its own fallback).
 
+    Fail-fast on misconfiguration (issue #214). An explicit override is an
+    operator statement, so a broken one is a hard error rather than a silent
+    fall-through — regardless of ``default``:
+
+      * **Finding 1** — a non-empty ``AGENTICA_MEMORY_BACKEND`` that does not
+        name a valid backend (e.g. the typo ``"sqllite"``) raises
+        :class:`ValueError`. Previously it was silently ignored and resolution
+        fell through to URL presence, so a typo plus a leftover URL routed
+        storage to postgres against the operator's intent.
+      * **Finding 3** — ``AGENTICA_MEMORY_BACKEND=postgres`` with no connection
+        URL raises :class:`ValueError` instead of resolving to ``"postgres"``
+        (which downstream collapsed into a silent sqlite fall-back in the
+        daemon). Blank/whitespace-only values are treated as unset, not invalid.
+
     Pure: reads only ``env``.
+
+    Raises:
+        ValueError: On an invalid override (Finding 1) or explicit ``postgres``
+            with no connection URL (Finding 3).
     """
-    explicit = (env.get(BACKEND_VAR) or "").strip().lower()
-    if explicit in VALID_BACKENDS:
+    raw = env.get(BACKEND_VAR)
+    explicit = (raw or "").strip().lower()
+    if explicit:
+        if explicit not in VALID_BACKENDS:
+            raise ValueError(
+                f"Invalid {BACKEND_VAR}={raw!r}: expected 'sqlite' or 'postgres' "
+                "(case-insensitive)."
+            )
+        if explicit == "postgres" and resolve_url(env) is None:
+            raise ValueError(
+                f"{BACKEND_VAR}=postgres but no PostgreSQL connection URL is set; "
+                f"set one of {', '.join(URL_VARS)}."
+            )
         return explicit
     if resolve_url(env) is not None:
         return "postgres"

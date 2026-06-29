@@ -106,6 +106,33 @@ class TestUsePostgres:
 
         assert use_postgres() is False
 
+    def test_raises_when_postgres_override_without_url(self, monkeypatch):
+        # Issue #214 Finding 3: an explicit AGENTICA_MEMORY_BACKEND=postgres with
+        # no connection URL previously made use_postgres() return False, silently
+        # demoting the daemon to SQLite. It must now fail fast so the misconfig is
+        # a clear startup error (daemon_loop calls this before its serving loop, so
+        # the #102 readiness handshake reports failure rather than crash-looping).
+        monkeypatch.setenv("AGENTICA_MEMORY_BACKEND", "postgres")
+        monkeypatch.delenv("CONTINUOUS_CLAUDE_DB_URL", raising=False)
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        monkeypatch.delenv("OPC_POSTGRES_URL", raising=False)
+        from scripts.core.memory_daemon_db import use_postgres
+
+        with pytest.raises(ValueError, match="no PostgreSQL connection URL"):
+            use_postgres()
+
+    def test_raises_on_invalid_override(self, monkeypatch):
+        # Issue #214 Finding 1: a typo'd override is a hard config error for the
+        # daemon too, not a silent fall-through to URL/sqlite.
+        monkeypatch.setenv("AGENTICA_MEMORY_BACKEND", "sqllite")
+        monkeypatch.delenv("CONTINUOUS_CLAUDE_DB_URL", raising=False)
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        monkeypatch.delenv("OPC_POSTGRES_URL", raising=False)
+        from scripts.core.memory_daemon_db import use_postgres
+
+        with pytest.raises(ValueError, match="sqllite"):
+            use_postgres()
+
 
 class TestPgConnect:
     """pg_connect wraps psycopg2.connect with exponential backoff retry."""

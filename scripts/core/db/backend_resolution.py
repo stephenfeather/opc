@@ -103,12 +103,17 @@ def resolve_backend(env: Mapping[str, str], *, default: str | None = "sqlite") -
         ValueError: On an invalid override (Finding 1) or explicit ``postgres``
             with no connection URL (Finding 3).
     """
-    raw = env.get(BACKEND_VAR)
-    explicit = (raw or "").strip().lower()
+    raw = env.get(BACKEND_VAR) or ""
+    explicit = raw.strip().lower()
     if explicit:
         if explicit not in VALID_BACKENDS:
+            # Truncate the reflected value: a backend selector is a short token,
+            # so a long value is a misconfiguration (e.g. a DSN pasted into the
+            # wrong var). Capping the echo avoids reflecting a credential-bearing
+            # paste back into stderr/logs (aegis defense-in-depth, issue #214).
+            shown = raw if len(raw) <= 32 else raw[:32] + "…"
             raise ValueError(
-                f"Invalid {BACKEND_VAR}={raw!r}: expected 'sqlite' or 'postgres' "
+                f"Invalid {BACKEND_VAR}={shown!r}: expected 'sqlite' or 'postgres' "
                 "(case-insensitive)."
             )
         if explicit == "postgres" and resolve_url(env) is None:

@@ -52,6 +52,15 @@ class TestResolveUrl:
         env = {"CONTINUOUS_CLAUDE_DB_URL": "", "DATABASE_URL": "", "OPC_POSTGRES_URL": ""}
         assert resolve_url(env) is None
 
+    def test_whitespace_only_is_treated_as_unset(self) -> None:
+        # Issue #214: a templated/blank value like "   " must not count as a URL,
+        # else it would bypass the postgres-without-URL fail-fast in resolve_backend.
+        assert resolve_url({"DATABASE_URL": "   "}) is None
+
+    def test_strips_surrounding_whitespace(self) -> None:
+        env = {"DATABASE_URL": "  postgresql://x/y  "}
+        assert resolve_url(env) == "postgresql://x/y"
+
 
 class TestResolveBackend:
     """resolve_backend() — explicit override > URL presence > default."""
@@ -95,6 +104,13 @@ class TestResolveBackend:
         # URL is a misconfiguration, not a silent fall-back to sqlite.
         with pytest.raises(ValueError, match="no PostgreSQL connection URL"):
             resolve_backend({"AGENTICA_MEMORY_BACKEND": "postgres"})
+
+    def test_explicit_postgres_with_whitespace_url_raises(self) -> None:
+        # Finding 3 edge: a whitespace-only URL is not a real URL, so explicit
+        # postgres still fails fast rather than passing a blank DSN downstream.
+        env = {"AGENTICA_MEMORY_BACKEND": "postgres", "DATABASE_URL": "   "}
+        with pytest.raises(ValueError, match="no PostgreSQL connection URL"):
+            resolve_backend(env)
 
     def test_explicit_postgres_without_url_raises_under_none_default(self) -> None:
         # The raise is independent of the caller's `default` (an explicit override

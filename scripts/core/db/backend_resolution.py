@@ -58,14 +58,19 @@ def resolve_url(env: Mapping[str, str]) -> str | None:
     """Return the connection URL by precedence, or ``None`` if unset.
 
     Order: ``CONTINUOUS_CLAUDE_DB_URL`` > ``DATABASE_URL`` >
-    ``OPC_POSTGRES_URL``. Empty-string values are treated as unset.
+    ``OPC_POSTGRES_URL``. Empty or whitespace-only values are treated as unset,
+    and the returned URL is stripped of surrounding whitespace so a blank
+    DSN never reaches the backend (a connection string never carries meaningful
+    leading/trailing whitespace). This keeps the postgres-without-URL fail-fast
+    in :func:`resolve_backend` from being bypassed by a templated ``"   "``
+    value (issue #214).
 
     Pure: reads only ``env``.
     """
     for var in URL_VARS:
         value = env.get(var)
-        if value:
-            return value
+        if value and value.strip():
+            return value.strip()
     return None
 
 

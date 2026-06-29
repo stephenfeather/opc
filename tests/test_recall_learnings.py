@@ -228,8 +228,30 @@ class TestGetBackend:
             assert get_backend() == "sqlite"
 
     def test_explicit_postgres(self):
-        with patch.dict("os.environ", {"AGENTICA_MEMORY_BACKEND": "postgres"}, clear=False):
+        # Issue #214: explicit postgres now requires a URL, so pin one rather than
+        # relying on ambient DATABASE_URL leakage from the dev/CI environment.
+        with patch.dict(
+            "os.environ",
+            {
+                "AGENTICA_MEMORY_BACKEND": "postgres",
+                "DATABASE_URL": "postgresql://localhost/test",
+            },
+            clear=False,
+        ):
             assert get_backend() == "postgres"
+
+    def test_explicit_postgres_without_url_raises(self):
+        # Issue #214 Finding 3 at the recall hot path: explicit postgres with no
+        # URL is a hard config error (get_backend runs on every recall).
+        env_clear = {
+            "AGENTICA_MEMORY_BACKEND": "postgres",
+            "CONTINUOUS_CLAUDE_DB_URL": "",
+            "DATABASE_URL": "",
+            "OPC_POSTGRES_URL": "",
+        }
+        with patch.dict("os.environ", env_clear, clear=False):
+            with pytest.raises(ValueError, match="no PostgreSQL connection URL"):
+                get_backend()
 
     def test_database_url_means_postgres(self):
         env = {"DATABASE_URL": "postgresql://localhost/test"}

@@ -1323,8 +1323,6 @@ async def main() -> int:
         print(f"Provider: {args.provider}")
         print()
 
-    backend = get_backend()
-
     # Fetch-time project scoping (issue #139). Opt-in: resolve a project for
     # --project-first, warn-and-degrade to global recall when none resolves.
     project_scope = resolve_project_scope(
@@ -1340,8 +1338,13 @@ async def main() -> int:
             file=sys.stderr,
         )
 
-    # Resolve and dispatch search
+    # Resolve and dispatch search. get_backend() runs inside the try so a
+    # fail-fast config error (issue #214: invalid AGENTICA_MEMORY_BACKEND, or
+    # postgres without a URL) is rendered through the structured error envelope
+    # below — machine callers (the memory-awareness hook runs this with --json)
+    # get a JSON error instead of a traceback swallowed into silent no-recall.
     try:
+        backend = get_backend()
         params = resolve_search_params(
             backend=backend,
             text_only=args.text_only,

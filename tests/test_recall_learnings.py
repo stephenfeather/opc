@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1214,3 +1215,37 @@ class TestLLMRerankIntegration:
             assert exit_code == 0
             mock_rerank.assert_called_once()
             assert mock_rerank.call_args.kwargs.get("k") == 3
+
+
+class TestMainConfigError:
+    """Issue #214 (review R2): a fail-fast backend-config error must surface
+    through main()'s structured error envelope, not as an uncaught traceback.
+
+    The memory-awareness hook runs recall with --json and reduces a non-zero
+    exit / empty stdout to silent no-recall, so an exception escaping before the
+    JSON envelope would make recall silently stop on every prompt. get_backend()
+    now runs inside main()'s try block, so the error is rendered as JSON.
+    """
+
+    @pytest.mark.asyncio
+    async def test_main_json_error_on_postgres_without_url(self, capsys):
+        env = {
+            "AGENTICA_MEMORY_BACKEND": "postgres",
+            "CONTINUOUS_CLAUDE_DB_URL": "",
+            "DATABASE_URL": "",
+            "OPC_POSTGRES_URL": "",
+        }
+        with (
+            patch.dict("os.environ", env, clear=False),
+            patch("sys.argv", ["recall", "-q", "test", "--json"]),
+        ):
+            from scripts.core.recall_learnings import main
+
+            exit_code = await main()
+
+        assert exit_code == 1
+        payload = json.loads(capsys.readouterr().out)
+        # Structured envelope, not a traceback: the resolver message is carried
+        # through and the results list is empty.
+        assert "no PostgreSQL connection URL" in payload["error"]
+        assert payload["results"] == []

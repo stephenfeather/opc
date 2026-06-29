@@ -659,8 +659,11 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    # Determine backend
-    using_pg = use_postgres() and not args.db  # Custom db path forces SQLite
+    # Determine backend. A custom --db path forces SQLite, so honor it BEFORE
+    # consulting the backend resolver: otherwise an invalid or postgres-without-URL
+    # AGENTICA_MEMORY_BACKEND would make use_postgres() fail-fast (issue #214) and
+    # block a purely local SQLite operation that never needed Postgres at all.
+    using_pg = False if args.db else use_postgres()
     db_type = "PostgreSQL" if using_pg else "SQLite"
 
     # Handle single file indexing (fast path for hooks).

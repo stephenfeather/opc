@@ -47,6 +47,25 @@ class TestArtifactIndexCustomDbOverride:
         assert payload["success"] is False
         assert "not found" in payload["error"].lower()
 
+    def test_no_db_config_error_yields_json_not_traceback(self, monkeypatch, tmp_path, capsys):
+        # Codex P2 (PR #262): without --db, the resolver IS consulted and may
+        # fail-fast (issue #214). Under --file --json the machine-caller contract
+        # requires exactly one JSON object on stdout, not an uncaught traceback.
+        monkeypatch.setenv("AGENTICA_MEMORY_BACKEND", "sqllite")  # invalid -> raises
+        missing = tmp_path / "does-not-exist.md"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["artifact_index.py", "--file", str(missing), "--json"],  # no --db
+        )
+
+        rc = artifact_index.main()
+
+        assert rc == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["success"] is False
+        assert "configuration error" in payload["error"].lower()
+
 
 @MODULES
 class TestArtifactBackendResolution:

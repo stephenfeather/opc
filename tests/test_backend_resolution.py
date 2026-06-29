@@ -99,16 +99,17 @@ class TestResolveBackend:
         with pytest.raises(ValueError, match="sqllite"):
             resolve_backend(env)
 
-    def test_invalid_explicit_long_value_is_truncated(self) -> None:
-        # Defense-in-depth (issue #214): a long misconfigured value (e.g. a DSN
-        # accidentally pasted into the wrong var) is truncated in the error so a
-        # credential-bearing paste is not fully reflected back into stderr/logs.
-        secretish = "postgresql://user:" + "p" * 80 + "@host/db"
+    def test_invalid_explicit_dsn_is_redacted_and_truncated(self) -> None:
+        # Defense-in-depth (issue #214): a DSN accidentally pasted into the wrong
+        # var must not have its credentials reflected back. The user:pass segment
+        # is redacted to ***, and an over-long value is then truncated.
+        secretish = "postgresql://user:" + "p" * 80 + "@" + "h" * 40 + "/db"
         with pytest.raises(ValueError) as exc:
             resolve_backend({"AGENTICA_MEMORY_BACKEND": secretish})
         msg = str(exc.value)
-        assert "…" in msg
-        assert "p" * 80 not in msg
+        assert "***" in msg  # credentials redacted
+        assert "p" * 80 not in msg  # password never reflected
+        assert "…" in msg  # long value still truncated
 
     def test_explicit_postgres_without_url_raises(self) -> None:
         # Finding 3 (issue #214): explicitly selecting postgres with no connection

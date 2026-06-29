@@ -663,7 +663,17 @@ def main() -> int:
     # consulting the backend resolver: otherwise an invalid or postgres-without-URL
     # AGENTICA_MEMORY_BACKEND would make use_postgres() fail-fast (issue #214) and
     # block a purely local SQLite operation that never needed Postgres at all.
-    using_pg = False if args.db else use_postgres()
+    # Without --db the resolver can still fail-fast; under --file --json that must
+    # remain a single JSON object on stdout (the hook fast path's contract), not a
+    # traceback. Guard it so every path yields a clean failure.
+    try:
+        using_pg = False if args.db else use_postgres()
+    except ValueError as e:
+        msg = f"Backend configuration error: {e}"
+        print(msg, file=sys.stderr)
+        if args.file and args.json:
+            print(json.dumps({"success": False, "error": msg}))
+        return 1
     db_type = "PostgreSQL" if using_pg else "SQLite"
 
     # Handle single file indexing (fast path for hooks).

@@ -38,6 +38,7 @@ from ``os.environ``. The thin :func:`get_connection_url` /
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping
 
 # Connection-URL env vars in priority order (canonical, compat, legacy).
@@ -107,11 +108,14 @@ def resolve_backend(env: Mapping[str, str], *, default: str | None = "sqlite") -
     explicit = raw.strip().lower()
     if explicit:
         if explicit not in VALID_BACKENDS:
-            # Truncate the reflected value: a backend selector is a short token,
-            # so a long value is a misconfiguration (e.g. a DSN pasted into the
-            # wrong var). Capping the echo avoids reflecting a credential-bearing
-            # paste back into stderr/logs (aegis defense-in-depth, issue #214).
-            shown = raw if len(raw) <= 32 else raw[:32] + "…"
+            # Reflect the bad value to aid debugging, but harden it first: a
+            # backend selector is a short token, so a long value is a
+            # misconfiguration (e.g. a DSN pasted into the wrong var). Redact any
+            # `://user:pass@` credential segment (mirroring artifact_index's URL
+            # redaction) and cap the length, so a credential-bearing paste is not
+            # reflected back into stderr/logs (issue #214 defense-in-depth).
+            redacted = re.sub(r"://[^@]+@", "://***@", raw)
+            shown = redacted if len(redacted) <= 32 else redacted[:32] + "…"
             raise ValueError(
                 f"Invalid {BACKEND_VAR}={shown!r}: expected 'sqlite' or 'postgres' "
                 "(case-insensitive)."

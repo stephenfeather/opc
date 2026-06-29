@@ -10,6 +10,8 @@ isolated from os.environ and deterministic.
 
 from __future__ import annotations
 
+import pytest
+
 from scripts.core.db.backend_resolution import resolve_backend, resolve_url
 
 
@@ -50,6 +52,15 @@ class TestResolveUrl:
         env = {"CONTINUOUS_CLAUDE_DB_URL": "", "DATABASE_URL": "", "OPC_POSTGRES_URL": ""}
         assert resolve_url(env) is None
 
+    def test_whitespace_only_is_treated_as_unset(self) -> None:
+        # Issue #214: a templated/blank value like "   " must not count as a URL,
+        # else it would bypass the postgres-without-URL fail-fast in resolve_backend.
+        assert resolve_url({"DATABASE_URL": "   "}) is None
+
+    def test_strips_surrounding_whitespace(self) -> None:
+        env = {"DATABASE_URL": "  postgresql://x/y  "}
+        assert resolve_url(env) == "postgresql://x/y"
+
 
 class TestResolveBackend:
     """resolve_backend() — explicit override > URL presence > default."""
@@ -61,16 +72,63 @@ class TestResolveBackend:
         }
         assert resolve_backend(env) == "sqlite"
 
-    def test_explicit_postgres(self) -> None:
-        assert resolve_backend({"AGENTICA_MEMORY_BACKEND": "postgres"}) == "postgres"
+    def test_explicit_postgres_with_url(self) -> None:
+        env = {
+            "AGENTICA_MEMORY_BACKEND": "postgres",
+            "DATABASE_URL": "postgresql://localhost/test",
+        }
+        assert resolve_backend(env) == "postgres"
 
     def test_explicit_is_case_insensitive(self) -> None:
-        assert resolve_backend({"AGENTICA_MEMORY_BACKEND": "PostgreS"}) == "postgres"
-
-    def test_invalid_explicit_is_ignored(self) -> None:
-        # An unrecognised value falls through to URL/default resolution.
-        env = {"AGENTICA_MEMORY_BACKEND": "redis", "DATABASE_URL": "postgresql://x/y"}
+        # sqlite needs no URL, so it exercises case-folding without Finding-3.
+        assert resolve_backend({"AGENTICA_MEMORY_BACKEND": "SqLite"}) == "sqlite"
+        env = {"AGENTICA_MEMORY_BACKEND": "PostgreS", "DATABASE_URL": "postgresql://x/y"}
         assert resolve_backend(env) == "postgres"
+
+    def test_invalid_explicit_raises(self) -> None:
+        # Finding 1 (issue #214): an unrecognised override is a hard config error,
+        # not silently ignored — it must not fall through to URL/default.
+        with pytest.raises(ValueError, match="AGENTICA_MEMORY_BACKEND"):
+            resolve_backend({"AGENTICA_MEMORY_BACKEND": "redis"})
+
+    def test_invalid_explicit_with_url_raises(self) -> None:
+        # Finding 1 core case: a typo'd override (e.g. "sqllite") together with a
+        # leftover URL previously fell through to postgres, silently ignoring the
+        # operator's intent. It must now fail fast.
+        env = {"AGENTICA_MEMORY_BACKEND": "sqllite", "DATABASE_URL": "postgresql://x/y"}
+        with pytest.raises(ValueError, match="sqllite"):
+            resolve_backend(env)
+
+    def test_invalid_explicit_dsn_is_redacted_and_truncated(self) -> None:
+        # Defense-in-depth (issue #214): a DSN accidentally pasted into the wrong
+        # var must not have its credentials reflected back. The user:pass segment
+        # is redacted to ***, and an over-long value is then truncated.
+        secretish = "postgresql://user:" + "p" * 80 + "@" + "h" * 40 + "/db"
+        with pytest.raises(ValueError) as exc:
+            resolve_backend({"AGENTICA_MEMORY_BACKEND": secretish})
+        msg = str(exc.value)
+        assert "***" in msg  # credentials redacted
+        assert "p" * 80 not in msg  # password never reflected
+        assert "…" in msg  # long value still truncated
+
+    def test_explicit_postgres_without_url_raises(self) -> None:
+        # Finding 3 (issue #214): explicitly selecting postgres with no connection
+        # URL is a misconfiguration, not a silent fall-back to sqlite.
+        with pytest.raises(ValueError, match="no PostgreSQL connection URL"):
+            resolve_backend({"AGENTICA_MEMORY_BACKEND": "postgres"})
+
+    def test_explicit_postgres_with_whitespace_url_raises(self) -> None:
+        # Finding 3 edge: a whitespace-only URL is not a real URL, so explicit
+        # postgres still fails fast rather than passing a blank DSN downstream.
+        env = {"AGENTICA_MEMORY_BACKEND": "postgres", "DATABASE_URL": "   "}
+        with pytest.raises(ValueError, match="no PostgreSQL connection URL"):
+            resolve_backend(env)
+
+    def test_explicit_postgres_without_url_raises_under_none_default(self) -> None:
+        # The raise is independent of the caller's `default` (an explicit override
+        # is an operator statement, so detect_backend's default=None path raises too).
+        with pytest.raises(ValueError, match="no PostgreSQL connection URL"):
+            resolve_backend({"AGENTICA_MEMORY_BACKEND": "postgres"}, default=None)
 
     def test_url_presence_implies_postgres(self) -> None:
         assert resolve_backend({"DATABASE_URL": "postgresql://localhost/test"}) == "postgres"

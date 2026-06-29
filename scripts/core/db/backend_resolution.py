@@ -24,7 +24,9 @@ Precedence (documented once, here):
 * **Backend** (:func:`resolve_backend`):
   1. ``AGENTICA_MEMORY_BACKEND`` when it explicitly names a valid backend
      (``"sqlite"``/``"postgres"``, case-insensitive) — an operator override
-     always wins.
+     always wins. A *non-empty* override that is invalid, or ``postgres`` with
+     no connection URL, raises ``ValueError`` (fail-fast, issue #214) rather
+     than silently falling through.
   2. Otherwise, the presence of *any* connection URL implies ``"postgres"``.
   3. Otherwise the supplied ``default`` (``"sqlite"`` unless overridden).
 
@@ -36,6 +38,7 @@ from ``os.environ``. The thin :func:`get_connection_url` /
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping
 
 # Connection-URL env vars in priority order (canonical, compat, legacy).
@@ -56,14 +59,19 @@ def resolve_url(env: Mapping[str, str]) -> str | None:
     """Return the connection URL by precedence, or ``None`` if unset.
 
     Order: ``CONTINUOUS_CLAUDE_DB_URL`` > ``DATABASE_URL`` >
-    ``OPC_POSTGRES_URL``. Empty-string values are treated as unset.
+    ``OPC_POSTGRES_URL``. Empty or whitespace-only values are treated as unset,
+    and the returned URL is stripped of surrounding whitespace so a blank
+    DSN never reaches the backend (a connection string never carries meaningful
+    leading/trailing whitespace). This keeps the postgres-without-URL fail-fast
+    in :func:`resolve_backend` from being bypassed by a templated ``"   "``
+    value (issue #214).
 
     Pure: reads only ``env``.
     """
     for var in URL_VARS:
         value = env.get(var)
-        if value:
-            return value
+        if value and value.strip():
+            return value.strip()
     return None
 
 
@@ -76,10 +84,47 @@ def resolve_backend(env: Mapping[str, str], *, default: str | None = "sqlite") -
       3. ``default`` (``"sqlite"`` by default; pass ``None`` to signal
          "undetermined" so the caller can apply its own fallback).
 
+    Fail-fast on misconfiguration (issue #214). An explicit override is an
+    operator statement, so a broken one is a hard error rather than a silent
+    fall-through — regardless of ``default``:
+
+      * **Finding 1** — a non-empty ``AGENTICA_MEMORY_BACKEND`` that does not
+        name a valid backend (e.g. the typo ``"sqllite"``) raises
+        :class:`ValueError`. Previously it was silently ignored and resolution
+        fell through to URL presence, so a typo plus a leftover URL routed
+        storage to postgres against the operator's intent.
+      * **Finding 3** — ``AGENTICA_MEMORY_BACKEND=postgres`` with no connection
+        URL raises :class:`ValueError` instead of resolving to ``"postgres"``
+        (which downstream collapsed into a silent sqlite fall-back in the
+        daemon). Blank/whitespace-only values are treated as unset, not invalid.
+
     Pure: reads only ``env``.
+
+    Raises:
+        ValueError: On an invalid override (Finding 1) or explicit ``postgres``
+            with no connection URL (Finding 3).
     """
-    explicit = (env.get(BACKEND_VAR) or "").strip().lower()
-    if explicit in VALID_BACKENDS:
+    raw = env.get(BACKEND_VAR) or ""
+    explicit = raw.strip().lower()
+    if explicit:
+        if explicit not in VALID_BACKENDS:
+            # Reflect the bad value to aid debugging, but harden it first: a
+            # backend selector is a short token, so a long value is a
+            # misconfiguration (e.g. a DSN pasted into the wrong var). Redact any
+            # `://user:pass@` credential segment (mirroring artifact_index's URL
+            # redaction) and cap the length, so a credential-bearing paste is not
+            # reflected back into stderr/logs (issue #214 defense-in-depth).
+            redacted = re.sub(r"://[^@]+@", "://***@", raw)
+            shown = redacted if len(redacted) <= 32 else redacted[:32] + "…"
+            raise ValueError(
+                f"Invalid {BACKEND_VAR}={shown!r}: expected 'sqlite' or 'postgres' "
+                "(case-insensitive)."
+            )
+        if explicit == "postgres" and resolve_url(env) is None:
+            raise ValueError(
+                f"{BACKEND_VAR}=postgres but no PostgreSQL connection URL is set; "
+                f"set one of {', '.join(URL_VARS)}."
+            )
         return explicit
     if resolve_url(env) is not None:
         return "postgres"

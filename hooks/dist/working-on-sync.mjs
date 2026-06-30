@@ -80,7 +80,7 @@ function resolveBackend(env, defaultBackend = "sqlite") {
   if (explicit) {
     if (!VALID_BACKENDS.has(explicit)) {
       const candidate = raw.trim();
-      const safeToken = /^[A-Za-z0-9_-]{1,16}$/.test(candidate);
+      const safeToken = /^[A-Za-z0-9_-]{1,8}$/.test(candidate);
       const shown = safeToken ? `'${candidate}'` : "<redacted non-token value>";
       throw new Error(
         `Invalid ${BACKEND_VAR}=${shown}: expected 'sqlite' or 'postgres' (case-insensitive).`

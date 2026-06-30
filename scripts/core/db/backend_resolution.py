@@ -119,7 +119,10 @@ def resolve_backend(env: Mapping[str, str], *, default: str | None = "sqlite") -
             # credential strings entirely (issue #265 r3 / #214 defense-in-depth;
             # kept in lockstep with hooks/src/shared/backend-resolution.ts).
             candidate = raw.strip()
-            safe_token = re.fullmatch(r"[A-Za-z0-9_-]{1,16}", candidate) is not None
+            # Bound at 8 chars: the longest legitimate backend token is
+            # 'postgres'. Keeping the window tight shrinks the residual where a
+            # short delimiter-free secret could be echoed (aegis #265 hardening).
+            safe_token = re.fullmatch(r"[A-Za-z0-9_-]{1,8}", candidate) is not None
             shown = repr(candidate) if safe_token else "<redacted non-token value>"
             raise ValueError(
                 f"Invalid {BACKEND_VAR}={shown}: expected 'sqlite' or 'postgres' "

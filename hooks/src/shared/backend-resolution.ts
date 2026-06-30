@@ -100,7 +100,10 @@ export function resolveBackend(env: Env, defaultBackend: string | null = 'sqlite
       // SessionStart output (#265 r2), a partial leak is unacceptable
       // (#265 r3 / #214 defense-in-depth).
       const candidate = raw.trim();
-      const safeToken = /^[A-Za-z0-9_-]{1,16}$/.test(candidate);
+      // Bound at 8 chars: the longest legitimate backend token is 'postgres'.
+      // Keeping the window tight shrinks the residual where a short delimiter-
+      // free secret could be echoed (aegis #265 low-finding hardening).
+      const safeToken = /^[A-Za-z0-9_-]{1,8}$/.test(candidate);
       const shown = safeToken ? `'${candidate}'` : '<redacted non-token value>';
       throw new Error(
         `Invalid ${BACKEND_VAR}=${shown}: expected 'sqlite' or 'postgres' (case-insensitive).`,

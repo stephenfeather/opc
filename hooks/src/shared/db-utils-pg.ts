@@ -15,7 +15,7 @@
 import { spawn, spawnSync } from 'child_process';
 import type { QueryResult } from './types.js';
 import { requireOpcDir } from './opc-path.js';
-import { pgCoordinationStatus } from './backend-resolution.js';
+import { pgCoordinationStatus, getConnectionUrl } from './backend-resolution.js';
 
 // Re-export SAFE_ID_PATTERN and isValidId from pattern-router for convenience
 export { SAFE_ID_PATTERN, isValidId } from './pattern-router.js';
@@ -78,14 +78,18 @@ function pgGate(): { proceed: boolean; reason?: string } {
  *
  * Issue #62: no hardcoded development fallback. Throws if none set.
  *
+ * Delegates to the shared resolver (getConnectionUrl -> resolveUrl) so URL
+ * selection here is byte-identical to the backend gate's decision (#265): same
+ * precedence, blank/whitespace-only values skipped, and the selected URL
+ * trimmed. Without this, the gate could approve Postgres via a valid fallback
+ * (e.g. DATABASE_URL) while this function returned a blank canonical
+ * CONTINUOUS_CLAUDE_DB_URL and fed whitespace to the subprocess.
+ *
  * @returns PostgreSQL connection string
  * @throws Error when no DB env var is set
  */
 export function getPgConnectionString(): string {
-  const url =
-    process.env.CONTINUOUS_CLAUDE_DB_URL ||
-    process.env.DATABASE_URL ||
-    process.env.OPC_POSTGRES_URL;
+  const url = getConnectionUrl();
   if (!url) {
     throw new Error(
       "Database URL not set. Set CONTINUOUS_CLAUDE_DB_URL (preferred), " +

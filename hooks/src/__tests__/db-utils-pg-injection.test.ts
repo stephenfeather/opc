@@ -149,3 +149,70 @@ describe('runPgQuery opcDir injection protection (Issue #88)', () => {
     expect(pythonArgs[pythonArgs.length - 1]).toBe('arg2');
   });
 });
+
+// ---------------------------------------------------------------------------
+// #265 round-1 regression: the URL injected into the subprocess MUST match the
+// resolver-selected URL the gate approved (precedence + blank-skip + trim),
+// not the old raw `||` lookup. Otherwise a blank canonical var shadows a valid
+// fallback and the subprocess connects with whitespace.
+// ---------------------------------------------------------------------------
+
+describe('runPgQuery URL resolution parity with the backend gate (#265)', () => {
+  const ENV_KEYS = [
+    'CONTINUOUS_CLAUDE_DB_URL',
+    'DATABASE_URL',
+    'OPC_POSTGRES_URL',
+    'AGENTICA_MEMORY_BACKEND',
+  ];
+  let saved: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    saved = {};
+    for (const k of ENV_KEYS) {
+      saved[k] = process.env[k];
+      delete process.env[k];
+    }
+    vi.clearAllMocks();
+    mockedRequireOpcDir.mockReturnValue('/tmp/safe-path');
+    mockedSpawnSync.mockReturnValue({
+      status: 0,
+      stdout: 'ok',
+      stderr: '',
+      pid: 1234,
+      signal: null,
+      output: ['', 'ok', ''],
+    });
+  });
+
+  afterEach(() => {
+    for (const k of ENV_KEYS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  });
+
+  function injectedDbUrl(): string {
+    const spawnOptions = mockedSpawnSync.mock.calls[0][2] as Record<string, unknown>;
+    const env = spawnOptions.env as Record<string, string>;
+    return env.CONTINUOUS_CLAUDE_DB_URL;
+  }
+
+  it('injects the resolver fallback when the canonical var is blank but DATABASE_URL is valid', () => {
+    process.env.CONTINUOUS_CLAUDE_DB_URL = '   ';
+    process.env.DATABASE_URL = 'postgres://valid@h/db';
+
+    const res = runPgQuery('print("x")');
+
+    expect(res.success).toBe(true);
+    expect(mockedSpawnSync).toHaveBeenCalledTimes(1);
+    expect(injectedDbUrl()).toBe('postgres://valid@h/db');
+  });
+
+  it('injects the trimmed URL (surrounding whitespace stripped)', () => {
+    process.env.CONTINUOUS_CLAUDE_DB_URL = '  postgres://valid@h/db  ';
+
+    runPgQuery('print("x")');
+
+    expect(injectedDbUrl()).toBe('postgres://valid@h/db');
+  });
+});

@@ -373,6 +373,9 @@ function resolveBackend(env, defaultBackend = "sqlite") {
   }
   return defaultBackend;
 }
+function getConnectionUrl() {
+  return resolveUrl(process.env);
+}
 function pgCoordinationStatus(env = process.env) {
   try {
     return { active: resolveBackend(env) === "postgres" };
@@ -399,7 +402,7 @@ function pgGate() {
   return { proceed: false };
 }
 function getPgConnectionString() {
-  const url = process.env.CONTINUOUS_CLAUDE_DB_URL || process.env.DATABASE_URL || process.env.OPC_POSTGRES_URL;
+  const url = getConnectionUrl();
   if (!url) {
     throw new Error(
       "Database URL not set. Set CONTINUOUS_CLAUDE_DB_URL (preferred), DATABASE_URL, or OPC_POSTGRES_URL. For local Docker dev, run `docker compose -f docker/docker-compose.yml up -d` and export the credentials from docker/.env before invoking this hook."

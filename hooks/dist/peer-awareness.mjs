@@ -303,6 +303,10 @@ function main() {
     console.log(JSON.stringify({}));
     return;
   }
+  if (!pgCoordinationStatus().active) {
+    console.log(JSON.stringify({}));
+    return;
+  }
   let ownSessionId = null;
   try {
     const stdinContent = readFileSync3(0, "utf-8");

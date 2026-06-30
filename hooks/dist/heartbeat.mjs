@@ -144,9 +144,12 @@ import os
 import asyncio
 import json
 
-# Add opc to path for imports
-sys.path.insert(0, '${opcDir}')
-os.chdir('${opcDir}')
+# Add opc to path for imports (read from env to avoid code injection)
+_opc_dir = os.environ.get('_OPC_DIR')
+if not _opc_dir:
+    raise RuntimeError('_OPC_DIR environment variable not set - must be called via runPgQueryDetached()')
+sys.path.insert(0, _opc_dir)
+os.chdir(_opc_dir)
 
 ${pythonCode}
 `;
@@ -159,7 +162,8 @@ ${pythonCode}
         // Never rewrite opc's uv.lock from a hook-triggered uv run (issue #71
         // follow-up); the frequent heartbeat path runs through here.
         UV_FROZEN: "1",
-        CONTINUOUS_CLAUDE_DB_URL: resolvedDbUrl
+        CONTINUOUS_CLAUDE_DB_URL: resolvedDbUrl,
+        _OPC_DIR: opcDir
       }
     });
     child.unref();

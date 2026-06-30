@@ -10,18 +10,20 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { spawnSync } from 'child_process';
+import { spawnSync, spawn } from 'child_process';
 
 // We test runPgQuery indirectly by mocking its dependencies and
 // verifying the generated Python code is safe.
 
-// Mock child_process.spawnSync to capture what gets passed to Python
+// Mock child_process spawnSync (runPgQuery) and spawn (runPgQueryDetached) to
+// capture what gets passed to Python.
 vi.mock('child_process', () => ({
   spawnSync: vi.fn(() => ({
     status: 0,
     stdout: 'ok',
     stderr: '',
   })),
+  spawn: vi.fn(() => ({ unref: vi.fn() })),
 }));
 
 // Mock opc-path to return controlled opcDir values
@@ -29,10 +31,11 @@ vi.mock('../shared/opc-path.js', () => ({
   requireOpcDir: vi.fn(() => '/tmp/safe-path'),
 }));
 
-import { runPgQuery } from '../shared/db-utils-pg.js';
+import { runPgQuery, runPgQueryDetached } from '../shared/db-utils-pg.js';
 import { requireOpcDir } from '../shared/opc-path.js';
 
 const mockedSpawnSync = vi.mocked(spawnSync);
+const mockedSpawn = vi.mocked(spawn);
 const mockedRequireOpcDir = vi.mocked(requireOpcDir);
 
 describe('runPgQuery opcDir injection protection (Issue #88)', () => {
@@ -214,5 +217,73 @@ describe('runPgQuery URL resolution parity with the backend gate (#265)', () => 
     runPgQuery('print("x")');
 
     expect(injectedDbUrl()).toBe('postgres://valid@h/db');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runPgQueryDetached opcDir injection protection (gemini PR #266 review).
+// The detached twin of runPgQuery had the same Issue #88 hole: it interpolated
+// opcDir directly into the Python string. It must pass opcDir via _OPC_DIR env
+// and read it with os.environ.get, exactly like runPgQuery.
+// ---------------------------------------------------------------------------
+
+describe('runPgQueryDetached opcDir injection protection (#88 parity)', () => {
+  const ENV_KEYS = [
+    'CONTINUOUS_CLAUDE_DB_URL',
+    'DATABASE_URL',
+    'OPC_POSTGRES_URL',
+    'AGENTICA_MEMORY_BACKEND',
+  ];
+  let saved: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    saved = {};
+    for (const k of ENV_KEYS) {
+      saved[k] = process.env[k];
+      delete process.env[k];
+    }
+    // Pin a URL so the backend gate proceeds to the spawn path deterministically.
+    process.env.CONTINUOUS_CLAUDE_DB_URL = 'postgres://test@localhost/test';
+    vi.clearAllMocks();
+    mockedRequireOpcDir.mockReturnValue('/tmp/safe-path');
+    mockedSpawn.mockReturnValue({ unref: vi.fn() } as unknown as ReturnType<typeof spawn>);
+  });
+
+  afterEach(() => {
+    for (const k of ENV_KEYS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  });
+
+  function detachedPythonCode(): string {
+    const callArgs = mockedSpawn.mock.calls[0];
+    const argv = callArgs[1] as string[];
+    const cIndex = argv.indexOf('-c');
+    return argv[cIndex + 1];
+  }
+
+  it('does not interpolate opcDir into the Python code string', () => {
+    const maliciousPath = "/tmp/it's-a-trap";
+    mockedRequireOpcDir.mockReturnValue(maliciousPath);
+
+    runPgQueryDetached('print("hello")');
+
+    expect(mockedSpawn).toHaveBeenCalledTimes(1);
+    const code = detachedPythonCode();
+    expect(code).not.toContain(maliciousPath);
+    expect(code).not.toContain("'${opcDir}'");
+  });
+
+  it('passes opcDir via the _OPC_DIR environment variable and reads it from os.environ', () => {
+    const pathWithQuote = "/tmp/path'with\"quotes";
+    mockedRequireOpcDir.mockReturnValue(pathWithQuote);
+
+    runPgQueryDetached('print("hello")');
+
+    const spawnOptions = mockedSpawn.mock.calls[0][2] as Record<string, unknown>;
+    const env = spawnOptions.env as Record<string, string>;
+    expect(env._OPC_DIR).toBe(pathWithQuote);
+    expect(detachedPythonCode()).toContain("os.environ.get('_OPC_DIR')");
   });
 });

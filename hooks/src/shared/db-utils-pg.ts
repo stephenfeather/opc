@@ -1125,15 +1125,23 @@ export function runPgQueryDetached(pythonCode: string, args: string[] = []): voi
   const resolvedDbUrl = getPgConnectionString();
   const opcDir = requireOpcDir();
   try {
+    // SECURITY: opcDir is passed via the _OPC_DIR environment variable, NOT
+    // interpolated into the Python string — a path containing a quote would
+    // otherwise break out of the literal and execute arbitrary code. This
+    // mirrors runPgQuery's Issue #88 fix (the detached twin had the same hole;
+    // gemini PR #266 review).
     const wrappedCode = `
 import sys
 import os
 import asyncio
 import json
 
-# Add opc to path for imports
-sys.path.insert(0, '${opcDir}')
-os.chdir('${opcDir}')
+# Add opc to path for imports (read from env to avoid code injection)
+_opc_dir = os.environ.get('_OPC_DIR')
+if not _opc_dir:
+    raise RuntimeError('_OPC_DIR environment variable not set - must be called via runPgQueryDetached()')
+sys.path.insert(0, _opc_dir)
+os.chdir(_opc_dir)
 
 ${pythonCode}
 `;
@@ -1148,6 +1156,7 @@ ${pythonCode}
         // follow-up); the frequent heartbeat path runs through here.
         UV_FROZEN: '1',
         CONTINUOUS_CLAUDE_DB_URL: resolvedDbUrl,
+        _OPC_DIR: opcDir,
       },
     });
 

@@ -40,7 +40,7 @@ uv run python -m scripts.core.type_affinity --refresh --model-label local
 
 ## 1. opc-memory MCP tools (agent-facing)
 
-18 tools, defined in `~/Tools/opc-memory-mcp/main.py`. These are what Claude calls during a session.
+17 tools, defined in `~/Tools/opc-memory-mcp/main.py`. These are what Claude calls during a session.
 
 ### Recall & Store
 
@@ -177,7 +177,7 @@ Start, stop, or check the background memory-extraction daemon. No parameters. `d
 
 ## 2. The `opc` CLI (human-facing)
 
-The `opc` dispatcher (`scripts/core/cli.py`) wraps 29 argparse scripts. Run `opc --help` to discover all of them, or `opc <command> --help` for per-command flags. Grouped by category below.
+The `opc` dispatcher (`scripts/core/cli.py`) registers **26 commands** across **25 unique argparse scripts** (`pattern detect` and `pattern batch` both map to `pattern_batch.py`). Run `opc --help` to discover all of them, or `opc <command> --help` for per-command flags. Grouped by category below.
 
 ### Recall & Store
 
@@ -325,6 +325,25 @@ Each calls an external API and prints results. None are in `opc`.
 | `benchmark_tokens.py` | Benchmark token savings: raw files vs TLDR | none |
 
 > Scripts marked *"must run from repo root"* import the in-repo MCP runtime and fail with an import error unless launched from the repository root (or with `PYTHONPATH=.`).
+
+### Shell scripts (`.sh`)
+
+Runnable shell helpers under `scripts/`. Most are invoked by hooks, skills, cron, or the status line rather than typed by hand.
+
+| Script | Description |
+|--------|-------------|
+| `build_hooks.sh` | Build `hooks/src/*.ts` into `hooks/dist/` atomically (staging dir + `rsync --delete`, mkdir lock — never leaves `dist/` partial) |
+| `deploy_hooks.sh` | Mirror `hooks/src`, `hooks/dist`, and top-level runtime files into `~/.claude/hooks/` (opc is source of truth; one-way sync) |
+| `run_mutmut_tests.sh` | Wrapper that runs the coordination test suite under mutmut with the correct `PYTHONPATH` |
+| `spec_metadata.sh` | Emit datetime + git metadata (repo, branch, commit) for thoughts/spec tooling |
+| `core/documents/rescan_cron.sh` | Cron wrapper: incremental, idempotent rescan of every registered doc collection (mkdir lock, logs to `~/.claude/logs/`) |
+| `client/status.sh` | Status-line renderer — context %, branch, last-done → current-focus one-liner |
+| `client/phase-progress-status.sh` | Status-line widget: multi-phase implementation progress from the ledger's checkbox state |
+| `client/agent-animation.sh` | Animated ASCII agent display driven by a marker file |
+| `client/get-resources.sh` | Cross-platform RAM detection, outputs JSON (`freeMemMB`, `totalMemMB`) |
+| `client/generate-reasoning.sh` | Capture per-commit reasoning (called by the `/commit` skill after each commit) |
+| `client/aggregate-reasoning.sh` | Aggregate reasoning across commits into an "Approaches Tried" PR section |
+| `client/search-reasoning.sh` | Search past reasoning files for failed approaches, solutions, and decisions |
 
 ### Library-only directories (no commands)
 

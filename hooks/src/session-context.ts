@@ -26,13 +26,18 @@ export interface HealthStatus {
  *
  * @param pgRegistrationSucceeded - Whether the session registration DB call succeeded
  * @param pidFilePath - Path to the daemon PID file (~/.claude/memory-daemon.pid)
+ * @param pgApplicable - Whether Postgres is the active backend (#265). When false
+ *   (a sqlite / non-postgres backend), PG is not the active store, so a
+ *   skipped/failed registration is reported as healthy to avoid a misleading
+ *   "PostgreSQL: unreachable" warning. Defaults to true (backward compatible).
  * @returns Health status for PG and daemon
  */
 export function checkMemoryHealth(
   pgRegistrationSucceeded: boolean,
   pidFilePath: string,
+  pgApplicable: boolean = true,
 ): HealthStatus {
-  const pgHealthy = pgRegistrationSucceeded;
+  const pgHealthy = pgApplicable ? pgRegistrationSucceeded : true;
   let daemonRunning = false;
 
   try {

@@ -60,6 +60,23 @@ describe('checkMemoryHealth', () => {
     expect(result.daemonRunning).toBe(false);
   });
 
+  it('forces pgHealthy=true when pgApplicable=false, even if registration failed (#265)', async () => {
+    // Under a non-postgres backend, PG is not the active store — a failed/skipped
+    // registration must NOT surface a misleading "PostgreSQL: unreachable" warning.
+    const { checkMemoryHealth } = await import('../session-context.js');
+
+    const result = checkMemoryHealth(false, '/nonexistent/path.pid', false);
+    expect(result.pgHealthy).toBe(true);
+  });
+
+  it('still honors registration failure when pgApplicable=true (default)', async () => {
+    const { checkMemoryHealth } = await import('../session-context.js');
+
+    expect(checkMemoryHealth(false, '/nonexistent/path.pid', true).pgHealthy).toBe(false);
+    // default param remains backward-compatible
+    expect(checkMemoryHealth(false, '/nonexistent/path.pid').pgHealthy).toBe(false);
+  });
+
   it('returns daemonRunning=false when PID process is dead', async () => {
     const { checkMemoryHealth } = await import('../session-context.js');
 

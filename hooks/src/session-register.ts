@@ -11,6 +11,7 @@
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { registerSession, isValidId } from './shared/db-utils-pg.js';
+import { pgCoordinationStatus } from './shared/backend-resolution.js';
 import { getProject } from './shared/session-id.js';
 import { checkMemoryHealth, formatHealthWarnings, getPendingTasksSummary } from './session-context.js';
 import type { SessionStartInput, HookOutput } from './shared/types.js';
@@ -49,13 +50,25 @@ export function main(): void {
   // Store session ID in environment for other hooks within this process
   process.env.COORDINATION_SESSION_ID = sessionId;
 
+  // Backend gate (#265): only register in Postgres when PG is the active
+  // backend. Under sqlite (explicit or the no-config default) the coordination
+  // layer is PG-only, so skip registration and don't report PG as unhealthy. A
+  // misconfig surfaces a loud (redacted) diagnostic but never blocks the session.
+  const pgStatus = pgCoordinationStatus();
+  if (pgStatus.misconfig) {
+    process.stderr.write(`[session-register] ${pgStatus.misconfig}\n`);
+  }
+
   // Register session in PostgreSQL (include Claude's session ID, transcript path, and PID for crash recovery)
   // process.ppid is the Claude CLI process that spawned this hook
-  const registerResult = registerSession(sessionId, project, '', input.session_id, input.transcript_path, process.ppid);
+  const registerResult = pgStatus.active
+    ? registerSession(sessionId, project, '', input.session_id, input.transcript_path, process.ppid)
+    : { success: false };
 
-  // Check memory system health (piggyback on registration result for PG status)
+  // Check memory system health. pgApplicable=false under a non-postgres backend
+  // so a skipped registration is not reported as "PostgreSQL: unreachable".
   const daemonPidPath = join(process.env.HOME || '/tmp', '.claude', 'memory-daemon.pid');
-  const health = checkMemoryHealth(registerResult.success, daemonPidPath);
+  const health = checkMemoryHealth(registerResult.success, daemonPidPath, pgStatus.active);
   const healthWarnings = formatHealthWarnings(health);
 
   // Check for pending tasks

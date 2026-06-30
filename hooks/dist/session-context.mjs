@@ -1,8 +1,8 @@
 // src/session-context.ts
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from "fs";
 import { dirname } from "path";
-function checkMemoryHealth(pgRegistrationSucceeded, pidFilePath) {
-  const pgHealthy = pgRegistrationSucceeded;
+function checkMemoryHealth(pgRegistrationSucceeded, pidFilePath, pgApplicable = true) {
+  const pgHealthy = pgApplicable ? pgRegistrationSucceeded : true;
   let daemonRunning = false;
   try {
     const pidContent = readFileSync(pidFilePath, "utf-8").trim();

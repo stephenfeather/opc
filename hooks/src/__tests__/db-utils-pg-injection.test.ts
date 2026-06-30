@@ -36,7 +36,17 @@ const mockedSpawnSync = vi.mocked(spawnSync);
 const mockedRequireOpcDir = vi.mocked(requireOpcDir);
 
 describe('runPgQuery opcDir injection protection (Issue #88)', () => {
+  // #265 backend gate: runPgQuery now no-ops unless the backend resolves to
+  // postgres. Pin a URL so the gate proceeds and spawnSync is reached —
+  // deterministic regardless of ambient env (no #214-style leakage dependency).
+  let savedDbUrl: string | undefined;
+  let savedBackend: string | undefined;
+
   beforeEach(() => {
+    savedDbUrl = process.env.CONTINUOUS_CLAUDE_DB_URL;
+    savedBackend = process.env.AGENTICA_MEMORY_BACKEND;
+    process.env.CONTINUOUS_CLAUDE_DB_URL = 'postgres://test:test@localhost:5432/test';
+    delete process.env.AGENTICA_MEMORY_BACKEND;
     vi.clearAllMocks();
     mockedSpawnSync.mockReturnValue({
       status: 0,
@@ -46,6 +56,13 @@ describe('runPgQuery opcDir injection protection (Issue #88)', () => {
       signal: null,
       output: ['', 'ok', ''],
     });
+  });
+
+  afterEach(() => {
+    if (savedDbUrl === undefined) delete process.env.CONTINUOUS_CLAUDE_DB_URL;
+    else process.env.CONTINUOUS_CLAUDE_DB_URL = savedDbUrl;
+    if (savedBackend === undefined) delete process.env.AGENTICA_MEMORY_BACKEND;
+    else process.env.AGENTICA_MEMORY_BACKEND = savedBackend;
   });
 
   it('should not interpolate opcDir directly into Python code string', () => {

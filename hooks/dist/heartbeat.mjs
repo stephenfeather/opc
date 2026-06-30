@@ -56,6 +56,54 @@ function requireOpcDir() {
   return opcDir;
 }
 
+// src/shared/backend-resolution.ts
+var URL_VARS = [
+  "CONTINUOUS_CLAUDE_DB_URL",
+  "DATABASE_URL",
+  "OPC_POSTGRES_URL"
+];
+var VALID_BACKENDS = /* @__PURE__ */ new Set(["sqlite", "postgres"]);
+var BACKEND_VAR = "AGENTICA_MEMORY_BACKEND";
+function resolveUrl(env) {
+  for (const varName of URL_VARS) {
+    const value = env[varName];
+    if (value && value.trim()) {
+      return value.trim();
+    }
+  }
+  return null;
+}
+function resolveBackend(env, defaultBackend = "sqlite") {
+  const raw = env[BACKEND_VAR] ?? "";
+  const explicit = raw.trim().toLowerCase();
+  if (explicit) {
+    if (!VALID_BACKENDS.has(explicit)) {
+      const redacted = raw.replace(/:\/\/[^@]+@/g, "://***@");
+      const shown = redacted.length <= 32 ? redacted : redacted.slice(0, 32) + "\u2026";
+      throw new Error(
+        `Invalid ${BACKEND_VAR}='${shown}': expected 'sqlite' or 'postgres' (case-insensitive).`
+      );
+    }
+    if (explicit === "postgres" && resolveUrl(env) === null) {
+      throw new Error(
+        `${BACKEND_VAR}=postgres but no PostgreSQL connection URL is set; set one of ${URL_VARS.join(", ")}.`
+      );
+    }
+    return explicit;
+  }
+  if (resolveUrl(env) !== null) {
+    return "postgres";
+  }
+  return defaultBackend;
+}
+function pgCoordinationStatus(env = process.env) {
+  try {
+    return { active: resolveBackend(env) === "postgres" };
+  } catch (err) {
+    return { active: false, misconfig: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 // src/shared/pattern-router.ts
 var SAFE_ID_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
 function isValidId(id) {
@@ -63,6 +111,22 @@ function isValidId(id) {
 }
 
 // src/shared/db-utils-pg.ts
+var misconfigLogged = false;
+function pgGate() {
+  const status = pgCoordinationStatus();
+  if (status.active) {
+    return { proceed: true };
+  }
+  if (status.misconfig) {
+    if (!misconfigLogged) {
+      misconfigLogged = true;
+      process.stderr.write(`[db-utils-pg] ${status.misconfig}
+`);
+    }
+    return { proceed: false, reason: status.misconfig };
+  }
+  return { proceed: false };
+}
 function getPgConnectionString() {
   const url = process.env.CONTINUOUS_CLAUDE_DB_URL || process.env.DATABASE_URL || process.env.OPC_POSTGRES_URL;
   if (!url) {
@@ -73,6 +137,9 @@ function getPgConnectionString() {
   return url;
 }
 function runPgQueryDetached(pythonCode, args = []) {
+  if (!pgGate().proceed) {
+    return;
+  }
   const resolvedDbUrl = getPgConnectionString();
   const opcDir = requireOpcDir();
   try {

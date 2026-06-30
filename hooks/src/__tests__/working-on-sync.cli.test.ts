@@ -76,8 +76,9 @@ describe("working-on-sync CLI", () => {
   });
 
   it("still emits continue (exit 0) on a DB-writing event when no DB URL is set", () => {
-    // Review r1: updateWorkingOnDetached -> getPgConnectionString() throws on
-    // missing DB env; the hook must swallow it and never fail the tool call.
+    // With no DB URL set, the #265 backend gate resolves to sqlite and
+    // updateWorkingOnDetached no-ops gracefully (no spawn, no throw); the hook
+    // must still emit continue and never fail the tool call.
     run(
       {
         session_id: SESSION,

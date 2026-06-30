@@ -12,6 +12,7 @@
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { getActiveSessions, isValidId } from './shared/db-utils-pg.js';
+import { pgCoordinationStatus } from './shared/backend-resolution.js';
 import { getProject } from './shared/session-id.js';
 import { readPeerCache, writePeerCache, formatPeerMessage } from './session-context.js';
 
@@ -20,6 +21,17 @@ const CACHE_TTL_SECONDS = 60;
 export function main(): void {
   // Skip for subagents
   if (process.env.CLAUDE_AGENT_ID) {
+    console.log(JSON.stringify({}));
+    return;
+  }
+
+  // Backend gate (#265): peer awareness is a Postgres-only coordination feature.
+  // The 60s peer cache below is a READ path that bypasses the db-utils-pg
+  // chokepoint, so gate here too — otherwise a cache entry written while PG was
+  // active could inject stale peers for up to 60s after switching to sqlite or
+  // losing the DB URL (gemini/codex PR #266 review). Silent under non-postgres,
+  // which matches the existing "silent when solo" contract.
+  if (!pgCoordinationStatus().active) {
     console.log(JSON.stringify({}));
     return;
   }

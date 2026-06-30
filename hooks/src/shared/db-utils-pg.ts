@@ -15,9 +15,51 @@
 import { spawn, spawnSync } from 'child_process';
 import type { QueryResult } from './types.js';
 import { requireOpcDir } from './opc-path.js';
+import { pgCoordinationStatus, getConnectionUrl } from './backend-resolution.js';
 
 // Re-export SAFE_ID_PATTERN and isValidId from pattern-router for convenience
 export { SAFE_ID_PATTERN, isValidId } from './pattern-router.js';
+
+// ---------------------------------------------------------------------------
+// Backend gate (issue #265)
+// ---------------------------------------------------------------------------
+//
+// Every Postgres operation routes through runPgQuery / runPgQueryDetached, so
+// gating here makes ALL coordination consumers (session-register, heartbeat,
+// file-claims, peer-awareness, working-on-sync, crash-recovery, broadcasts)
+// honor AGENTICA_MEMORY_BACKEND in one place — mirroring the Python design
+// where the pure resolver decides and consumers inherit.
+//
+// #62 RELAXATION (intentional, user-approved): historically a missing DB URL
+// threw loudly here. Per #265 and to match Python resolve_backend's
+// default='sqlite', "no URL + no explicit backend" now resolves to sqlite and
+// the chokepoint no-ops gracefully instead of throwing. Hooks never block —
+// fail-loud, not fail-closed.
+//
+// Surfacing a misconfig (invalid backend value, or AGENTICA_MEMORY_BACKEND=
+// postgres with no URL) is the SessionStart hook's job, not the chokepoint's:
+// session-register injects a user-facing health warning once per session
+// (#265 round 2). The chokepoint deliberately does NOT write to stderr — these
+// helpers run as fresh processes on every hook event (heartbeat/working-on-sync
+// fire on each PostToolUse), so a per-call stderr write would be per-event
+// debug-log noise that bounds nothing and never reaches the user. It only
+// returns the (already credential-redacted) reason for callers that surface it.
+
+/**
+ * Decide whether a Postgres operation should proceed. Pure (no I/O).
+ *
+ * @returns proceed=true when the backend is postgres. proceed=false when the
+ *   backend is sqlite or misconfigured — callers must no-op gracefully.
+ *   `reason` carries the (already credential-redacted) misconfig message when
+ *   applicable, for callers that choose to surface it.
+ */
+function pgGate(): { proceed: boolean; reason?: string } {
+  const status = pgCoordinationStatus();
+  if (status.active) {
+    return { proceed: true };
+  }
+  return { proceed: false, reason: status.misconfig };
+}
 
 /**
  * Get the PostgreSQL connection string.
@@ -29,14 +71,18 @@ export { SAFE_ID_PATTERN, isValidId } from './pattern-router.js';
  *
  * Issue #62: no hardcoded development fallback. Throws if none set.
  *
+ * Delegates to the shared resolver (getConnectionUrl -> resolveUrl) so URL
+ * selection here is byte-identical to the backend gate's decision (#265): same
+ * precedence, blank/whitespace-only values skipped, and the selected URL
+ * trimmed. Without this, the gate could approve Postgres via a valid fallback
+ * (e.g. DATABASE_URL) while this function returned a blank canonical
+ * CONTINUOUS_CLAUDE_DB_URL and fed whitespace to the subprocess.
+ *
  * @returns PostgreSQL connection string
  * @throws Error when no DB env var is set
  */
 export function getPgConnectionString(): string {
-  const url =
-    process.env.CONTINUOUS_CLAUDE_DB_URL ||
-    process.env.DATABASE_URL ||
-    process.env.OPC_POSTGRES_URL;
+  const url = getConnectionUrl();
   if (!url) {
     throw new Error(
       "Database URL not set. Set CONTINUOUS_CLAUDE_DB_URL (preferred), " +
@@ -59,14 +105,20 @@ export function getPgConnectionString(): string {
  * @returns QueryResult with success, stdout, and stderr
  */
 export function runPgQuery(pythonCode: string, args: string[] = []): QueryResult {
+  // Backend gate (#265): when the backend is not postgres, no-op gracefully via
+  // the {success:false} path every consumer already handles. See pgGate() above
+  // for the #62 relaxation rationale.
+  const gate = pgGate();
+  if (!gate.proceed) {
+    return { success: false, stdout: '', stderr: gate.reason ?? 'postgres backend inactive' };
+  }
+
   const opcDir = requireOpcDir();
 
-  // Resolve the DB URL up-front — BEFORE the try/catch — so a missing
-  // env-var configuration surfaces as a hard crash with the actionable
-  // message, rather than being swallowed by the generic exception path
-  // below and silently returned as `{success: false, stderr: "Error: ..."}`.
-  // Callers treat `success=false` as "query failed" and often fall back
-  // silently, which would bury the #62 fail-fast contract.
+  // Resolve the DB URL up-front — BEFORE the try/catch. After the gate, the
+  // backend is postgres, which guarantees a URL is present (resolveBackend
+  // throws postgres-without-URL), so this no longer throws in practice; it
+  // remains as a defensive resolution of the canonical URL for the subprocess.
   const resolvedDbUrl = getPgConnectionString();
 
   // Wrap the Python code to use asyncio.run() for async queries.
@@ -1059,23 +1111,37 @@ asyncio.run(main())
  * @param args - Arguments passed to Python (sys.argv[1], sys.argv[2], ...)
  */
 export function runPgQueryDetached(pythonCode: string, args: string[] = []): void {
-  // Resolve DB URL up-front, BEFORE the try/catch, for the same reason as
-  // runPgQuery: the catch is a fire-and-forget swallower, and an unset
-  // DB env var is a configuration error that must surface loudly rather
-  // than silently stop the heartbeat / detached refresh path (Aegis
-  // round cycle on #62 — companion fix to runPgQuery's earlier hoist).
+  // Backend gate (#265): when the backend is not postgres, no-op (no spawn). The
+  // fire-and-forget detached path is the high-frequency heartbeat route, so a
+  // sqlite override must not spawn a doomed subprocess. See pgGate() above for
+  // the #62 relaxation rationale.
+  if (!pgGate().proceed) {
+    return;
+  }
+
+  // Resolve DB URL up-front, BEFORE the try/catch. After the gate the backend is
+  // postgres (which guarantees a URL is present), so this resolves the canonical
+  // URL for the subprocess without throwing in practice.
   const resolvedDbUrl = getPgConnectionString();
   const opcDir = requireOpcDir();
   try {
+    // SECURITY: opcDir is passed via the _OPC_DIR environment variable, NOT
+    // interpolated into the Python string — a path containing a quote would
+    // otherwise break out of the literal and execute arbitrary code. This
+    // mirrors runPgQuery's Issue #88 fix (the detached twin had the same hole;
+    // gemini PR #266 review).
     const wrappedCode = `
 import sys
 import os
 import asyncio
 import json
 
-# Add opc to path for imports
-sys.path.insert(0, '${opcDir}')
-os.chdir('${opcDir}')
+# Add opc to path for imports (read from env to avoid code injection)
+_opc_dir = os.environ.get('_OPC_DIR')
+if not _opc_dir:
+    raise RuntimeError('_OPC_DIR environment variable not set - must be called via runPgQueryDetached()')
+sys.path.insert(0, _opc_dir)
+os.chdir(_opc_dir)
 
 ${pythonCode}
 `;
@@ -1090,6 +1156,7 @@ ${pythonCode}
         // follow-up); the frequent heartbeat path runs through here.
         UV_FROZEN: '1',
         CONTINUOUS_CLAUDE_DB_URL: resolvedDbUrl,
+        _OPC_DIR: opcDir,
       },
     });
 

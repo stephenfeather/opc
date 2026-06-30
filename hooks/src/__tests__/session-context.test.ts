@@ -60,6 +60,23 @@ describe('checkMemoryHealth', () => {
     expect(result.daemonRunning).toBe(false);
   });
 
+  it('forces pgHealthy=true when pgApplicable=false, even if registration failed (#265)', async () => {
+    // Under a non-postgres backend, PG is not the active store — a failed/skipped
+    // registration must NOT surface a misleading "PostgreSQL: unreachable" warning.
+    const { checkMemoryHealth } = await import('../session-context.js');
+
+    const result = checkMemoryHealth(false, '/nonexistent/path.pid', false);
+    expect(result.pgHealthy).toBe(true);
+  });
+
+  it('still honors registration failure when pgApplicable=true (default)', async () => {
+    const { checkMemoryHealth } = await import('../session-context.js');
+
+    expect(checkMemoryHealth(false, '/nonexistent/path.pid', true).pgHealthy).toBe(false);
+    // default param remains backward-compatible
+    expect(checkMemoryHealth(false, '/nonexistent/path.pid').pgHealthy).toBe(false);
+  });
+
   it('returns daemonRunning=false when PID process is dead', async () => {
     const { checkMemoryHealth } = await import('../session-context.js');
 
@@ -354,5 +371,27 @@ describe('formatHealthWarnings', () => {
     const result = formatHealthWarnings({ pgHealthy: false, daemonRunning: false });
     expect(result).toContain('PostgreSQL');
     expect(result).toContain('daemon');
+  });
+
+  it('surfaces an explicit pgMessage in place of the default unreachable line (#265)', async () => {
+    const { formatHealthWarnings } = await import('../session-context.js');
+    const result = formatHealthWarnings({
+      pgHealthy: true,
+      daemonRunning: true,
+      pgMessage: 'PostgreSQL: misconfigured (AGENTICA_MEMORY_BACKEND=postgres but no URL)',
+    });
+    expect(result).toContain('misconfigured');
+    expect(result).not.toContain('unreachable');
+  });
+
+  it('pgMessage takes precedence over the default unreachable line when pgHealthy is false (#265)', async () => {
+    const { formatHealthWarnings } = await import('../session-context.js');
+    const result = formatHealthWarnings({
+      pgHealthy: false,
+      daemonRunning: true,
+      pgMessage: 'PostgreSQL: no connection URL set — cross-session coordination disabled.',
+    });
+    expect(result).toContain('no connection URL set');
+    expect(result).not.toContain('unreachable');
   });
 });

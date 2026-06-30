@@ -108,16 +108,24 @@ def resolve_backend(env: Mapping[str, str], *, default: str | None = "sqlite") -
     explicit = raw.strip().lower()
     if explicit:
         if explicit not in VALID_BACKENDS:
-            # Reflect the bad value to aid debugging, but harden it first: a
-            # backend selector is a short token, so a long value is a
-            # misconfiguration (e.g. a DSN pasted into the wrong var). Redact any
-            # `://user:pass@` credential segment (mirroring artifact_index's URL
-            # redaction) and cap the length, so a credential-bearing paste is not
-            # reflected back into stderr/logs (issue #214 defense-in-depth).
-            redacted = re.sub(r"://[^@]+@", "://***@", raw)
-            shown = redacted if len(redacted) <= 32 else redacted[:32] + "…"
+            # Reflect the bad value to aid debugging, but ONLY when it is
+            # safe-shaped. A backend selector is a short token
+            # ('sqlite'/'postgres'), so a plausible typo (e.g. 'sqllite') is
+            # worth echoing. Anything else — a DSN or credential blob pasted into
+            # the wrong var — is shown as a fixed placeholder, never reflected.
+            # An allowlist of safe shapes is more robust than blacklist
+            # redaction: `://[^@]+@` only redacts to the first `@` (so
+            # `://user:p@ssword@h` leaks "ssword") and misses no-scheme
+            # credential strings entirely (issue #265 r3 / #214 defense-in-depth;
+            # kept in lockstep with hooks/src/shared/backend-resolution.ts).
+            candidate = raw.strip()
+            # Bound at 8 chars: the longest legitimate backend token is
+            # 'postgres'. Keeping the window tight shrinks the residual where a
+            # short delimiter-free secret could be echoed (aegis #265 hardening).
+            safe_token = re.fullmatch(r"[A-Za-z0-9_-]{1,8}", candidate) is not None
+            shown = repr(candidate) if safe_token else "<redacted non-token value>"
             raise ValueError(
-                f"Invalid {BACKEND_VAR}={shown!r}: expected 'sqlite' or 'postgres' "
+                f"Invalid {BACKEND_VAR}={shown}: expected 'sqlite' or 'postgres' "
                 "(case-insensitive)."
             )
         if explicit == "postgres" and resolve_url(env) is None:

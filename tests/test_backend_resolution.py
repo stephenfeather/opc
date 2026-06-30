@@ -99,17 +99,44 @@ class TestResolveBackend:
         with pytest.raises(ValueError, match="sqllite"):
             resolve_backend(env)
 
-    def test_invalid_explicit_dsn_is_redacted_and_truncated(self) -> None:
-        # Defense-in-depth (issue #214): a DSN accidentally pasted into the wrong
-        # var must not have its credentials reflected back. The user:pass segment
-        # is redacted to ***, and an over-long value is then truncated.
-        secretish = "postgresql://user:" + "p" * 80 + "@" + "h" * 40 + "/db"
+    def test_invalid_safe_token_is_echoed(self) -> None:
+        # A short alnum value (a plausible backend-name typo) is safe to reflect.
+        with pytest.raises(ValueError, match="'sqllite'"):
+            resolve_backend({"AGENTICA_MEMORY_BACKEND": "sqllite"})
+
+    def test_invalid_dsn_is_not_reflected(self) -> None:
+        # Defense-in-depth (issue #214/#265 r3): a DSN accidentally pasted into
+        # the wrong var must NOT have any fragment reflected back. An allowlist
+        # of safe shapes beats blacklist redaction — the old `://[^@]+@` only
+        # redacted to the first `@` and missed no-scheme credential strings, and
+        # this message now reaches user-facing SessionStart output via the TS
+        # mirror. Anything non-token becomes a fixed placeholder.
+        secretish = "postgresql://user:supersecret@host.example.com/db"
         with pytest.raises(ValueError) as exc:
             resolve_backend({"AGENTICA_MEMORY_BACKEND": secretish})
         msg = str(exc.value)
-        assert "***" in msg  # credentials redacted
-        assert "p" * 80 not in msg  # password never reflected
-        assert "…" in msg  # long value still truncated
+        assert "<redacted non-token value>" in msg
+        assert "supersecret" not in msg
+        assert "user" not in msg
+        assert "host" not in msg
+
+    def test_invalid_password_with_at_sign_is_not_leaked(self) -> None:
+        # The first-`@` blind spot: `://user:p@ssword@h` previously leaked the
+        # "ssword" fragment after the first `@`. Must be fully suppressed now.
+        with pytest.raises(ValueError) as exc:
+            resolve_backend({"AGENTICA_MEMORY_BACKEND": "postgres://user:p@ssword@host/db"})
+        msg = str(exc.value)
+        assert "<redacted non-token value>" in msg
+        assert "ssword" not in msg
+
+    def test_invalid_no_scheme_credential_is_not_leaked(self) -> None:
+        # A no-scheme credential string never matched the old `://` regex and was
+        # reflected verbatim. The allowlist suppresses it.
+        with pytest.raises(ValueError) as exc:
+            resolve_backend({"AGENTICA_MEMORY_BACKEND": "user:supersecret@host/db"})
+        msg = str(exc.value)
+        assert "<redacted non-token value>" in msg
+        assert "supersecret" not in msg
 
     def test_explicit_postgres_without_url_raises(self) -> None:
         # Finding 3 (issue #214): explicitly selecting postgres with no connection

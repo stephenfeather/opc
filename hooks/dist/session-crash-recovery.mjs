@@ -333,9 +333,68 @@ function requireOpcDir() {
   return opcDir;
 }
 
+// src/shared/backend-resolution.ts
+var URL_VARS = [
+  "CONTINUOUS_CLAUDE_DB_URL",
+  "DATABASE_URL",
+  "OPC_POSTGRES_URL"
+];
+var VALID_BACKENDS = /* @__PURE__ */ new Set(["sqlite", "postgres"]);
+var BACKEND_VAR = "AGENTICA_MEMORY_BACKEND";
+function resolveUrl(env) {
+  for (const varName of URL_VARS) {
+    const value = env[varName];
+    if (value && value.trim()) {
+      return value.trim();
+    }
+  }
+  return null;
+}
+function resolveBackend(env, defaultBackend = "sqlite") {
+  const raw = env[BACKEND_VAR] ?? "";
+  const explicit = raw.trim().toLowerCase();
+  if (explicit) {
+    if (!VALID_BACKENDS.has(explicit)) {
+      const candidate = raw.trim();
+      const safeToken = /^[A-Za-z0-9_-]{1,8}$/.test(candidate);
+      const shown = safeToken ? `'${candidate}'` : "<redacted non-token value>";
+      throw new Error(
+        `Invalid ${BACKEND_VAR}=${shown}: expected 'sqlite' or 'postgres' (case-insensitive).`
+      );
+    }
+    if (explicit === "postgres" && resolveUrl(env) === null) {
+      throw new Error(
+        `${BACKEND_VAR}=postgres but no PostgreSQL connection URL is set; set one of ${URL_VARS.join(", ")}.`
+      );
+    }
+    return explicit;
+  }
+  if (resolveUrl(env) !== null) {
+    return "postgres";
+  }
+  return defaultBackend;
+}
+function getConnectionUrl() {
+  return resolveUrl(process.env);
+}
+function pgCoordinationStatus(env = process.env) {
+  try {
+    return { active: resolveBackend(env) === "postgres" };
+  } catch (err) {
+    return { active: false, misconfig: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 // src/shared/db-utils-pg.ts
+function pgGate() {
+  const status = pgCoordinationStatus();
+  if (status.active) {
+    return { proceed: true };
+  }
+  return { proceed: false, reason: status.misconfig };
+}
 function getPgConnectionString() {
-  const url = process.env.CONTINUOUS_CLAUDE_DB_URL || process.env.DATABASE_URL || process.env.OPC_POSTGRES_URL;
+  const url = getConnectionUrl();
   if (!url) {
     throw new Error(
       "Database URL not set. Set CONTINUOUS_CLAUDE_DB_URL (preferred), DATABASE_URL, or OPC_POSTGRES_URL. For local Docker dev, run `docker compose -f docker/docker-compose.yml up -d` and export the credentials from docker/.env before invoking this hook."
@@ -344,6 +403,10 @@ function getPgConnectionString() {
   return url;
 }
 function runPgQuery(pythonCode, args = []) {
+  const gate = pgGate();
+  if (!gate.proceed) {
+    return { success: false, stdout: "", stderr: gate.reason ?? "postgres backend inactive" };
+  }
   const opcDir = requireOpcDir();
   const resolvedDbUrl = getPgConnectionString();
   const wrappedCode = `

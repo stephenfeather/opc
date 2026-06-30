@@ -102,19 +102,55 @@ describe('resolveBackend', () => {
     ).toThrow(/no PostgreSQL connection URL/);
   });
 
-  it('redacts credentials and caps length in the invalid-value error (Finding 1 defense-in-depth)', async () => {
+  it('echoes a safe-shaped typo to aid debugging', async () => {
     const { resolveBackend } = await import(MOD);
-    const dsn = 'postgres://user:supersecret@host.example.com:5432/mydb';
     let msg = '';
     try {
-      resolveBackend({ AGENTICA_MEMORY_BACKEND: dsn });
+      resolveBackend({ AGENTICA_MEMORY_BACKEND: 'sqllite' });
+    } catch (e) {
+      msg = e instanceof Error ? e.message : String(e);
+    }
+    expect(msg).toContain("'sqllite'"); // short alnum token is safe to reflect
+  });
+
+  it('never reflects credential-shaped values verbatim — DSN with a scheme (#265 r3)', async () => {
+    const { resolveBackend } = await import(MOD);
+    let msg = '';
+    try {
+      resolveBackend({ AGENTICA_MEMORY_BACKEND: 'postgres://user:supersecret@host.example.com:5432/mydb' });
     } catch (e) {
       msg = e instanceof Error ? e.message : String(e);
     }
     expect(msg).toMatch(/Invalid AGENTICA_MEMORY_BACKEND/);
-    expect(msg).toContain('://***@'); // credential segment redacted
-    expect(msg).not.toContain('supersecret'); // password never reflected
-    expect(msg).not.toContain('user:'); // username:password segment gone
+    expect(msg).toContain('<redacted non-token value>');
+    expect(msg).not.toContain('supersecret');
+    expect(msg).not.toContain('user');
+    expect(msg).not.toContain('host');
+  });
+
+  it('does not leak a password containing @ (the first-@ redaction blind spot) (#265 r3)', async () => {
+    const { resolveBackend } = await import(MOD);
+    let msg = '';
+    try {
+      resolveBackend({ AGENTICA_MEMORY_BACKEND: 'postgres://user:p@ssword@host/db' });
+    } catch (e) {
+      msg = e instanceof Error ? e.message : String(e);
+    }
+    expect(msg).toContain('<redacted non-token value>');
+    expect(msg).not.toContain('ssword'); // the fragment the old regex leaked
+    expect(msg).not.toContain('p@ssword');
+  });
+
+  it('does not leak a no-scheme credential string (#265 r3)', async () => {
+    const { resolveBackend } = await import(MOD);
+    let msg = '';
+    try {
+      resolveBackend({ AGENTICA_MEMORY_BACKEND: 'user:supersecret@host/db' });
+    } catch (e) {
+      msg = e instanceof Error ? e.message : String(e);
+    }
+    expect(msg).toContain('<redacted non-token value>');
+    expect(msg).not.toContain('supersecret');
   });
 });
 

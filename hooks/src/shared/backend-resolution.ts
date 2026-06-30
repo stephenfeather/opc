@@ -89,16 +89,21 @@ export function resolveBackend(env: Env, defaultBackend: string | null = 'sqlite
   const explicit = raw.trim().toLowerCase();
   if (explicit) {
     if (!VALID_BACKENDS.has(explicit)) {
-      // Reflect the bad value to aid debugging, but harden it first: a backend
-      // selector is a short token, so a long value is a misconfiguration (e.g.
-      // a DSN pasted into the wrong var). Redact any `://user:pass@` credential
-      // segment (mirroring artifact_index's URL redaction) and cap the length,
-      // so a credential-bearing paste is not reflected back into stderr/logs
-      // (issue #214 defense-in-depth).
-      const redacted = raw.replace(/:\/\/[^@]+@/g, '://***@');
-      const shown = redacted.length <= 32 ? redacted : redacted.slice(0, 32) + '…';
+      // Reflect the bad value to aid debugging, but ONLY when it is safe-shaped.
+      // A backend selector is a short token ('sqlite'/'postgres'), so a plausible
+      // typo (e.g. 'sqllite') is worth echoing. Anything else — a DSN or
+      // credential blob pasted into the wrong var — is shown as a fixed
+      // placeholder, never reflected. An allowlist of safe shapes is more robust
+      // than blacklist redaction: `://[^@]+@` only redacts to the first `@`
+      // (so `://user:p@ssword@h` leaks "ssword") and misses no-scheme credential
+      // strings entirely. Since this message now reaches the user-facing
+      // SessionStart output (#265 r2), a partial leak is unacceptable
+      // (#265 r3 / #214 defense-in-depth).
+      const candidate = raw.trim();
+      const safeToken = /^[A-Za-z0-9_-]{1,16}$/.test(candidate);
+      const shown = safeToken ? `'${candidate}'` : '<redacted non-token value>';
       throw new Error(
-        `Invalid ${BACKEND_VAR}='${shown}': expected 'sqlite' or 'postgres' (case-insensitive).`,
+        `Invalid ${BACKEND_VAR}=${shown}: expected 'sqlite' or 'postgres' (case-insensitive).`,
       );
     }
     if (explicit === 'postgres' && resolveUrl(env) === null) {

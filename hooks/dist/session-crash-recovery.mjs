@@ -355,10 +355,11 @@ function resolveBackend(env, defaultBackend = "sqlite") {
   const explicit = raw.trim().toLowerCase();
   if (explicit) {
     if (!VALID_BACKENDS.has(explicit)) {
-      const redacted = raw.replace(/:\/\/[^@]+@/g, "://***@");
-      const shown = redacted.length <= 32 ? redacted : redacted.slice(0, 32) + "\u2026";
+      const candidate = raw.trim();
+      const safeToken = /^[A-Za-z0-9_-]{1,16}$/.test(candidate);
+      const shown = safeToken ? `'${candidate}'` : "<redacted non-token value>";
       throw new Error(
-        `Invalid ${BACKEND_VAR}='${shown}': expected 'sqlite' or 'postgres' (case-insensitive).`
+        `Invalid ${BACKEND_VAR}=${shown}: expected 'sqlite' or 'postgres' (case-insensitive).`
       );
     }
     if (explicit === "postgres" && resolveUrl(env) === null) {

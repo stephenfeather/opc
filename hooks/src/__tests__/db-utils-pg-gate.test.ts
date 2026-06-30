@@ -69,13 +69,13 @@ describe('db-utils-pg backend gate (#265)', () => {
     expect(stderrSpy).not.toHaveBeenCalled();
   });
 
-  it('redacts credentials in the returned misconfig reason', async () => {
+  it('redacts credential-shaped values in the returned misconfig reason (#265 r3)', async () => {
     process.env.AGENTICA_MEMORY_BACKEND = 'postgres://user:supersecret@h/db';
     const { runPgQuery } = await import('../shared/db-utils-pg.js');
     const res = runPgQuery('print("x")');
     expect(res.success).toBe(false);
     expect(res.stderr).not.toContain('supersecret');
-    expect(res.stderr).toContain('://***@');
+    expect(res.stderr).toContain('<redacted non-token value>');
     expect(stderrSpy).not.toHaveBeenCalled();
   });
 

@@ -100,6 +100,9 @@ function resolveBackend(env, defaultBackend = "sqlite") {
 function getConnectionUrl() {
   return resolveUrl(process.env);
 }
+function backendExplicitlySet(env = process.env) {
+  return (env[BACKEND_VAR] ?? "").trim() !== "";
+}
 function pgCoordinationStatus(env = process.env) {
   try {
     return { active: resolveBackend(env) === "postgres" };
@@ -115,21 +118,12 @@ function isValidId(id) {
 }
 
 // src/shared/db-utils-pg.ts
-var misconfigLogged = false;
 function pgGate() {
   const status = pgCoordinationStatus();
   if (status.active) {
     return { proceed: true };
   }
-  if (status.misconfig) {
-    if (!misconfigLogged) {
-      misconfigLogged = true;
-      process.stderr.write(`[db-utils-pg] ${status.misconfig}
-`);
-    }
-    return { proceed: false, reason: status.misconfig };
-  }
-  return { proceed: false };
+  return { proceed: false, reason: status.misconfig };
 }
 function getPgConnectionString() {
   const url = getConnectionUrl();
@@ -280,7 +274,7 @@ function getProject() {
 
 // src/session-context.ts
 import { readFileSync as readFileSync2, writeFileSync, mkdirSync, renameSync } from "fs";
-function checkMemoryHealth(pgRegistrationSucceeded, pidFilePath, pgApplicable = true) {
+function checkMemoryHealth(pgRegistrationSucceeded, pidFilePath, pgApplicable = true, pgMessage) {
   const pgHealthy = pgApplicable ? pgRegistrationSucceeded : true;
   let daemonRunning = false;
   try {
@@ -293,11 +287,13 @@ function checkMemoryHealth(pgRegistrationSucceeded, pidFilePath, pgApplicable = 
   } catch {
     daemonRunning = false;
   }
-  return { pgHealthy, daemonRunning };
+  return { pgHealthy, daemonRunning, pgMessage };
 }
 function formatHealthWarnings(health) {
   const warnings = [];
-  if (!health.pgHealthy) {
+  if (health.pgMessage) {
+    warnings.push(`- ${health.pgMessage}`);
+  } else if (!health.pgHealthy) {
     warnings.push("- PostgreSQL: unreachable");
   }
   if (!health.daemonRunning) {
@@ -354,13 +350,15 @@ function main() {
   const projectName = project.split("/").pop() || "unknown";
   process.env.COORDINATION_SESSION_ID = sessionId;
   const pgStatus = pgCoordinationStatus();
+  let pgMessage;
   if (pgStatus.misconfig) {
-    process.stderr.write(`[session-register] ${pgStatus.misconfig}
-`);
+    pgMessage = `PostgreSQL: misconfigured (${pgStatus.misconfig})`;
+  } else if (!pgStatus.active && !backendExplicitlySet()) {
+    pgMessage = "PostgreSQL: no connection URL set \u2014 cross-session coordination disabled. Set CONTINUOUS_CLAUDE_DB_URL to enable it, or AGENTICA_MEMORY_BACKEND=sqlite to silence this note.";
   }
   const registerResult = pgStatus.active ? registerSession(sessionId, project, "", input.session_id, input.transcript_path, process.ppid) : { success: false };
   const daemonPidPath = join2(process.env.HOME || "/tmp", ".claude", "memory-daemon.pid");
-  const health = checkMemoryHealth(registerResult.success, daemonPidPath, pgStatus.active);
+  const health = checkMemoryHealth(registerResult.success, daemonPidPath, pgStatus.active, pgMessage);
   const healthWarnings = formatHealthWarnings(health);
   const tasksPath = join2(project, "thoughts", "shared", "Tasks.md");
   const tasksSummary = getPendingTasksSummary(tasksPath);

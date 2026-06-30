@@ -1,7 +1,7 @@
 // src/session-context.ts
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from "fs";
 import { dirname } from "path";
-function checkMemoryHealth(pgRegistrationSucceeded, pidFilePath, pgApplicable = true) {
+function checkMemoryHealth(pgRegistrationSucceeded, pidFilePath, pgApplicable = true, pgMessage) {
   const pgHealthy = pgApplicable ? pgRegistrationSucceeded : true;
   let daemonRunning = false;
   try {
@@ -14,11 +14,13 @@ function checkMemoryHealth(pgRegistrationSucceeded, pidFilePath, pgApplicable = 
   } catch {
     daemonRunning = false;
   }
-  return { pgHealthy, daemonRunning };
+  return { pgHealthy, daemonRunning, pgMessage };
 }
 function formatHealthWarnings(health) {
   const warnings = [];
-  if (!health.pgHealthy) {
+  if (health.pgMessage) {
+    warnings.push(`- ${health.pgMessage}`);
+  } else if (!health.pgHealthy) {
     warnings.push("- PostgreSQL: unreachable");
   }
   if (!health.daemonRunning) {

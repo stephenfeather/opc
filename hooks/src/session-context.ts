@@ -19,6 +19,12 @@ import type { SessionInfo } from './shared/db-utils-pg.js';
 export interface HealthStatus {
   pgHealthy: boolean;
   daemonRunning: boolean;
+  /**
+   * Explicit PostgreSQL status line to surface (#265). When set, it replaces the
+   * default "PostgreSQL: unreachable" line — used for an operator misconfig
+   * ("misconfigured (...)") or the no-config note ("no connection URL set ...").
+   */
+  pgMessage?: string;
 }
 
 /**
@@ -30,12 +36,16 @@ export interface HealthStatus {
  *   (a sqlite / non-postgres backend), PG is not the active store, so a
  *   skipped/failed registration is reported as healthy to avoid a misleading
  *   "PostgreSQL: unreachable" warning. Defaults to true (backward compatible).
+ * @param pgMessage - An explicit PG status line to surface instead of the default
+ *   unreachable/healthy logic (#265). Used to make an explicit-postgres misconfig
+ *   or the no-config case visible in the user-facing SessionStart message.
  * @returns Health status for PG and daemon
  */
 export function checkMemoryHealth(
   pgRegistrationSucceeded: boolean,
   pidFilePath: string,
   pgApplicable: boolean = true,
+  pgMessage?: string,
 ): HealthStatus {
   const pgHealthy = pgApplicable ? pgRegistrationSucceeded : true;
   let daemonRunning = false;
@@ -52,7 +62,7 @@ export function checkMemoryHealth(
     daemonRunning = false;
   }
 
-  return { pgHealthy, daemonRunning };
+  return { pgHealthy, daemonRunning, pgMessage };
 }
 
 /**
@@ -61,7 +71,11 @@ export function checkMemoryHealth(
 export function formatHealthWarnings(health: HealthStatus): string | null {
   const warnings: string[] = [];
 
-  if (!health.pgHealthy) {
+  if (health.pgMessage) {
+    // An explicit PG status line (misconfig / no-config note) takes precedence
+    // over the default reachable/unreachable logic (#265).
+    warnings.push(`- ${health.pgMessage}`);
+  } else if (!health.pgHealthy) {
     warnings.push('- PostgreSQL: unreachable');
   }
   if (!health.daemonRunning) {

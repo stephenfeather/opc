@@ -118,6 +118,18 @@ describe('resolveBackend', () => {
   });
 });
 
+describe('backendExplicitlySet', () => {
+  it('is true only when AGENTICA_MEMORY_BACKEND is a non-blank value', async () => {
+    const { backendExplicitlySet } = await import(MOD);
+    expect(backendExplicitlySet({})).toBe(false);
+    expect(backendExplicitlySet({ AGENTICA_MEMORY_BACKEND: '' })).toBe(false);
+    expect(backendExplicitlySet({ AGENTICA_MEMORY_BACKEND: '   ' })).toBe(false);
+    expect(backendExplicitlySet({ AGENTICA_MEMORY_BACKEND: 'sqlite' })).toBe(true);
+    // even an invalid value counts as "explicitly set" (it's an operator statement)
+    expect(backendExplicitlySet({ AGENTICA_MEMORY_BACKEND: 'sqllite' })).toBe(true);
+  });
+});
+
 describe('pgCoordinationStatus', () => {
   it('active=true only when backend resolves to postgres', async () => {
     const { pgCoordinationStatus } = await import(MOD);

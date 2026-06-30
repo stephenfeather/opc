@@ -57,33 +57,35 @@ describe('db-utils-pg backend gate (#265)', () => {
     expect(stderrSpy).not.toHaveBeenCalled();
   });
 
-  it('runPgQuery returns success:false WITH a loud stderr on misconfig (postgres w/o URL)', async () => {
+  it('returns the misconfig reason in the result (postgres w/o URL) — without writing stderr (#265 r2)', async () => {
+    // The chokepoint is silent: surfacing the misconfig is SessionStart's job.
+    // High-frequency hooks run as fresh processes per event, so a per-call
+    // stderr write would be unbounded debug noise. The reason rides the return.
     process.env.AGENTICA_MEMORY_BACKEND = 'postgres';
     const { runPgQuery } = await import('../shared/db-utils-pg.js');
     const res = runPgQuery('print("x")');
     expect(res.success).toBe(false);
     expect(res.stderr).toMatch(/no PostgreSQL connection URL/);
-    expect(stderrSpy).toHaveBeenCalledTimes(1);
+    expect(stderrSpy).not.toHaveBeenCalled();
   });
 
-  it('redacts credentials in the misconfig diagnostic (return + stderr)', async () => {
+  it('redacts credentials in the returned misconfig reason', async () => {
     process.env.AGENTICA_MEMORY_BACKEND = 'postgres://user:supersecret@h/db';
     const { runPgQuery } = await import('../shared/db-utils-pg.js');
     const res = runPgQuery('print("x")');
     expect(res.success).toBe(false);
     expect(res.stderr).not.toContain('supersecret');
-    const written = stderrSpy.mock.calls.map((c: unknown[]) => String(c[0])).join('');
-    expect(written).not.toContain('supersecret');
-    expect(written).toContain('://***@');
+    expect(res.stderr).toContain('://***@');
+    expect(stderrSpy).not.toHaveBeenCalled();
   });
 
-  it('emits the misconfig diagnostic at most once per process', async () => {
+  it('never writes process.stderr from the chokepoint, even across repeated misconfig calls', async () => {
     process.env.AGENTICA_MEMORY_BACKEND = 'postgres';
-    const { runPgQuery } = await import('../shared/db-utils-pg.js');
+    const { runPgQuery, runPgQueryDetached } = await import('../shared/db-utils-pg.js');
     runPgQuery('print("x")');
     runPgQuery('print("x")');
-    runPgQuery('print("x")');
-    expect(stderrSpy).toHaveBeenCalledTimes(1);
+    runPgQueryDetached('print("x")');
+    expect(stderrSpy).not.toHaveBeenCalled();
   });
 
   it('runPgQueryDetached no-ops without throwing or writing stderr under sqlite', async () => {
@@ -92,11 +94,10 @@ describe('db-utils-pg backend gate (#265)', () => {
     expect(stderrSpy).not.toHaveBeenCalled();
   });
 
-  it('runPgQueryDetached emits the misconfig diagnostic once', async () => {
+  it('runPgQueryDetached no-ops without throwing on misconfig (reason discarded, no stderr)', async () => {
     process.env.AGENTICA_MEMORY_BACKEND = 'postgres';
     const { runPgQueryDetached } = await import('../shared/db-utils-pg.js');
-    runPgQueryDetached('print("x")');
-    runPgQueryDetached('print("x")');
-    expect(stderrSpy).toHaveBeenCalledTimes(1);
+    expect(() => runPgQueryDetached('print("x")')).not.toThrow();
+    expect(stderrSpy).not.toHaveBeenCalled();
   });
 });

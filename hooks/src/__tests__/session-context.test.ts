@@ -372,4 +372,26 @@ describe('formatHealthWarnings', () => {
     expect(result).toContain('PostgreSQL');
     expect(result).toContain('daemon');
   });
+
+  it('surfaces an explicit pgMessage in place of the default unreachable line (#265)', async () => {
+    const { formatHealthWarnings } = await import('../session-context.js');
+    const result = formatHealthWarnings({
+      pgHealthy: true,
+      daemonRunning: true,
+      pgMessage: 'PostgreSQL: misconfigured (AGENTICA_MEMORY_BACKEND=postgres but no URL)',
+    });
+    expect(result).toContain('misconfigured');
+    expect(result).not.toContain('unreachable');
+  });
+
+  it('pgMessage takes precedence over the default unreachable line when pgHealthy is false (#265)', async () => {
+    const { formatHealthWarnings } = await import('../session-context.js');
+    const result = formatHealthWarnings({
+      pgHealthy: false,
+      daemonRunning: true,
+      pgMessage: 'PostgreSQL: no connection URL set — cross-session coordination disabled.',
+    });
+    expect(result).toContain('no connection URL set');
+    expect(result).not.toContain('unreachable');
+  });
 });

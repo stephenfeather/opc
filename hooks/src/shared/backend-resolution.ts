@@ -120,6 +120,19 @@ export function getConnectionUrl(): string | null {
   return resolveUrl(process.env);
 }
 
+/**
+ * Whether AGENTICA_MEMORY_BACKEND is explicitly set to a non-blank value.
+ *
+ * Lets a consumer distinguish an intentional sqlite selection
+ * (AGENTICA_MEMORY_BACKEND=sqlite) from the no-config default (no URL and no
+ * backend var) so it can stay silent for the former while surfacing a
+ * "coordination disabled — maybe you lost your DB URL" note for the latter
+ * (#265 round 2). Reads only `env`.
+ */
+export function backendExplicitlySet(env: Env = process.env): boolean {
+  return (env[BACKEND_VAR] ?? '').trim() !== '';
+}
+
 /** Resolve the active backend from the live environment. */
 export function getActiveBackend(defaultBackend: string | null = 'sqlite'): string | null {
   return resolveBackend(process.env, defaultBackend);

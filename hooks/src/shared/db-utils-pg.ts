@@ -33,39 +33,32 @@ export { SAFE_ID_PATTERN, isValidId } from './pattern-router.js';
 // #62 RELAXATION (intentional, user-approved): historically a missing DB URL
 // threw loudly here. Per #265 and to match Python resolve_backend's
 // default='sqlite', "no URL + no explicit backend" now resolves to sqlite and
-// the chokepoint no-ops gracefully instead of throwing. Loud failure is
-// preserved exactly where intent is explicit: an invalid backend value, or
-// AGENTICA_MEMORY_BACKEND=postgres with no URL, still surfaces a (credential-
-// redacted) diagnostic. Hooks never block — fail-loud, not fail-closed.
-
-// Once-per-process guard so a sustained misconfig logs once per hook invocation
-// rather than on every PG call within it (a single hook like file-claims makes
-// multiple PG calls). The diagnostic only reaches stderr/debug logs, never the
-// user-facing channel; cross-process throttling is out of scope.
-let misconfigLogged = false;
+// the chokepoint no-ops gracefully instead of throwing. Hooks never block —
+// fail-loud, not fail-closed.
+//
+// Surfacing a misconfig (invalid backend value, or AGENTICA_MEMORY_BACKEND=
+// postgres with no URL) is the SessionStart hook's job, not the chokepoint's:
+// session-register injects a user-facing health warning once per session
+// (#265 round 2). The chokepoint deliberately does NOT write to stderr — these
+// helpers run as fresh processes on every hook event (heartbeat/working-on-sync
+// fire on each PostToolUse), so a per-call stderr write would be per-event
+// debug-log noise that bounds nothing and never reaches the user. It only
+// returns the (already credential-redacted) reason for callers that surface it.
 
 /**
- * Decide whether a Postgres operation should proceed, emitting a one-time
- * redacted diagnostic on operator misconfiguration.
+ * Decide whether a Postgres operation should proceed. Pure (no I/O).
  *
  * @returns proceed=true when the backend is postgres. proceed=false when the
  *   backend is sqlite or misconfigured — callers must no-op gracefully.
  *   `reason` carries the (already credential-redacted) misconfig message when
- *   applicable.
+ *   applicable, for callers that choose to surface it.
  */
 function pgGate(): { proceed: boolean; reason?: string } {
   const status = pgCoordinationStatus();
   if (status.active) {
     return { proceed: true };
   }
-  if (status.misconfig) {
-    if (!misconfigLogged) {
-      misconfigLogged = true;
-      process.stderr.write(`[db-utils-pg] ${status.misconfig}\n`);
-    }
-    return { proceed: false, reason: status.misconfig };
-  }
-  return { proceed: false };
+  return { proceed: false, reason: status.misconfig };
 }
 
 /**

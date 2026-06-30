@@ -115,21 +115,12 @@ function isValidId(id) {
 }
 
 // src/shared/db-utils-pg.ts
-var misconfigLogged = false;
 function pgGate() {
   const status = pgCoordinationStatus();
   if (status.active) {
     return { proceed: true };
   }
-  if (status.misconfig) {
-    if (!misconfigLogged) {
-      misconfigLogged = true;
-      process.stderr.write(`[db-utils-pg] ${status.misconfig}
-`);
-    }
-    return { proceed: false, reason: status.misconfig };
-  }
-  return { proceed: false };
+  return { proceed: false, reason: status.misconfig };
 }
 function getPgConnectionString() {
   const url = getConnectionUrl();

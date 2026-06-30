@@ -31,28 +31,31 @@ function run(extraEnv: Record<string, string>) {
 }
 
 describe('session-register CLI under the #265 backend gate', () => {
-  it('sqlite default: exits 0, continues, and does NOT warn "PostgreSQL: unreachable"', () => {
+  it('no-config (no URL, no backend var): continues and surfaces a user-facing no-URL note', () => {
     const res = run({});
     expect(res.status).toBe(0);
     const out = JSON.parse(res.stdout.trim());
     expect(out.result).toBe('continue');
+    // Ambiguous case (maybe a lost DB URL) is surfaced in the awareness message.
+    expect(out.message ?? '').toContain('no connection URL set');
     expect(out.message ?? '').not.toContain('PostgreSQL: unreachable');
+    expect(out.message ?? '').not.toContain('misconfigured');
   });
 
-  it('explicit sqlite: continues, no PG warning', () => {
+  it('explicit sqlite: continues and stays fully silent about PostgreSQL', () => {
     const res = run({ AGENTICA_MEMORY_BACKEND: 'sqlite' });
     expect(res.status).toBe(0);
     const out = JSON.parse(res.stdout.trim());
     expect(out.result).toBe('continue');
-    expect(out.message ?? '').not.toContain('PostgreSQL: unreachable');
+    expect(out.message ?? '').not.toContain('PostgreSQL');
   });
 
-  it('misconfig (postgres w/o URL): continues, emits a loud stderr diagnostic, no PG warning', () => {
+  it('misconfig (postgres w/o URL): continues and surfaces a user-facing "misconfigured" warning', () => {
     const res = run({ AGENTICA_MEMORY_BACKEND: 'postgres' });
     expect(res.status).toBe(0);
     const out = JSON.parse(res.stdout.trim());
     expect(out.result).toBe('continue');
+    expect(out.message ?? '').toContain('PostgreSQL: misconfigured');
     expect(out.message ?? '').not.toContain('PostgreSQL: unreachable');
-    expect(res.stderr).toMatch(/no PostgreSQL connection URL/);
   });
 });

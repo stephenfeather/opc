@@ -11,7 +11,7 @@
  */
 
 import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
-import { execSync, spawnSync } from 'child_process';
+import { execSync, spawn, spawnSync } from 'child_process';
 import { join, resolve } from 'path';
 import { tmpdir } from 'os';
 import * as net from 'net';
@@ -101,6 +101,59 @@ function releaseLock(projectDir: string): void {
 
 /** Query timeout in milliseconds (3 seconds) */
 const QUERY_TIMEOUT = 3000;
+
+/**
+ * Per-invocation query deadline.
+ *
+ * QUERY_TIMEOUT bounds a single daemon round-trip, but hooks make several
+ * sequential calls, so their worst case is N x QUERY_TIMEOUT — which blows
+ * through Claude Code's per-hook timeout and gets the whole hook killed with
+ * its output discarded (impact-refactor: 7 calls vs a 10s budget;
+ * signature-helper: 10 calls vs 5s). A hook sets one overall budget up front;
+ * every subsequent queryDaemonSync call is clamped to the time remaining and
+ * short-circuits once the budget is spent. Module-level state is safe because
+ * each hook invocation is its own short-lived Node process.
+ */
+let queryDeadlineAt: number | null = null;
+
+/** Below this remaining budget a query cannot usefully complete — skip it. */
+const MIN_QUERY_BUDGET_MS = 100;
+
+/**
+ * Set the shared time budget for all subsequent daemon queries in this
+ * process. Call once at hook startup with a value safely under the hook's
+ * Claude Code timeout.
+ */
+export function setQueryDeadline(budgetMs: number): void {
+  queryDeadlineAt = Date.now() + budgetMs;
+}
+
+/** Remove the deadline (subsequent queries use QUERY_TIMEOUT only). */
+export function clearQueryDeadline(): void {
+  queryDeadlineAt = null;
+}
+
+/**
+ * Milliseconds left in the current budget, or null when no deadline is set.
+ * May be negative once the deadline has passed.
+ */
+export function remainingQueryBudget(): number | null {
+  if (queryDeadlineAt === null) return null;
+  return queryDeadlineAt - Date.now();
+}
+
+/** True when a deadline is set and effectively spent. */
+function budgetExhausted(): boolean {
+  const remaining = remainingQueryBudget();
+  return remaining !== null && remaining < MIN_QUERY_BUDGET_MS;
+}
+
+/** Clamp a wait/timeout to the remaining budget (no-op without a deadline). */
+function budgetClamp(defaultMs: number): number {
+  const remaining = remainingQueryBudget();
+  if (remaining === null) return defaultMs;
+  return Math.max(0, Math.min(defaultMs, remaining));
+}
 
 /**
  * Query structure for daemon commands.
@@ -362,6 +415,11 @@ export function tryStartDaemon(projectDir: string): boolean {
   if (process.env.TLDR_NO_AUTOSTART === '1') {
     return false;
   }
+  // Starting the daemon can cost tens of seconds (spawn + readiness wait);
+  // under a spent hook budget, report unavailable instead.
+  if (budgetExhausted()) {
+    return false;
+  }
   try {
     // FAST CHECK: Is daemon process running? (checks PID file + kill -0)
     // This is faster and more reliable than socket ping
@@ -378,8 +436,9 @@ export function tryStartDaemon(projectDir: string): boolean {
     // Try to acquire lock - if another process is starting daemon, wait for it
     if (!tryAcquireLock(projectDir)) {
       // Another process is starting the daemon - wait and check if it succeeds
+      const lockWaitMs = budgetClamp(5000);
       const start = Date.now();
-      while (Date.now() - start < 5000) {
+      while (Date.now() - start < lockWaitMs) {
         // Check process first (faster), then socket
         if (isDaemonProcessRunning(projectDir) || isDaemonReachable(projectDir)) {
           return true;
@@ -400,7 +459,7 @@ export function tryStartDaemon(projectDir: string): boolean {
       // Try local dev installation first (only if it exists)
       if (existsSync(tldrPath)) {
         const result = spawnSync('uv', ['run', 'tldr', 'daemon', 'start', '--project', projectDir], {
-          timeout: 10000,
+          timeout: Math.max(MIN_QUERY_BUDGET_MS, budgetClamp(10000)),
           stdio: 'ignore',
           cwd: tldrPath,
         });
@@ -411,14 +470,16 @@ export function tryStartDaemon(projectDir: string): boolean {
       // Skip fallback in dev mode (TLDR_DEV=1) to prevent duplicate daemons
       if (!started && !process.env.TLDR_DEV) {
         spawnSync('tldr', ['daemon', 'start', '--project', projectDir], {
-          timeout: 5000,
+          timeout: Math.max(MIN_QUERY_BUDGET_MS, budgetClamp(5000)),
           stdio: 'ignore',
         });
       }
 
-      // Wait for daemon to become reachable (up to 10s for slow starts)
+      // Wait for daemon to become reachable (up to 10s for slow starts,
+      // clamped to whatever is left of the hook's budget)
+      const reachWaitMs = budgetClamp(10000);
       const start = Date.now();
-      while (Date.now() - start < 10000) {
+      while (Date.now() - start < reachWaitMs) {
         if (isDaemonReachable(projectDir)) {
           // Daemon is ready - keep lock for a bit longer to prevent races
           const cooldown = Date.now() + 1000;
@@ -549,6 +610,12 @@ export function queryDaemon(query: DaemonQuery, projectDir: string): Promise<Dae
  * @returns Daemon response
  */
 export function queryDaemonSync(query: DaemonQuery, projectDir: string): DaemonResponse {
+  // Deadline spent — skip the query (and especially the auto-start path)
+  // rather than letting Claude Code kill the whole hook.
+  if (budgetExhausted()) {
+    return { status: 'unavailable', error: 'query deadline exceeded' };
+  }
+
   // Check if indexing - return early with indexing flag
   if (isIndexing(projectDir)) {
     return {
@@ -567,6 +634,10 @@ export function queryDaemonSync(query: DaemonQuery, projectDir: string): DaemonR
       return { status: 'unavailable', error: 'Daemon not running and could not start' };
     }
   }
+
+  // tryStartDaemon may have consumed the rest of the budget; each execSync
+  // below must never wait longer than what is left of it.
+  const queryTimeout = Math.max(MIN_QUERY_BUDGET_MS, budgetClamp(QUERY_TIMEOUT));
 
   try {
     const input = JSON.stringify(query);
@@ -588,14 +659,14 @@ export function queryDaemonSync(query: DaemonQuery, projectDir: string): DaemonR
 
       result = execSync(`powershell -Command "${psCommand.replace(/"/g, '\\"')}"`, {
         encoding: 'utf-8',
-        timeout: QUERY_TIMEOUT,
+        timeout: queryTimeout,
       });
     } else {
       // Unix: Use nc (netcat) to communicate with Unix socket
       // echo '{"cmd":"ping"}' | nc -U /tmp/tldr-xxx.sock
       result = execSync(`echo '${input}' | nc -U "${connInfo.path}"`, {
         encoding: 'utf-8',
-        timeout: QUERY_TIMEOUT,
+        timeout: queryTimeout,
       });
     }
 
@@ -978,10 +1049,35 @@ export function trackHookActivitySync(
   metrics: Record<string, number> = {}
 ): void {
   try {
-    queryDaemonSync(
-      { cmd: 'track', hook: hookName, success, metrics },
-      projectDir
-    );
+    // Stats are best-effort: never charge them against the hook's time
+    // budget. Fire the write as a detached child and return immediately;
+    // if the daemon isn't up, drop the sample instead of auto-starting it.
+    const connInfo = getConnectionInfo(projectDir);
+    const input = JSON.stringify({ cmd: 'track', hook: hookName, success, metrics });
+
+    if (connInfo.type === 'tcp') {
+      const psCommand = `
+        $client = New-Object System.Net.Sockets.TcpClient('${connInfo.host}', ${connInfo.port})
+        $stream = $client.GetStream()
+        $writer = New-Object System.IO.StreamWriter($stream)
+        $writer.WriteLine('${input.replace(/'/g, "''")}')
+        $writer.Flush()
+        $client.Close()
+      `.trim();
+      spawn('powershell', ['-Command', psCommand], {
+        detached: true,
+        stdio: 'ignore',
+      }).unref();
+      return;
+    }
+
+    if (!connInfo.path || !existsSync(connInfo.path)) {
+      return;
+    }
+    spawn('sh', ['-c', `echo '${input}' | nc -U "${connInfo.path}"`], {
+      detached: true,
+      stdio: 'ignore',
+    }).unref();
   } catch {
     // Silently ignore errors - stats tracking is best-effort
   }

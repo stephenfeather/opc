@@ -4,7 +4,7 @@ import { basename } from "path";
 
 // src/daemon-client.ts
 import { existsSync, readFileSync, writeFileSync, unlinkSync } from "fs";
-import { execSync, spawnSync } from "child_process";
+import { execSync, spawn, spawnSync } from "child_process";
 import { join, resolve } from "path";
 import { tmpdir } from "os";
 import * as net from "net";
@@ -72,6 +72,24 @@ function releaseLock(projectDir) {
   }
 }
 var QUERY_TIMEOUT = 3e3;
+var queryDeadlineAt = null;
+var MIN_QUERY_BUDGET_MS = 100;
+function setQueryDeadline(budgetMs) {
+  queryDeadlineAt = Date.now() + budgetMs;
+}
+function remainingQueryBudget() {
+  if (queryDeadlineAt === null) return null;
+  return queryDeadlineAt - Date.now();
+}
+function budgetExhausted() {
+  const remaining = remainingQueryBudget();
+  return remaining !== null && remaining < MIN_QUERY_BUDGET_MS;
+}
+function budgetClamp(defaultMs) {
+  const remaining = remainingQueryBudget();
+  if (remaining === null) return defaultMs;
+  return Math.max(0, Math.min(defaultMs, remaining));
+}
 function getConnectionInfo(projectDir) {
   const resolvedPath = resolveProjectDir(projectDir);
   const hash = crypto.createHash("md5").update(resolvedPath).digest("hex").substring(0, 8);
@@ -155,6 +173,9 @@ function tryStartDaemon(projectDir) {
   if (process.env.TLDR_NO_AUTOSTART === "1") {
     return false;
   }
+  if (budgetExhausted()) {
+    return false;
+  }
   try {
     if (isDaemonProcessRunning(projectDir)) {
       return true;
@@ -163,8 +184,9 @@ function tryStartDaemon(projectDir) {
       return true;
     }
     if (!tryAcquireLock(projectDir)) {
+      const lockWaitMs = budgetClamp(5e3);
       const start = Date.now();
-      while (Date.now() - start < 5e3) {
+      while (Date.now() - start < lockWaitMs) {
         if (isDaemonProcessRunning(projectDir) || isDaemonReachable(projectDir)) {
           return true;
         }
@@ -180,7 +202,7 @@ function tryStartDaemon(projectDir) {
       let started = false;
       if (existsSync(tldrPath)) {
         const result = spawnSync("uv", ["run", "tldr", "daemon", "start", "--project", projectDir], {
-          timeout: 1e4,
+          timeout: Math.max(MIN_QUERY_BUDGET_MS, budgetClamp(1e4)),
           stdio: "ignore",
           cwd: tldrPath
         });
@@ -188,12 +210,13 @@ function tryStartDaemon(projectDir) {
       }
       if (!started && !process.env.TLDR_DEV) {
         spawnSync("tldr", ["daemon", "start", "--project", projectDir], {
-          timeout: 5e3,
+          timeout: Math.max(MIN_QUERY_BUDGET_MS, budgetClamp(5e3)),
           stdio: "ignore"
         });
       }
+      const reachWaitMs = budgetClamp(1e4);
       const start = Date.now();
-      while (Date.now() - start < 1e4) {
+      while (Date.now() - start < reachWaitMs) {
         if (isDaemonReachable(projectDir)) {
           const cooldown = Date.now() + 1e3;
           while (Date.now() < cooldown) {
@@ -213,6 +236,9 @@ function tryStartDaemon(projectDir) {
   }
 }
 function queryDaemonSync(query, projectDir) {
+  if (budgetExhausted()) {
+    return { status: "unavailable", error: "query deadline exceeded" };
+  }
   if (isIndexing(projectDir)) {
     return {
       indexing: true,
@@ -226,6 +252,7 @@ function queryDaemonSync(query, projectDir) {
       return { status: "unavailable", error: "Daemon not running and could not start" };
     }
   }
+  const queryTimeout = Math.max(MIN_QUERY_BUDGET_MS, budgetClamp(QUERY_TIMEOUT));
   try {
     const input = JSON.stringify(query);
     let result;
@@ -243,12 +270,12 @@ function queryDaemonSync(query, projectDir) {
       `.trim();
       result = execSync(`powershell -Command "${psCommand.replace(/"/g, '\\"')}"`, {
         encoding: "utf-8",
-        timeout: QUERY_TIMEOUT
+        timeout: queryTimeout
       });
     } else {
       result = execSync(`echo '${input}' | nc -U "${connInfo.path}"`, {
         encoding: "utf-8",
-        timeout: QUERY_TIMEOUT
+        timeout: queryTimeout
       });
     }
     return JSON.parse(result.trim());
@@ -264,10 +291,30 @@ function queryDaemonSync(query, projectDir) {
 }
 function trackHookActivitySync(hookName, projectDir, success = true, metrics = {}) {
   try {
-    queryDaemonSync(
-      { cmd: "track", hook: hookName, success, metrics },
-      projectDir
-    );
+    const connInfo = getConnectionInfo(projectDir);
+    const input = JSON.stringify({ cmd: "track", hook: hookName, success, metrics });
+    if (connInfo.type === "tcp") {
+      const psCommand = `
+        $client = New-Object System.Net.Sockets.TcpClient('${connInfo.host}', ${connInfo.port})
+        $stream = $client.GetStream()
+        $writer = New-Object System.IO.StreamWriter($stream)
+        $writer.WriteLine('${input.replace(/'/g, "''")}')
+        $writer.Flush()
+        $client.Close()
+      `.trim();
+      spawn("powershell", ["-Command", psCommand], {
+        detached: true,
+        stdio: "ignore"
+      }).unref();
+      return;
+    }
+    if (!connInfo.path || !existsSync(connInfo.path)) {
+      return;
+    }
+    spawn("sh", ["-c", `echo '${input}' | nc -U "${connInfo.path}"`], {
+      detached: true,
+      stdio: "ignore"
+    }).unref();
   } catch {
   }
 }
@@ -279,6 +326,7 @@ function trackHookActivitySync(hookName, projectDir, success = true, metrics = {
  * Injects file structure from TLDR before Claude edits a file.
  * Uses TLDR daemon for fast code extraction (replaces CLI spawning).
  */
+var DAEMON_BUDGET_MS = 3500;
 function getTLDRImports(filePath) {
   try {
     const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
@@ -326,6 +374,7 @@ async function main() {
     console.log("{}");
     return;
   }
+  setQueryDeadline(DAEMON_BUDGET_MS);
   const extract = getTLDRExtract(filePath, input.session_id);
   const imports = getTLDRImports(filePath);
   const classCount = extract?.classes?.length || 0;

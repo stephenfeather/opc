@@ -9,7 +9,13 @@
 
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
-import { queryDaemonSync, DaemonResponse, trackHookActivitySync } from './daemon-client.js';
+import { queryDaemonSync, setQueryDeadline, DaemonResponse, trackHookActivitySync } from './daemon-client.js';
+
+// Overall daemon budget. This hook runs under a 10s Claude Code timeout but
+// makes up to 7 daemon calls (3 identifiers x impact+importers, plus stats),
+// each individually capped at 3s — 21s worst case. The shared deadline keeps
+// the sum bounded, with headroom for node startup and stdout.
+const DAEMON_BUDGET_MS = 8000;
 
 interface UserPromptInput {
   session_id: string;
@@ -182,6 +188,8 @@ async function main() {
   }
 
   const projectDir = process.env.CLAUDE_PROJECT_DIR || input.cwd;
+
+  setQueryDeadline(DAEMON_BUDGET_MS);
 
   const results: string[] = [];
 

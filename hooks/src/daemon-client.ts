@@ -364,12 +364,13 @@ function isDaemonReachable(projectDir: string): boolean {
     // First check if daemon process is running via PID file
     // This is more reliable than socket ping which can timeout when busy
     if (isDaemonProcessRunning(projectDir)) {
-      // Process exists - socket might just be busy, don't delete it
-      // Try a quick ping but don't delete socket on failure
+      // Process exists - socket might just be busy, don't delete it.
+      // The ping is only advisory here (both outcomes return true), so
+      // never spend more of the hook's budget on it than is left.
       try {
         execSync(`echo '{"cmd":"ping"}' | nc -U "${connInfo.path}"`, {
           encoding: 'utf-8',
-          timeout: 1000,  // Increased from 500ms
+          timeout: Math.max(50, budgetClamp(1000)),
           stdio: ['pipe', 'pipe', 'pipe'],
         });
         return true;
@@ -384,7 +385,7 @@ function isDaemonReachable(projectDir: string): boolean {
     try {
       execSync(`echo '{"cmd":"ping"}' | nc -U "${connInfo.path}"`, {
         encoding: 'utf-8',
-        timeout: 500,
+        timeout: Math.max(50, budgetClamp(500)),
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       return true;
@@ -451,6 +452,12 @@ export function tryStartDaemon(projectDir: string): boolean {
     }
 
     try {
+      // The reachability checks above may have drained the budget — starting
+      // a daemon we can no longer wait for would only overrun the hook.
+      if (budgetExhausted()) {
+        return false;
+      }
+
       // We hold the lock - start the daemon
       const opcDir = process.env.CLAUDE_OPC_DIR || join(projectDir, 'opc');
       const tldrPath = join(opcDir, 'packages', 'tldr-code');
@@ -482,7 +489,8 @@ export function tryStartDaemon(projectDir: string): boolean {
       while (Date.now() - start < reachWaitMs) {
         if (isDaemonReachable(projectDir)) {
           // Daemon is ready - keep lock for a bit longer to prevent races
-          const cooldown = Date.now() + 1000;
+          // (clamped: the race-prevention hold is worth less than the hook)
+          const cooldown = Date.now() + budgetClamp(1000);
           while (Date.now() < cooldown) { /* spin */ }
           return true;
         }
@@ -635,8 +643,13 @@ export function queryDaemonSync(query: DaemonQuery, projectDir: string): DaemonR
     }
   }
 
-  // tryStartDaemon may have consumed the rest of the budget; each execSync
-  // below must never wait longer than what is left of it.
+  // The reachability probe / auto-start above may have consumed the rest of
+  // the budget — don't begin a query that can no longer usefully complete.
+  if (budgetExhausted()) {
+    return { status: 'unavailable', error: 'query deadline exceeded' };
+  }
+
+  // Each execSync below must never wait longer than what is left of the budget.
   const queryTimeout = Math.max(MIN_QUERY_BUDGET_MS, budgetClamp(QUERY_TIMEOUT));
 
   try {

@@ -143,8 +143,7 @@ function isDaemonReachable(projectDir) {
       try {
         execSync(`echo '{"cmd":"ping"}' | nc -U "${connInfo.path}"`, {
           encoding: "utf-8",
-          timeout: 1e3,
-          // Increased from 500ms
+          timeout: Math.max(50, budgetClamp(1e3)),
           stdio: ["pipe", "pipe", "pipe"]
         });
         return true;
@@ -155,7 +154,7 @@ function isDaemonReachable(projectDir) {
     try {
       execSync(`echo '{"cmd":"ping"}' | nc -U "${connInfo.path}"`, {
         encoding: "utf-8",
-        timeout: 500,
+        timeout: Math.max(50, budgetClamp(500)),
         stdio: ["pipe", "pipe", "pipe"]
       });
       return true;
@@ -196,6 +195,9 @@ function tryStartDaemon(projectDir) {
       return isDaemonProcessRunning(projectDir) || isDaemonReachable(projectDir);
     }
     try {
+      if (budgetExhausted()) {
+        return false;
+      }
       const opcDir = process.env.CLAUDE_OPC_DIR || join(projectDir, "opc");
       const tldrPath = join(opcDir, "packages", "tldr-code");
       let started = false;
@@ -217,7 +219,7 @@ function tryStartDaemon(projectDir) {
       const start = Date.now();
       while (Date.now() - start < reachWaitMs) {
         if (isDaemonReachable(projectDir)) {
-          const cooldown = Date.now() + 1e3;
+          const cooldown = Date.now() + budgetClamp(1e3);
           while (Date.now() < cooldown) {
           }
           return true;
@@ -250,6 +252,9 @@ function queryDaemonSync(query, projectDir) {
     if (!tryStartDaemon(projectDir)) {
       return { status: "unavailable", error: "Daemon not running and could not start" };
     }
+  }
+  if (budgetExhausted()) {
+    return { status: "unavailable", error: "query deadline exceeded" };
   }
   const queryTimeout = Math.max(MIN_QUERY_BUDGET_MS, budgetClamp(QUERY_TIMEOUT));
   try {

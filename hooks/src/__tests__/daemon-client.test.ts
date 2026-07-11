@@ -617,13 +617,56 @@ describe('query deadline budget', () => {
           const result = queryDaemonSync({ cmd: 'ping' }, TEST_PROJECT_DIR);
           const elapsed = Date.now() - t0;
           expect(elapsed).toBeLessThan(2500);
-          expect(result.status).toBe('error');
+          // 'error' (query issued and killed at the clamp) or 'unavailable'
+          // (budget already spent by the clamped reachability probe) — both
+          // are bounded outcomes; only the full 3s QUERY_TIMEOUT would be a bug.
+          expect(['error', 'unavailable']).toContain(result.status);
           resolve();
         } catch (err) {
           reject(err);
         }
       });
     });
+  });
+
+  it('clamps the stale-socket reachability probe to the remaining budget', async () => {
+    // Hung listener, no PID file: isDaemonReachable falls through to its
+    // stale-socket nc ping, which used a fixed 500ms timeout regardless of
+    // the deadline.
+    mockServer = net.createServer(() => {
+      // never respond
+    });
+    await new Promise<void>((resolve) => {
+      mockServer!.listen(mockSocketPath, () => resolve());
+    });
+
+    setQueryDeadline(150);
+    const t0 = Date.now();
+    const result = queryDaemonSync({ cmd: 'ping' }, TEST_PROJECT_DIR);
+    const elapsed = Date.now() - t0;
+    expect(result.status).toBe('unavailable');
+    expect(elapsed).toBeLessThan(500);
+  });
+
+  it('busy-daemon probe plus query cannot stack past the deadline', async () => {
+    // Hung listener WITH a PID file: the reachability ping burns its timeout
+    // (fixed 1000ms before this change), returns true anyway, and the code
+    // then charged a further full QUERY_TIMEOUT to the actual query — 4s
+    // total against e.g. a 5s hook budget.
+    mockServer = net.createServer(() => {
+      // never respond
+    });
+    await new Promise<void>((resolve) => {
+      mockServer!.listen(mockSocketPath, () => resolve());
+    });
+    writeFileSync(mockPidPath, String(process.pid));
+
+    setQueryDeadline(400);
+    const t0 = Date.now();
+    const result = queryDaemonSync({ cmd: 'ping' }, TEST_PROJECT_DIR);
+    const elapsed = Date.now() - t0;
+    expect(['unavailable', 'error']).toContain(result.status);
+    expect(elapsed).toBeLessThan(1200);
   });
 
   it('queryDaemonSync still succeeds against a responsive daemon under a deadline', async () => {

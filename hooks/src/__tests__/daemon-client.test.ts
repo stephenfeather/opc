@@ -713,6 +713,7 @@ describe('trackHookActivitySync non-blocking', () => {
   let mockServer: net.Server | null = null;
   let mockSocketPath: string;
   let mockPidPath: string;
+  const acceptedConns: net.Socket[] = [];
 
   beforeEach(() => {
     setupTestEnv();
@@ -725,6 +726,11 @@ describe('trackHookActivitySync non-blocking', () => {
 
   afterEach(async () => {
     clearQueryDeadline();
+    // Hung-server tests hold accepted connections open; destroy them so
+    // server.close() can complete.
+    for (const conn of acceptedConns.splice(0)) {
+      conn.destroy();
+    }
     if (mockServer) {
       await new Promise<void>((resolve) => {
         mockServer!.close(() => {
@@ -744,8 +750,9 @@ describe('trackHookActivitySync non-blocking', () => {
   });
 
   it('returns immediately even when the daemon never responds', async () => {
-    mockServer = net.createServer(() => {
+    mockServer = net.createServer((conn) => {
       // never respond — a blocking implementation would stall for 3s here
+      acceptedConns.push(conn);
     });
     await new Promise<void>((resolve) => {
       mockServer!.listen(mockSocketPath, () => resolve());
@@ -760,4 +767,56 @@ describe('trackHookActivitySync non-blocking', () => {
   it('does not throw when the daemon socket is missing', () => {
     expect(() => trackHookActivitySync('test-hook', TEST_PROJECT_DIR)).not.toThrow();
   });
+
+  it('leaves no external child process behind on a hung accepted connection', async () => {
+    // A detached `sh -c "echo ... | nc -U ..."` writer would keep an nc
+    // process alive as long as the daemon holds the accepted connection
+    // open — one leaked child per hook invocation.
+    mockServer = net.createServer((conn) => {
+      // accept and hold the connection open, never respond, never close
+      acceptedConns.push(conn);
+    });
+    await new Promise<void>((resolve) => {
+      mockServer!.listen(mockSocketPath, () => resolve());
+    });
+    writeFileSync(mockPidPath, String(process.pid));
+
+    trackHookActivitySync('test-hook', TEST_PROJECT_DIR, true, { runs: 1 });
+
+    // Give any spawned child time to start and get stuck
+    await new Promise((r) => setTimeout(r, 1500));
+    const pgrep = spawnSync('pgrep', ['-f', mockSocketPath], { encoding: 'utf-8' });
+    // pgrep exits 1 when nothing matches; 0 means a process referencing our
+    // socket path is still alive (the leak)
+    expect(pgrep.status).toBe(1);
+  }, 10000);
+
+  it('delivers the track payload to the daemon', async () => {
+    const received: string[] = [];
+    let resolveReceived: (() => void) | null = null;
+    const gotPayload = new Promise<void>((resolve) => {
+      resolveReceived = resolve;
+    });
+
+    mockServer = net.createServer((conn) => {
+      conn.on('data', (data) => {
+        received.push(data.toString());
+        resolveReceived?.();
+      });
+    });
+    await new Promise<void>((resolve) => {
+      mockServer!.listen(mockSocketPath, () => resolve());
+    });
+    writeFileSync(mockPidPath, String(process.pid));
+
+    trackHookActivitySync('test-hook', TEST_PROJECT_DIR, true, { runs: 1 });
+
+    await Promise.race([
+      gotPayload,
+      new Promise((r) => setTimeout(r, 2000)),
+    ]);
+    const payload = received.join('');
+    expect(payload).toContain('"cmd":"track"');
+    expect(payload).toContain('"hook":"test-hook"');
+  }, 10000);
 });

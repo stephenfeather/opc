@@ -11,7 +11,7 @@
  */
 
 import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
-import { execSync, spawn, spawnSync } from 'child_process';
+import { execSync, spawnSync } from 'child_process';
 import { join, resolve } from 'path';
 import { tmpdir } from 'os';
 import * as net from 'net';
@@ -118,6 +118,9 @@ let queryDeadlineAt: number | null = null;
 
 /** Below this remaining budget a query cannot usefully complete — skip it. */
 const MIN_QUERY_BUDGET_MS = 100;
+
+/** Hard bound on the fire-and-forget stats write in trackHookActivitySync. */
+const TRACK_WRITE_TIMEOUT_MS = 1000;
 
 /**
  * Set the shared time budget for all subsequent daemon queries in this
@@ -1063,34 +1066,33 @@ export function trackHookActivitySync(
 ): void {
   try {
     // Stats are best-effort: never charge them against the hook's time
-    // budget. Fire the write as a detached child and return immediately;
-    // if the daemon isn't up, drop the sample instead of auto-starting it.
+    // budget and never leave anything running after the hook exits. The
+    // write happens on an in-process socket that is unref'd (so it cannot
+    // keep the hook process alive) and hard-bounded by a timeout (so a
+    // daemon that accepts but never closes cannot pin resources). If the
+    // process exits before the write flushes, the sample is dropped —
+    // dropped stats beat leaked children or burned hook budget. If the
+    // daemon isn't up, drop the sample instead of auto-starting it.
     const connInfo = getConnectionInfo(projectDir);
-    const input = JSON.stringify({ cmd: 'track', hook: hookName, success, metrics });
+    const payload = JSON.stringify({ cmd: 'track', hook: hookName, success, metrics }) + '\n';
 
+    let sock: net.Socket;
     if (connInfo.type === 'tcp') {
-      const psCommand = `
-        $client = New-Object System.Net.Sockets.TcpClient('${connInfo.host}', ${connInfo.port})
-        $stream = $client.GetStream()
-        $writer = New-Object System.IO.StreamWriter($stream)
-        $writer.WriteLine('${input.replace(/'/g, "''")}')
-        $writer.Flush()
-        $client.Close()
-      `.trim();
-      spawn('powershell', ['-Command', psCommand], {
-        detached: true,
-        stdio: 'ignore',
-      }).unref();
-      return;
+      sock = net.createConnection({ host: connInfo.host!, port: connInfo.port! });
+    } else {
+      if (!connInfo.path || !existsSync(connInfo.path)) {
+        return;
+      }
+      sock = net.createConnection(connInfo.path);
     }
 
-    if (!connInfo.path || !existsSync(connInfo.path)) {
-      return;
-    }
-    spawn('sh', ['-c', `echo '${input}' | nc -U "${connInfo.path}"`], {
-      detached: true,
-      stdio: 'ignore',
-    }).unref();
+    sock.setTimeout(TRACK_WRITE_TIMEOUT_MS);
+    sock.on('timeout', () => sock.destroy());
+    sock.on('error', () => sock.destroy());
+    sock.on('connect', () => {
+      sock.write(payload, () => sock.end());
+    });
+    sock.unref();
   } catch {
     // Silently ignore errors - stats tracking is best-effort
   }

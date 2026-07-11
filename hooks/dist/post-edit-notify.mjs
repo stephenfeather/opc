@@ -3,7 +3,7 @@ import { readFileSync as readFileSync2 } from "fs";
 
 // src/daemon-client.ts
 import { existsSync, readFileSync, writeFileSync, unlinkSync } from "fs";
-import { execSync, spawn, spawnSync } from "child_process";
+import { execSync, spawnSync } from "child_process";
 import { join, resolve } from "path";
 import { tmpdir } from "os";
 import * as net from "net";
@@ -73,6 +73,7 @@ function releaseLock(projectDir) {
 var QUERY_TIMEOUT = 3e3;
 var queryDeadlineAt = null;
 var MIN_QUERY_BUDGET_MS = 100;
+var TRACK_WRITE_TIMEOUT_MS = 1e3;
 function remainingQueryBudget() {
   if (queryDeadlineAt === null) return null;
   return queryDeadlineAt - Date.now();
@@ -293,29 +294,23 @@ function queryDaemonSync(query, projectDir) {
 function trackHookActivitySync(hookName, projectDir, success = true, metrics = {}) {
   try {
     const connInfo = getConnectionInfo(projectDir);
-    const input = JSON.stringify({ cmd: "track", hook: hookName, success, metrics });
+    const payload = JSON.stringify({ cmd: "track", hook: hookName, success, metrics }) + "\n";
+    let sock;
     if (connInfo.type === "tcp") {
-      const psCommand = `
-        $client = New-Object System.Net.Sockets.TcpClient('${connInfo.host}', ${connInfo.port})
-        $stream = $client.GetStream()
-        $writer = New-Object System.IO.StreamWriter($stream)
-        $writer.WriteLine('${input.replace(/'/g, "''")}')
-        $writer.Flush()
-        $client.Close()
-      `.trim();
-      spawn("powershell", ["-Command", psCommand], {
-        detached: true,
-        stdio: "ignore"
-      }).unref();
-      return;
+      sock = net.createConnection({ host: connInfo.host, port: connInfo.port });
+    } else {
+      if (!connInfo.path || !existsSync(connInfo.path)) {
+        return;
+      }
+      sock = net.createConnection(connInfo.path);
     }
-    if (!connInfo.path || !existsSync(connInfo.path)) {
-      return;
-    }
-    spawn("sh", ["-c", `echo '${input}' | nc -U "${connInfo.path}"`], {
-      detached: true,
-      stdio: "ignore"
-    }).unref();
+    sock.setTimeout(TRACK_WRITE_TIMEOUT_MS);
+    sock.on("timeout", () => sock.destroy());
+    sock.on("error", () => sock.destroy());
+    sock.on("connect", () => {
+      sock.write(payload, () => sock.end());
+    });
+    sock.unref();
   } catch {
   }
 }

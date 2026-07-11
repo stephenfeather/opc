@@ -669,6 +669,23 @@ describe('query deadline budget', () => {
     expect(elapsed).toBeLessThan(1200);
   });
 
+  it('never unlinks the socket of a live-but-busy daemon on probe timeout', async () => {
+    // No PID file, hung listener: a connect that *succeeds* proves a
+    // listener is alive (a truly stale socket refuses instantly), so a ping
+    // timeout must not be treated as staleness — unlinking here would let a
+    // concurrent hook autostart a duplicate daemon against the same project.
+    mockServer = net.createServer(() => {
+      // accept, never respond — busy daemon
+    });
+    await new Promise<void>((resolve) => {
+      mockServer!.listen(mockSocketPath, () => resolve());
+    });
+
+    setQueryDeadline(150);
+    queryDaemonSync({ cmd: 'ping' }, TEST_PROJECT_DIR);
+    expect(existsSync(mockSocketPath)).toBe(true);
+  });
+
   it('queryDaemonSync still succeeds against a responsive daemon under a deadline', async () => {
     // queryDaemonSync shells out to nc and blocks the event loop, so an
     // in-process net server can never answer it — run the responder in a
@@ -818,5 +835,50 @@ describe('trackHookActivitySync non-blocking', () => {
     const payload = received.join('');
     expect(payload).toContain('"cmd":"track"');
     expect(payload).toContain('"hook":"test-hook"');
+  }, 10000);
+
+  it('delivers the sample even when the calling process exits immediately', async () => {
+    // Real hooks call trackHookActivitySync and exit right away. An unref'd
+    // socket lets the process die before connect/write runs, silently
+    // dropping every sample — the write must hold the process just long
+    // enough to flush (bounded by the track timeout).
+    const distClient = resolve(__dirname, '../../dist/daemon-client.mjs');
+    if (!existsSync(distClient)) {
+      // dist not built in this checkout; `npm test` builds it via pretest
+      return;
+    }
+
+    const received: string[] = [];
+    let resolveReceived: (() => void) | null = null;
+    const gotPayload = new Promise<void>((res) => {
+      resolveReceived = res;
+    });
+
+    mockServer = net.createServer((conn) => {
+      acceptedConns.push(conn);
+      conn.on('data', (data) => {
+        received.push(data.toString());
+        resolveReceived?.();
+      });
+    });
+    await new Promise<void>((res) => {
+      mockServer!.listen(mockSocketPath, () => res());
+    });
+    writeFileSync(mockPidPath, String(process.pid));
+
+    const childScript = `
+      import { trackHookActivitySync } from ${JSON.stringify(distClient)};
+      trackHookActivitySync('child-hook', ${JSON.stringify(TEST_PROJECT_DIR)}, true, { runs: 1 });
+    `;
+    const child = spawn(process.execPath, ['--input-type=module', '-e', childScript], {
+      stdio: 'ignore',
+    });
+    await new Promise<void>((res) => child.on('exit', () => res()));
+
+    await Promise.race([
+      gotPayload,
+      new Promise((r) => setTimeout(r, 2000)),
+    ]);
+    expect(received.join('')).toContain('"hook":"child-hook"');
   }, 10000);
 });

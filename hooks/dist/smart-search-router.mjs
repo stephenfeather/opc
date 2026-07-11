@@ -75,7 +75,7 @@ function releaseLock(projectDir) {
 var QUERY_TIMEOUT = 3e3;
 var queryDeadlineAt = null;
 var MIN_QUERY_BUDGET_MS = 100;
-var TRACK_WRITE_TIMEOUT_MS = 1e3;
+var TRACK_WRITE_TIMEOUT_MS = 250;
 function remainingQueryBudget() {
   if (queryDeadlineAt === null) return null;
   return queryDeadlineAt - Date.now();
@@ -88,6 +88,13 @@ function budgetClamp(defaultMs) {
   const remaining = remainingQueryBudget();
   if (remaining === null) return defaultMs;
   return Math.max(0, Math.min(defaultMs, remaining));
+}
+function isTimeoutError(err) {
+  return err?.killed === true || err?.code === "ETIMEDOUT" || err?.signal === "SIGTERM";
+}
+function sleepSync(ms) {
+  if (ms <= 0) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 function getConnectionInfo(projectDir) {
   const resolvedPath = resolveProjectDir(projectDir);
@@ -158,7 +165,10 @@ function isDaemonReachable(projectDir) {
         stdio: ["pipe", "pipe", "pipe"]
       });
       return true;
-    } catch {
+    } catch (err) {
+      if (isTimeoutError(err)) {
+        return true;
+      }
       try {
         unlinkSync(connInfo.path);
       } catch {
@@ -188,9 +198,7 @@ function tryStartDaemon(projectDir) {
         if (isDaemonProcessRunning(projectDir) || isDaemonReachable(projectDir)) {
           return true;
         }
-        const end = Date.now() + 100;
-        while (Date.now() < end) {
-        }
+        sleepSync(Math.min(100, lockWaitMs - (Date.now() - start)));
       }
       return isDaemonProcessRunning(projectDir) || isDaemonReachable(projectDir);
     }
@@ -219,14 +227,10 @@ function tryStartDaemon(projectDir) {
       const start = Date.now();
       while (Date.now() - start < reachWaitMs) {
         if (isDaemonReachable(projectDir)) {
-          const cooldown = Date.now() + budgetClamp(1e3);
-          while (Date.now() < cooldown) {
-          }
+          sleepSync(budgetClamp(1e3));
           return true;
         }
-        const end = Date.now() + 100;
-        while (Date.now() < end) {
-        }
+        sleepSync(Math.min(100, reachWaitMs - (Date.now() - start)));
       }
       return isDaemonReachable(projectDir);
     } finally {
@@ -284,7 +288,7 @@ function queryDaemonSync(query, projectDir) {
     }
     return JSON.parse(result.trim());
   } catch (err) {
-    if (err.killed) {
+    if (isTimeoutError(err)) {
       return { status: "error", error: "timeout" };
     }
     if (err.message?.includes("ECONNREFUSED") || err.message?.includes("ENOENT")) {
@@ -310,9 +314,8 @@ function trackHookActivitySync(hookName, projectDir, success = true, metrics = {
     sock.on("timeout", () => sock.destroy());
     sock.on("error", () => sock.destroy());
     sock.on("connect", () => {
-      sock.write(payload, () => sock.end());
+      sock.write(payload, () => sock.destroy());
     });
-    sock.unref();
   } catch {
   }
 }

@@ -119,8 +119,13 @@ let queryDeadlineAt: number | null = null;
 /** Below this remaining budget a query cannot usefully complete — skip it. */
 const MIN_QUERY_BUDGET_MS = 100;
 
-/** Hard bound on the fire-and-forget stats write in trackHookActivitySync. */
-const TRACK_WRITE_TIMEOUT_MS = 1000;
+/**
+ * Hard bound on the fire-and-forget stats write in trackHookActivitySync.
+ * The socket stays ref'd until the payload flushes, so this is also the
+ * longest a finished hook process can be held open by tracking. Unix-socket
+ * connect+write normally completes in single-digit milliseconds.
+ */
+const TRACK_WRITE_TIMEOUT_MS = 250;
 
 /**
  * Set the shared time budget for all subsequent daemon queries in this
@@ -156,6 +161,27 @@ function budgetClamp(defaultMs: number): number {
   const remaining = remainingQueryBudget();
   if (remaining === null) return defaultMs;
   return Math.max(0, Math.min(defaultMs, remaining));
+}
+
+/**
+ * Classify an execSync/spawnSync error as a timeout kill. Node has not been
+ * consistent here across versions: some set `killed: true`, Node 26 sets
+ * `code: 'ETIMEDOUT'` with `killed` undefined; the SIGTERM signal is what
+ * the timeout kill actually sends.
+ */
+function isTimeoutError(err: any): boolean {
+  return err?.killed === true || err?.code === 'ETIMEDOUT' || err?.signal === 'SIGTERM';
+}
+
+/**
+ * Synchronous sleep that yields the CPU (unlike a Date.now() spin, which
+ * pegs a core per waiting hook process — under startup lock contention every
+ * concurrent hook used to spin, amplifying the very load that causes
+ * timeouts).
+ */
+function sleepSync(ms: number): void {
+  if (ms <= 0) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 /**
@@ -392,8 +418,16 @@ function isDaemonReachable(projectDir: string): boolean {
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       return true;
-    } catch {
-      // Connection failed AND no daemon process - socket is stale, safe to remove
+    } catch (err: any) {
+      if (isTimeoutError(err)) {
+        // Timed out: the connect was ACCEPTED, so a listener is alive but
+        // busy (a truly stale socket refuses instantly). Treat as reachable
+        // — unlinking here would let a concurrent hook delete a live
+        // daemon's socket and autostart a duplicate. This matters more now
+        // that the deadline can clamp this probe well below 500ms.
+        return true;
+      }
+      // Connection refused / ENOENT AND no daemon process - socket is stale
       try {
         unlinkSync(connInfo.path!);
       } catch {
@@ -447,9 +481,7 @@ export function tryStartDaemon(projectDir: string): boolean {
         if (isDaemonProcessRunning(projectDir) || isDaemonReachable(projectDir)) {
           return true;
         }
-        // Brief wait
-        const end = Date.now() + 100;
-        while (Date.now() < end) { /* spin */ }
+        sleepSync(Math.min(100, lockWaitMs - (Date.now() - start)));
       }
       return isDaemonProcessRunning(projectDir) || isDaemonReachable(projectDir);
     }
@@ -493,13 +525,10 @@ export function tryStartDaemon(projectDir: string): boolean {
         if (isDaemonReachable(projectDir)) {
           // Daemon is ready - keep lock for a bit longer to prevent races
           // (clamped: the race-prevention hold is worth less than the hook)
-          const cooldown = Date.now() + budgetClamp(1000);
-          while (Date.now() < cooldown) { /* spin */ }
+          sleepSync(budgetClamp(1000));
           return true;
         }
-        // Brief wait
-        const end = Date.now() + 100;
-        while (Date.now() < end) { /* spin */ }
+        sleepSync(Math.min(100, reachWaitMs - (Date.now() - start)));
       }
 
       return isDaemonReachable(projectDir);
@@ -688,7 +717,7 @@ export function queryDaemonSync(query: DaemonQuery, projectDir: string): DaemonR
 
     return JSON.parse(result.trim());
   } catch (err: any) {
-    if (err.killed) {
+    if (isTimeoutError(err)) {
       return { status: 'error', error: 'timeout' };
     }
     if (err.message?.includes('ECONNREFUSED') || err.message?.includes('ENOENT')) {
@@ -1067,12 +1096,13 @@ export function trackHookActivitySync(
   try {
     // Stats are best-effort: never charge them against the hook's time
     // budget and never leave anything running after the hook exits. The
-    // write happens on an in-process socket that is unref'd (so it cannot
-    // keep the hook process alive) and hard-bounded by a timeout (so a
-    // daemon that accepts but never closes cannot pin resources). If the
-    // process exits before the write flushes, the sample is dropped —
-    // dropped stats beat leaked children or burned hook budget. If the
-    // daemon isn't up, drop the sample instead of auto-starting it.
+    // write happens on an in-process socket that is destroyed as soon as
+    // the payload flushes (no response wait), and a short timeout bounds
+    // the pathological accept-but-hang case. The socket stays ref'd until
+    // then — an unref'd socket lets the hook process exit before connect
+    // even runs, silently dropping every sample — but the hold is at most
+    // TRACK_WRITE_TIMEOUT_MS and typically single-digit ms. If the daemon
+    // isn't up, drop the sample instead of auto-starting it.
     const connInfo = getConnectionInfo(projectDir);
     const payload = JSON.stringify({ cmd: 'track', hook: hookName, success, metrics }) + '\n';
 
@@ -1090,9 +1120,8 @@ export function trackHookActivitySync(
     sock.on('timeout', () => sock.destroy());
     sock.on('error', () => sock.destroy());
     sock.on('connect', () => {
-      sock.write(payload, () => sock.end());
+      sock.write(payload, () => sock.destroy());
     });
-    sock.unref();
   } catch {
     // Silently ignore errors - stats tracking is best-effort
   }

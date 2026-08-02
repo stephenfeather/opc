@@ -72,6 +72,29 @@ function releaseLock(projectDir) {
   }
 }
 var QUERY_TIMEOUT = 3e3;
+var queryDeadlineAt = null;
+var MIN_QUERY_BUDGET_MS = 100;
+var TRACK_WRITE_TIMEOUT_MS = 250;
+function remainingQueryBudget() {
+  if (queryDeadlineAt === null) return null;
+  return queryDeadlineAt - Date.now();
+}
+function budgetExhausted() {
+  const remaining = remainingQueryBudget();
+  return remaining !== null && remaining < MIN_QUERY_BUDGET_MS;
+}
+function budgetClamp(defaultMs) {
+  const remaining = remainingQueryBudget();
+  if (remaining === null) return defaultMs;
+  return Math.max(0, Math.min(defaultMs, remaining));
+}
+function isTimeoutError(err) {
+  return err?.killed === true || err?.code === "ETIMEDOUT" || err?.signal === "SIGTERM";
+}
+function sleepSync(ms) {
+  if (ms <= 0) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
 function getConnectionInfo(projectDir) {
   const resolvedPath = resolveProjectDir(projectDir);
   const hash = crypto.createHash("md5").update(resolvedPath).digest("hex").substring(0, 8);
@@ -126,8 +149,7 @@ function isDaemonReachable(projectDir) {
       try {
         execSync(`echo '{"cmd":"ping"}' | nc -U "${connInfo.path}"`, {
           encoding: "utf-8",
-          timeout: 1e3,
-          // Increased from 500ms
+          timeout: Math.max(50, budgetClamp(1e3)),
           stdio: ["pipe", "pipe", "pipe"]
         });
         return true;
@@ -138,11 +160,14 @@ function isDaemonReachable(projectDir) {
     try {
       execSync(`echo '{"cmd":"ping"}' | nc -U "${connInfo.path}"`, {
         encoding: "utf-8",
-        timeout: 500,
+        timeout: Math.max(50, budgetClamp(500)),
         stdio: ["pipe", "pipe", "pipe"]
       });
       return true;
-    } catch {
+    } catch (err) {
+      if (isTimeoutError(err)) {
+        return true;
+      }
       try {
         unlinkSync(connInfo.path);
       } catch {
@@ -155,6 +180,9 @@ function tryStartDaemon(projectDir) {
   if (process.env.TLDR_NO_AUTOSTART === "1") {
     return false;
   }
+  if (budgetExhausted()) {
+    return false;
+  }
   try {
     if (isDaemonProcessRunning(projectDir)) {
       return true;
@@ -163,24 +191,26 @@ function tryStartDaemon(projectDir) {
       return true;
     }
     if (!tryAcquireLock(projectDir)) {
+      const lockWaitMs = budgetClamp(5e3);
       const start = Date.now();
-      while (Date.now() - start < 5e3) {
+      while (Date.now() - start < lockWaitMs) {
         if (isDaemonProcessRunning(projectDir) || isDaemonReachable(projectDir)) {
           return true;
         }
-        const end = Date.now() + 100;
-        while (Date.now() < end) {
-        }
+        sleepSync(Math.min(100, lockWaitMs - (Date.now() - start)));
       }
       return isDaemonProcessRunning(projectDir) || isDaemonReachable(projectDir);
     }
     try {
+      if (budgetExhausted()) {
+        return false;
+      }
       const opcDir = process.env.CLAUDE_OPC_DIR || join(projectDir, "opc");
       const tldrPath = join(opcDir, "packages", "tldr-code");
       let started = false;
       if (existsSync(tldrPath)) {
         const result = spawnSync("uv", ["run", "tldr", "daemon", "start", "--project", projectDir], {
-          timeout: 1e4,
+          timeout: Math.max(MIN_QUERY_BUDGET_MS, budgetClamp(1e4)),
           stdio: "ignore",
           cwd: tldrPath
         });
@@ -188,21 +218,18 @@ function tryStartDaemon(projectDir) {
       }
       if (!started && !process.env.TLDR_DEV) {
         spawnSync("tldr", ["daemon", "start", "--project", projectDir], {
-          timeout: 5e3,
+          timeout: Math.max(MIN_QUERY_BUDGET_MS, budgetClamp(5e3)),
           stdio: "ignore"
         });
       }
+      const reachWaitMs = budgetClamp(1e4);
       const start = Date.now();
-      while (Date.now() - start < 1e4) {
+      while (Date.now() - start < reachWaitMs) {
         if (isDaemonReachable(projectDir)) {
-          const cooldown = Date.now() + 1e3;
-          while (Date.now() < cooldown) {
-          }
+          sleepSync(budgetClamp(1e3));
           return true;
         }
-        const end = Date.now() + 100;
-        while (Date.now() < end) {
-        }
+        sleepSync(Math.min(100, reachWaitMs - (Date.now() - start)));
       }
       return isDaemonReachable(projectDir);
     } finally {
@@ -213,6 +240,9 @@ function tryStartDaemon(projectDir) {
   }
 }
 function queryDaemonSync(query, projectDir) {
+  if (budgetExhausted()) {
+    return { status: "unavailable", error: "query deadline exceeded" };
+  }
   if (isIndexing(projectDir)) {
     return {
       indexing: true,
@@ -226,6 +256,10 @@ function queryDaemonSync(query, projectDir) {
       return { status: "unavailable", error: "Daemon not running and could not start" };
     }
   }
+  if (budgetExhausted()) {
+    return { status: "unavailable", error: "query deadline exceeded" };
+  }
+  const queryTimeout = Math.max(MIN_QUERY_BUDGET_MS, budgetClamp(QUERY_TIMEOUT));
   try {
     const input = JSON.stringify(query);
     let result;
@@ -243,17 +277,17 @@ function queryDaemonSync(query, projectDir) {
       `.trim();
       result = execSync(`powershell -Command "${psCommand.replace(/"/g, '\\"')}"`, {
         encoding: "utf-8",
-        timeout: QUERY_TIMEOUT
+        timeout: queryTimeout
       });
     } else {
       result = execSync(`echo '${input}' | nc -U "${connInfo.path}"`, {
         encoding: "utf-8",
-        timeout: QUERY_TIMEOUT
+        timeout: queryTimeout
       });
     }
     return JSON.parse(result.trim());
   } catch (err) {
-    if (err.killed) {
+    if (isTimeoutError(err)) {
       return { status: "error", error: "timeout" };
     }
     if (err.message?.includes("ECONNREFUSED") || err.message?.includes("ENOENT")) {
@@ -264,10 +298,23 @@ function queryDaemonSync(query, projectDir) {
 }
 function trackHookActivitySync(hookName, projectDir, success = true, metrics = {}) {
   try {
-    queryDaemonSync(
-      { cmd: "track", hook: hookName, success, metrics },
-      projectDir
-    );
+    const connInfo = getConnectionInfo(projectDir);
+    const payload = JSON.stringify({ cmd: "track", hook: hookName, success, metrics }) + "\n";
+    let sock;
+    if (connInfo.type === "tcp") {
+      sock = net.createConnection({ host: connInfo.host, port: connInfo.port });
+    } else {
+      if (!connInfo.path || !existsSync(connInfo.path)) {
+        return;
+      }
+      sock = net.createConnection(connInfo.path);
+    }
+    sock.setTimeout(TRACK_WRITE_TIMEOUT_MS);
+    sock.on("timeout", () => sock.destroy());
+    sock.on("error", () => sock.destroy());
+    sock.on("connect", () => {
+      sock.write(payload, () => sock.destroy());
+    });
   } catch {
   }
 }

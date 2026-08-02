@@ -7,7 +7,12 @@
 
 import { readFileSync } from 'fs';
 import { basename } from 'path';
-import { queryDaemonSync, trackHookActivitySync } from './daemon-client.js';
+import { queryDaemonSync, setQueryDeadline, trackHookActivitySync } from './daemon-client.js';
+
+// Overall daemon budget. This hook runs under a 5s Claude Code timeout but
+// makes two daemon calls (extract + imports), each capped at 3s. The shared
+// deadline keeps the sum bounded, with headroom for node startup and stdout.
+const DAEMON_BUDGET_MS = 3500;
 
 interface HookInput {
   tool_name: string;
@@ -111,6 +116,8 @@ async function main() {
     console.log('{}');
     return;
   }
+
+  setQueryDeadline(DAEMON_BUDGET_MS);
 
   // Get file structure from TLDR (pass session_id for token tracking)
   const extract = getTLDRExtract(filePath, input.session_id);

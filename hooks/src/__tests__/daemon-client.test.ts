@@ -8,7 +8,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { existsSync, mkdirSync, writeFileSync, rmSync, unlinkSync } from 'fs';
 import { join, resolve } from 'path';
-import { execSync, spawnSync } from 'child_process';
+import { execSync, spawn, spawnSync } from 'child_process';
 import * as net from 'net';
 import * as crypto from 'crypto';
 import * as os from 'os';
@@ -20,6 +20,10 @@ import {
   isIndexing,
   queryDaemon,
   queryDaemonSync,
+  setQueryDeadline,
+  clearQueryDeadline,
+  remainingQueryBudget,
+  trackHookActivitySync,
   DaemonQuery,
   DaemonResponse,
 } from '../daemon-client.js';
@@ -514,4 +518,367 @@ describe('error handling', () => {
     expect(errorResponse.status).toBe('error');
     expect(errorResponse.error).toBeDefined();
   });
+});
+
+// =============================================================================
+// Test 9: Per-invocation query deadline
+//
+// Hooks that make several sequential queryDaemonSync calls were killed by
+// Claude Code's per-hook timeout because each call carries its own 3s cap:
+// impact-refactor (7 calls x 3s = 21s worst case vs a 10s hook budget) and
+// signature-helper (10 calls x 3s = 30s vs 5s). The deadline lets a hook
+// declare one overall budget that every subsequent call shares.
+// =============================================================================
+
+describe('query deadline budget', () => {
+  let mockServer: net.Server | null = null;
+  let mockSocketPath: string;
+  let mockPidPath: string;
+
+  beforeEach(() => {
+    setupTestEnv();
+    mockSocketPath = computeSocketPath(TEST_PROJECT_DIR);
+    mockPidPath = computePidPath(TEST_PROJECT_DIR);
+    if (existsSync(mockSocketPath)) {
+      unlinkSync(mockSocketPath);
+    }
+  });
+
+  afterEach(async () => {
+    clearQueryDeadline();
+    if (mockServer) {
+      await new Promise<void>((resolve) => {
+        mockServer!.close(() => {
+          mockServer = null;
+          resolve();
+        });
+      });
+    }
+    for (const p of [mockSocketPath, mockPidPath]) {
+      if (existsSync(p)) {
+        try {
+          unlinkSync(p);
+        } catch {}
+      }
+    }
+    cleanupTestEnv();
+  });
+
+  it('remainingQueryBudget returns null when no deadline is set', () => {
+    clearQueryDeadline();
+    expect(remainingQueryBudget()).toBeNull();
+  });
+
+  it('setQueryDeadline establishes a countdown', () => {
+    setQueryDeadline(1000);
+    const remaining = remainingQueryBudget();
+    expect(remaining).not.toBeNull();
+    expect(remaining!).toBeGreaterThan(0);
+    expect(remaining!).toBeLessThanOrEqual(1000);
+  });
+
+  it('clearQueryDeadline removes the deadline', () => {
+    setQueryDeadline(1000);
+    clearQueryDeadline();
+    expect(remainingQueryBudget()).toBeNull();
+  });
+
+  it('queryDaemonSync returns unavailable immediately when budget is exhausted', () => {
+    setQueryDeadline(0);
+    const t0 = Date.now();
+    const result = queryDaemonSync({ cmd: 'ping' }, TEST_PROJECT_DIR);
+    expect(result.status).toBe('unavailable');
+    expect(Date.now() - t0).toBeLessThan(500);
+  });
+
+  it('exhausted budget short-circuits before daemon auto-start', () => {
+    // Autostart enabled (env seam removed): without the deadline short-circuit
+    // this path would block in tryStartDaemon on a real spawn + wait loop.
+    delete process.env.TLDR_NO_AUTOSTART;
+    setQueryDeadline(0);
+    const t0 = Date.now();
+    const result = queryDaemonSync({ cmd: 'ping' }, TEST_PROJECT_DIR);
+    expect(result.status).toBe('unavailable');
+    expect(Date.now() - t0).toBeLessThan(500);
+  });
+
+  it('queryDaemonSync clamps the per-query timeout to the remaining budget', () => {
+    // Hung daemon: accepts connections but never responds. Without the
+    // deadline the sync client would block for the full QUERY_TIMEOUT (3s).
+    mockServer = net.createServer(() => {
+      // never respond
+    });
+    return new Promise<void>((resolve, reject) => {
+      mockServer!.listen(mockSocketPath, () => {
+        try {
+          writeFileSync(mockPidPath, String(process.pid));
+          setQueryDeadline(700);
+          const t0 = Date.now();
+          const result = queryDaemonSync({ cmd: 'ping' }, TEST_PROJECT_DIR);
+          const elapsed = Date.now() - t0;
+          expect(elapsed).toBeLessThan(2500);
+          // 'error' (query issued and killed at the clamp) or 'unavailable'
+          // (budget already spent by the clamped reachability probe) — both
+          // are bounded outcomes; only the full 3s QUERY_TIMEOUT would be a bug.
+          expect(['error', 'unavailable']).toContain(result.status);
+          resolve();
+        } catch (err) {
+          reject(err);
+        }
+      });
+    });
+  });
+
+  it('clamps the stale-socket reachability probe to the remaining budget', async () => {
+    // Hung listener, no PID file: isDaemonReachable falls through to its
+    // stale-socket nc ping, which used a fixed 500ms timeout regardless of
+    // the deadline.
+    mockServer = net.createServer(() => {
+      // never respond
+    });
+    await new Promise<void>((resolve) => {
+      mockServer!.listen(mockSocketPath, () => resolve());
+    });
+
+    setQueryDeadline(150);
+    const t0 = Date.now();
+    const result = queryDaemonSync({ cmd: 'ping' }, TEST_PROJECT_DIR);
+    const elapsed = Date.now() - t0;
+    expect(result.status).toBe('unavailable');
+    expect(elapsed).toBeLessThan(500);
+  });
+
+  it('busy-daemon probe plus query cannot stack past the deadline', async () => {
+    // Hung listener WITH a PID file: the reachability ping burns its timeout
+    // (fixed 1000ms before this change), returns true anyway, and the code
+    // then charged a further full QUERY_TIMEOUT to the actual query — 4s
+    // total against e.g. a 5s hook budget.
+    mockServer = net.createServer(() => {
+      // never respond
+    });
+    await new Promise<void>((resolve) => {
+      mockServer!.listen(mockSocketPath, () => resolve());
+    });
+    writeFileSync(mockPidPath, String(process.pid));
+
+    setQueryDeadline(400);
+    const t0 = Date.now();
+    const result = queryDaemonSync({ cmd: 'ping' }, TEST_PROJECT_DIR);
+    const elapsed = Date.now() - t0;
+    expect(['unavailable', 'error']).toContain(result.status);
+    expect(elapsed).toBeLessThan(1200);
+  });
+
+  it('never unlinks the socket of a live-but-busy daemon on probe timeout', async () => {
+    // No PID file, hung listener: a connect that *succeeds* proves a
+    // listener is alive (a truly stale socket refuses instantly), so a ping
+    // timeout must not be treated as staleness — unlinking here would let a
+    // concurrent hook autostart a duplicate daemon against the same project.
+    mockServer = net.createServer(() => {
+      // accept, never respond — busy daemon
+    });
+    await new Promise<void>((resolve) => {
+      mockServer!.listen(mockSocketPath, () => resolve());
+    });
+
+    setQueryDeadline(150);
+    queryDaemonSync({ cmd: 'ping' }, TEST_PROJECT_DIR);
+    expect(existsSync(mockSocketPath)).toBe(true);
+  });
+
+  it('queryDaemonSync still succeeds against a responsive daemon under a deadline', async () => {
+    // queryDaemonSync shells out to nc and blocks the event loop, so an
+    // in-process net server can never answer it — run the responder in a
+    // child Node process instead.
+    const responderScript = `
+      const net = require('net');
+      const server = net.createServer((conn) => {
+        conn.on('data', () => {
+          conn.write(JSON.stringify({ status: 'ok' }) + '\\n');
+          conn.end();
+        });
+      });
+      server.listen(${JSON.stringify(mockSocketPath)});
+    `;
+    const child = spawn(process.execPath, ['-e', responderScript], { stdio: 'ignore' });
+    try {
+      // Wait for the child's server socket to appear
+      const start = Date.now();
+      while (!existsSync(mockSocketPath) && Date.now() - start < 3000) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      expect(existsSync(mockSocketPath)).toBe(true);
+      writeFileSync(mockPidPath, String(process.pid));
+
+      setQueryDeadline(2000);
+      const result = queryDaemonSync({ cmd: 'ping' }, TEST_PROJECT_DIR);
+      expect(result.status).toBe('ok');
+    } finally {
+      child.kill();
+    }
+  });
+});
+
+// =============================================================================
+// Test 10: trackHookActivitySync must not block the hook
+//
+// Stats tracking is best-effort; it used to be a full blocking daemon query
+// (up to 3s) charged against the hook's Claude Code timeout.
+// =============================================================================
+
+describe('trackHookActivitySync non-blocking', () => {
+  let mockServer: net.Server | null = null;
+  let mockSocketPath: string;
+  let mockPidPath: string;
+  const acceptedConns: net.Socket[] = [];
+
+  beforeEach(() => {
+    setupTestEnv();
+    mockSocketPath = computeSocketPath(TEST_PROJECT_DIR);
+    mockPidPath = computePidPath(TEST_PROJECT_DIR);
+    if (existsSync(mockSocketPath)) {
+      unlinkSync(mockSocketPath);
+    }
+  });
+
+  afterEach(async () => {
+    clearQueryDeadline();
+    // Hung-server tests hold accepted connections open; destroy them so
+    // server.close() can complete.
+    for (const conn of acceptedConns.splice(0)) {
+      conn.destroy();
+    }
+    if (mockServer) {
+      await new Promise<void>((resolve) => {
+        mockServer!.close(() => {
+          mockServer = null;
+          resolve();
+        });
+      });
+    }
+    for (const p of [mockSocketPath, mockPidPath]) {
+      if (existsSync(p)) {
+        try {
+          unlinkSync(p);
+        } catch {}
+      }
+    }
+    cleanupTestEnv();
+  });
+
+  it('returns immediately even when the daemon never responds', async () => {
+    mockServer = net.createServer((conn) => {
+      // never respond — a blocking implementation would stall for 3s here
+      acceptedConns.push(conn);
+    });
+    await new Promise<void>((resolve) => {
+      mockServer!.listen(mockSocketPath, () => resolve());
+    });
+    writeFileSync(mockPidPath, String(process.pid));
+
+    const t0 = Date.now();
+    trackHookActivitySync('test-hook', TEST_PROJECT_DIR, true, { runs: 1 });
+    expect(Date.now() - t0).toBeLessThan(500);
+  });
+
+  it('does not throw when the daemon socket is missing', () => {
+    expect(() => trackHookActivitySync('test-hook', TEST_PROJECT_DIR)).not.toThrow();
+  });
+
+  it('leaves no external child process behind on a hung accepted connection', async () => {
+    // A detached `sh -c "echo ... | nc -U ..."` writer would keep an nc
+    // process alive as long as the daemon holds the accepted connection
+    // open — one leaked child per hook invocation.
+    mockServer = net.createServer((conn) => {
+      // accept and hold the connection open, never respond, never close
+      acceptedConns.push(conn);
+    });
+    await new Promise<void>((resolve) => {
+      mockServer!.listen(mockSocketPath, () => resolve());
+    });
+    writeFileSync(mockPidPath, String(process.pid));
+
+    trackHookActivitySync('test-hook', TEST_PROJECT_DIR, true, { runs: 1 });
+
+    // Give any spawned child time to start and get stuck
+    await new Promise((r) => setTimeout(r, 1500));
+    const pgrep = spawnSync('pgrep', ['-f', mockSocketPath], { encoding: 'utf-8' });
+    // pgrep exits 1 when nothing matches; 0 means a process referencing our
+    // socket path is still alive (the leak)
+    expect(pgrep.status).toBe(1);
+  }, 10000);
+
+  it('delivers the track payload to the daemon', async () => {
+    const received: string[] = [];
+    let resolveReceived: (() => void) | null = null;
+    const gotPayload = new Promise<void>((resolve) => {
+      resolveReceived = resolve;
+    });
+
+    mockServer = net.createServer((conn) => {
+      conn.on('data', (data) => {
+        received.push(data.toString());
+        resolveReceived?.();
+      });
+    });
+    await new Promise<void>((resolve) => {
+      mockServer!.listen(mockSocketPath, () => resolve());
+    });
+    writeFileSync(mockPidPath, String(process.pid));
+
+    trackHookActivitySync('test-hook', TEST_PROJECT_DIR, true, { runs: 1 });
+
+    await Promise.race([
+      gotPayload,
+      new Promise((r) => setTimeout(r, 2000)),
+    ]);
+    const payload = received.join('');
+    expect(payload).toContain('"cmd":"track"');
+    expect(payload).toContain('"hook":"test-hook"');
+  }, 10000);
+
+  it('delivers the sample even when the calling process exits immediately', async () => {
+    // Real hooks call trackHookActivitySync and exit right away. An unref'd
+    // socket lets the process die before connect/write runs, silently
+    // dropping every sample — the write must hold the process just long
+    // enough to flush (bounded by the track timeout).
+    const distClient = resolve(__dirname, '../../dist/daemon-client.mjs');
+    if (!existsSync(distClient)) {
+      // dist not built in this checkout; `npm test` builds it via pretest
+      return;
+    }
+
+    const received: string[] = [];
+    let resolveReceived: (() => void) | null = null;
+    const gotPayload = new Promise<void>((res) => {
+      resolveReceived = res;
+    });
+
+    mockServer = net.createServer((conn) => {
+      acceptedConns.push(conn);
+      conn.on('data', (data) => {
+        received.push(data.toString());
+        resolveReceived?.();
+      });
+    });
+    await new Promise<void>((res) => {
+      mockServer!.listen(mockSocketPath, () => res());
+    });
+    writeFileSync(mockPidPath, String(process.pid));
+
+    const childScript = `
+      import { trackHookActivitySync } from ${JSON.stringify(distClient)};
+      trackHookActivitySync('child-hook', ${JSON.stringify(TEST_PROJECT_DIR)}, true, { runs: 1 });
+    `;
+    const child = spawn(process.execPath, ['--input-type=module', '-e', childScript], {
+      stdio: 'ignore',
+    });
+    await new Promise<void>((res) => child.on('exit', () => res()));
+
+    await Promise.race([
+      gotPayload,
+      new Promise((r) => setTimeout(r, 2000)),
+    ]);
+    expect(received.join('')).toContain('"hook":"child-hook"');
+  }, 10000);
 });

@@ -42,12 +42,24 @@ while any `xfail_bypass` remains. Promoting those to hard failures in a security
 job is a policy decision for the project, not one this file assumes.
 
 The hook only greps the command text — it never touches the filesystem or
-network — so every payload below is inert. No command is ever executed.
+network — so every payload below is inert. No command is ever executed. The
+payloads reach the hook as JSON on stdin and are only ever matched by `grep`;
+nothing here runs a shell over them.
+
+ADDING A NEW BYPASS CASE — read first:
+    Every bypass catalogued here is ALREADY public, described in #276/#278 and
+    derivable in minutes from the 67-line hook in this same repo. That is why
+    listing them costs nothing. A newly discovered bypass that is NOT yet
+    public is different: this file is the highest-value artifact an attacker
+    could want, a curated and machine-verified list of what works. Report a
+    fresh finding through a private advisory first, and add it here once the
+    fix or the issue is public.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -509,8 +521,45 @@ def test_malformed_payload_fails_open() -> None:
     assert result.returncode == ALLOW
 
 
-def test_blocked_commands_explain_themselves_on_stderr() -> None:
-    """A denial must tell the user why, since it surfaces as a hook error."""
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "OPEN POLICY QUESTION: unparseable input disables the guard SILENTLY. "
+        'The hook does CMD=$(... jq ... 2>/dev/null) then `[ -z "$CMD" ] && '
+        "exit 0`, so a jq that is missing or erroring is indistinguishable from "
+        "a payload with no command — every call is allowed with zero output. "
+        "Failing open is defensible; failing open *silently* means the control "
+        "can be off and nobody knows. Not filed against an issue yet"
+    ),
+)
+def test_malformed_payload_warns_while_failing_open() -> None:
+    """Failing open is fine; failing open without saying so is not.
+
+    Deliberately paired with the test above rather than replacing it: allowing
+    the command is the right call (the text was never understood, so there is
+    nothing to judge), but it should be audible. Fixing this needs a one-line
+    hook change to separate jq's exit status from an empty result, so it is
+    recorded here rather than silently accepted as correct behavior.
+    """
+    result = subprocess.run(
+        ["bash", str(GUARD)],
+        input="not json at all",
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == ALLOW
+    assert result.stderr.strip(), "guard disabled itself with no diagnostic"
+
+
+def test_blocked_commands_identify_which_rule_fired() -> None:
+    """A denial must say WHICH rule fired, not just that something did.
+
+    All seven rules emit the bare token "BLOCKED", so asserting only that word
+    cannot detect a misattribution — Rule 3 firing where Rule 1 was intended
+    would look identical. The denial is surfaced to the user as a hook error,
+    so it is the only diagnostic they get.
+    """
     result = subprocess.run(
         ["bash", str(GUARD)],
         input=json.dumps(
@@ -525,3 +574,26 @@ def test_blocked_commands_explain_themselves_on_stderr() -> None:
     )
     assert result.returncode == BLOCK
     assert "BLOCKED" in result.stderr
+    # Rule 3 is the one that should fire here — not Rule 1, which needs a
+    # credential path, nor Rule 4, which needs a pipe from a sensitive file.
+    assert "non-whitelisted domain" in result.stderr, result.stderr
+
+
+def test_guard_has_no_side_effects_in_source() -> None:
+    """The guard must only read stdin and write diagnostics to stderr.
+
+    Nothing in the corpus would notice if a future change started writing an
+    audit file or POSTing blocks to a collector — every verdict test would
+    still pass. This pins the shape of the script instead: the only output
+    redirections permitted are to stderr.
+    """
+    code_lines = []
+    for line in GUARD.read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue  # whole-line comment, e.g. the ">>> CUSTOMIZE <<<" banner
+        code_lines.append(line)
+
+    redirections = re.findall(r"(?<![0-9<>&])>>?\s*\S+", "\n".join(code_lines))
+    unexpected = [r for r in redirections if not r.replace(" ", "").startswith(">&2")]
+    assert not unexpected, f"unexpected output redirection in guard: {unexpected}"

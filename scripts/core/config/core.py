@@ -11,15 +11,16 @@ from typing import Any
 
 from scripts.core.config.models import (
     ArchivalConfig,
-    DatabaseConfig,
     DaemonConfig,
+    DatabaseConfig,
     DedupConfig,
     EmbeddingConfig,
     OPCConfig,
     PatternsConfig,
     QueryExpansionConfig,
-    RerankerConfig,
     RecallConfig,
+    RerankerConfig,
+    SessionAuditConfig,
 )
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,7 @@ _SECTION_MAP: dict[str, type] = {
     "reranker": RerankerConfig,
     "patterns": PatternsConfig,
     "recall": RecallConfig,
+    "session_audit": SessionAuditConfig,
     "embedding": EmbeddingConfig,
     "query_expansion": QueryExpansionConfig,
     "archival": ArchivalConfig,

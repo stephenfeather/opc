@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -44,6 +46,8 @@ def test_top_level_help_lists_grouped_commands() -> None:
     assert "pattern detect" in text
     assert "Daemon:" in text
     assert "daemon" in text
+    assert "Session Analysis:" in text
+    assert "session audit" in text
 
 
 def test_prefix_help_lists_only_matching_subcommands() -> None:
@@ -53,6 +57,15 @@ def test_prefix_help_lists_only_matching_subcommands() -> None:
     assert "artifact query" in text
     assert "artifact mark" in text
     assert "artifact index" in text
+    assert "recall" not in text
+
+
+def test_session_prefix_help_lists_audit_subcommand() -> None:
+    text = cli.format_help(("session",))
+
+    assert "opc session" in text
+    assert "session audit" in text
+    assert "Find mistakes and estimate avoidable time" in text
     assert "recall" not in text
 
 
@@ -78,6 +91,18 @@ def test_main_forwards_to_script_with_remaining_args() -> None:
     assert forwarded[0] == cli.sys.executable
     assert forwarded[1].endswith("scripts/core/recall_learnings.py")
     assert forwarded[2:] == ["--query", "auth patterns", "--k", "5"]
+
+
+def test_session_audit_forwards_argv_and_propagates_exit_code() -> None:
+    completed = SimpleNamespace(returncode=5)
+    with patch.object(cli.subprocess, "run", return_value=completed) as run:
+        result = cli.main(["session", "audit", "--jsonl", "/tmp/session.jsonl", "--format", "json"])
+
+    assert result == 5
+    forwarded = run.call_args.args[0]
+    assert forwarded[0] == cli.sys.executable
+    assert forwarded[1].endswith("scripts/core/session_audit_cli.py")
+    assert forwarded[2:] == ["--jsonl", "/tmp/session.jsonl", "--format", "json"]
 
 
 def test_main_prints_prefix_help_without_forwarding(capsys) -> None:
@@ -112,3 +137,45 @@ def test_cli_style_core_scripts_are_registered_or_explicitly_excluded() -> None:
 
     missing = cli_style_scripts - registered - cli.EXCLUDED_CORE_SCRIPTS
     assert missing == set()
+
+
+def test_session_audit_registration_points_to_an_existing_script() -> None:
+    command = cli.COMMANDS[("session", "audit")]
+    core_dir = Path(cli.__file__).resolve().parent
+
+    assert command.script == "session_audit_cli.py"
+    assert (core_dir / command.script).is_file()
+
+
+def test_execute_command_reports_a_missing_registered_script(capsys) -> None:
+    command = cli.Command("missing_session_audit.py", "missing", "test")
+
+    result = cli.execute_command(command, [])
+
+    captured = capsys.readouterr()
+    assert result == 127
+    assert "Registered script is missing" in captured.err
+    assert "missing_session_audit.py" in captured.err
+
+
+def test_session_audit_dispatches_wrapper_in_a_real_subprocess() -> None:
+    project_root = Path(__file__).resolve().parent.parent
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(project_root / "scripts" / "core" / "cli.py"),
+            "session",
+            "audit",
+            "--help",
+        ],
+        cwd=project_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "usage: opc session audit" in completed.stdout
+    assert "--jsonl" in completed.stdout
+    assert "Traceback" not in completed.stderr

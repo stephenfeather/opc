@@ -1,0 +1,2 @@
+{"type":"assistant","uuid":"safety-command","timestamp":"2026-08-11T12:00:00Z","message":{"content":[{"type":"tool_use","id":"safety-command-tool","name":"Bash","input":{"command":"deploy --token=fixture-sensitive-value --password fixture-password"}}]}}
+{"type":"assistant","uuid":"safety-admission","parentUuid":"safety-command","timestamp":"2026-08-11T12:00:10Z","message":{"content":"I was wrong about that command."}}

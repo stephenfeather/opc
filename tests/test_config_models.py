@@ -2,15 +2,16 @@
 
 from scripts.core.config.models import (
     ArchivalConfig,
-    DatabaseConfig,
     DaemonConfig,
+    DatabaseConfig,
     DedupConfig,
     EmbeddingConfig,
     OPCConfig,
     PatternsConfig,
     QueryExpansionConfig,
-    RerankerConfig,
     RecallConfig,
+    RerankerConfig,
+    SessionAuditConfig,
 )
 
 
@@ -143,6 +144,18 @@ class TestRecallConfig:
         assert cfg.llm_selector_model == "claude-haiku-4"
 
 
+class TestSessionAuditConfig:
+    def test_judge_model_has_independent_sonnet_5_default(self):
+        cfg = SessionAuditConfig()
+
+        assert cfg.judge_model == "claude-sonnet-5"
+
+    def test_judge_model_can_be_overridden(self):
+        cfg = SessionAuditConfig(judge_model="claude-opus-5")
+
+        assert cfg.judge_model == "claude-opus-5"
+
+
 class TestPatternsConfig:
     def test_defaults(self):
         cfg = PatternsConfig()
@@ -187,6 +200,7 @@ class TestOPCConfig:
         assert isinstance(cfg.reranker, RerankerConfig)
         assert isinstance(cfg.patterns, PatternsConfig)
         assert isinstance(cfg.recall, RecallConfig)
+        assert isinstance(cfg.session_audit, SessionAuditConfig)
         assert isinstance(cfg.embedding, EmbeddingConfig)
         assert isinstance(cfg.query_expansion, QueryExpansionConfig)
         assert isinstance(cfg.archival, ArchivalConfig)

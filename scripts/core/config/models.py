@@ -182,6 +182,13 @@ class RecallConfig:
 
 
 @dataclass(frozen=True)
+class SessionAuditConfig:
+    """Configuration for the optional session-audit semantic judge."""
+
+    judge_model: str = "claude-sonnet-5"
+
+
+@dataclass(frozen=True)
 class EmbeddingConfig:
     ollama_model: str = "nomic-embed-text"
     ollama_host: str = "http://localhost:11434"
@@ -220,6 +227,7 @@ class OPCConfig:
     reranker: RerankerConfig = field(default_factory=RerankerConfig)
     patterns: PatternsConfig = field(default_factory=PatternsConfig)
     recall: RecallConfig = field(default_factory=RecallConfig)
+    session_audit: SessionAuditConfig = field(default_factory=SessionAuditConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     query_expansion: QueryExpansionConfig = field(default_factory=QueryExpansionConfig)
     archival: ArchivalConfig = field(default_factory=ArchivalConfig)

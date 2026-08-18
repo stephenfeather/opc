@@ -31,6 +31,7 @@ from scripts.core.session_audit.parser import events_share_lineage
 _MAX_DEICTIC_EVENT_DISTANCE = 8
 _ARTIFACT_FIELDS = frozenset({"file_path", "notebook_path"})
 _CAUSAL_ACTION_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit", "Bash"})
+_COMMAND_OBJECT_NOUNS = frozenset({"command", "flag", "argument", "option", "profile"})
 
 
 @dataclass(frozen=True)
@@ -72,10 +73,24 @@ _USER_CORRECTION_RE = re.compile(
 _FENCE_LINE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
 _INLINE_CODE_RE = re.compile(r"`[^`\n]*(?:`|$)")
 _QUOTED_TEXT_RE = re.compile(r'("[^"\n]*"|“[^”\n]*”|‘[^’\n]*’|(?<!\w)\'[^\'\n]*\'(?!\w))')
+_NON_MISTAKE_ACTION_TAIL_RE = re.compile(
+    r"\b(?:as\s+requested|intentionally|deliberately|purposely|on\s+purpose|by\s+design|"
+    r"to\s+test|(?:for|as)\s+(?:(?:a|the)\s+)?(?:negative\s+)?test(?:ing)?)\b",
+    re.IGNORECASE,
+)
 _ADMISSION_CLAUSE_RE = re.compile(
     r"^\s*(?:(?:actually|admittedly|clearly|yes|right|you(?:'re|\s+are)\s+right|"
     r"sorry(?:\s+about\s+that)?|I\s+apologize|on\s+reflection|after\s+checking)"
     r"(?:(?:\s*[—–]\s*)|(?:\s*[,:-]\s+)|\s+))?(?:"
+    r"Correction\s+first\s*:\s*[^.!?;\n]{1,160}?[—–]\s*"
+    r"I\s+gave\s+you\s+the\s+wrong\s+command\b|"
+    r"(?P<guarded_action>I\s+(?:(?:gave|sent)\s+you|provided|ran|used|passed)\s+the\s+"
+    r"(?:wrong|incorrect)\s+(?:command|flag|argument|option|profile)\b"
+    r"|The\s+command\s+I\s+gave\s+you\s+was\s+(?:wrong|incorrect)\b"
+    r"|Correction\s*:\s*I\s+dropped\s+the\s+[\w./-]+\s+flag\b)|"
+    r"I\s+accidentally\s+omitted\s+the\s+[\w./-]+\s+argument\b|"
+    r"I\s+forgot\s+to\s+include\s+the\s+[\w./-]+\s+option\b|"
+    r"I\s+should\s+have\s+passed\s+the\s+[\w./-]+\s+profile\b|"
     r"I\s+was\s+wrong\b|"
     r"I\s+(?:misunderstood|misread|misinterpreted)\b|"
     r"I\s+(?:incorrectly|wrongly)\s+(?:assumed|thought|said|stated|changed|edited|"
@@ -113,7 +128,8 @@ _REQUIREMENT_CHANGE_RE = re.compile(
 _GENERIC_APOLOGY_RE = re.compile(r"\b(?:sorry|I\s+apologize)\b", re.IGNORECASE)
 _DEICTIC_ACTION_RE = re.compile(
     r"\b(?:that|this|the)\s+(?:[\w./-]+\s+){0,3}"
-    r"(?P<action_noun>edit|change|write|command|revert|patch|implementation)\b",
+    r"(?P<action_noun>edit|change|write|command|flag|argument|option|profile|revert|patch|"
+    r"implementation)\b",
     re.IGNORECASE,
 )
 _ARTIFACT_MENTION_RE = re.compile(
@@ -164,10 +180,18 @@ def _has_specific_visible_admission(text: str) -> bool:
     if _RETRACTION_TAIL_RE.search(prose):
         return False
     clauses = re.split(r"(?<=[.!?])\s+|[;\n]+", prose)
-    return any(
-        clause.strip() and not clause.rstrip().endswith("?") and _ADMISSION_CLAUSE_RE.search(clause)
-        for clause in clauses
-    )
+    for clause in clauses:
+        if not clause.strip() or clause.rstrip().endswith("?"):
+            continue
+        match = _ADMISSION_CLAUSE_RE.search(clause)
+        if match is None:
+            continue
+        if match.group("guarded_action") is not None and _NON_MISTAKE_ACTION_TAIL_RE.search(
+            clause, match.end("guarded_action")
+        ):
+            continue
+        return True
+    return False
 
 
 def _is_suppressed_admission_like(event: NormalizedEvent) -> bool:
@@ -414,6 +438,7 @@ class _LineageWindowIndex:
 
 def _linked_affected_event(
     ordered: tuple[NormalizedEvent, ...],
+    event_by_id: dict[str, NormalizedEvent],
     event_position_by_id: dict[str, int],
     detection_index: int,
     policy: DetectionPolicy,
@@ -466,6 +491,21 @@ def _linked_affected_event(
         candidate_position = prior_window.index(candidate)
         if len(prior_window) - candidate_position - 1 <= _MAX_DEICTIC_EVENT_DISTANCE:
             return candidate
+    if (
+        len(candidates_since_boundary) > 1
+        and deictic_match is not None
+        and deictic_match.group("action_noun").casefold() in _COMMAND_OBJECT_NOUNS
+    ):
+        retry_root = _unique_completed_material_retry_root(
+            ordered,
+            event_by_id,
+            event_position_by_id,
+            prior_window[last_boundary + 1 :],
+            policy,
+            lineage_windows,
+        )
+        if retry_root is not None:
+            return retry_root
     if not allow_user_bridge or not prior_window:
         return None
     previous = next(
@@ -486,6 +526,7 @@ def _linked_affected_event(
     ):
         bridged_root = _linked_affected_event(
             ordered,
+            event_by_id,
             event_position_by_id,
             event_position_by_id[previous.event_id],
             policy,
@@ -533,7 +574,10 @@ def _artifact_selector(event: NormalizedEvent) -> tuple[str | None, tuple[tuple[
 
 
 def _tool_value(event: NormalizedEvent, field: str) -> str:
-    return dict(event.tool_input).get(field, "")
+    for key, value in reversed(event.tool_input):
+        if key == field:
+            return value if isinstance(value, str) else ""
+    return ""
 
 
 def _is_validation_use(event: NormalizedEvent) -> bool:
@@ -568,7 +612,7 @@ def _is_mutation_use(event: NormalizedEvent) -> bool:
 
 
 def _matches_deictic_action(event: NormalizedEvent, noun: str) -> bool:
-    if noun.casefold() == "command":
+    if noun.casefold() in _COMMAND_OBJECT_NOUNS:
         return event.kind is ContentKind.TOOL_USE and event.tool_name == "Bash"
     if noun.casefold() == "revert":
         return _is_revert_use(event)
@@ -800,21 +844,22 @@ def _command_intent(command: str) -> str | None:
     return parts[0] if parts else None
 
 
-def _material_retry(
+def _completed_material_retry_chains(
     ordered: tuple[NormalizedEvent, ...],
     event_by_id: dict[str, NormalizedEvent],
     result_index: int,
     policy: DetectionPolicy,
     lineage_windows: _LineageWindowIndex,
-) -> tuple[NormalizedEvent, NormalizedEvent, NormalizedEvent] | None:
+) -> tuple[tuple[NormalizedEvent, NormalizedEvent, NormalizedEvent], ...]:
     result = ordered[result_index]
     if result.kind is not ContentKind.TOOL_RESULT or result.tool_result_is_error is not True:
-        return None
+        return ()
     failed_use = event_by_id.get(result.correlated_event_id or "")
     if failed_use is None or failed_use.tool_name != "Bash":
-        return None
+        return ()
     failed_command = _tool_value(failed_use, "command")
     failed_intent = _command_intent(failed_command)
+    chains: list[tuple[NormalizedEvent, NormalizedEvent, NormalizedEvent]] = []
     for event in _compatible_window_side(
         lineage_windows,
         result_index,
@@ -829,8 +874,60 @@ def _material_retry(
             continue
         recovery = _correlated_success(event, event_by_id)
         if recovery is not None and events_share_lineage(result, recovery):
-            return failed_use, event, recovery
-    return None
+            chains.append((failed_use, event, recovery))
+    return tuple(chains)
+
+
+def _material_retry(
+    ordered: tuple[NormalizedEvent, ...],
+    event_by_id: dict[str, NormalizedEvent],
+    result_index: int,
+    policy: DetectionPolicy,
+    lineage_windows: _LineageWindowIndex,
+) -> tuple[NormalizedEvent, NormalizedEvent, NormalizedEvent] | None:
+    chains = _completed_material_retry_chains(
+        ordered,
+        event_by_id,
+        result_index,
+        policy,
+        lineage_windows,
+    )
+    return chains[0] if chains else None
+
+
+def _unique_completed_material_retry_root(
+    ordered: tuple[NormalizedEvent, ...],
+    event_by_id: dict[str, NormalizedEvent],
+    event_position_by_id: dict[str, int],
+    active_window: tuple[NormalizedEvent, ...],
+    policy: DetectionPolicy,
+    lineage_windows: _LineageWindowIndex,
+) -> NormalizedEvent | None:
+    active_positions = {event.event_id: index for index, event in enumerate(active_window)}
+    active_ids = set(active_positions)
+    chains: dict[tuple[str, str, str, str], NormalizedEvent] = {}
+    for result in active_window:
+        result_index = event_position_by_id[result.event_id]
+        for failed_use, retry_use, recovery in _completed_material_retry_chains(
+            ordered,
+            event_by_id,
+            result_index,
+            policy,
+            lineage_windows,
+        ):
+            chain_ids = (
+                result.event_id,
+                failed_use.event_id,
+                retry_use.event_id,
+                recovery.event_id,
+            )
+            if not set(chain_ids) <= active_ids:
+                continue
+            root_position = active_positions[failed_use.event_id]
+            if len(active_window) - root_position - 1 > _MAX_DEICTIC_EVENT_DISTANCE:
+                continue
+            chains[chain_ids] = failed_use
+    return next(iter(chains.values())) if len(chains) == 1 else None
 
 
 def _thinking_correction(
@@ -1332,6 +1429,7 @@ def detect_mistakes(
         ):
             thinking_root = _linked_affected_event(
                 ordered,
+                event_by_id,
                 event_position_by_id,
                 index,
                 policy,
@@ -1415,6 +1513,7 @@ def detect_mistakes(
         ):
             user_root = _linked_affected_event(
                 ordered,
+                event_by_id,
                 event_position_by_id,
                 index,
                 policy,
@@ -1454,6 +1553,7 @@ def detect_mistakes(
             continue
         admission_root = _linked_affected_event(
             ordered,
+            event_by_id,
             event_position_by_id,
             index,
             policy,

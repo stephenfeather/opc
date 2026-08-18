@@ -751,6 +751,190 @@ def test_deictic_action_noun_must_match_the_prior_tool_kind(
         assert result.unconfirmed_candidates[0].onset_event_id is None
 
 
+def test_live_wrong_command_acknowledgement_links_proximal_bash_action() -> None:
+    prior_command = _event(
+        0,
+        kind=ContentKind.TOOL_USE,
+        source_kind=EvidenceSourceKind.TOOL_USE,
+        tool_use_id="overlay-command",
+        tool_name="Bash",
+        tool_input=(("command", "overlay base --restore"),),
+    )
+    admission = _event(
+        1,
+        text=(
+            "Correction first: the overlay isn't broken — I gave you the wrong command. "
+            "It's designed for base + pilot + restore, and I dropped the pilot flag."
+        ),
+    )
+
+    result = detect_mistakes(_parsed(prior_command, admission))
+
+    assert len(result.episodes) == 1
+    assert result.unconfirmed_candidates == ()
+    episode = result.episodes[0]
+    assert episode.local_classification is Classification.CONFIRMED
+    assert episode.category == "wrong_assumption"
+    assert episode.onset_event_id == prior_command.event_id
+    assert any(
+        evidence.event_id == admission.event_id
+        and evidence.evidence_kind is EvidenceKind.VISIBLE_ADMISSION
+        and evidence.qualifies_for_promotion
+        for evidence in episode.evidence
+    )
+
+
+def test_wrong_command_admission_links_bash_but_rejects_wrappers() -> None:
+    prior_command = _event(
+        0,
+        kind=ContentKind.TOOL_USE,
+        source_kind=EvidenceSourceKind.TOOL_USE,
+        tool_use_id="command-a",
+        tool_name="Bash",
+        tool_input=(("command", "overlay base --restore"),),
+    )
+    admission = _event(1, text="I gave you the wrong command.")
+
+    result = detect_mistakes(_parsed(prior_command, admission))
+
+    assert len(result.episodes) == 1
+    assert result.unconfirmed_candidates == ()
+    episode = result.episodes[0]
+    assert episode.local_classification is Classification.CONFIRMED
+    assert episode.onset_event_id == prior_command.event_id
+    assert any(
+        evidence.event_id == admission.event_id
+        and evidence.evidence_kind is EvidenceKind.VISIBLE_ADMISSION
+        and evidence.qualifies_for_promotion
+        for evidence in episode.evidence
+    )
+
+    wrapped_texts = (
+        'The detector should match "I gave you the wrong command."',
+        "```text\nI gave you the wrong command.\n```",
+        "If I gave you the wrong command, I would correct it.",
+    )
+    for text in wrapped_texts:
+        wrapped_result = detect_mistakes(_parsed(prior_command, _event(1, text=text)))
+        assert wrapped_result.eligible_candidates == 0
+        assert wrapped_result.episodes == ()
+        assert wrapped_result.unconfirmed_candidates == ()
+
+
+def test_omission_admissions_link_bash_but_reject_intent_and_conditionals() -> None:
+    positive_texts = (
+        "Correction: I dropped the pilot flag.",
+        "I accidentally omitted the --pilot argument.",
+        "I forgot to include the pilot option.",
+        "I should have passed the pilot profile.",
+    )
+    for case_index, text in enumerate(positive_texts):
+        prior_command = _event(
+            0,
+            kind=ContentKind.TOOL_USE,
+            source_kind=EvidenceSourceKind.TOOL_USE,
+            tool_use_id=f"omission-command-{case_index}",
+            tool_name="Bash",
+            tool_input=(("command", "overlay base --restore"),),
+        )
+        admission = _event(1, text=text)
+
+        result = detect_mistakes(_parsed(prior_command, admission))
+
+        assert len(result.episodes) == 1, text
+        assert result.unconfirmed_candidates == (), text
+        episode = result.episodes[0]
+        assert episode.local_classification is Classification.CONFIRMED, text
+        assert episode.onset_event_id == prior_command.event_id, text
+        assert any(
+            evidence.event_id == admission.event_id
+            and evidence.evidence_kind is EvidenceKind.VISIBLE_ADMISSION
+            and evidence.qualifies_for_promotion
+            for evidence in episode.evidence
+        ), text
+
+    negative_texts = (
+        "I intentionally dropped the pilot flag.",
+        "I dropped the pilot flag as requested.",
+        "Correction: I dropped the pilot flag as requested.",
+        "Correction: I dropped the pilot flag on purpose for the test.",
+        "If I omitted the pilot flag, I would correct it.",
+    )
+    for case_index, text in enumerate(negative_texts):
+        prior_command = _event(
+            0,
+            kind=ContentKind.TOOL_USE,
+            source_kind=EvidenceSourceKind.TOOL_USE,
+            tool_use_id=f"non-omission-command-{case_index}",
+            tool_name="Bash",
+            tool_input=(("command", "overlay base --restore"),),
+        )
+
+        result = detect_mistakes(_parsed(prior_command, _event(1, text=text)))
+
+        assert result.eligible_candidates == 0, text
+        assert result.episodes == (), text
+        assert result.unconfirmed_candidates == (), text
+
+
+def test_wrong_action_admissions_link_bash_but_reject_intent_and_conditionals() -> None:
+    positive_texts = (
+        "I sent you the incorrect command.",
+        "I provided the wrong command.",
+        "I ran the wrong command.",
+        "I used the incorrect profile.",
+        "I passed the wrong argument.",
+        "The command I gave you was wrong.",
+    )
+    for case_index, text in enumerate(positive_texts):
+        prior_command = _event(
+            0,
+            kind=ContentKind.TOOL_USE,
+            source_kind=EvidenceSourceKind.TOOL_USE,
+            tool_use_id=f"wrong-command-{case_index}",
+            tool_name="Bash",
+            tool_input=(("command", "overlay base --restore"),),
+        )
+        admission = _event(1, text=text)
+
+        result = detect_mistakes(_parsed(prior_command, admission))
+
+        assert len(result.episodes) == 1, text
+        assert result.unconfirmed_candidates == (), text
+        episode = result.episodes[0]
+        assert episode.local_classification is Classification.CONFIRMED, text
+        assert episode.onset_event_id == prior_command.event_id, text
+        assert any(
+            evidence.event_id == admission.event_id
+            and evidence.evidence_kind is EvidenceKind.VISIBLE_ADMISSION
+            and evidence.qualifies_for_promotion
+            for evidence in episode.evidence
+        ), text
+
+    negative_texts = (
+        "I intentionally ran the wrong command to test failure handling.",
+        "I used the wrong command on purpose to reproduce the bug.",
+        "I ran the wrong command to test failure handling.",
+        "The command I gave you was intentionally wrong for the negative test.",
+        "If I used the wrong profile, I would correct it.",
+    )
+    for case_index, text in enumerate(negative_texts):
+        prior_command = _event(
+            0,
+            kind=ContentKind.TOOL_USE,
+            source_kind=EvidenceSourceKind.TOOL_USE,
+            tool_use_id=f"intentional-command-{case_index}",
+            tool_name="Bash",
+            tool_input=(("command", "overlay base --restore"),),
+        )
+
+        result = detect_mistakes(_parsed(prior_command, _event(1, text=text)))
+
+        assert result.eligible_candidates == 0, text
+        assert result.episodes == (), text
+        assert result.unconfirmed_candidates == (), text
+
+
 def test_deictic_admission_does_not_cross_a_human_task_boundary() -> None:
     prior_edit = _event(
         0,

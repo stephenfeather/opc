@@ -14,6 +14,7 @@ from scripts.core.session_audit.models import (
     Classification,
     ContentKind,
     EventActor,
+    EvidenceKind,
     EvidenceSourceKind,
     NormalizedEvent,
     ParsedSession,
@@ -470,6 +471,84 @@ def test_direct_retry_chain_and_admission_merge_by_shared_affected_event() -> No
     assert episode.local_classification is Classification.CONFIRMED
     assert episode.onset_event_id == failed_use.event_id
     assert episode.retry_event_ids == (retry.event_id,)
+
+
+def test_wrong_command_admission_merges_with_unique_completed_retry_chain() -> None:
+    failed_use = _event(
+        0,
+        record_uuid="main",
+        ancestry_start=0,
+        ancestry_end=1,
+        kind=ContentKind.TOOL_USE,
+        source_kind=EvidenceSourceKind.TOOL_USE,
+        tool_use_id="bad-overlay-command",
+        tool_name="Bash",
+        tool_input=(("command", "overlay base --restore"),),
+        correlated_event_id="E1",
+    )
+    failure = _event(
+        1,
+        text="error: pilot profile required",
+        actor=EventActor.TOOL,
+        kind=ContentKind.TOOL_RESULT,
+        source_kind=EvidenceSourceKind.TOOL_RESULT,
+        record_uuid="main",
+        ancestry_start=0,
+        ancestry_end=1,
+        tool_use_id="bad-overlay-command",
+        tool_result_is_error=True,
+        correlated_event_id="E0",
+    )
+    retry = _event(
+        2,
+        record_uuid="main",
+        ancestry_start=0,
+        ancestry_end=1,
+        kind=ContentKind.TOOL_USE,
+        source_kind=EvidenceSourceKind.TOOL_USE,
+        tool_use_id="good-overlay-command",
+        tool_name="Bash",
+        tool_input=(("command", "overlay base --pilot pilot --restore"),),
+        correlated_event_id="E3",
+    )
+    success = _event(
+        3,
+        text="overlay restored",
+        actor=EventActor.TOOL,
+        kind=ContentKind.TOOL_RESULT,
+        source_kind=EvidenceSourceKind.TOOL_RESULT,
+        record_uuid="main",
+        ancestry_start=0,
+        ancestry_end=1,
+        tool_use_id="good-overlay-command",
+        tool_result_is_error=False,
+        correlated_event_id="E2",
+    )
+    admission = _event(
+        4,
+        text=(
+            "Correction first: the overlay isn't broken — I gave you the wrong command. "
+            "It's designed for base + pilot + restore, and I dropped the pilot flag."
+        ),
+        record_uuid="main",
+        ancestry_start=0,
+        ancestry_end=1,
+    )
+
+    result = detect_mistakes(_parsed(failed_use, failure, retry, success, admission))
+
+    assert result.eligible_candidates == 2
+    assert len(result.episodes) == 1
+    assert result.unconfirmed_candidates == ()
+    episode = result.episodes[0]
+    assert episode.local_classification is Classification.CONFIRMED
+    assert episode.onset_event_id == failed_use.event_id
+    assert episode.retry_event_ids == (retry.event_id,)
+    assert any(
+        evidence.event_id == admission.event_id
+        and evidence.evidence_kind is EvidenceKind.VISIBLE_ADMISSION
+        for evidence in episode.evidence
+    )
 
 
 def test_retained_bridge_candidate_merges_all_causal_components() -> None:

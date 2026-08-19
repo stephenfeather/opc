@@ -440,7 +440,7 @@ def test_output_hardlink_alias_is_rejected_before_the_transcript_can_be_replaced
     assert output_alias.read_bytes() == original
 
 
-def test_replace_failure_preserves_old_output_cleans_temp_and_redacts_error(
+def test_replace_failure_preserves_old_output_cleans_temp_and_hides_error_details(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -472,8 +472,7 @@ def test_replace_failure_preserves_old_output_cleans_temp_and_redacts_error(
     assert captured.out == ""
     assert output.read_text(encoding="utf-8") == "old report\n"
     assert list(tmp_path.glob("report.json.*.tmp")) == []
-    assert "<redacted-secret>" in captured.err
-    assert "sk-12345678" not in captured.err
+    assert captured.err == "session-audit error: unexpected operational failure\n"
 
 
 def test_output_failure_overrides_requested_judge_failure_exit(
@@ -534,8 +533,7 @@ def test_output_failure_overrides_requested_judge_failure_exit(
     assert captured.out == ""
     assert output.read_text(encoding="utf-8") == "old report\n"
     assert list(tmp_path.glob("report.json.*.tmp")) == []
-    assert "<redacted-secret>" in captured.err
-    assert "sk-12345678" not in captured.err
+    assert captured.err == "session-audit error: unexpected operational failure\n"
 
 
 def test_fifo_input_is_rejected_before_parser_open_can_block(
@@ -745,7 +743,7 @@ def test_unexpected_internal_failure_maps_to_safe_exit_one(
     transcript.write_text("{}\n", encoding="utf-8")
 
     def fail_execution(*args: object, **kwargs: object) -> object:
-        raise RuntimeError("internal failure sk-12345678")
+        raise RuntimeError("internal failure sk-12345678 private customer transcript detail")
 
     monkeypatch.setattr(cli, "execute_audit", fail_execution)
 
@@ -754,8 +752,7 @@ def test_unexpected_internal_failure_maps_to_safe_exit_one(
     captured = capsys.readouterr()
     assert exit_code == 1
     assert captured.out == ""
-    assert "<redacted-secret>" in captured.err
-    assert "sk-12345678" not in captured.err
+    assert captured.err == "session-audit error: unexpected operational failure\n"
 
 
 def test_real_detected_admission_flows_through_typed_json_episode(

@@ -16,7 +16,6 @@ from tomllib import TOMLDecodeError, load
 from typing import cast
 
 from scripts.core.config import get_config
-from scripts.core.log_safety import safe_secret
 from scripts.core.session_audit.detector import DetectionPolicy, detect_mistakes
 from scripts.core.session_audit.judge import (
     MessagesTransport,
@@ -50,6 +49,22 @@ class AuditExecution:
 
 class AuditOperationalError(RuntimeError):
     """Safe, expected command failure that maps to exit code 1."""
+
+
+class _InputOpenError(AuditOperationalError):
+    """The requested transcript cannot be opened."""
+
+
+class _NonRegularInputError(AuditOperationalError):
+    """The requested transcript is not a regular file."""
+
+
+class _InputOutputIdentityError(AuditOperationalError):
+    """Input/output identity could not be validated."""
+
+
+class _OutputAliasError(AuditOperationalError):
+    """The requested output aliases the input transcript."""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -221,9 +236,9 @@ def _regular_input(path: Path) -> None:
     try:
         mode = path.stat().st_mode
     except OSError as exc:
-        raise AuditOperationalError("input cannot be opened") from exc
+        raise _InputOpenError from exc
     if not stat.S_ISREG(mode):
-        raise AuditOperationalError("input is not a regular file")
+        raise _NonRegularInputError
 
 
 def _reject_output_alias(input_path: Path, output_path: Path | None) -> None:
@@ -233,9 +248,9 @@ def _reject_output_alias(input_path: Path, output_path: Path | None) -> None:
         resolved_alias = input_path.resolve(strict=True) == output_path.resolve(strict=False)
         same_file = output_path.exists() and os.path.samefile(input_path, output_path)
     except OSError as exc:
-        raise AuditOperationalError("input/output identity cannot be validated") from exc
+        raise _InputOutputIdentityError from exc
     if resolved_alias or same_file:
-        raise AuditOperationalError("output must not alias the input transcript")
+        raise _OutputAliasError
 
 
 def _render(result: AuditResult, output_format: OutputFormat) -> str:
@@ -291,8 +306,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         for warning in execution.warnings:
             print(f"session-audit warning: {warning}", file=sys.stderr)
         return int(execution.exit_code)
-    except Exception as exc:  # noqa: BLE001 - top-level command boundary maps internal failure
-        print(f"session-audit error: {safe_secret(exc)}", file=sys.stderr)
+    except _InputOpenError:
+        print("session-audit error: input cannot be opened", file=sys.stderr)
+        return int(AuditExitCode.OPERATIONAL_FAILURE)
+    except _NonRegularInputError:
+        print("session-audit error: input is not a regular file", file=sys.stderr)
+        return int(AuditExitCode.OPERATIONAL_FAILURE)
+    except _InputOutputIdentityError:
+        print("session-audit error: input/output identity cannot be validated", file=sys.stderr)
+        return int(AuditExitCode.OPERATIONAL_FAILURE)
+    except _OutputAliasError:
+        print("session-audit error: output must not alias the input transcript", file=sys.stderr)
+        return int(AuditExitCode.OPERATIONAL_FAILURE)
+    except Exception:  # noqa: BLE001 - top-level boundary emits no exception details
+        print("session-audit error: unexpected operational failure", file=sys.stderr)
         return int(AuditExitCode.OPERATIONAL_FAILURE)
 
 

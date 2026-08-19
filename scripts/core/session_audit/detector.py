@@ -55,6 +55,7 @@ _ADMISSION_LEXEME_RE = re.compile(
     r"I\s+(?:misunderstood|misread|misinterpreted)\b|"
     r"I\s+(?:incorrectly|wrongly)\s+(?:assumed|thought|said|stated|changed|edited|"
     r"implemented|used|claimed)\b|"
+    r"The\s+command\s+I\s+gave\s+you\s+was\b[^.!?;\n]{0,48}\b(?:wrong|incorrect)\b|"
     r"my\s+(?:assumption|diagnosis|interpretation|change|edit)\s+(?:was|is)\s+"
     r"(?:wrong|incorrect)\b|"
     r"(?:that|this)\s+was\s+my\s+(?:mistake|error)\b|"
@@ -70,6 +71,11 @@ _USER_CORRECTION_RE = re.compile(
     r"not\s+what\s+I\s+(?:asked|said))\b",
     re.IGNORECASE,
 )
+_USER_COMMAND_CORRECTION_RE = re.compile(
+    r"\byou\s+(?:(?:gave|sent)\s+me|provided|ran|used|passed)\s+the\s+"
+    r"(?:wrong|incorrect)\s+(?P<action_noun>command|flag|argument|option|profile)\b",
+    re.IGNORECASE,
+)
 _FENCE_LINE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
 _INLINE_CODE_RE = re.compile(r"`[^`\n]*(?:`|$)")
 _QUOTED_TEXT_RE = re.compile(r'("[^"\n]*"|“[^”\n]*”|‘[^’\n]*’|(?<!\w)\'[^\'\n]*\'(?!\w))')
@@ -78,13 +84,25 @@ _NON_MISTAKE_ACTION_TAIL_RE = re.compile(
     r"to\s+test|(?:for|as)\s+(?:(?:a|the)\s+)?(?:negative\s+)?test(?:ing)?)\b",
     re.IGNORECASE,
 )
+_NEGATED_NON_MISTAKE_ACTION_RE = re.compile(
+    r"\b(?:not|never)\s+(?:as\s+requested|intentionally|deliberately|purposely|"
+    r"on\s+purpose|by\s+design|to\s+test|(?:for|as)\s+"
+    r"(?:(?:a|the)\s+)?(?:negative\s+)?test(?:ing)?)\b",
+    re.IGNORECASE,
+)
+_LOGICAL_CLAUSE_SPLIT_RE = re.compile(
+    r"(?<=[.!?])\s+|[;\n]+|"
+    r"(?:,\s*+|(?<!\s)\s++)(?:and|but|while|because)\s+"
+    r"(?=(?:I|you|the|Correction)\b)",
+    re.IGNORECASE,
+)
 _ADMISSION_CLAUSE_RE = re.compile(
     r"^\s*(?:(?:actually|admittedly|clearly|yes|right|you(?:'re|\s+are)\s+right|"
     r"sorry(?:\s+about\s+that)?|I\s+apologize|on\s+reflection|after\s+checking)"
     r"(?:(?:\s*[—–]\s*)|(?:\s*[,:-]\s+)|\s+))?(?:"
-    r"Correction\s+first\s*:\s*[^.!?;\n]{1,160}?[—–]\s*"
+    r"(?P<guarded_action>Correction\s+first\s*:\s*[^.!?;\n]{1,160}?[—–]\s*"
     r"I\s+gave\s+you\s+the\s+wrong\s+command\b|"
-    r"(?P<guarded_action>I\s+(?:(?:gave|sent)\s+you|provided|ran|used|passed)\s+the\s+"
+    r"I\s+(?:(?:gave|sent)\s+you|provided|ran|used|passed)\s+the\s+"
     r"(?:wrong|incorrect)\s+(?:command|flag|argument|option|profile)\b"
     r"|The\s+command\s+I\s+gave\s+you\s+was\s+(?:wrong|incorrect)\b"
     r"|Correction\s*:\s*I\s+dropped\s+the\s+[\w./-]+\s+flag\b)|"
@@ -101,6 +119,16 @@ _ADMISSION_CLAUSE_RE = re.compile(
     r"I\s+(?:made|introduced|caused)\s+(?:an?|the)\s+(?:mistake|error|bug)\b|"
     r"I\s+should\s+have\s+(?:checked|read|verified|tested|confirmed)\b"
     r")",
+    re.IGNORECASE,
+)
+_COMMAND_ACKNOWLEDGMENT_RE = re.compile(
+    r"\b(?:I\s+(?:(?:gave|sent)\s+you|provided|ran|used|passed)\s+the\s+"
+    r"(?:wrong|incorrect)\s+(?:command|flag|argument|option|profile)\b|"
+    r"The\s+command\s+I\s+gave\s+you\s+was\s+(?:wrong|incorrect)\b|"
+    r"Correction\s*:\s*I\s+dropped\s+the\s+[\w./-]+\s+flag\b|"
+    r"I\s+accidentally\s+omitted\s+the\s+[\w./-]+\s+argument\b|"
+    r"I\s+forgot\s+to\s+include\s+the\s+[\w./-]+\s+option\b|"
+    r"I\s+should\s+have\s+passed\s+the\s+[\w./-]+\s+profile\b)",
     re.IGNORECASE,
 )
 _RETRACTION_TAIL_RE = re.compile(
@@ -128,8 +156,11 @@ _REQUIREMENT_CHANGE_RE = re.compile(
 _GENERIC_APOLOGY_RE = re.compile(r"\b(?:sorry|I\s+apologize)\b", re.IGNORECASE)
 _DEICTIC_ACTION_RE = re.compile(
     r"\b(?:that|this|the)\s+(?:[\w./-]+\s+){0,3}"
-    r"(?P<action_noun>edit|change|write|command|flag|argument|option|profile|revert|patch|"
-    r"implementation)\b",
+    r"(?P<action_noun>edit|change|write|command|revert|patch|implementation)\b",
+    re.IGNORECASE,
+)
+_COMMAND_OBJECT_NOUN_RE = re.compile(
+    r"\b(?P<action_noun>command|flag|argument|option|profile)\b",
     re.IGNORECASE,
 )
 _ARTIFACT_MENTION_RE = re.compile(
@@ -175,23 +206,39 @@ def _prose_for_signal_matching(text: str) -> str:
     )
 
 
-def _has_specific_visible_admission(text: str) -> bool:
+def _has_non_mistake_action_marker(action_tail: str) -> bool:
+    without_negated_markers = _NEGATED_NON_MISTAKE_ACTION_RE.sub(" ", action_tail)
+    return _NON_MISTAKE_ACTION_TAIL_RE.search(without_negated_markers) is not None
+
+
+def _accepted_admission_clauses(text: str) -> tuple[str, ...]:
     prose = _prose_for_signal_matching(text)
     if _RETRACTION_TAIL_RE.search(prose):
-        return False
-    clauses = re.split(r"(?<=[.!?])\s+|[;\n]+", prose)
+        return ()
+    accepted: list[str] = []
+    clauses = _LOGICAL_CLAUSE_SPLIT_RE.split(prose)
     for clause in clauses:
         if not clause.strip() or clause.rstrip().endswith("?"):
             continue
         match = _ADMISSION_CLAUSE_RE.search(clause)
         if match is None:
             continue
-        if match.group("guarded_action") is not None and _NON_MISTAKE_ACTION_TAIL_RE.search(
-            clause, match.end("guarded_action")
+        guarded_action = match.group("guarded_action")
+        if guarded_action is not None and _has_non_mistake_action_marker(
+            clause[match.end("guarded_action") :]
         ):
             continue
-        return True
-    return False
+        accepted.append(clause)
+    return tuple(accepted)
+
+
+def _has_specific_visible_admission(text: str) -> bool:
+    return bool(_accepted_admission_clauses(text))
+
+
+def _is_user_correction(text: str) -> bool:
+    prose = _prose_for_signal_matching(text)
+    return bool(_USER_CORRECTION_RE.search(prose) or _USER_COMMAND_CORRECTION_RE.search(prose))
 
 
 def _is_suppressed_admission_like(event: NormalizedEvent) -> bool:
@@ -206,6 +253,7 @@ def _is_suppressed_admission_like(event: NormalizedEvent) -> bool:
     return bool(
         _GENERIC_APOLOGY_RE.search(_prose_for_signal_matching(event.text))
         or _ADMISSION_LEXEME_RE.search(event.text)
+        or _COMMAND_ACKNOWLEDGMENT_RE.search(event.text)
     )
 
 
@@ -474,16 +522,21 @@ def _linked_affected_event(
         ),
         -1,
     )
-    deictic_match = _DEICTIC_ACTION_RE.search(_prose_for_signal_matching(detection.text))
+    action_noun = (
+        _user_correction_action_noun(detection.text)
+        if detection.actor is EventActor.HUMAN
+        and detection.source_kind is EvidenceSourceKind.USER_PROMPT
+        else _admission_action_noun(detection.text)
+    )
     candidates_since_boundary = (
         tuple(
             event
             for event in prior_window[last_boundary + 1 :]
             if event.kind is ContentKind.TOOL_USE
             and event.tool_name in _CAUSAL_ACTION_TOOLS
-            and _matches_deictic_action(event, deictic_match.group("action_noun"))
+            and _matches_deictic_action(event, action_noun)
         )
-        if deictic_match is not None
+        if action_noun is not None
         else ()
     )
     if len(candidates_since_boundary) == 1:
@@ -493,8 +546,8 @@ def _linked_affected_event(
             return candidate
     if (
         len(candidates_since_boundary) > 1
-        and deictic_match is not None
-        and deictic_match.group("action_noun").casefold() in _COMMAND_OBJECT_NOUNS
+        and action_noun is not None
+        and action_noun.casefold() in _COMMAND_OBJECT_NOUNS
     ):
         retry_root = _unique_completed_material_retry_root(
             ordered,
@@ -522,7 +575,7 @@ def _linked_affected_event(
         and previous.actor is EventActor.HUMAN
         and previous.kind is ContentKind.VISIBLE_TEXT
         and previous.source_kind is EvidenceSourceKind.USER_PROMPT
-        and _USER_CORRECTION_RE.search(_prose_for_signal_matching(previous.text))
+        and _is_user_correction(previous.text)
     ):
         bridged_root = _linked_affected_event(
             ordered,
@@ -537,15 +590,12 @@ def _linked_affected_event(
             return None
         if _has_conflicting_artifact_reference(detection_text, bridged_root):
             return None
-        deictic_match = _DEICTIC_ACTION_RE.search(_prose_for_signal_matching(detection.text))
+        bridge_action_noun = _admission_action_noun(detection.text)
         bridge_is_supported = (
             _text_names_event_selector(detection_text, bridged_root)
             or (
-                deictic_match is not None
-                and _matches_deictic_action(
-                    bridged_root,
-                    deictic_match.group("action_noun"),
-                )
+                bridge_action_noun is not None
+                and _matches_deictic_action(bridged_root, bridge_action_noun)
             )
             or _EXPLICIT_ACKNOWLEDGMENT_RE.search(detection_text) is not None
         )
@@ -617,6 +667,38 @@ def _matches_deictic_action(event: NormalizedEvent, noun: str) -> bool:
     if noun.casefold() == "revert":
         return _is_revert_use(event)
     return _is_mutation_use(event)
+
+
+def _admission_action_noun(text: str) -> str | None:
+    action_nouns: set[str] = set()
+    for clause in _accepted_admission_clauses(text):
+        command_acknowledgment = _COMMAND_ACKNOWLEDGMENT_RE.search(clause)
+        if command_acknowledgment is not None:
+            command_object = _COMMAND_OBJECT_NOUN_RE.search(
+                clause,
+                command_acknowledgment.start(),
+                command_acknowledgment.end(),
+            )
+            if command_object is not None:
+                action_nouns.add(command_object.group("action_noun").casefold())
+                continue
+        deictic_action = _DEICTIC_ACTION_RE.search(clause)
+        if deictic_action is not None:
+            action_nouns.add(deictic_action.group("action_noun").casefold())
+    return next(iter(action_nouns)) if len(action_nouns) == 1 else None
+
+
+def _user_correction_action_noun(text: str) -> str | None:
+    prose = _prose_for_signal_matching(text)
+    user_correction = _USER_COMMAND_CORRECTION_RE.search(prose)
+    if user_correction is not None:
+        return user_correction.group("action_noun").casefold()
+    deictic_action = _DEICTIC_ACTION_RE.search(prose)
+    return (
+        deictic_action.group("action_noun").casefold()
+        if _USER_CORRECTION_RE.search(prose) and deictic_action is not None
+        else None
+    )
 
 
 def _shell_parts(command: str) -> tuple[str, ...]:
@@ -927,7 +1009,17 @@ def _unique_completed_material_retry_root(
             if len(active_window) - root_position - 1 > _MAX_DEICTIC_EVENT_DISTANCE:
                 continue
             chains[chain_ids] = failed_use
-    return next(iter(chains.values())) if len(chains) == 1 else None
+    if len(chains) != 1:
+        return None
+    chain_ids, root = next(iter(chains.items()))
+    chain_command_use_ids = {chain_ids[1], chain_ids[2]}
+    root_position = active_positions[chain_ids[1]]
+    active_command_use_ids = {
+        event.event_id
+        for event in active_window[root_position:]
+        if event.kind is ContentKind.TOOL_USE and event.tool_name == "Bash"
+    }
+    return root if active_command_use_ids == chain_command_use_ids else None
 
 
 def _thinking_correction(
@@ -1509,7 +1601,7 @@ def detect_mistakes(
         if (
             event.kind is ContentKind.VISIBLE_TEXT
             and event.source_kind is EvidenceSourceKind.USER_PROMPT
-            and _USER_CORRECTION_RE.search(_prose_for_signal_matching(event.text))
+            and _is_user_correction(event.text)
         ):
             user_root = _linked_affected_event(
                 ordered,

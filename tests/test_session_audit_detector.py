@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from time import perf_counter
 
 import pytest
 
@@ -751,6 +752,27 @@ def test_deictic_action_noun_must_match_the_prior_tool_kind(
         assert result.unconfirmed_candidates[0].onset_event_id is None
 
 
+def test_generic_command_object_nouns_do_not_bind_a_proximal_bash_action() -> None:
+    for case_index, noun in enumerate(("profile", "argument", "flag")):
+        prior_command = _event(
+            0,
+            kind=ContentKind.TOOL_USE,
+            source_kind=EvidenceSourceKind.TOOL_USE,
+            tool_use_id=f"generic-noun-command-{case_index}",
+            tool_name="Bash",
+            tool_input=(("command", "overlay base --restore"),),
+        )
+        admission = _event(1, text=f"I was wrong about the {noun}.")
+
+        result = detect_mistakes(_parsed(prior_command, admission))
+
+        assert result.episodes == (), noun
+        assert len(result.unconfirmed_candidates) == 1, noun
+        candidate = result.unconfirmed_candidates[0]
+        assert candidate.local_classification is Classification.UNCONFIRMED, noun
+        assert candidate.onset_event_id is None, noun
+
+
 def test_live_wrong_command_acknowledgement_links_proximal_bash_action() -> None:
     prior_command = _event(
         0,
@@ -933,6 +955,206 @@ def test_wrong_action_admissions_link_bash_but_reject_intent_and_conditionals() 
         assert result.eligible_candidates == 0, text
         assert result.episodes == (), text
         assert result.unconfirmed_candidates == (), text
+
+
+def test_correction_first_intentional_wrong_commands_are_suppressed() -> None:
+    texts = (
+        "Correction first: the overlay isn't broken — I gave you the wrong command "
+        "intentionally for the test.",
+        "Correction first: the overlay isn't broken — I gave you the wrong command "
+        "to test failure handling.",
+    )
+    for case_index, text in enumerate(texts):
+        prior_command = _event(
+            0,
+            kind=ContentKind.TOOL_USE,
+            source_kind=EvidenceSourceKind.TOOL_USE,
+            tool_use_id=f"correction-first-intent-{case_index}",
+            tool_name="Bash",
+            tool_input=(("command", "overlay base --restore"),),
+        )
+
+        result = detect_mistakes(_parsed(prior_command, _event(1, text=text)))
+
+        assert result.eligible_candidates == 0, text
+        assert result.episodes == (), text
+        assert result.unconfirmed_candidates == (), text
+
+
+def test_negated_intent_markers_preserve_wrong_action_admissions() -> None:
+    texts = (
+        "I ran the wrong command, but not intentionally.",
+        "I used the wrong profile, but not on purpose.",
+    )
+    for case_index, text in enumerate(texts):
+        prior_command = _event(
+            0,
+            kind=ContentKind.TOOL_USE,
+            source_kind=EvidenceSourceKind.TOOL_USE,
+            tool_use_id=f"negated-intent-command-{case_index}",
+            tool_name="Bash",
+            tool_input=(("command", "overlay base --restore"),),
+        )
+        admission = _event(1, text=text)
+
+        result = detect_mistakes(_parsed(prior_command, admission))
+
+        assert len(result.episodes) == 1, text
+        assert result.unconfirmed_candidates == (), text
+        episode = result.episodes[0]
+        assert episode.local_classification is Classification.CONFIRMED, text
+        assert episode.onset_event_id == prior_command.event_id, text
+        assert any(
+            evidence.event_id == admission.event_id
+            and evidence.evidence_kind is EvidenceKind.VISIBLE_ADMISSION
+            for evidence in episode.evidence
+        ), text
+
+
+def test_suppressed_wrong_action_phrases_are_counted_in_diagnostics() -> None:
+    prior_command = _event(
+        0,
+        kind=ContentKind.TOOL_USE,
+        source_kind=EvidenceSourceKind.TOOL_USE,
+        tool_use_id="suppressed-diagnostics-command",
+        tool_name="Bash",
+        tool_input=(("command", "overlay base --restore"),),
+    )
+    suppressed_events = (
+        _event(1, text="I ran the wrong command to test failure handling."),
+        _event(
+            2,
+            text="The command I gave you was intentionally wrong for the negative test.",
+        ),
+    )
+
+    result = detect_mistakes(_parsed(prior_command, *suppressed_events))
+
+    assert result.eligible_candidates == 0
+    assert result.episodes == ()
+    assert result.unconfirmed_candidates == ()
+    assert result.diagnostics.raw_signal_candidates == 2
+    assert result.diagnostics.suppressed_non_mistakes == 2
+
+
+def test_mixed_clauses_link_using_the_accepted_admission_selector() -> None:
+    mixed_text = (
+        "I was wrong about that edit. " "I ran the wrong command intentionally for the test."
+    )
+    prior_bash = _event(
+        0,
+        kind=ContentKind.TOOL_USE,
+        source_kind=EvidenceSourceKind.TOOL_USE,
+        tool_use_id="mixed-clause-command",
+        tool_name="Bash",
+        tool_input=(("command", "overlay base --restore"),),
+    )
+    bash_only_admission = _event(1, text=mixed_text)
+
+    bash_only = detect_mistakes(_parsed(prior_bash, bash_only_admission))
+
+    assert bash_only.episodes == ()
+    assert len(bash_only.unconfirmed_candidates) == 1
+    bash_only_candidate = bash_only.unconfirmed_candidates[0]
+    assert bash_only_candidate.detection_event_id == bash_only_admission.event_id
+    assert bash_only_candidate.onset_event_id is None
+
+    prior_edit = _event(
+        1,
+        kind=ContentKind.TOOL_USE,
+        source_kind=EvidenceSourceKind.TOOL_USE,
+        tool_use_id="mixed-clause-edit",
+        tool_name="Edit",
+        tool_input=(("file_path", "/src/overlay.py"),),
+    )
+    linked_admission = _event(2, text=mixed_text)
+
+    linked = detect_mistakes(_parsed(prior_bash, prior_edit, linked_admission))
+
+    assert len(linked.episodes) == 1
+    assert linked.unconfirmed_candidates == ()
+    episode = linked.episodes[0]
+    assert episode.local_classification is Classification.CONFIRMED
+    assert episode.onset_event_id == prior_edit.event_id
+    assert prior_bash.event_id not in episode.affected_event_ids
+
+
+def test_same_clause_uses_the_accepted_edit_selector_instead_of_bash() -> None:
+    prior_bash = _event(
+        0,
+        kind=ContentKind.TOOL_USE,
+        source_kind=EvidenceSourceKind.TOOL_USE,
+        tool_use_id="same-clause-command",
+        tool_name="Bash",
+        tool_input=(("command", "overlay base --restore"),),
+    )
+    prior_edit = _event(
+        1,
+        kind=ContentKind.TOOL_USE,
+        source_kind=EvidenceSourceKind.TOOL_USE,
+        tool_use_id="same-clause-edit",
+        tool_name="Edit",
+        tool_input=(("file_path", "/src/overlay.py"),),
+    )
+    admission = _event(
+        2,
+        text=(
+            "I was wrong about that edit, and I ran the wrong command intentionally "
+            "for the test."
+        ),
+    )
+
+    result = detect_mistakes(_parsed(prior_bash, prior_edit, admission))
+
+    assert len(result.episodes) == 1
+    assert result.unconfirmed_candidates == ()
+    episode = result.episodes[0]
+    assert episode.local_classification is Classification.CONFIRMED
+    assert episode.onset_event_id == prior_edit.event_id
+    assert prior_bash.event_id not in episode.affected_event_ids
+
+
+def test_clause_scanning_stays_bounded_on_long_whitespace_runs() -> None:
+    long_admission = "I was wrong about that edit" + (" " * 4_000) + "with no conjunction."
+    events = tuple(_event(index, text=long_admission) for index in range(8))
+
+    started = perf_counter()
+    result = detect_mistakes(_parsed(*events))
+    elapsed = perf_counter() - started
+
+    assert elapsed < 1.0
+    assert result.eligible_candidates == len(events)
+
+
+def test_correction_first_preceding_intent_preserves_the_admitted_action() -> None:
+    prior_command = _event(
+        0,
+        kind=ContentKind.TOOL_USE,
+        source_kind=EvidenceSourceKind.TOOL_USE,
+        tool_use_id="intent-before-admission-command",
+        tool_name="Bash",
+        tool_input=(("command", "overlay base --restore"),),
+    )
+    admission = _event(
+        1,
+        text=(
+            "Correction first: I intentionally tested the overlay — "
+            "I gave you the wrong command."
+        ),
+    )
+
+    result = detect_mistakes(_parsed(prior_command, admission))
+
+    assert len(result.episodes) == 1
+    assert result.unconfirmed_candidates == ()
+    episode = result.episodes[0]
+    assert episode.local_classification is Classification.CONFIRMED
+    assert episode.onset_event_id == prior_command.event_id
+    assert any(
+        evidence.event_id == admission.event_id
+        and evidence.evidence_kind is EvidenceKind.VISIBLE_ADMISSION
+        for evidence in episode.evidence
+    )
 
 
 def test_deictic_admission_does_not_cross_a_human_task_boundary() -> None:
@@ -1612,6 +1834,95 @@ def test_user_correction_and_linked_agent_admission_merge_into_one_episode() -> 
         EvidenceKind.VISIBLE_ADMISSION,
     }
     assert any(gap.crosses_human_boundary for gap in episode.affected_gap_refs)
+
+
+def test_wrong_profile_acknowledgment_bridges_to_the_user_corrected_bash() -> None:
+    prior_command = _event(
+        0,
+        kind=ContentKind.TOOL_USE,
+        source_kind=EvidenceSourceKind.TOOL_USE,
+        tool_use_id="profile-command",
+        tool_name="Bash",
+        tool_input=(("command", "overlay base --restore"),),
+    )
+    user_correction = _event(
+        1,
+        text="You used the wrong profile.",
+        actor=EventActor.HUMAN,
+        source_kind=EvidenceSourceKind.USER_PROMPT,
+    )
+    admission = _event(2, text="You're right. I used the wrong profile.")
+
+    result = detect_mistakes(_parsed(prior_command, user_correction, admission))
+
+    assert result.eligible_candidates == 2
+    assert len(result.episodes) == 1
+    assert result.unconfirmed_candidates == ()
+    episode = result.episodes[0]
+    assert episode.local_classification is Classification.CONFIRMED
+    assert episode.onset_event_id == prior_command.event_id
+    assert {evidence.evidence_kind for evidence in episode.evidence} >= {
+        EvidenceKind.USER_CORRECTION,
+        EvidenceKind.VISIBLE_ADMISSION,
+    }
+    assert any(gap.crosses_human_boundary for gap in episode.affected_gap_refs)
+
+
+@pytest.mark.parametrize(
+    ("user_text", "admission_text"),
+    [
+        ("You ran the wrong command.", "You're right. I ran the wrong command."),
+        (
+            "You gave me the wrong command.",
+            "You're right. I gave you the wrong command.",
+        ),
+        (
+            "You sent me the wrong command.",
+            "You're right. I sent you the wrong command.",
+        ),
+        (
+            "You provided the wrong command.",
+            "You're right. I provided the wrong command.",
+        ),
+        (
+            "You passed the wrong argument.",
+            "You're right. I passed the wrong argument.",
+        ),
+    ],
+    ids=("ran", "gave", "sent", "provided", "passed"),
+)
+def test_explicit_user_action_corrections_bridge_to_bash(
+    user_text: str,
+    admission_text: str,
+) -> None:
+    prior_command = _event(
+        0,
+        kind=ContentKind.TOOL_USE,
+        source_kind=EvidenceSourceKind.TOOL_USE,
+        tool_use_id="user-action-command",
+        tool_name="Bash",
+        tool_input=(("command", "overlay base --restore"),),
+    )
+    user_correction = _event(
+        1,
+        text=user_text,
+        actor=EventActor.HUMAN,
+        source_kind=EvidenceSourceKind.USER_PROMPT,
+    )
+    admission = _event(2, text=admission_text)
+
+    result = detect_mistakes(_parsed(prior_command, user_correction, admission))
+
+    assert result.eligible_candidates == 2
+    assert len(result.episodes) == 1
+    assert result.unconfirmed_candidates == ()
+    episode = result.episodes[0]
+    assert episode.local_classification is Classification.CONFIRMED
+    assert episode.onset_event_id == prior_command.event_id
+    assert {evidence.evidence_kind for evidence in episode.evidence} >= {
+        EvidenceKind.USER_CORRECTION,
+        EvidenceKind.VISIBLE_ADMISSION,
+    }
 
 
 def test_user_bridge_rejects_an_explicit_artifact_conflicting_with_its_root() -> None:

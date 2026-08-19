@@ -1054,3 +1054,184 @@ clause rather than crashing), but **`--archive --execute` aborts** (exit 1, afte
 because `archive_row` requires the column — run the migration before archiving. `CREATE INDEX
 CONCURRENTLY` cannot run inside a transaction block — apply the file with `psql -f` (autocommit),
 not `psql -1`.
+
+---
+
+# Session Audit API Reference
+
+`opc session audit` scans one Claude Code JSONL transcript for high-precision, locally supported
+mistake episodes and reports a rough measure of avoidable time. The default deterministic command
+is network-free. The explicit `--judge` option sends only bounded candidate windows to one
+configured Anthropic model call for evidence-constrained semantic adjudication.
+
+## Examples
+
+```bash
+# Markdown to stdout
+opc session audit --jsonl ~/.claude/projects/example/session.jsonl
+
+# Stable JSON to stdout
+opc session audit --jsonl session.jsonl --format json
+
+# Atomically publish a Markdown report without also writing it to stdout
+opc session audit --jsonl session.jsonl --output audit.md
+
+# Exclude assistant thinking from parsing and detection
+opc session audit --jsonl session.jsonl --format json --no-thinking
+
+# Opt in to one bounded semantic judge call
+opc session audit --jsonl session.jsonl --format json --judge
+
+# Override [session_audit].judge_model for this opt-in run
+opc session audit --jsonl session.jsonl --judge --judge-model claude-sonnet-5
+```
+
+## Flags
+
+| Flag | Meaning |
+|------|---------|
+| `--jsonl PATH` | Required regular-file transcript input. FIFOs, devices, sockets, and directories are rejected before parsing. |
+| `--format {markdown,json}` | Output representation; defaults to `markdown`. |
+| `--output PATH` | Atomically write the complete report in the destination directory instead of stdout. The destination must not alias the transcript through the same path, a symlink, or a hard link. |
+| `--no-thinking` | Exclude thinking blocks from parsing and detection and record `thinking_included: false` in run provenance. |
+| `--judge` | Opt in to at most one Anthropic Messages call. Up to 12 bounded candidate excerpts are sent after known credential-shape and command-flag masking. Raw JSONL and unselected records are not uploaded, but a short session's entire normalized semantic content can fit inside a candidate window. Project or personal prose may remain. Omit this flag if the data must stay local. |
+| `--judge-model MODEL` | Override `[session_audit].judge_model` for an opt-in run. Precedence is this flag, then config, then `claude-sonnet-5`. It has no network effect without `--judge`. |
+
+`--judge` requires `ANTHROPIC_API_KEY` only when at least one candidate window can actually be
+submitted. A no-candidate run remains network-free and does not read the key. Judge failures keep
+all deterministic results, mark the otherwise-complete report `partial`, and return exit 3.
+
+## Resource envelope
+
+Every invocation records its effective limits in `run.effective_limits`. Current defaults are:
+
+- 64 MiB total input bytes;
+- 8 MiB per physical input line;
+- 125,000 nonblank JSONL records;
+- 25,000 normalized semantic events;
+- 500 retained local candidates.
+
+The optional judge additionally retains at most 12 candidates, at most 24 events and 4,000
+post-encoding characters per candidate, at most 48,000 candidate characters total, one request,
+2,048 output tokens, and a 60-second deadline. A successful HTTP response is capped at 256 KiB
+before JSON decoding. Designed count/payload omissions retain local results and do not by
+themselves make the judge fail.
+
+Crossing a parser/schema resource boundary produces a schema-valid `refused` report. Crossing the
+candidate-retention limit produces a `partial` report containing retained findings and the exact
+omitted count.
+
+## JSON envelope
+
+JSON output is UTF-8, deterministic for identical input and configuration, and ends with one
+newline. The top-level key order is stable:
+
+```text
+schema_version, status, run, session, summary,
+episodes, unconfirmed_candidates, diagnostics
+```
+
+- `status` is `complete`, `partial`, or `refused`.
+- `run` records the tool/ruleset versions, chosen format, thinking provenance, whether the judge
+  was requested, the effective model, timeout, and every effective limit.
+- `session` records only bounded input identity (`input_bytes` and SHA-256), not the transcript.
+- `summary` contains `totals_complete`, retained classification counts, the exact omitted count,
+  and separate `local_estimates` / `final_estimates` blocks.
+- Each reportable episode carries typed local/final category, classification, boundaries,
+  affected event IDs, bounded evidence citations, local/final timing, and judge adjudication
+  provenance when requested.
+- `unconfirmed_candidates` remain separate, say `excluded_from_totals: true`, and do not serialize
+  time claims. Their typed internal projection remains available for a later validated promotion.
+- `diagnostics` has stable `parser`, `detector`, `timing`, and `judge` namespaces. The judge
+  namespace contains only fixed status/reason codes, counts, and validated local IDs; it never
+  contains a request body, response body, key, headers, or raw exception text.
+
+Evidence citations contain an event ID, source line, optional timestamp, exact source/signal/evidence
+roles, and a re-redacted excerpt of at most 500 characters. Context windows and whole transcripts
+are never serialized as evidence.
+
+## Refusal and overflow semantics
+
+A `refused` report has empty finding arrays, `totals_complete: false`, and null episode counts and
+estimate blocks. Parser refusal reason codes remain under `diagnostics.parser.refusal_reasons`.
+It never says that no mistakes were found because analysis did not complete.
+
+An overflow report has `status: partial`, retains the selected episodes/candidates and their
+per-episode timing, records the exact omitted count, and sets both aggregate estimate blocks to
+null. This prevents retained work from looking like a complete session total.
+
+A complete zero-finding report uses numeric zero counts and timing totals rather than null.
+
+## Time fields
+
+Time attribution is deterministic interval math, not a model-generated number:
+
+- `directly_attributed_observed_seconds` unions correlated affected tool-use/result intervals.
+- `central_avoidable_active_seconds` adds detector-approved affected gaps, each capped at five
+  minutes.
+- `inclusive_avoidable_active_seconds` also adds explicitly ambiguous recovery gaps, each capped at
+  fifteen minutes.
+- `estimate_range.low_seconds`, `.central_seconds`, and `.high_seconds` repeat those policy views.
+  The heuristic range is not a confidence interval or a mathematical lower/upper bound.
+- `observed_onset_to_recovery_seconds` is the observed wall-clock span between validated episode
+  boundaries.
+- `affected_counts` de-duplicates assistant turns, tool calls, failed tool calls, retries, and
+  reverted edits.
+
+Intervals are unioned across tools and episodes so overlap is not double-counted. Explicit
+unrelated-branch and human-idle gap flags exclude those intervals. A missing or invalid timestamp
+produces JSON `null` (and an explicit Markdown `Unavailable` label) only for dependent metrics;
+it is never silently treated as zero.
+
+## Exit codes
+
+Analysis status and process exit are deliberately separate:
+
+| Code | Meaning |
+|------|---------|
+| 0 | Complete deterministic report, including a complete report with no findings. |
+| 1 | Operational, invariant, rendering, or output-write failure. |
+| 2 | Argparse usage error. |
+| 3 | A requested judge failed or returned a partial/invalid decision set; deterministic local results were still emitted. |
+| 4 | Parser/schema/resource refusal; a refusal report was emitted successfully. |
+| 5 | Local candidate overflow; a partial retained-findings report was emitted successfully. |
+
+An output-write failure overrides every analysis outcome and returns 1. Parser refusal returns 4
+without invoking the judge. Local candidate overflow returns 5 even if the requested judge also
+degrades. Existing destination content remains intact when atomic publication fails.
+
+## Optional judge authority and privacy
+
+The judge receives one canonical JSON message containing selected event IDs, ordering and source
+roles, bounded semantic text, and tool-name-specific allowlisted inputs. UUID ancestry, arbitrary
+record fields, correlation IDs, and unselected context are not sent. Raw JSONL is never uploaded,
+but a short session's entire normalized semantic content can fit inside a selected candidate
+window. Known credential shapes and `--password`, `--token`, `--secret`, `--key`, and `--api-key`
+values are masked before slicing. This is best-effort masking, not anonymization: ordinary project,
+personal, or proprietary prose can remain.
+
+The forced result schema contains no time, duration, token, cost, or estimate field. Returned IDs,
+roles, branches, boundaries, and classifications are treated as untrusted. A decision is applied
+only after every citation and boundary resolves inside that candidate's exact submitted event
+allowlist, matches its local actor/source role, shares validated lineage, and satisfies chronology
+and local causal constraints. Unknown or sibling-branch IDs reject the decision without being
+echoed into diagnostics.
+
+User-only support cannot promote an episode. Thinking-only support cannot confirm one; separately
+corroborated thinking reaches at most `probable`. `confirmed` requires either a specific visible
+assistant admission tied to earlier detector-approved affected work or a complete locally verified
+contradiction/correction-or-revert/recovery chain. The judge may downgrade a valid local finding,
+but the report keeps both local and final states. All local and final time blocks are recalculated
+from the same local timestamps and detector-approved intervals; model-returned numbers cannot
+enter them.
+
+## Interpretation limits
+
+Detection favors precision over recall. A specific visible assistant admission tied to earlier
+affected work is stronger than a user claim; complete objective contradiction/correction/recovery
+chains can also support a reportable episode. User-only claims remain unconfirmed and are excluded
+from time totals. Thinking evidence is labeled and is never silently presented as visible evidence.
+
+Real-world precision and recall are not yet established. Treat the result as an auditable triage
+report, inspect cited evidence, and do not treat the heuristic time range as billing, productivity,
+or statistical truth.

@@ -13,6 +13,7 @@ from scripts.core.config.models import (
     DedupConfig,
     OPCConfig,
     RerankerConfig,
+    SessionAuditConfig,
 )
 
 
@@ -183,3 +184,12 @@ class TestBuildConfig:
     def test_vector_candidate_multiplier_negative_rejected(self):
         with pytest.raises(ConfigValidationError, match="below minimum"):
             build_config({"recall": {"vector_candidate_multiplier": -3}})
+
+    def test_session_audit_section_loads_judge_model(self):
+        cfg = build_config({"session_audit": {"judge_model": "claude-opus-5"}})
+
+        assert cfg.session_audit == SessionAuditConfig(judge_model="claude-opus-5")
+
+    def test_session_audit_judge_model_rejects_wrong_type(self):
+        with pytest.raises(ConfigValidationError, match=r"\[session_audit\].*expected str"):
+            build_config({"session_audit": {"judge_model": 5}})

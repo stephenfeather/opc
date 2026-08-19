@@ -130,6 +130,11 @@ COMMANDS: dict[CommandKey, Command] = {
         "Extract workflow patterns from session JSONL",
         "Extraction",
     ),
+    ("session", "audit"): Command(
+        "session_audit_cli.py",
+        "Find mistakes and estimate avoidable time in a Claude session",
+        "Session Analysis",
+    ),
     ("handoff",): Command(
         "generate_mini_handoff.py",
         "Generate a mini-handoff from session JSONL",

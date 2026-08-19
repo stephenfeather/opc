@@ -14,6 +14,7 @@ This project began as a fork of [Continuous-Claude-v3](https://github.com/parcad
 - **Session handoffs** - Generate YAML handoff documents so new sessions can resume where previous ones left off
 - **Artifact indexing** - Track and query files, plans, and other artifacts across the project
 - **Memory daemon** - Background process that extracts thinking blocks, workflow patterns, and generates mini-handoffs automatically, with date-based log rotation
+- **Session mistake audit** - Scan one Claude Code JSONL transcript for evidence-backed mistake episodes and estimate avoidable active time, locally by default with an optional bounded semantic judge
 - **Multi-provider embeddings** - Pluggable embedding service supporting Voyage AI, OpenAI, local sentence-transformers, and Ollama
 - **Contextual reranking** - Adaptive reranker that reorders recall results using recency, tag relevance, type inference, and per-mode calibration
 - **Cross-session pattern detection** - Identifies recurring patterns across sessions (repeated errors, tool preferences, architectural decisions) and boosts them in recall
@@ -56,6 +57,8 @@ scripts/core/              Core memory system
   extract_thinking_blocks.py Thinking block extraction from transcripts
   extract_workflow_patterns.py Workflow pattern extraction
   generate_mini_handoff.py   Automatic mini-handoff generation
+  session_audit_cli.py        Entry point for session mistake and lost-time reports
+  session_audit/              Parser, detector, timing, reporting, and optional judge
   config/                     TOML config loading, validation, models
   db/                        Database layer
     embedding_service.py       Multi-provider embedding abstraction
@@ -104,6 +107,75 @@ uv run python scripts/core/memory_daemon.py start
 # Run with verbose diagnostic logging (Issue #99)
 uv run python scripts/core/memory_daemon.py start --debug
 ```
+
+## Session Mistake and Lost-Time Audit
+
+`opc session audit` analyzes one Claude Code session log. It identifies mistake episodes from
+agent admissions, objective correction chains, and corroborating evidence, then estimates the
+avoidable active time associated with each episode. The default path is deterministic, read-only,
+and network-free.
+
+Claude Code normally stores session logs under
+`~/.claude/projects/<project>/<session-id>.jsonl`. Choose one file and run:
+
+```bash
+SESSION_LOG="/absolute/path/to/session.jsonl"
+
+# Human-readable Markdown on stdout
+uv run opc session audit --jsonl "$SESSION_LOG"
+
+# Stable JSON written atomically to a file
+uv run opc session audit \
+  --jsonl "$SESSION_LOG" \
+  --format json \
+  --output /private/tmp/session-audit.json
+
+# Exclude assistant thinking from detection and evidence
+uv run opc session audit --jsonl "$SESSION_LOG" --no-thinking
+```
+
+Reports contain bounded transcript excerpts and include assistant thinking unless you pass
+`--no-thinking`. Store reports in a private location, and do not commit them to the repository.
+
+The JSON report separates confirmed and probable episodes from unconfirmed signals. Unconfirmed
+signals do not contribute to time totals. Time values come from local timestamp and tool-interval
+calculations; the low, central, and high values are rough policy estimates, not billing or
+productivity measurements.
+
+### Optional semantic judge
+
+Add `--judge` to submit bounded candidate windows to Anthropic for evidence-constrained semantic
+adjudication. `ANTHROPIC_API_KEY` must already be available in the environment when candidates are
+present.
+
+```bash
+uv run opc session audit \
+  --jsonl "$SESSION_LOG" \
+  --format json \
+  --judge \
+  --judge-model claude-sonnet-5 \
+  --output /private/tmp/session-audit-judged.json
+```
+
+Judge mode makes at most one request. It does not upload raw JSONL or unselected records, but a
+short session's entire normalized semantic content can fit inside a bounded candidate window.
+Submitted excerpts can contain project, personal, or proprietary prose after best-effort
+credential masking. Omit `--judge` when the transcript must remain entirely local. The report
+preserves both local and final classifications, and all timing remains deterministic and local.
+
+Process exit codes distinguish complete analysis from degraded or incomplete results:
+
+| Code | Meaning |
+|------|---------|
+| `0` | Complete report |
+| `1` | Operational, rendering, or output error |
+| `2` | Invalid command-line arguments |
+| `3` | Judge failure; local results were preserved |
+| `4` | Input refused because of schema or resource limits |
+| `5` | Candidate overflow; a partial report was produced |
+
+See the [Session Audit API Reference](docs/recall-api-reference.md#session-audit-api-reference)
+for evidence rules, resource limits, JSON fields, privacy details, and interpretation guidance.
 
 ## Embedding Providers
 

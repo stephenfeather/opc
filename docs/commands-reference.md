@@ -177,7 +177,7 @@ Start, stop, or check the background memory-extraction daemon. No parameters. `d
 
 ## 2. The `opc` CLI (human-facing)
 
-The `opc` dispatcher (`scripts/core/cli.py`) registers **26 commands** across **25 unique argparse scripts** (`pattern detect` and `pattern batch` both map to `pattern_batch.py`). Run `opc --help` to discover all of them, or `opc <command> --help` for per-command flags. Grouped by category below.
+The `opc` dispatcher (`scripts/core/cli.py`) registers **27 commands** across **26 unique argparse scripts** (`pattern detect` and `pattern batch` both map to `pattern_batch.py`). Run `opc --help` to discover all of them, or `opc <command> --help` for per-command flags. Grouped by category below.
 
 ### Recall & Store
 
@@ -214,6 +214,12 @@ The `opc` dispatcher (`scripts/core/cli.py`) registers **26 commands** across **
 | Command | Script | Key flags |
 |---------|--------|-----------|
 | `opc daemon` | `memory_daemon.py` | `{start,stop,status}`, `--debug` |
+
+### Session Analysis
+
+| Command | Script | Key flags |
+|---------|--------|-----------|
+| `opc session audit` | `session_audit_cli.py` | `--jsonl PATH` (req), `--format {markdown,json}`, `--output PATH`, `--no-thinking`, opt-in `--judge`, `--judge-model MODEL` — local and network-free unless `--judge` is supplied |
 
 ### Extraction
 

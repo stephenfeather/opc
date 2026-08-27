@@ -9,13 +9,24 @@
  *
  * This reader loops on readSync, sleeping briefly on EAGAIN until data or EOF
  * arrives, so every hook sees the complete payload regardless of scheduling.
+ *
+ * Semantics relative to readFileSync(0) are otherwise unchanged: the read
+ * completes at EOF, which Claude Code produces by closing the hook's stdin
+ * after writing the payload. On a *blocking* pipe readSync simply waits for
+ * that EOF (as readFileSync did); the idle cap below only bounds the
+ * non-blocking EAGAIN spin and is not a wall-clock deadline for the hook —
+ * that remains Claude Code's per-hook timeout.
  */
 
 import { fstatSync, readSync } from 'fs';
 
 const CHUNK_SIZE = 64 * 1024;
 const EAGAIN_SLEEP_MS = 5;
-/** Give up after this long with no data at all — a hook must never hang. */
+/**
+ * Stop retrying EAGAIN after this long with no data at all (non-blocking pipes
+ * only). Well under Claude Code's default 60s hook timeout; a reader that has
+ * seen no byte in 10s is not going to get a payload.
+ */
 const DEFAULT_MAX_IDLE_MS = 10_000;
 /**
  * Override for the idle cap (ms). The vitest config sets it to 0 so a hook
@@ -48,7 +59,10 @@ function sleepMs(ms: number): void {
 }
 
 export interface ReadStdinOptions {
-  /** Max time to wait for *any* data before giving up (default 10 s). */
+  /**
+   * Max time to keep retrying EAGAIN with no data before giving up (default
+   * 10 s). Applies to non-blocking pipes only; a blocking read waits for EOF.
+   */
   maxIdleMs?: number;
   /** File descriptor to read (default 0). Exposed for tests. */
   fd?: number;
@@ -58,7 +72,8 @@ export interface ReadStdinOptions {
  * Read stdin to EOF and return it as UTF-8.
  *
  * Returns "" if stdin is closed with no data. Throws only for non-EAGAIN
- * errors, or if no data arrives within `maxIdleMs` (RangeError: stdin idle).
+ * errors, or — on a non-blocking pipe — if no data arrives within `maxIdleMs`
+ * (RangeError: stdin idle).
  */
 export function readStdinSync(options: ReadStdinOptions = {}): string {
   const fd = options.fd ?? 0;

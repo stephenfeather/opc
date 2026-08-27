@@ -133,6 +133,14 @@ function indexScriptCandidates(projectDir, opcDir = null) {
   );
   return candidates;
 }
+function indexerArgs(indexScript, fullPath, opcDir) {
+  const args = ["run"];
+  if (opcDir) {
+    args.push("--project", opcDir);
+  }
+  args.push("python", indexScript, "--file", fullPath);
+  return args;
+}
 function isWithinProject(fullPath, projectDir) {
   let projectRoot;
   let target;
@@ -232,7 +240,7 @@ ${content}`;
     }
     const indexScript = indexScriptCandidates(projectDir, getOpcDir()).find((p) => fs.existsSync(p));
     if (indexScript) {
-      const child = spawn("uv", ["run", "python", indexScript, "--file", fullPath], {
+      const child = spawn("uv", indexerArgs(indexScript, fullPath, getOpcDir()), {
         cwd: projectDir,
         detached: true,
         stdio: "ignore",
@@ -259,6 +267,7 @@ if (process.argv[1] && (process.argv[1].endsWith("handoff-index.ts") || process.
 export {
   classifyArtifactPath,
   indexScriptCandidates,
+  indexerArgs,
   isIndexableToolEvent,
   isWithinProject
 };

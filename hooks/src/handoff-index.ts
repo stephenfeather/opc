@@ -164,6 +164,20 @@ export function indexScriptCandidates(projectDir: string, opcDir: string | null 
  * the indexer read (and, for handoffs, rewrite) a file elsewhere. Paths that
  * do not exist are rejected.
  */
+/**
+ * `uv` argv for the indexer. With `--project <opcDir>` uv uses OPC's own
+ * environment (psycopg2 etc.) instead of resolving — or creating — a venv in
+ * whatever project the artifact was written in.
+ */
+export function indexerArgs(indexScript: string, fullPath: string, opcDir: string | null): string[] {
+  const args = ['run'];
+  if (opcDir) {
+    args.push('--project', opcDir);
+  }
+  args.push('python', indexScript, '--file', fullPath);
+  return args;
+}
+
 export function isWithinProject(fullPath: string, projectDir: string): boolean {
   let projectRoot: string;
   let target: string;
@@ -301,7 +315,7 @@ async function main() {
     const indexScript = indexScriptCandidates(projectDir, getOpcDir()).find(p => fs.existsSync(p));
 
     if (indexScript) {
-      const child = spawn('uv', ['run', 'python', indexScript, '--file', fullPath], {
+      const child = spawn('uv', indexerArgs(indexScript, fullPath, getOpcDir()), {
         cwd: projectDir,
         detached: true,
         stdio: 'ignore',

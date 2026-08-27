@@ -14,6 +14,7 @@ import * as path from 'path';
 import {
   classifyArtifactPath,
   indexScriptCandidates,
+  indexerArgs,
   isIndexableToolEvent,
   isWithinProject,
 } from '../handoff-index.js';
@@ -33,6 +34,20 @@ describe('indexScriptCandidates', () => {
       '/repo/scripts/artifact_index.py',
     ]);
     expect(indexScriptCandidates('/repo')).toEqual(indexScriptCandidates('/repo', null));
+  });
+});
+
+describe('indexerArgs', () => {
+  it('runs the indexer inside the OPC project environment', () => {
+    expect(indexerArgs('/opc/scripts/core/artifact_index.py', '/p/thoughts/shared/plans/x.md', '/opc')).toEqual([
+      'run', '--project', '/opc', 'python', '/opc/scripts/core/artifact_index.py', '--file', '/p/thoughts/shared/plans/x.md',
+    ]);
+  });
+
+  it('omits --project when no OPC dir is resolvable', () => {
+    expect(indexerArgs('/p/scripts/core/artifact_index.py', '/p/a.md', null)).toEqual([
+      'run', 'python', '/p/scripts/core/artifact_index.py', '--file', '/p/a.md',
+    ]);
   });
 });
 

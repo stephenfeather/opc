@@ -174,14 +174,21 @@ Session handoffs/task completions with embeddings for semantic search. Indexed b
 | `outcome_notes` | TEXT | | Notes on the outcome |
 | `content` | TEXT | | Full handoff content |
 | `embedding` | VECTOR(1024) | | For semantic search |
-| `created_at` | TIMESTAMPTZ | NOW() | |
+| `created_at` | TIMESTAMPTZ | NOW() | Handoff frontmatter `date` (normalised); `COALESCE`d on re-index so it never regresses to now() (#283) |
 | `indexed_at` | TIMESTAMPTZ | NOW() | |
+| `task_number` | INTEGER | | From the `task-NN` filename (#283) |
+| `files_modified` | TEXT | | JSON array (#283) |
+| `turn_span_id` | TEXT | | Braintrust turn span (#283) |
+| `braintrust_session_id` | TEXT | | (#283) |
 
-**Indexes:** session_name, session_id, root_span_id, created_at DESC, outcome, goal FTS (GIN), HNSW on embedding
+**Indexes:** session_name, session_id, root_span_id, created_at DESC, outcome, goal FTS (GIN), `idx_handoffs_search_fts` (GIN over goal/what_worked/what_failed/key_decisions, #282), HNSW on embedding
+
+`file_path` is the upsert key and is always absolute (paths are resolved before hashing the id, #283). Rows with a relative `file_path` predate that change; the #287 backfill re-homes them.
 
 | Script/Hook | Operation | Details |
 |-------------|-----------|---------|
-| `scripts/core/artifact_index.py` | WRITE (upsert) | Indexes handoff markdown files into PostgreSQL via `_adapt_for_postgres()` |
+| `scripts/core/artifact_index.py` | WRITE (upsert) | Indexes handoff markdown files into PostgreSQL via `_adapt_for_postgres()`; `init_postgres()` adds the #283 columns idempotently |
+| `hooks/src/handoff-index.ts` | TRIGGER | PostToolUse:Write → `artifact_index.py --file` for handoffs **and** `thoughts/shared/plans/*.md` (#283) |
 
 ---
 
@@ -299,10 +306,13 @@ Indexed implementation plans for cross-session discovery. Defined in `init-schem
 | `phases` | TEXT | | Phases (JSON) |
 | `constraints` | TEXT | | Constraints and limitations |
 | `indexed_at` | TIMESTAMP | NOW() | When indexed |
+| `created_at` | TIMESTAMPTZ | | Frontmatter `date`, else a leading `YYYY-MM-DD` in the file name, else NULL (#283) |
+
+`id` is a hash of the absolute file path; a bulk `--plans` run first deletes legacy rows whose `file_path` is relative (`prune_legacy_rows`, #283). Queries return `COALESCE(created_at, indexed_at)`.
 
 | Script/Hook | Operation | Details |
 |-------------|-----------|---------|
-| `scripts/core/artifact_index.py` | WRITE (upsert) | Indexes plan markdown files via `DatabaseConnection` |
+| `scripts/core/artifact_index.py` | WRITE (upsert) | Indexes plan markdown files (`--plans`, or `--file` from the Write hook since #283) |
 
 ---
 

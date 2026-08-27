@@ -17,7 +17,11 @@ from pathlib import Path
 import pytest
 
 from scripts.core import artifact_index as ai
-from scripts.core.artifact_index_core import adapt_for_postgres, generate_file_id
+from scripts.core.artifact_index_core import (
+    adapt_for_postgres,
+    generate_file_id,
+    normalize_artifact_date,
+)
 from scripts.core.artifact_query_sql import sql_for
 
 _SCHEMA = Path(__file__).resolve().parent.parent / "scripts" / "core" / "artifact_schema.sql"
@@ -137,6 +141,112 @@ class TestPlanCreatedAt:
 
 
 # ---------------------------------------------------------------------------
+# Date normalisation (review R1: quoted YAML dates fail the TIMESTAMPTZ cast)
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeArtifactDate:
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        (
+            ("2026-02-01", "2026-02-01"),
+            ('"2026-02-01"', "2026-02-01"),
+            ("'2026-02-01'", "2026-02-01"),
+            ("2026-02-01T10:20:30", "2026-02-01T10:20:30"),
+            ("2026-02-01T10:20:30+00:00", "2026-02-01T10:20:30+00:00"),
+            ("2026-02-01 10:20:30Z", "2026-02-01 10:20:30Z"),
+            ("2026-08-26_22-57", "2026-08-26T22:57:00"),  # handoff filename style
+            ("  2026-02-01  ", "2026-02-01"),
+        ),
+    )
+    def test_accepted_forms(self, raw, expected):
+        assert normalize_artifact_date(raw) == expected
+
+    @pytest.mark.parametrize("raw", ("", None, "yesterday", "2026-13-40", "02/01/2026", '""'))
+    def test_rejected_forms_become_none(self, raw):
+        assert normalize_artifact_date(raw) is None
+
+    def test_quoted_frontmatter_date_reaches_plan_and_handoff(self, repo):
+        (repo / "thoughts/shared/plans/p.md").write_text('---\ndate: "2026-02-01"\n---\n# X\n')
+        assert ai.parse_plan(Path("thoughts/shared/plans/p.md"))["created_at"] == "2026-02-01"
+        (repo / "thoughts/shared/handoffs/sess/task-01.md").write_text(
+            "---\ndate: '2026-03-04'\n---\n## What was done\nx\n"
+        )
+        assert (
+            ai.parse_handoff(Path("thoughts/shared/handoffs/sess/task-01.md"))["created_at"]
+            == "2026-03-04"
+        )
+
+    def test_garbage_handoff_date_falls_back_to_now(self, repo):
+        (repo / "thoughts/shared/handoffs/sess/task-01.md").write_text(
+            "---\ndate: someday\n---\n## What was done\nx\n"
+        )
+        created = ai.parse_handoff(Path("thoughts/shared/handoffs/sess/task-01.md"))["created_at"]
+        assert normalize_artifact_date(created) == created  # valid ISO, not "someday"
+
+    def test_adapter_rejects_unnormalised_created_at(self):
+        params = list(_SQLITE_ORDER[:15]) + ['"2026-02-01"']
+        _, new_params = adapt_for_postgres(
+            "INSERT INTO handoffs (col) VALUES (?)", tuple(params), "handoffs"
+        )
+        assert new_params[-1] == "2026-02-01"
+
+
+# ---------------------------------------------------------------------------
+# Legacy relative-path rows (review R1: canonical paths must not leave dupes)
+# ---------------------------------------------------------------------------
+
+
+class TestLegacyRowPruning:
+    def test_bulk_index_replaces_legacy_relative_plan_row(self, conn, repo):
+        conn.execute(
+            "INSERT INTO plans (id, title, file_path) VALUES (?, ?, ?)",
+            ("legacyid", "old", "thoughts/shared/plans/p.md"),
+        )
+        conn.commit()
+        ai.index_plans(conn, Path("thoughts/shared/plans"))
+        rows = conn.execute("SELECT file_path FROM plans").fetchall()
+        assert rows == [(str((repo / "thoughts/shared/plans/p.md").resolve()),)]
+
+    def test_bulk_index_replaces_legacy_relative_continuity_row(self, conn, repo):
+        conn.execute(
+            "INSERT INTO continuity (id, session_name) VALUES (?, ?)",
+            ("legacyid", "sess"),
+        )
+        conn.commit()
+        ai.index_continuity(conn, Path("."))
+        ids = [r[0] for r in conn.execute("SELECT id FROM continuity").fetchall()]
+        assert ids == [generate_file_id(str((repo / "CONTINUITY_CLAUDE-sess.md").resolve()))]
+
+    def test_prune_is_idempotent_and_keeps_absolute_rows(self, conn, repo):
+        absolute = str((repo / "thoughts/shared/plans/p.md").resolve())
+        conn.execute(
+            "INSERT INTO plans (id, title, file_path) VALUES (?, ?, ?)", ("a", "t", absolute)
+        )
+        conn.execute(
+            "INSERT INTO plans (id, title, file_path) VALUES (?, ?, ?)", ("r", "t", "rel/p.md")
+        )
+        conn.commit()
+        assert ai.prune_legacy_rows(conn, "plans") == 1
+        assert ai.prune_legacy_rows(conn, "plans") == 0
+        assert conn.execute("SELECT id FROM plans").fetchall() == [("a",)]
+
+    def test_handoffs_are_not_pruned_here(self, conn, repo):
+        """Legacy handoff rows span ~600 project roots; #287 backfill owns them."""
+        conn.execute(
+            "INSERT INTO handoffs (id, session_name, file_path) VALUES (?, ?, ?)",
+            ("legacy", "s", "thoughts/shared/handoffs/s/x.md"),
+        )
+        conn.commit()
+        ai.index_handoffs(conn, Path("thoughts/shared/handoffs"))
+        assert conn.execute("SELECT count(*) FROM handoffs").fetchone()[0] == 2
+
+    def test_prune_rejects_unknown_table(self, conn):
+        with pytest.raises(ValueError):
+            ai.prune_legacy_rows(conn, "handoffs; DROP TABLE plans")
+
+
+# ---------------------------------------------------------------------------
 # C. Adapter carries every field
 # ---------------------------------------------------------------------------
 
@@ -160,14 +270,20 @@ _SQLITE_ORDER = (
 )
 
 
+_DATE = "2026-01-01"
+# Each value names its column, except created_at which must be a real date
+# (the adapter normalises it and binds NULL for anything unparseable).
+_NAMED_PARAMS = tuple(_SQLITE_ORDER[:15]) + (_DATE,)
+
+
 class TestHandoffAdapter:
     def _adapt(self, params=None):
-        params = params or tuple(_SQLITE_ORDER)  # each value names its column
+        params = params or _NAMED_PARAMS
         return adapt_for_postgres("INSERT INTO handoffs (col) VALUES (?)", params, "handoffs")
 
     def test_all_fields_bound_except_id(self):
         _, new_params = self._adapt()
-        assert set(new_params) == set(_SQLITE_ORDER) - {"id"}
+        assert set(new_params) == (set(_SQLITE_ORDER) - {"id", "created_at"}) | {_DATE}
         assert len(new_params) == 15
 
     @pytest.mark.parametrize(
@@ -183,7 +299,9 @@ class TestHandoffAdapter:
         cols_clause = sql.split("(", 1)[1].split(")", 1)[0]
         cols = [c.strip() for c in cols_clause.split(",")]
         assert cols[0] == "id"
-        assert cols[1:] == [("goal" if c == "task_summary" else c) for c in list(new_params)]
+        bound = [("goal" if c == "task_summary" else c) for c in list(new_params)]
+        bound[-1] = "created_at"  # the date value stands for its column
+        assert cols[1:] == bound
 
     def test_created_at_never_regresses_on_conflict(self):
         sql, _ = self._adapt()
@@ -272,6 +390,14 @@ class TestInitPostgresMigration:
 # ---------------------------------------------------------------------------
 # E. Query prefers the stored task_number
 # ---------------------------------------------------------------------------
+
+
+class TestPlanQueryTimestamp:
+    def test_pg_plans_return_authored_date_with_indexed_fallback(self):
+        sql = sql_for("postgres", "search_plans")
+        assert "COALESCE(p.created_at, p.indexed_at) AS created_at" in sql
+        assert "ORDER BY score DESC, COALESCE(p.created_at, p.indexed_at) DESC" in sql
+        assert "p.indexed_at AS created_at" not in sql
 
 
 class TestQueryUsesStoredTaskNumber:

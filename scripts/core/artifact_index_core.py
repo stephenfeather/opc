@@ -314,7 +314,7 @@ def adapt_for_postgres(sql: str, params: tuple, table_hint: str) -> tuple:
         # An empty created_at would fail the timestamp cast — bind NULL so the
         # COALESCE above keeps whatever the row already has.
         rest = list(params[1:])
-        rest[-1] = rest[-1] or None
+        rest[-1] = normalize_artifact_date(rest[-1])
         return sql, tuple(rest)
 
     if "INSERT OR REPLACE INTO" in sql:
@@ -326,6 +326,41 @@ def adapt_for_postgres(sql: str, params: tuple, table_hint: str) -> tuple:
 # =============================================================================
 # FILE ID & CLASSIFICATION
 # =============================================================================
+
+
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?$"
+)
+_FILENAME_STAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})$")
+
+
+def normalize_artifact_date(raw) -> str | None:
+    """Return an ISO-8601 date/datetime string PostgreSQL can cast, or ``None``.
+
+    Frontmatter values arrive as raw text (``parse_frontmatter`` keeps YAML
+    quotes), and anything bound to a ``TIMESTAMPTZ`` column must be a valid
+    literal — otherwise the insert fails, silently when the hook runs detached.
+    Accepts ``YYYY-MM-DD``, ISO datetimes (optional ``Z``/offset), and the
+    ``YYYY-MM-DD_HH-MM`` handoff filename stamp; rejects everything else.
+    """
+    from datetime import datetime
+
+    if raw is None:
+        return None
+    text = str(raw).strip().strip('"').strip("'").strip()
+    if not text:
+        return None
+    stamp = _FILENAME_STAMP_RE.match(text)
+    if stamp:
+        text = f"{stamp.group(1)}T{stamp.group(2)}:{stamp.group(3)}:00"
+    if not (_DATE_ONLY_RE.match(text) or _DATETIME_RE.match(text)):
+        return None
+    try:
+        datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return text
 
 
 def generate_file_id(file_path: str) -> str:
@@ -400,7 +435,7 @@ def parse_handoff_content(raw_content: str, file_path) -> dict:
         "turn_span_id": frontmatter.get("turn_span_id", ""),
         "session_id": frontmatter.get("session_id", ""),
         "braintrust_session_id": frontmatter.get("braintrust_session_id", ""),
-        "created_at": frontmatter.get("date", ""),
+        "created_at": normalize_artifact_date(frontmatter.get("date")) or "",
     }
 
 
@@ -491,7 +526,7 @@ def parse_handoff_yaml_content(raw_content: str, file_path) -> dict:
         "turn_span_id": frontmatter.get("turn_span_id", ""),
         "session_id": frontmatter.get("session_id", ""),
         "braintrust_session_id": frontmatter.get("braintrust_session_id", ""),
-        "created_at": frontmatter.get("date", ""),
+        "created_at": normalize_artifact_date(frontmatter.get("date")) or "",
     }
 
 
@@ -524,7 +559,8 @@ def parse_plan_content(content: str, file_path) -> dict:
         "approach": sections.get("implementation_approach", sections.get("approach", ""))[:1000],
         "phases": json.dumps(phases),
         "constraints": sections.get("what_we're_not_doing", sections.get("constraints", "")),
-        "created_at": frontmatter.get("date", "") or _date_from_filename(file_path),
+        "created_at": normalize_artifact_date(frontmatter.get("date"))
+        or _date_from_filename(file_path),
     }
 
 

@@ -209,10 +209,9 @@ class TestSqlTable:
         assert "task-([0-9]{1,6})" in sql
         assert "AS task_number" in sql
 
-    @pytest.mark.parametrize(
-        "name", ("search_plans", "search_continuity", "get_ledger_for_session")
-    )
+    @pytest.mark.parametrize("name", ("search_continuity", "get_ledger_for_session"))
     def test_postgres_aliases_indexed_at_as_created_at(self, name):
+        # plans carry an authored created_at since #283 (COALESCE with indexed_at)
         assert "indexed_at AS created_at" in sql_for("postgres", name)
 
     @pytest.mark.parametrize("name", ("search_handoffs", "search_plans", "search_continuity"))

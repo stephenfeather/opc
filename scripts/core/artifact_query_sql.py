@@ -135,11 +135,11 @@ _SQL: dict[str, dict[str, str]] = {
         "search_handoffs_tail": " ORDER BY score DESC, h.created_at DESC LIMIT %s",
         "search_plans": f"""
         SELECT p.id, p.title, p.overview, p.approach, p.file_path,
-               p.indexed_at AS created_at,
+               COALESCE(p.created_at, p.indexed_at) AS created_at,
                ts_rank({_PG_PLAN_DOC}, websearch_to_tsquery('english', %s)) AS score
         FROM plans p
         WHERE {_PG_PLAN_DOC} @@ websearch_to_tsquery('english', %s)
-        ORDER BY score DESC, p.indexed_at DESC
+        ORDER BY score DESC, COALESCE(p.created_at, p.indexed_at) DESC
         LIMIT %s
     """,
         "search_continuity": f"""

@@ -354,10 +354,11 @@ class TestAdaptForPostgres:
         #   9=files_modified, 10=outcome, 11=root_span_id, 12=turn_span_id,
         #   13=session_id, 14=braintrust_session_id, 15=created_at
         # PG binds params[1:] in that order (id is gen_random_uuid()).
-        params = tuple(f"p{i}" for i in range(16))
+        # created_at (15) must be a real date: the adapter normalises it.
+        params = tuple(f"p{i}" for i in range(15)) + ("2026-01-01",)
         sql = "INSERT INTO handoffs (col) VALUES (?)"
         _, new_params = adapt_for_postgres(sql, params, "handoffs")
-        assert new_params == tuple(f"p{i}" for i in range(1, 16))
+        assert new_params == tuple(f"p{i}" for i in range(1, 15)) + ("2026-01-01",)
         assert new_params[4] == "p5"  # task_summary -> goal column
 
     def test_handoffs_session_uuid_in_sql(self):

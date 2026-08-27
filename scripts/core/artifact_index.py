@@ -446,6 +446,36 @@ def index_handoffs(conn, base_path: Path = Path("thoughts/shared/handoffs")):
     return count
 
 
+# Tables whose legacy rows can be identified by a non-canonical (relative)
+# file_path. ``handoffs`` is deliberately absent: its ~566 relative rows span
+# hundreds of project roots and are re-homed by the #287 backfill, not here.
+_PRUNABLE_TABLES: dict[str, str] = {"plans": "file_path"}
+
+
+def _is_pg(conn) -> bool:
+    return not isinstance(conn, sqlite3.Connection)
+
+
+def prune_legacy_rows(conn, table: str) -> int:
+    """Delete rows whose path is not absolute (pre-#283 relative-glob rows).
+
+    Idempotent: canonical rows have absolute paths and are never touched. Returns
+    the number of rows removed. Only tables in ``_PRUNABLE_TABLES`` are allowed —
+    the name is interpolated into SQL, so it must come from that allowlist.
+    """
+    if table not in _PRUNABLE_TABLES:
+        raise ValueError(f"prune_legacy_rows: unsupported table {table!r}")
+    column = _PRUNABLE_TABLES[table]
+    if _is_pg(conn):
+        cur = conn.cursor()
+        try:
+            cur.execute(f"DELETE FROM {table} WHERE {column} NOT LIKE %s", ("/%",))
+            return cur.rowcount
+        finally:
+            cur.close()
+    return conn.execute(f"DELETE FROM {table} WHERE {column} NOT LIKE ?", ("/%",)).rowcount
+
+
 def parse_plan(file_path: Path) -> dict:
     """Parse a plan markdown file into structured data (path resolved, see parse_handoff)."""
     file_path = Path(file_path).resolve()
@@ -458,6 +488,10 @@ def index_plans(conn, base_path: Path = Path("thoughts/shared/plans")):
     if not base_path.exists():
         print(f"Plans directory not found: {base_path}")
         return 0
+
+    pruned = prune_legacy_rows(conn, "plans")
+    if pruned:
+        print(f"Removed {pruned} legacy relative-path plan rows (re-indexed below)")
 
     count = 0
     for plan_file in base_path.glob("*.md"):
@@ -486,25 +520,15 @@ def index_continuity(conn, base_path: Path = Path(".")):
     for ledger_file in base_path.glob("CONTINUITY_CLAUDE-*.md"):
         try:
             data = parse_continuity(ledger_file)
+            _index_continuity(conn, data)
+            # One ledger per session: drop any pre-#283 row for this session
+            # whose id was hashed from a relative path (continuity stores no
+            # file_path, so the session name is the only legacy key).
             db_execute(
                 conn,
-                """
-                INSERT OR REPLACE INTO continuity
-                (id, session_name, goal, state_done, state_now, state_next,
-                 key_learnings, key_decisions, snapshot_reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-                (
-                    data["id"],
-                    data["session_name"],
-                    data["goal"],
-                    data["state_done"],
-                    data["state_now"],
-                    data["state_next"],
-                    data["key_learnings"],
-                    data["key_decisions"],
-                    data["snapshot_reason"],
-                ),
+                "DELETE FROM continuity WHERE session_name = ? AND id != ?",
+                (data["session_name"], data["id"]),
+                table_hint="continuity",
             )
             count += 1
         except Exception as e:

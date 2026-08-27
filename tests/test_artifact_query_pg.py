@@ -27,6 +27,7 @@ from scripts.core.artifact_query import (
     get_handoff_by_span_id,
     get_ledger_for_session,
     handle_span_id_lookup,
+    pg_search_query,
     search_continuity,
     search_dispatch,
     search_handoffs,
@@ -177,9 +178,13 @@ class TestSqlTable:
         assert "?" not in sql  # psycopg2 placeholders
 
     @pytest.mark.parametrize("name", ("search_handoffs", "search_plans", "search_continuity"))
-    def test_postgres_search_uses_tsquery(self, name):
+    def test_postgres_search_uses_websearch_tsquery(self, name):
         sql = sql_for("postgres", name)
-        assert "plainto_tsquery" in sql
+        # websearch_to_tsquery understands OR and never raises on odd input;
+        # plainto_tsquery would AND the terms (recall regression vs SQLite).
+        assert "websearch_to_tsquery" in sql
+        assert "plainto_tsquery" not in sql
+        assert "to_tsquery('english', %s)" not in sql.replace("websearch_to_tsquery", "")
         assert "@@" in sql
         assert "ts_rank" in sql
 
@@ -309,21 +314,23 @@ class TestSearchHandoffsPostgres:
         conn = _StubPgConn()
         search_handoffs(conn, "oauth login", limit=7, backend="postgres")
         sql, params = conn.calls[0]
-        assert params == ["oauth login", "oauth login", 7]
+        assert params == ['"oauth" OR "login"', '"oauth" OR "login"', 7]
         assert "outcome = %s" not in sql
 
     def test_params_order_with_outcome(self):
         conn = _StubPgConn()
         search_handoffs(conn, "oauth", outcome="SUCCEEDED", limit=3, backend="postgres")
         sql, params = conn.calls[0]
-        assert params == ["oauth", "oauth", "SUCCEEDED", 3]
+        assert params == ['"oauth"', '"oauth"', "SUCCEEDED", 3]
         assert "h.outcome = %s" in sql
 
-    def test_raw_query_not_fts5_escaped(self):
+    def test_query_is_or_joined_like_sqlite(self):
+        """SQLite FTS5 ORs the terms; PostgreSQL must keep that recall contract."""
         conn = _StubPgConn()
-        search_handoffs(conn, "a b", backend="postgres")
+        search_handoffs(conn, "oauth login", backend="postgres")
         _, params = conn.calls[0]
-        assert params[0] == "a b"  # not '"a" OR "b"'
+        assert params[0] == '"oauth" OR "login"'
+        assert params[0] == params[1]
 
     def test_rows_become_dicts(self):
         row = ("uuid-1", "sess", 3, "goal text", None, None, None, "SUCCEEDED", "f", None, 0.5)
@@ -337,13 +344,38 @@ class TestSearchPlansContinuityPostgres:
         conn = _StubPgConn()
         search_plans(conn, "api design", limit=2, backend="postgres")
         _, params = conn.calls[0]
-        assert params == ["api design", "api design", 2]
+        assert params == ['"api" OR "design"', '"api" OR "design"', 2]
 
     def test_continuity_params(self):
         conn = _StubPgConn()
         search_continuity(conn, "deploy", limit=4, backend="postgres")
         _, params = conn.calls[0]
-        assert params == ["deploy", "deploy", 4]
+        assert params == ['"deploy"', '"deploy"', 4]
+
+
+class TestPgSearchQuery:
+    """websearch_to_tsquery input: quoted tokens OR-joined, never a syntax error."""
+
+    def test_or_joined_and_quoted(self):
+        assert pg_search_query("oauth login") == '"oauth" OR "login"'
+
+    def test_empty_and_whitespace_give_empty_query(self):
+        assert pg_search_query("") == ""
+        assert pg_search_query("   \t ") == ""
+
+    def test_embedded_quotes_stripped(self):
+        assert pg_search_query('say "hi" there') == '"say" OR "hi" OR "there"'
+
+    def test_quote_only_tokens_dropped(self):
+        assert pg_search_query('"" foo') == '"foo"'
+
+    def test_operators_are_neutralised_by_quoting(self):
+        # websearch syntax: leading '-' negates, bare OR/AND are operators.
+        assert pg_search_query("-secret OR") == '"-secret" OR "OR"'
+
+    def test_same_tokenisation_as_sqlite(self):
+        q = "a  b\tc"
+        assert pg_search_query(q).count(" OR ") == aq.escape_fts5_query(q).count(" OR ")
 
 
 class TestLookupsPostgres:
@@ -458,23 +490,135 @@ class TestRunnersPostgres:
             aq._run_search(self._args("hello"), "hello")
         assert conn.close_count == 1
 
-    def test_run_search_save_skipped_on_pg(self, monkeypatch, capsys):
+    def test_run_search_save_rejected_on_pg_before_searching(self, monkeypatch, capsys):
+        """--save must not report success when nothing is persisted (no queries table on PG)."""
         conn = _StubPgConn()
         monkeypatch.setattr(aq, "use_postgres", lambda: True)
         monkeypatch.setattr(aq, "_open_pg", lambda: conn)
         called = []
         monkeypatch.setattr(aq, "save_query", lambda *a, **k: called.append(a))
-        aq._run_search(self._args("hello", "--save"), "hello")
+        rc = aq._run_search(self._args("hello", "--save"), "hello")
+        assert rc == 2
         assert called == []
-        assert "not supported" in capsys.readouterr().out.lower()
+        assert conn.calls == []  # rejected before any search ran
+        assert "--save" in capsys.readouterr().err
+
+    def test_run_search_save_still_works_on_sqlite(self, tmp_path, capsys):
+        db_file = tmp_path / "t.db"
+        c = sqlite3.connect(str(db_file))
+        c.executescript(_SCHEMA_PATH.read_text())
+        c.close()
+        rc = aq._run_search(self._args("q", "--save", "--db", str(db_file)), "q")
+        assert rc == 0
+        assert "Query saved" in capsys.readouterr().out
+        c = sqlite3.connect(str(db_file))
+        assert c.execute("SELECT count(*) FROM queries").fetchone()[0] == 1
+        c.close()
 
     def test_run_search_config_error_is_clean(self, monkeypatch, capsys):
         def boom():
             raise ValueError("AGENTICA_MEMORY_BACKEND=bogus")
 
         monkeypatch.setattr(aq, "use_postgres", boom)
-        aq._run_search(self._args("hello"), "hello")
+        rc = aq._run_search(self._args("hello"), "hello")
+        assert rc == 1
         assert "Backend configuration error" in capsys.readouterr().err
+
+    def test_run_search_success_returns_zero(self, monkeypatch, capsys):
+        monkeypatch.setattr(aq, "use_postgres", lambda: True)
+        monkeypatch.setattr(aq, "_open_pg", lambda: _StubPgConn())
+        assert aq._run_search(self._args("hello", "--json"), "hello") == 0
+
+
+class _FakePgError(Exception):
+    """Stands in for psycopg2.Error (module name is what the boundary checks)."""
+
+    __module__ = "psycopg2.errors"
+
+
+class TestPostgresFailureBoundary:
+    """Connection/schema failures on the PG path must be diagnostics, not tracebacks."""
+
+    def _args(self, *argv):
+        return aq._build_parser().parse_args(list(argv))
+
+    def test_connection_failure(self, monkeypatch, capsys):
+        monkeypatch.setattr(aq, "use_postgres", lambda: True)
+
+        def refuse():
+            raise _FakePgError("connection refused")
+
+        monkeypatch.setattr(aq, "_open_pg", refuse)
+        rc = aq._run_search(self._args("hello"), "hello")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "PostgreSQL" in err and "connection refused" in err
+
+    def test_missing_schema_points_to_indexer(self, monkeypatch, capsys):
+        conn = _StubPgConn()
+
+        def undefined(*a, **k):
+            raise _FakePgError('relation "handoffs" does not exist')
+
+        monkeypatch.setattr(conn, "cursor", undefined)
+        monkeypatch.setattr(aq, "use_postgres", lambda: True)
+        monkeypatch.setattr(aq, "_open_pg", lambda: conn)
+        rc = aq._run_search(self._args("hello"), "hello")
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "artifact_index.py --all" in err
+        assert conn.close_count == 1  # still closed on failure
+
+    def test_span_lookup_failure(self, monkeypatch, capsys):
+        monkeypatch.setattr(aq, "use_postgres", lambda: True)
+
+        def refuse():
+            raise _FakePgError("timeout expired")
+
+        monkeypatch.setattr(aq, "_open_pg", refuse)
+        rc = aq._run_span_lookup(self._args("--by-span-id", "x"))
+        assert rc == 1
+        assert "timeout expired" in capsys.readouterr().err
+
+    def test_non_pg_errors_still_propagate(self, monkeypatch):
+        monkeypatch.setattr(aq, "use_postgres", lambda: True)
+        monkeypatch.setattr(aq, "_open_pg", lambda: _StubPgConn())
+
+        def boom(*a, **k):
+            raise RuntimeError("bug")
+
+        monkeypatch.setattr(aq, "search_dispatch", boom)
+        with pytest.raises(RuntimeError):
+            aq._run_search(self._args("hello"), "hello")
+
+    def test_main_exits_nonzero_on_pg_failure(self, monkeypatch):
+        from unittest.mock import patch
+
+        monkeypatch.setattr(aq, "use_postgres", lambda: True)
+
+        def refuse():
+            raise _FakePgError("connection refused")
+
+        monkeypatch.setattr(aq, "_open_pg", refuse)
+        with (
+            patch("scripts.core.artifact_query._enable_faulthandler"),
+            patch("sys.argv", ["artifact_query.py", "hello"]),
+            pytest.raises(SystemExit) as exc,
+        ):
+            aq.main()
+        assert exc.value.code == 1
+
+    def test_main_returns_normally_on_success(self, monkeypatch, capsys):
+        from unittest.mock import patch
+
+        monkeypatch.setattr(aq, "use_postgres", lambda: True)
+        monkeypatch.setattr(aq, "_open_pg", lambda: _StubPgConn())
+        with (
+            patch("scripts.core.artifact_query._enable_faulthandler"),
+            patch("sys.argv", ["artifact_query.py", "hello", "--json"]),
+        ):
+            aq.main()  # no SystemExit
+        assert json.loads(capsys.readouterr().out)["past_queries"] == []
 
     def test_run_span_lookup_uses_pg(self, monkeypatch, capsys):
         cols = ("id", "session_name", "task_number", "outcome", "file_path")

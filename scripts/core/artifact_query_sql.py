@@ -120,27 +120,27 @@ _SQL: dict[str, dict[str, str]] = {
                h.goal AS task_summary,
                h.what_worked, h.what_failed, h.key_decisions,
                h.outcome, h.file_path, h.created_at,
-               ts_rank({_PG_HANDOFF_DOC}, plainto_tsquery('english', %s)) AS score
+               ts_rank({_PG_HANDOFF_DOC}, websearch_to_tsquery('english', %s)) AS score
         FROM handoffs h
-        WHERE {_PG_HANDOFF_DOC} @@ plainto_tsquery('english', %s)
+        WHERE {_PG_HANDOFF_DOC} @@ websearch_to_tsquery('english', %s)
     """,
         "search_handoffs_outcome_filter": " AND h.outcome = %s",
         "search_handoffs_tail": " ORDER BY score DESC, h.created_at DESC LIMIT %s",
         "search_plans": f"""
         SELECT p.id, p.title, p.overview, p.approach, p.file_path,
                p.indexed_at AS created_at,
-               ts_rank({_PG_PLAN_DOC}, plainto_tsquery('english', %s)) AS score
+               ts_rank({_PG_PLAN_DOC}, websearch_to_tsquery('english', %s)) AS score
         FROM plans p
-        WHERE {_PG_PLAN_DOC} @@ plainto_tsquery('english', %s)
+        WHERE {_PG_PLAN_DOC} @@ websearch_to_tsquery('english', %s)
         ORDER BY score DESC, p.indexed_at DESC
         LIMIT %s
     """,
         "search_continuity": f"""
         SELECT c.id, c.session_name, c.goal, c.key_learnings, c.key_decisions,
                c.state_now, c.indexed_at AS created_at,
-               ts_rank({_PG_CONTINUITY_DOC}, plainto_tsquery('english', %s)) AS score
+               ts_rank({_PG_CONTINUITY_DOC}, websearch_to_tsquery('english', %s)) AS score
         FROM continuity c
-        WHERE {_PG_CONTINUITY_DOC} @@ plainto_tsquery('english', %s)
+        WHERE {_PG_CONTINUITY_DOC} @@ websearch_to_tsquery('english', %s)
         ORDER BY score DESC, c.indexed_at DESC
         LIMIT %s
     """,

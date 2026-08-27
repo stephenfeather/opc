@@ -227,14 +227,30 @@ def _rows_as_dicts(columns: list[str], rows: list) -> list[dict]:
     return [dict(zip(columns, row)) for row in rows]
 
 
+def pg_search_query(query: str) -> str:
+    """Build the ``websearch_to_tsquery`` input with the same contract as FTS5.
+
+    Mirrors :func:`escape_fts5_query`: whitespace-split tokens, each quoted and
+    OR-joined, so a multi-word search matches artifacts containing *any* term on
+    both backends (``plainto_tsquery`` would AND them — a silent recall
+    regression). Quoting neutralises websearch operators (``-term``, bare
+    ``OR``/``AND``); embedded double quotes are stripped since they cannot be
+    escaped inside a websearch phrase. ``websearch_to_tsquery`` never raises on
+    malformed input; an empty result simply matches nothing.
+    """
+    tokens = [w.replace('"', "") for w in query.split()]
+    return " OR ".join(f'"{t}"' for t in tokens if t)
+
+
 def _search_params(query: str, backend: Backend) -> list:
     """Query params bound by the search statements, per backend.
 
-    SQLite FTS5 takes one escaped ``MATCH`` expression; PostgreSQL binds the raw
-    text twice (``ts_rank`` in the SELECT and the ``@@`` filter).
+    SQLite FTS5 takes one escaped ``MATCH`` expression; PostgreSQL binds the
+    websearch expression twice (``ts_rank`` in the SELECT and the ``@@`` filter).
     """
     if backend == POSTGRES:
-        return [query, query]
+        q = pg_search_query(query)
+        return [q, q]
     return [escape_fts5_query(query)]
 
 
@@ -859,19 +875,54 @@ def _open_conn(args: argparse.Namespace, backend: Backend):
     return _open_db(db_path)
 
 
-def _run_span_lookup(args: argparse.Namespace) -> None:
-    """Handle --by-span-id CLI mode."""
+def _is_pg_error(exc: BaseException) -> bool:
+    """True for any psycopg2 exception, without importing psycopg2 at module load."""
+    return type(exc).__module__.split(".")[0] == "psycopg2"
+
+
+def _report_pg_error(exc: BaseException) -> int:
+    """Print a concise, actionable PostgreSQL failure to stderr; return exit code 1.
+
+    Connection/auth/timeout failures and missing artifact tables both surface
+    here. No automatic SQLite fallback: that would silently reintroduce the
+    split-brain read this module exists to fix. Pass ``--db <path>`` to query a
+    local SQLite index explicitly.
+    """
+    print(f"PostgreSQL error: {exc}", file=sys.stderr)
+    if "does not exist" in str(exc):
+        print(
+            "The artifact tables are missing in this database. "
+            "Run: uv run python scripts/core/artifact_index.py --all",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "Check the configured URL (CONTINUOUS_CLAUDE_DB_URL / DATABASE_URL / "
+            "OPC_POSTGRES_URL) and that the server is reachable; "
+            "or pass --db <path> to query a local SQLite index.",
+            file=sys.stderr,
+        )
+    return 1
+
+
+def _run_span_lookup(args: argparse.Namespace) -> int:
+    """Handle --by-span-id CLI mode. Returns a process exit code."""
     backend = _resolve_backend_or_report(args)
     if backend is None:
-        return
-    conn = _open_conn(args, backend)
-    if conn is None:
-        return
+        return 1
+    try:
+        conn = _open_conn(args, backend)
+        if conn is None:
+            return 0
 
-    with contextlib.closing(conn):
-        handoff = handle_span_id_lookup(
-            conn, args.by_span_id, with_content=args.with_content, backend=backend
-        )
+        with contextlib.closing(conn):
+            handoff = handle_span_id_lookup(
+                conn, args.by_span_id, with_content=args.with_content, backend=backend
+            )
+    except Exception as e:
+        if _is_pg_error(e):
+            return _report_pg_error(e)
+        raise
 
     if args.json:
         print(json.dumps(handoff, indent=2, default=str))
@@ -883,32 +934,48 @@ def _run_span_lookup(args: argparse.Namespace) -> None:
             print(f"\n{handoff['content']}")
     else:
         print(f"No handoff found for root_span_id: {args.by_span_id}")
+    return 0
 
 
-def _run_search(args: argparse.Namespace, query: str) -> None:
-    """Handle regular search CLI mode."""
+def _run_search(args: argparse.Namespace, query: str) -> int:
+    """Handle regular search CLI mode. Returns a process exit code."""
     backend = _resolve_backend_or_report(args)
     if backend is None:
-        return
-    conn = _open_conn(args, backend)
-    if conn is None:
-        return
+        return 1
+    if args.save and backend != SQLITE:
+        # Refuse up front rather than search, print results, and exit 0 while
+        # silently dropping the requested compound-learning record.
+        print(
+            "--save is only supported on the SQLite backend (PostgreSQL has no queries "
+            "table). Re-run with --db <path> or without --save.",
+            file=sys.stderr,
+        )
+        return 2
 
-    with contextlib.closing(conn):
-        results = search_dispatch(conn, query, args.type, args.outcome, args.limit, backend=backend)
+    try:
+        conn = _open_conn(args, backend)
+        if conn is None:
+            return 0
 
-        if args.json:
-            print(json.dumps(results, indent=2, default=str))
-        else:
-            formatted = format_results(results)
-            print(formatted)
+        with contextlib.closing(conn):
+            results = search_dispatch(
+                conn, query, args.type, args.outcome, args.limit, backend=backend
+            )
 
-            if args.save:
-                if backend == SQLITE:
+            if args.json:
+                print(json.dumps(results, indent=2, default=str))
+            else:
+                formatted = format_results(results)
+                print(formatted)
+
+                if args.save:
                     save_query(conn, query, formatted, results)
                     print("\n[Query saved for compound learning]")
-                else:
-                    print("\n[--save not supported on the PostgreSQL backend: no queries table]")
+    except Exception as e:
+        if _is_pg_error(e):
+            return _report_pg_error(e)
+        raise
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -924,15 +991,15 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.by_span_id:
-        _run_span_lookup(args)
-        return
-
-    if not args.query:
+        rc = _run_span_lookup(args)
+    elif not args.query:
         parser.print_help()
-        return
+        rc = 0
+    else:
+        rc = _run_search(args, " ".join(args.query))
 
-    query = " ".join(args.query)
-    _run_search(args, query)
+    if rc:
+        sys.exit(rc)
 
 
 if __name__ == "__main__":

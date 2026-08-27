@@ -344,28 +344,22 @@ class TestAdaptForPostgres:
         new_sql, new_params = adapt_for_postgres(sql, params, "handoffs")
         assert "gen_random_uuid()" in new_sql
         assert "ON CONFLICT" in new_sql
-        assert len(new_params) == 10  # reordered to 10 params (added session_uuid)
+        # Issue #283: every SQLite field except the deterministic id is carried
+        assert len(new_params) == 15
 
     def test_handoffs_param_reorder(self):
-        # Verify specific param positions are mapped correctly
         # SQLite column order (16 params):
         #   0=id, 1=session_name, 2=session_uuid, 3=task_number, 4=file_path,
         #   5=task_summary, 6=what_worked, 7=what_failed, 8=key_decisions,
         #   9=files_modified, 10=outcome, 11=root_span_id, 12=turn_span_id,
         #   13=session_id, 14=braintrust_session_id, 15=created_at
-        params = tuple(f"p{i}" for i in range(16))
+        # PG binds params[1:] in that order (id is gen_random_uuid()).
+        # created_at (15) must be a real date: the adapter normalises it.
+        params = tuple(f"p{i}" for i in range(15)) + ("2026-01-01",)
         sql = "INSERT INTO handoffs (col) VALUES (?)"
         _, new_params = adapt_for_postgres(sql, params, "handoffs")
-        assert new_params[0] == "p1"   # session_name
-        assert new_params[1] == "p2"   # session_uuid
-        assert new_params[2] == "p4"   # file_path
-        assert new_params[3] == "p5"   # task_summary -> goal
-        assert new_params[4] == "p6"   # what_worked
-        assert new_params[5] == "p7"   # what_failed
-        assert new_params[6] == "p8"   # key_decisions
-        assert new_params[7] == "p10"  # outcome
-        assert new_params[8] == "p11"  # root_span_id
-        assert new_params[9] == "p13"  # session_id
+        assert new_params == tuple(f"p{i}" for i in range(1, 15)) + ("2026-01-01",)
+        assert new_params[4] == "p5"  # task_summary -> goal column
 
     def test_handoffs_session_uuid_in_sql(self):
         """session_uuid column appears in the PG INSERT and ON CONFLICT UPDATE."""
@@ -384,6 +378,7 @@ class TestAdaptForPostgres:
     def test_handoffs_wrong_param_count_raises(self):
         """Fail fast when handoff params tuple has unexpected length."""
         import pytest
+
         params = tuple(f"val{i}" for i in range(15))  # wrong count
         sql = "INSERT INTO handoffs (col) VALUES (?)"
         with pytest.raises(ValueError, match="Expected 16 handoff params"):
@@ -623,10 +618,7 @@ class TestParseHandoffYamlContent:
         assert "Did work" in result["task_summary"]
 
     def test_top_level_files_inline(self):
-        content = (
-            "---\nsession: test\nstatus: SUCCESS\n---\n"
-            "files: [new_file.py, old_file.py]\n"
-        )
+        content = "---\nsession: test\nstatus: SUCCESS\n---\n" "files: [new_file.py, old_file.py]\n"
         path = Path("thoughts/shared/handoffs/test/h.yaml")
         result = parse_handoff_yaml_content(content, path)
         files = json.loads(result["files_modified"])
@@ -700,31 +692,20 @@ class TestParsePlanContent:
         assert result["title"] == "fallback-name"
 
     def test_phases_extracted(self):
-        content = (
-            "# Plan\n\n"
-            "## Phase 1\nDo first thing\n\n"
-            "## Phase 2\nDo second thing\n"
-        )
+        content = "# Plan\n\n" "## Phase 1\nDo first thing\n\n" "## Phase 2\nDo second thing\n"
         path = Path("thoughts/shared/plans/phased.md")
         result = parse_plan_content(content, path)
         phases = json.loads(result["phases"])
         assert len(phases) >= 2
 
     def test_constraints_section(self):
-        content = (
-            "# Plan\n\n"
-            "## Overview\nStuff\n\n"
-            "## What We're Not Doing\nNo gold plating\n"
-        )
+        content = "# Plan\n\n" "## Overview\nStuff\n\n" "## What We're Not Doing\nNo gold plating\n"
         path = Path("thoughts/shared/plans/constrained.md")
         result = parse_plan_content(content, path)
         assert "gold plating" in result["constraints"]
 
     def test_implementation_approach_alias(self):
-        content = (
-            "# Plan\n\n"
-            "## Implementation Approach\nThe strategy here\n"
-        )
+        content = "# Plan\n\n" "## Implementation Approach\nThe strategy here\n"
         path = Path("thoughts/shared/plans/impl.md")
         result = parse_plan_content(content, path)
         assert "strategy" in result["approach"]
@@ -779,10 +760,7 @@ class TestParseContinuityContent:
         assert len(done) == 2
 
     def test_key_decisions(self):
-        content = (
-            "## Goal\nStuff\n\n"
-            "## Key Decisions\nDecided to use Python\n"
-        )
+        content = "## Goal\nStuff\n\n" "## Key Decisions\nDecided to use Python\n"
         path = Path("CONTINUITY_CLAUDE-test.md")
         result = parse_continuity_content(content, path)
         assert "Python" in result["key_decisions"]

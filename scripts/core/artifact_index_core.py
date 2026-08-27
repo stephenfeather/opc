@@ -82,7 +82,7 @@ def extract_sections(content: str, level: int = 2) -> dict:
         if line.startswith(prefix):
             if current_section:
                 sections[current_section] = "\n".join(current_content).strip()
-            current_section = line[len(prefix):].strip().lower().replace(" ", "_")
+            current_section = line[len(prefix) :].strip().lower().replace(" ", "_")
             current_content = []
         elif next_level_prefix and line.startswith(next_level_prefix):
             if current_section:
@@ -149,11 +149,7 @@ def extract_files(content: str) -> list:
 
 def _parse_inline_list(value: str) -> list[str]:
     """Parse an inline YAML list like '[a, b, "c"]' into a Python list."""
-    return [
-        x.strip().strip('"').strip("'")
-        for x in value[1:-1].split(",")
-        if x.strip()
-    ]
+    return [x.strip().strip('"').strip("'") for x in value[1:-1].split(",") if x.strip()]
 
 
 def _parse_yaml_list_item(stripped: str, current_list: list | None) -> list:
@@ -172,11 +168,7 @@ def _parse_yaml_list_item(stripped: str, current_list: list | None) -> list:
         k, v = item.split(": ", 1)
         k = k.strip()
         v = v.strip().strip('"')
-        if (
-            current_list
-            and isinstance(current_list[-1], dict)
-            and k not in current_list[-1]
-        ):
+        if current_list and isinstance(current_list[-1], dict) and k not in current_list[-1]:
             current_list[-1][k] = v
         else:
             current_list.append({k: v})
@@ -285,39 +277,51 @@ def adapt_for_postgres(sql: str, params: tuple, table_hint: str) -> tuple:
     sql = sql.replace("?", "%s")
 
     if "INTO handoffs" in sql or table_hint == "handoffs":
+        # Column order here MUST mirror the SQLite insert in
+        # artifact_index._index_handoff (minus id, which PG generates), with
+        # task_summary stored as the upstream schema's ``goal``. Issue #283:
+        # task_number, files_modified, turn_span_id, braintrust_session_id and
+        # created_at used to be dropped here, so PG created_at was now().
         sql = """
             INSERT INTO handoffs
-            (id, session_name, session_uuid, file_path, goal, what_worked,
-             what_failed, key_decisions, outcome, root_span_id, session_id)
-            VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            (id, session_name, session_uuid, task_number, file_path, goal,
+             what_worked, what_failed, key_decisions, files_modified, outcome,
+             root_span_id, turn_span_id, session_id, braintrust_session_id, created_at)
+            VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s)
             ON CONFLICT (file_path) DO UPDATE SET
+                session_name = COALESCE(NULLIF(EXCLUDED.session_name, ''), handoffs.session_name),
                 session_uuid = COALESCE(EXCLUDED.session_uuid, handoffs.session_uuid),
+                task_number = COALESCE(EXCLUDED.task_number, handoffs.task_number),
                 goal = EXCLUDED.goal,
                 what_worked = EXCLUDED.what_worked,
                 what_failed = EXCLUDED.what_failed,
                 key_decisions = EXCLUDED.key_decisions,
+                files_modified = EXCLUDED.files_modified,
                 outcome = EXCLUDED.outcome,
-                root_span_id = EXCLUDED.root_span_id,
-                session_id = EXCLUDED.session_id,
+                root_span_id = COALESCE(NULLIF(EXCLUDED.root_span_id, ''), handoffs.root_span_id),
+                turn_span_id = COALESCE(NULLIF(EXCLUDED.turn_span_id, ''), handoffs.turn_span_id),
+                session_id = COALESCE(NULLIF(EXCLUDED.session_id, ''), handoffs.session_id),
+                braintrust_session_id = COALESCE(
+                    NULLIF(EXCLUDED.braintrust_session_id, ''), handoffs.braintrust_session_id
+                ),
+                created_at = COALESCE(EXCLUDED.created_at, handoffs.created_at),
                 indexed_at = NOW()
         """
+        # Content fields (goal, what_worked, what_failed, key_decisions,
+        # files_modified, outcome) mirror the file and are overwritten on
+        # re-index. Correlation/identity fields are only replaced by a non-empty
+        # incoming value so a partial rewrite cannot erase trace metadata.
         if len(params) != 16:
             raise ValueError(
                 f"Expected 16 handoff params for PostgreSQL adaptation, got {len(params)}"
             )
-        params = (
-            params[1],   # session_name
-            params[2],   # session_uuid
-            params[4],   # file_path
-            params[5],   # task_summary -> goal
-            params[6],   # what_worked
-            params[7],   # what_failed
-            params[8],   # key_decisions
-            params[10],  # outcome
-            params[11],  # root_span_id
-            params[13],  # session_id
-        )
-        return sql, params
+        # Drop the deterministic id (index 0); everything else in SQLite order.
+        # An empty created_at would fail the timestamp cast — bind NULL so the
+        # COALESCE above keeps whatever the row already has.
+        rest = list(params[1:])
+        rest[-1] = normalize_artifact_date(rest[-1])
+        return sql, tuple(rest)
 
     if "INSERT OR REPLACE INTO" in sql:
         sql = convert_pg_upsert(sql)
@@ -328,6 +332,41 @@ def adapt_for_postgres(sql: str, params: tuple, table_hint: str) -> tuple:
 # =============================================================================
 # FILE ID & CLASSIFICATION
 # =============================================================================
+
+
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?$"
+)
+_FILENAME_STAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})$")
+
+
+def normalize_artifact_date(raw) -> str | None:
+    """Return an ISO-8601 date/datetime string PostgreSQL can cast, or ``None``.
+
+    Frontmatter values arrive as raw text (``parse_frontmatter`` keeps YAML
+    quotes), and anything bound to a ``TIMESTAMPTZ`` column must be a valid
+    literal — otherwise the insert fails, silently when the hook runs detached.
+    Accepts ``YYYY-MM-DD``, ISO datetimes (optional ``Z``/offset), and the
+    ``YYYY-MM-DD_HH-MM`` handoff filename stamp; rejects everything else.
+    """
+    from datetime import datetime
+
+    if raw is None:
+        return None
+    text = str(raw).strip().strip('"').strip("'").strip()
+    if not text:
+        return None
+    stamp = _FILENAME_STAMP_RE.match(text)
+    if stamp:
+        text = f"{stamp.group(1)}T{stamp.group(2)}:{stamp.group(3)}:00"
+    if not (_DATE_ONLY_RE.match(text) or _DATETIME_RE.match(text)):
+        return None
+    try:
+        datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return text
 
 
 def generate_file_id(file_path: str) -> str:
@@ -392,23 +431,17 @@ def parse_handoff_content(raw_content: str, file_path) -> dict:
         "session_uuid": session_uuid,
         "task_number": task_number,
         "file_path": str(file_path),
-        "task_summary": sections.get(
-            "what_was_done", sections.get("summary", "")
-        )[:500],
+        "task_summary": sections.get("what_was_done", sections.get("summary", ""))[:500],
         "what_worked": sections.get("what_worked", ""),
         "what_failed": sections.get("what_failed", ""),
-        "key_decisions": sections.get(
-            "key_decisions", sections.get("decisions", "")
-        ),
-        "files_modified": json.dumps(
-            extract_files(sections.get("files_modified", ""))
-        ),
+        "key_decisions": sections.get("key_decisions", sections.get("decisions", "")),
+        "files_modified": json.dumps(extract_files(sections.get("files_modified", ""))),
         "outcome": outcome,
         "root_span_id": frontmatter.get("root_span_id", ""),
         "turn_span_id": frontmatter.get("turn_span_id", ""),
         "session_id": frontmatter.get("session_id", ""),
         "braintrust_session_id": frontmatter.get("braintrust_session_id", ""),
-        "created_at": frontmatter.get("date", ""),
+        "created_at": normalize_artifact_date(frontmatter.get("date")) or "",
     }
 
 
@@ -499,7 +532,7 @@ def parse_handoff_yaml_content(raw_content: str, file_path) -> dict:
         "turn_span_id": frontmatter.get("turn_span_id", ""),
         "session_id": frontmatter.get("session_id", ""),
         "braintrust_session_id": frontmatter.get("braintrust_session_id", ""),
-        "created_at": frontmatter.get("date", ""),
+        "created_at": normalize_artifact_date(frontmatter.get("date")) or "",
     }
 
 
@@ -512,10 +545,12 @@ def parse_plan_content(content: str, file_path) -> dict:
 
     file_id = generate_file_id(str(file_path))
 
-    title_match = re.search(r"^# (.+)$", content, re.MULTILINE)
+    frontmatter, body = parse_frontmatter(content)
+
+    title_match = re.search(r"^# (.+)$", body, re.MULTILINE)
     title = title_match.group(1) if title_match else file_path.stem
 
-    sections = extract_sections(content, level=2)
+    sections = extract_sections(body, level=2)
 
     phases = []
     for key in sections:
@@ -527,14 +562,41 @@ def parse_plan_content(content: str, file_path) -> dict:
         "title": title,
         "file_path": str(file_path),
         "overview": sections.get("overview", "")[:1000],
-        "approach": sections.get(
-            "implementation_approach", sections.get("approach", "")
-        )[:1000],
+        "approach": sections.get("implementation_approach", sections.get("approach", ""))[:1000],
         "phases": json.dumps(phases),
-        "constraints": sections.get(
-            "what_we're_not_doing", sections.get("constraints", "")
-        ),
+        "constraints": sections.get("what_we're_not_doing", sections.get("constraints", "")),
+        "created_at": normalize_artifact_date(frontmatter.get("date"))
+        or _date_from_filename(file_path),
     }
+
+
+_FILENAME_DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
+
+
+def _date_from_filename(file_path) -> str:
+    """Return a leading ``YYYY-MM-DD`` from the file name, or "" (plans rarely
+    carry a frontmatter date; dated file names are the next best signal).
+
+    Calendar-validated via ``normalize_artifact_date`` — ``2026-13-45-foo.md``
+    must yield "" rather than a value that aborts the TIMESTAMPTZ insert.
+    """
+    match = _FILENAME_DATE_RE.match(file_path.name)
+    return (normalize_artifact_date(match.group(1)) or "") if match else ""
+
+
+def legacy_relative_path(canonical_path: str) -> str | None:
+    """Return the pre-#283 relative form of an absolute artifact path, or None.
+
+    Old bulk runs stored the glob path relative to the project root, which always
+    began at the ``thoughts/`` directory (``thoughts/shared/plans/x.md``). The
+    legacy twin is therefore derivable exactly, so callers can delete it with an
+    equality predicate instead of a wildcard scan.
+    """
+    marker = "/thoughts/"
+    idx = canonical_path.find(marker)
+    if not canonical_path.startswith("/") or idx < 0:
+        return None
+    return canonical_path[idx + 1 :]
 
 
 def parse_continuity_content(content: str, file_path) -> dict:

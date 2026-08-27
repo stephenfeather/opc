@@ -75,23 +75,62 @@ function extractSessionName(filePath) {
   }
   return null;
 }
+var INDEXABLE_TOOLS = /* @__PURE__ */ new Set(["Write", "Edit", "MultiEdit"]);
+function indexScriptCandidates(projectDir) {
+  return [
+    path.join(projectDir, "scripts", "core", "artifact_index.py"),
+    path.join(projectDir, "scripts", "artifact_index.py")
+  ];
+}
+function isWithinProject(fullPath, projectDir) {
+  let projectRoot;
+  let target;
+  try {
+    projectRoot = fs.realpathSync.native(projectDir);
+    target = fs.realpathSync.native(fullPath);
+  } catch {
+    return false;
+  }
+  const rel = path.relative(projectRoot, target);
+  return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+function isIndexableToolEvent(toolName) {
+  return !!toolName && INDEXABLE_TOOLS.has(toolName);
+}
+function classifyArtifactPath(filePath) {
+  if (!filePath) return null;
+  const normalized = filePath.replace(/\\/g, "/");
+  const segments = normalized.split("/");
+  const isMd = normalized.endsWith(".md");
+  const isYaml = normalized.endsWith(".yaml") || normalized.endsWith(".yml");
+  if (segments.includes("handoffs") && (isMd || isYaml)) {
+    return "handoff";
+  }
+  if (isMd && normalized.includes("/thoughts/shared/plans/")) {
+    return "plan";
+  }
+  if (isMd && normalized.startsWith("thoughts/shared/plans/")) {
+    return "plan";
+  }
+  return null;
+}
 async function main() {
   const input = JSON.parse(await readStdin());
   const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const homeDir = process.env.HOME || process.env.USERPROFILE || "";
-  if (input.tool_name !== "Write") {
+  if (!isIndexableToolEvent(input.tool_name)) {
     console.log(JSON.stringify({ result: "continue" }));
     return;
   }
   const filePath = input.tool_input?.file_path || "";
-  const isHandoffFile = filePath.endsWith(".md") || filePath.endsWith(".yaml") || filePath.endsWith(".yml");
-  if (!filePath.includes("handoffs") || !isHandoffFile) {
+  const kind = classifyArtifactPath(filePath);
+  if (kind === null) {
     console.log(JSON.stringify({ result: "continue" }));
     return;
   }
   try {
     const fullPath = path.isAbsolute(filePath) ? filePath : path.join(projectDir, filePath);
-    if (!fs.existsSync(fullPath)) {
+    if (!isWithinProject(fullPath, projectDir) || !fs.existsSync(fullPath)) {
       console.log(JSON.stringify({ result: "continue" }));
       return;
     }
@@ -100,7 +139,7 @@ async function main() {
     const isYamlFile = fullPath.endsWith(".yaml") || fullPath.endsWith(".yml");
     const hasFrontmatter = content.startsWith("---");
     const hasRootSpanId = content.includes("root_span_id:");
-    if (!hasRootSpanId) {
+    if (kind === "handoff" && !hasRootSpanId) {
       const stateFile = path.join(homeDir, ".claude", "state", "braintrust_sessions", `${input.session_id}.json`);
       if (fs.existsSync(stateFile)) {
         try {
@@ -133,13 +172,15 @@ ${content}`;
         }
       }
     }
-    const terminalPid = getTerminalShellPid();
-    const sessionName = extractSessionName(fullPath);
-    if (terminalPid && sessionName) {
-      storeSessionAffinity(projectDir, terminalPid, sessionName);
+    if (kind === "handoff") {
+      const terminalPid = getTerminalShellPid();
+      const sessionName = extractSessionName(fullPath);
+      if (terminalPid && sessionName) {
+        storeSessionAffinity(projectDir, terminalPid, sessionName);
+      }
     }
-    const indexScript = path.join(projectDir, "scripts", "artifact_index.py");
-    if (fs.existsSync(indexScript)) {
+    const indexScript = indexScriptCandidates(projectDir).find((p) => fs.existsSync(p));
+    if (indexScript) {
       const child = spawn("uv", ["run", "python", indexScript, "--file", fullPath], {
         cwd: projectDir,
         detached: true,
@@ -161,4 +202,12 @@ async function readStdin() {
     process.stdin.on("end", () => resolve(data));
   });
 }
-main().catch(console.error);
+if (process.argv[1] && (process.argv[1].endsWith("handoff-index.ts") || process.argv[1].endsWith("handoff-index.js") || process.argv[1].endsWith("handoff-index.mjs"))) {
+  main().catch(console.error);
+}
+export {
+  classifyArtifactPath,
+  indexScriptCandidates,
+  isIndexableToolEvent,
+  isWithinProject
+};

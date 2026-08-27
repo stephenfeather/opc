@@ -32,6 +32,7 @@ try:
     )
     from scripts.core.artifact_index_core import (
         classify_file,
+        legacy_relative_path,
         parse_continuity_content,
         parse_handoff_content,
         parse_handoff_yaml_content,
@@ -48,6 +49,7 @@ except ModuleNotFoundError:
     )
     from artifact_index_core import (  # type: ignore[no-redef]
         classify_file,
+        legacy_relative_path,  # type: ignore[no-redef]
         parse_continuity_content,
         parse_handoff_content,
         parse_handoff_yaml_content,
@@ -163,6 +165,17 @@ def pg_connect():
     return psycopg2.connect(get_postgres_url())
 
 
+# Additive, idempotent column migrations for databases provisioned from the
+# upstream init-schema.sql before these fields were carried (issue #283).
+PG_COLUMN_MIGRATIONS: tuple[str, ...] = (
+    "ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS task_number INTEGER",
+    "ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS files_modified TEXT",
+    "ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS turn_span_id TEXT",
+    "ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS braintrust_session_id TEXT",
+    "ALTER TABLE plans ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ",
+)
+
+
 def init_postgres():
     """Initialize PostgreSQL connection and ensure schema exists."""
     conn = pg_connect()
@@ -191,14 +204,6 @@ def init_postgres():
             indexed_at TIMESTAMP DEFAULT NOW(),
             goal TEXT
         )
-    """)
-
-    # Idempotent migration for existing databases missing session_uuid
-    cur.execute("""
-        ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS session_uuid TEXT
-    """)
-    cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_handoffs_session_uuid ON handoffs(session_uuid)
     """)
 
     # Create plans table if not exists
@@ -231,13 +236,43 @@ def init_postgres():
         )
     """)
 
-    # GIN expression indexes backing artifact_query.py searches (issue #282).
-    # Idempotent; existing databases pick them up on the next indexer run.
-    for ddl in PG_FTS_INDEX_DDL:
-        cur.execute(ddl)
+    # Schema evolution (#282 GIN indexes, #283 columns) is idempotent but not
+    # free: ALTER TABLE / CREATE INDEX take relation locks, and the hook's --file
+    # fast path calls init_postgres() on every artifact write. Gate the DDL on a
+    # single catalog probe so an up-to-date database only pays one SELECT.
+    if not _pg_schema_is_current(cur):
+        # Older migration (session_uuid) lives under the same gate: a database
+        # carrying the sentinel column necessarily went through it already.
+        cur.execute("ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS session_uuid TEXT")
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_handoffs_session_uuid ON handoffs(session_uuid)"
+        )
+        for ddl in PG_COLUMN_MIGRATIONS:
+            cur.execute(ddl)
+        for ddl in PG_FTS_INDEX_DDL:
+            cur.execute(ddl)
 
     conn.commit()
     return conn
+
+
+# The last column and index added by the migrations above; their presence
+# means every earlier statement has already been applied.
+_PG_SCHEMA_SENTINEL_COLUMN = ("plans", "created_at")
+_PG_SCHEMA_SENTINEL_INDEX = "idx_continuity_search_fts"
+_PG_SCHEMA_PROBE_SQL = """
+    SELECT
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_name = %s AND column_name = %s)
+        AND EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = %s)
+"""
+
+
+def _pg_schema_is_current(cur) -> bool:
+    """One catalog SELECT: True when the #282/#283 DDL has already been applied."""
+    cur.execute(_PG_SCHEMA_PROBE_SQL, (*_PG_SCHEMA_SENTINEL_COLUMN, _PG_SCHEMA_SENTINEL_INDEX))
+    row = cur.fetchone()
+    return bool(row and row[0])
 
 
 # =============================================================================
@@ -378,7 +413,13 @@ def db_execute(
 
 
 def parse_handoff(file_path: Path) -> dict:
-    """Parse a handoff markdown file into structured data."""
+    """Parse a handoff markdown file into structured data.
+
+    The path is resolved first so ``id`` (a hash of the path string) and
+    ``file_path`` are identical whether the caller passed a relative glob hit
+    or the hook's absolute ``--file`` (issue #283: two rows per artifact).
+    """
+    file_path = Path(file_path).resolve()
     raw_content = file_path.read_text()
     result = parse_handoff_content(raw_content, file_path)
     if not result["created_at"]:
@@ -387,7 +428,8 @@ def parse_handoff(file_path: Path) -> dict:
 
 
 def parse_handoff_yaml(file_path: Path) -> dict:
-    """Parse a handoff YAML file into structured data."""
+    """Parse a handoff YAML file into structured data (path resolved, see parse_handoff)."""
+    file_path = Path(file_path).resolve()
     raw_content = file_path.read_text()
     result = parse_handoff_yaml_content(raw_content, file_path)
     if not result["created_at"]:
@@ -423,8 +465,53 @@ def index_handoffs(conn, base_path: Path = Path("thoughts/shared/handoffs")):
     return count
 
 
+# Tables whose legacy rows can be identified by a non-canonical (relative)
+# file_path. ``handoffs`` is deliberately absent: its ~566 relative rows span
+# hundreds of project roots and are re-homed by the #287 backfill, not here.
+_PRUNABLE_TABLES: dict[str, str] = {"plans": "file_path"}
+
+
+def _is_pg(conn) -> bool:
+    return not isinstance(conn, sqlite3.Connection)
+
+
+def prune_legacy_rows(conn, table: str, canonical_path: str) -> int:
+    """Delete the legacy relative-path row that ``canonical_path`` replaces.
+
+    Pre-#283 bulk runs stored the glob path relative to the project root
+    (``thoughts/shared/plans/p.md``) and hashed the id from it; the canonical row
+    uses the absolute path. The legacy twin is derived exactly
+    (:func:`legacy_relative_path`) and matched by equality — no wildcard scan, no
+    LIKE-pattern surprises from stored values — and nothing is deleted unless its
+    replacement was just written. **SQLite only**: SQLite indexes are per-project,
+    whereas a shared PostgreSQL database can hold the same relative path from
+    several projects; there this is a no-op and the project-aware #287 backfill
+    re-homes legacy rows. Idempotent; returns rows removed.
+
+    Only tables in ``_PRUNABLE_TABLES`` are allowed — the name is interpolated
+    into SQL, so it must come from that allowlist.
+    """
+    if table not in _PRUNABLE_TABLES:
+        raise ValueError(f"prune_legacy_rows: unsupported table {table!r}")
+    if not canonical_path.startswith("/"):
+        raise ValueError("prune_legacy_rows: canonical_path must be absolute")
+    legacy = legacy_relative_path(canonical_path)
+    if legacy is None:
+        return 0
+    if _is_pg(conn):
+        # A shared PostgreSQL database holds artifacts from many projects, and
+        # a relative path (``thoughts/shared/plans/p.md``) is not unique across
+        # them — deleting by it could remove another project's row. Re-homing
+        # those rows needs project awareness and belongs to the #287 backfill.
+        # SQLite indexes are per-project, so the equality delete is safe there.
+        return 0
+    column = _PRUNABLE_TABLES[table]
+    return conn.execute(f"DELETE FROM {table} WHERE {column} = ?", (legacy,)).rowcount
+
+
 def parse_plan(file_path: Path) -> dict:
-    """Parse a plan markdown file into structured data."""
+    """Parse a plan markdown file into structured data (path resolved, see parse_handoff)."""
+    file_path = Path(file_path).resolve()
     content = file_path.read_text()
     return parse_plan_content(content, file_path)
 
@@ -436,37 +523,27 @@ def index_plans(conn, base_path: Path = Path("thoughts/shared/plans")):
         return 0
 
     count = 0
+    pruned = 0
     for plan_file in base_path.glob("*.md"):
         try:
             data = parse_plan(plan_file)
-            db_execute(
-                conn,
-                """
-                INSERT OR REPLACE INTO plans
-                (id, title, file_path, overview, approach, phases, constraints)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-                (
-                    data["id"],
-                    data["title"],
-                    data["file_path"],
-                    data["overview"],
-                    data["approach"],
-                    data["phases"],
-                    data["constraints"],
-                ),
-            )
+            _index_plan(conn, data)
+            # Replacement row is written; now retire its pre-#283 relative twin.
+            pruned += prune_legacy_rows(conn, "plans", data["file_path"])
             count += 1
         except Exception as e:
             print(f"Error indexing {plan_file}: {e}")
 
     conn.commit()
+    if pruned:
+        print(f"Removed {pruned} legacy relative-path plan rows")
     print(f"Indexed {count} plans")
     return count
 
 
 def parse_continuity(file_path: Path) -> dict:
-    """Parse a continuity ledger into structured data."""
+    """Parse a continuity ledger into structured data (path resolved, see parse_handoff)."""
+    file_path = Path(file_path).resolve()
     content = file_path.read_text()
     return parse_continuity_content(content, file_path)
 
@@ -477,26 +554,10 @@ def index_continuity(conn, base_path: Path = Path(".")):
     for ledger_file in base_path.glob("CONTINUITY_CLAUDE-*.md"):
         try:
             data = parse_continuity(ledger_file)
-            db_execute(
-                conn,
-                """
-                INSERT OR REPLACE INTO continuity
-                (id, session_name, goal, state_done, state_now, state_next,
-                 key_learnings, key_decisions, snapshot_reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-                (
-                    data["id"],
-                    data["session_name"],
-                    data["goal"],
-                    data["state_done"],
-                    data["state_now"],
-                    data["state_next"],
-                    data["key_learnings"],
-                    data["key_decisions"],
-                    data["snapshot_reason"],
-                ),
-            )
+            _index_continuity(conn, data)
+            # No legacy pruning here: continuity stores no file_path, and a
+            # session name alone cannot distinguish a stale row from another
+            # project's ledger in a shared database (#284 decides its future).
             count += 1
         except Exception as e:
             print(f"Error indexing {ledger_file}: {e}")
@@ -544,15 +605,22 @@ def _index_handoff(conn, data: dict, return_id: bool = False) -> str | None:
     )
 
 
+_PLAN_INSERT_SQL = """
+        INSERT OR REPLACE INTO plans
+        (id, title, file_path, overview, approach, phases, constraints, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """
+
+
 def _index_plan(conn, data: dict, return_id: bool = False) -> str | None:
-    """Write plan data to database. Returns the stored row id when requested."""
+    """Write plan data to database. Returns the stored row id when requested.
+
+    ``created_at`` comes from the plan's frontmatter ``date`` (issue #283); an
+    absent date binds NULL rather than "" so PostgreSQL's timestamp cast holds.
+    """
     return db_execute(
         conn,
-        """
-        INSERT OR REPLACE INTO plans
-        (id, title, file_path, overview, approach, phases, constraints)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """,
+        _PLAN_INSERT_SQL,
         (
             data["id"],
             data["title"],
@@ -561,6 +629,7 @@ def _index_plan(conn, data: dict, return_id: bool = False) -> str | None:
             data["approach"],
             data["phases"],
             data["constraints"],
+            data.get("created_at") or None,
         ),
         return_id=return_id,
     )
@@ -628,6 +697,10 @@ def index_single_file(conn, file_path: Path) -> dict:
     try:
         data = parser(file_path)
         row_id = writer(conn, data, return_id=True)
+        if file_type == "plan":
+            # Same transaction as the replacement row (#283 review R3): the hook
+            # path must retire the legacy relative twin too, not only --plans.
+            prune_legacy_rows(conn, "plans", data["file_path"])
         conn.commit()
         if row_id is None:
             # The whole point is to surface the persisted PK; if the write

@@ -19,16 +19,40 @@ the optional outcome and the limit; see ``artifact_query.py`` for param order.
 
 BACKENDS: tuple[str, ...] = ("sqlite", "postgres")
 
-# --- PostgreSQL document expressions (concat_ws skips NULLs) ------------------
+# --- PostgreSQL document expressions -----------------------------------------
+#
+# Built from IMMUTABLE functions only (COALESCE, textcat, to_tsvector with an
+# explicit regconfig) so the identical expression can back a GIN expression
+# index. ``concat_ws`` is STABLE and cannot be indexed. The planner only uses an
+# expression index when the query expression matches it exactly, so the search
+# statements and ``PG_FTS_INDEX_DDL`` are generated from the same source.
 
-_PG_HANDOFF_DOC = (
-    "to_tsvector('english', concat_ws(' ', h.goal, h.what_worked, h.what_failed, h.key_decisions))"
-)
-_PG_PLAN_DOC = "to_tsvector('english', concat_ws(' ', p.title, p.overview, p.approach, p.phases))"
-_PG_CONTINUITY_DOC = (
-    "to_tsvector('english', concat_ws(' ', c.goal, c.key_learnings, c.key_decisions, c.state_now))"
-)
+HANDOFF_DOC_COLUMNS: tuple[str, ...] = ("goal", "what_worked", "what_failed", "key_decisions")
+PLAN_DOC_COLUMNS: tuple[str, ...] = ("title", "overview", "approach", "phases")
+CONTINUITY_DOC_COLUMNS: tuple[str, ...] = ("goal", "key_learnings", "key_decisions", "state_now")
+
+
+def pg_document_expression(columns: tuple[str, ...], prefix: str = "") -> str:
+    """Return the tsvector expression over ``columns`` (optionally ``alias.``-prefixed)."""
+    parts = " || ' ' || ".join(f"COALESCE({prefix}{c}, '')" for c in columns)
+    return f"to_tsvector('english', {parts})"
+
+
+_PG_HANDOFF_DOC = pg_document_expression(HANDOFF_DOC_COLUMNS, "h.")
+_PG_PLAN_DOC = pg_document_expression(PLAN_DOC_COLUMNS, "p.")
+_PG_CONTINUITY_DOC = pg_document_expression(CONTINUITY_DOC_COLUMNS, "c.")
 _PG_TASK_NUMBER = "substring(h.file_path from 'task-([0-9]+)')::int AS task_number"
+
+# Idempotent DDL the indexer applies on init so the searches above are
+# index-backed. Searches still work (as sequential scans) without these.
+PG_FTS_INDEX_DDL: tuple[str, ...] = (
+    "CREATE INDEX IF NOT EXISTS idx_handoffs_search_fts ON handoffs "
+    f"USING gin({pg_document_expression(HANDOFF_DOC_COLUMNS)})",
+    "CREATE INDEX IF NOT EXISTS idx_plans_search_fts ON plans "
+    f"USING gin({pg_document_expression(PLAN_DOC_COLUMNS)})",
+    "CREATE INDEX IF NOT EXISTS idx_continuity_search_fts ON continuity "
+    f"USING gin({pg_document_expression(CONTINUITY_DOC_COLUMNS)})",
+)
 
 _SQL: dict[str, dict[str, str]] = {
     "sqlite": {

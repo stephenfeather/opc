@@ -33,7 +33,15 @@ from scripts.core.artifact_query import (
     search_past_queries,
     search_plans,
 )
-from scripts.core.artifact_query_sql import BACKENDS, sql_for
+from scripts.core.artifact_query_sql import (
+    BACKENDS,
+    CONTINUITY_DOC_COLUMNS,
+    HANDOFF_DOC_COLUMNS,
+    PG_FTS_INDEX_DDL,
+    PLAN_DOC_COLUMNS,
+    pg_document_expression,
+    sql_for,
+)
 
 _SCHEMA_PATH = Path(__file__).resolve().parent.parent / "scripts" / "core" / "artifact_schema.sql"
 
@@ -74,6 +82,9 @@ class _StubPgConn:
 
     def cursor(self):
         return _StubCursor(self, self.rows, self.description)
+
+    def commit(self):
+        pass
 
     def close(self):
         self.close_count += 1
@@ -187,6 +198,50 @@ class TestSqlTable:
     @pytest.mark.parametrize("name", ("search_handoffs", "search_plans", "search_continuity"))
     def test_sqlite_search_still_fts5(self, name):
         assert "MATCH ?" in sql_for("sqlite", name)
+
+
+class TestPgFtsIndexParity:
+    """The GIN expression indexes only help if the query expression matches exactly."""
+
+    def test_document_expression_is_immutable_safe(self):
+        expr = pg_document_expression(("a", "b"), "x.")
+        assert expr == "to_tsvector('english', COALESCE(x.a, '') || ' ' || COALESCE(x.b, ''))"
+        assert "concat_ws" not in expr  # STABLE, cannot back an expression index
+
+    @pytest.mark.parametrize(
+        ("statement", "alias", "columns", "table"),
+        (
+            ("search_handoffs", "h.", HANDOFF_DOC_COLUMNS, "handoffs"),
+            ("search_plans", "p.", PLAN_DOC_COLUMNS, "plans"),
+            ("search_continuity", "c.", CONTINUITY_DOC_COLUMNS, "continuity"),
+        ),
+    )
+    def test_query_expression_matches_index_ddl(self, statement, alias, columns, table):
+        query_expr = pg_document_expression(columns, alias)
+        assert query_expr in sql_for("postgres", statement)
+        index_expr = pg_document_expression(columns)
+        ddl = next(d for d in PG_FTS_INDEX_DDL if f" ON {table} " in d)
+        assert ddl.startswith("CREATE INDEX IF NOT EXISTS ")
+        assert f"USING gin({index_expr})" in ddl
+        # Same expression modulo the table alias.
+        assert query_expr.replace(alias, "") == index_expr
+
+    def test_docker_schema_carries_the_same_indexes(self):
+        schema = (Path(__file__).resolve().parent.parent / "docker" / "init-schema.sql").read_text()
+        for ddl in PG_FTS_INDEX_DDL:
+            head, _, expr = ddl.partition(" USING gin(")
+            assert head in schema, head
+            assert expr.rstrip(")") in schema.replace("\n    ", " ")
+
+    def test_init_postgres_applies_index_ddl(self, monkeypatch):
+        from scripts.core import artifact_index as ai
+
+        conn = _StubPgConn()
+        monkeypatch.setattr(ai, "pg_connect", lambda: conn)
+        ai.init_postgres()
+        executed = [sql for sql, _ in conn.calls]
+        for ddl in PG_FTS_INDEX_DDL:
+            assert ddl in executed
 
 
 # ===========================================================================

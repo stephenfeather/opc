@@ -308,7 +308,7 @@ Indexed implementation plans for cross-session discovery. Defined in `init-schem
 | `indexed_at` | TIMESTAMP | NOW() | When indexed |
 | `created_at` | TIMESTAMPTZ | | Frontmatter `date`, else a leading `YYYY-MM-DD` in the file name, else NULL (#283) |
 
-`id` is a hash of the absolute file path; a bulk `--plans` run first deletes legacy rows whose `file_path` is relative (`prune_legacy_rows`, #283). Queries return `COALESCE(created_at, indexed_at)`.
+`id` is a hash of the absolute file path. On SQLite, indexing a plan also deletes its pre-#283 relative-path twin (`prune_legacy_rows`); on PostgreSQL that is a no-op — a relative path is not unique across the projects sharing the database, so legacy rows are re-homed by the project-aware #287 backfill. Queries return `COALESCE(created_at, indexed_at)`.
 
 | Script/Hook | Operation | Details |
 |-------------|-----------|---------|

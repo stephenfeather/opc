@@ -482,9 +482,11 @@ def prune_legacy_rows(conn, table: str, canonical_path: str) -> int:
     (``thoughts/shared/plans/p.md``) and hashed the id from it; the canonical row
     uses the absolute path. The legacy twin is derived exactly
     (:func:`legacy_relative_path`) and matched by equality — no wildcard scan, no
-    LIKE-pattern surprises from stored values — so a row from another project can
-    only be touched if it has the identical relative path, and nothing is deleted
-    unless its replacement was just written. Idempotent; returns rows removed.
+    LIKE-pattern surprises from stored values — and nothing is deleted unless its
+    replacement was just written. **SQLite only**: SQLite indexes are per-project,
+    whereas a shared PostgreSQL database can hold the same relative path from
+    several projects; there this is a no-op and the project-aware #287 backfill
+    re-homes legacy rows. Idempotent; returns rows removed.
 
     Only tables in ``_PRUNABLE_TABLES`` are allowed — the name is interpolated
     into SQL, so it must come from that allowlist.
@@ -496,14 +498,14 @@ def prune_legacy_rows(conn, table: str, canonical_path: str) -> int:
     legacy = legacy_relative_path(canonical_path)
     if legacy is None:
         return 0
-    column = _PRUNABLE_TABLES[table]
     if _is_pg(conn):
-        cur = conn.cursor()
-        try:
-            cur.execute(f"DELETE FROM {table} WHERE {column} = %s", (legacy,))
-            return cur.rowcount
-        finally:
-            cur.close()
+        # A shared PostgreSQL database holds artifacts from many projects, and
+        # a relative path (``thoughts/shared/plans/p.md``) is not unique across
+        # them — deleting by it could remove another project's row. Re-homing
+        # those rows needs project awareness and belongs to the #287 backfill.
+        # SQLite indexes are per-project, so the equality delete is safe there.
+        return 0
+    column = _PRUNABLE_TABLES[table]
     return conn.execute(f"DELETE FROM {table} WHERE {column} = ?", (legacy,)).rowcount
 
 

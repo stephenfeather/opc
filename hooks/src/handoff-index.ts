@@ -147,9 +147,23 @@ export function indexScriptCandidates(projectDir: string): string[] {
   ];
 }
 
-/** True when `fullPath` is lexically inside `projectDir` (no `..` escape). */
+/**
+ * True when `fullPath` is inside `projectDir` on disk. Both sides are resolved
+ * through symlinks (realpath), so a link under thoughts/shared/plans that
+ * points outside the project is rejected — a lexical path.resolve() would let
+ * the indexer read (and, for handoffs, rewrite) a file elsewhere. Paths that
+ * do not exist are rejected.
+ */
 export function isWithinProject(fullPath: string, projectDir: string): boolean {
-  const rel = path.relative(path.resolve(projectDir), path.resolve(fullPath));
+  let projectRoot: string;
+  let target: string;
+  try {
+    projectRoot = fs.realpathSync.native(projectDir);
+    target = fs.realpathSync.native(fullPath);
+  } catch {
+    return false;
+  }
+  const rel = path.relative(projectRoot, target);
   return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
 }
 

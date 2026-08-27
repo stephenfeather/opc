@@ -83,7 +83,15 @@ function indexScriptCandidates(projectDir) {
   ];
 }
 function isWithinProject(fullPath, projectDir) {
-  const rel = path.relative(path.resolve(projectDir), path.resolve(fullPath));
+  let projectRoot;
+  let target;
+  try {
+    projectRoot = fs.realpathSync.native(projectDir);
+    target = fs.realpathSync.native(fullPath);
+  } catch {
+    return false;
+  }
+  const rel = path.relative(projectRoot, target);
   return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
 }
 function isIndexableToolEvent(toolName) {
@@ -188,10 +196,10 @@ ${content}`;
   }
 }
 async function readStdin() {
-  return new Promise((resolve2) => {
+  return new Promise((resolve) => {
     let data = "";
     process.stdin.on("data", (chunk) => data += chunk);
-    process.stdin.on("end", () => resolve2(data));
+    process.stdin.on("end", () => resolve(data));
   });
 }
 if (process.argv[1] && (process.argv[1].endsWith("handoff-index.ts") || process.argv[1].endsWith("handoff-index.js") || process.argv[1].endsWith("handoff-index.mjs"))) {

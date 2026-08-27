@@ -7,7 +7,10 @@
  * routing decision can be tested without spawning anything.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import {
   classifyArtifactPath,
   indexScriptCandidates,
@@ -25,16 +28,50 @@ describe('indexScriptCandidates', () => {
 });
 
 describe('isWithinProject', () => {
-  it('accepts paths inside the project', () => {
-    expect(isWithinProject('/repo/thoughts/shared/plans/x.md', '/repo')).toBe(true);
-    expect(isWithinProject('/repo/thoughts/shared/plans/x.md', '/repo/')).toBe(true);
+  let root: string;
+  let repo: string;
+  let outside: string;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'hoi-'));
+    repo = path.join(root, 'repo');
+    outside = path.join(root, 'outside');
+    fs.mkdirSync(path.join(repo, 'thoughts', 'shared', 'plans'), { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(repo, 'thoughts', 'shared', 'plans', 'x.md'), '# x');
+    fs.writeFileSync(path.join(outside, 'secret.md'), '# secret');
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('accepts a real file inside the project (trailing slash tolerated)', () => {
+    const f = path.join(repo, 'thoughts', 'shared', 'plans', 'x.md');
+    expect(isWithinProject(f, repo)).toBe(true);
+    expect(isWithinProject(f, repo + path.sep)).toBe(true);
   });
 
   it('rejects the project root itself, siblings, and traversal', () => {
-    expect(isWithinProject('/repo', '/repo')).toBe(false);
-    expect(isWithinProject('/repo-other/thoughts/shared/plans/x.md', '/repo')).toBe(false);
-    expect(isWithinProject('/repo/../elsewhere/thoughts/shared/plans/x.md', '/repo')).toBe(false);
-    expect(isWithinProject('/tmp/thoughts/shared/plans/x.md', '/repo')).toBe(false);
+    expect(isWithinProject(repo, repo)).toBe(false);
+    expect(isWithinProject(path.join(outside, 'secret.md'), repo)).toBe(false);
+    expect(isWithinProject(path.join(repo, '..', 'outside', 'secret.md'), repo)).toBe(false);
+  });
+
+  it('rejects a symlink inside the project that points outside it', () => {
+    const link = path.join(repo, 'thoughts', 'shared', 'plans', 'link.md');
+    fs.symlinkSync(path.join(outside, 'secret.md'), link);
+    expect(isWithinProject(link, repo)).toBe(false);
+  });
+
+  it('rejects a symlinked directory that escapes the project', () => {
+    const linkDir = path.join(repo, 'thoughts', 'shared', 'plans', 'ext');
+    fs.symlinkSync(outside, linkDir);
+    expect(isWithinProject(path.join(linkDir, 'secret.md'), repo)).toBe(false);
+  });
+
+  it('rejects paths that do not exist', () => {
+    expect(isWithinProject(path.join(repo, 'thoughts', 'shared', 'plans', 'nope.md'), repo)).toBe(false);
   });
 });
 

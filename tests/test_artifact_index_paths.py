@@ -252,6 +252,13 @@ class TestLegacyRowPruning:
     def test_prune_is_noop_for_paths_outside_a_thoughts_tree(self, conn):
         assert ai.prune_legacy_rows(conn, "plans", "/somewhere/plan.md") == 0
 
+    def test_prune_is_noop_on_postgres(self):
+        """A relative path is not unique across projects sharing one PostgreSQL
+        database; re-homing there is #287's project-aware backfill (PR review)."""
+        pg = _Conn()
+        assert ai.prune_legacy_rows(pg, "plans", "/x/thoughts/shared/plans/p.md") == 0
+        assert not any("DELETE" in s for s in pg.executed)
+
     def test_single_file_index_also_retires_the_legacy_twin(self, conn, repo):
         """The hook path (--file) must not leave the pre-#283 row behind (R3)."""
         conn.execute(

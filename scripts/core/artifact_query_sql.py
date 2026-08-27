@@ -1,0 +1,152 @@
+"""Per-backend SQL for artifact_query.py (issue #282).
+
+The artifact indexer writes to PostgreSQL when it is the active backend, but
+the PostgreSQL tables were designed upstream with a different shape from the
+indexer's own SQLite schema (``artifact_schema.sql``):
+
+- ``handoffs``: ``goal`` instead of ``task_summary``; no ``task_number`` column
+  (derived here from the ``task-NN`` filename convention); ``id`` is a uuid.
+- ``plans`` / ``continuity``: ``indexed_at`` only, no ``created_at``.
+- Full-text search is ``tsvector``/``tsquery``, not FTS5 ``MATCH``.
+
+The SQLite statements are the original ones, unchanged. Both backends return
+the same column names so formatters and callers are backend-agnostic.
+
+Placeholders: SQLite uses ``?``, PostgreSQL (psycopg2) uses ``%s``. Search
+statements bind the query text twice on PostgreSQL (rank + filter) followed by
+the optional outcome and the limit; see ``artifact_query.py`` for param order.
+"""
+
+BACKENDS: tuple[str, ...] = ("sqlite", "postgres")
+
+# --- PostgreSQL document expressions (concat_ws skips NULLs) ------------------
+
+_PG_HANDOFF_DOC = (
+    "to_tsvector('english', concat_ws(' ', h.goal, h.what_worked, h.what_failed, h.key_decisions))"
+)
+_PG_PLAN_DOC = "to_tsvector('english', concat_ws(' ', p.title, p.overview, p.approach, p.phases))"
+_PG_CONTINUITY_DOC = (
+    "to_tsvector('english', concat_ws(' ', c.goal, c.key_learnings, c.key_decisions, c.state_now))"
+)
+_PG_TASK_NUMBER = "substring(h.file_path from 'task-([0-9]+)')::int AS task_number"
+
+_SQL: dict[str, dict[str, str]] = {
+    "sqlite": {
+        "search_handoffs": """
+        SELECT h.id, h.session_name, h.task_number, h.task_summary,
+               h.what_worked, h.what_failed, h.key_decisions,
+               h.outcome, h.file_path, h.created_at,
+               handoffs_fts.rank as score
+        FROM handoffs_fts
+        JOIN handoffs h ON handoffs_fts.rowid = h.rowid
+        WHERE handoffs_fts MATCH ?
+    """,
+        "search_handoffs_outcome_filter": " AND h.outcome = ?",
+        "search_handoffs_tail": " ORDER BY rank LIMIT ?",
+        "search_plans": """
+        SELECT p.id, p.title, p.overview, p.approach, p.file_path, p.created_at,
+               plans_fts.rank as score
+        FROM plans_fts
+        JOIN plans p ON plans_fts.rowid = p.rowid
+        WHERE plans_fts MATCH ?
+        ORDER BY rank
+        LIMIT ?
+    """,
+        "search_continuity": """
+        SELECT c.id, c.session_name, c.goal, c.key_learnings, c.key_decisions,
+               c.state_now, c.created_at,
+               continuity_fts.rank as score
+        FROM continuity_fts
+        JOIN continuity c ON continuity_fts.rowid = c.rowid
+        WHERE continuity_fts MATCH ?
+        ORDER BY rank
+        LIMIT ?
+    """,
+        "search_past_queries": """
+        SELECT q.id, q.question, q.answer, q.was_helpful, q.created_at,
+               queries_fts.rank as score
+        FROM queries_fts
+        JOIN queries q ON queries_fts.rowid = q.rowid
+        WHERE queries_fts MATCH ?
+        ORDER BY rank
+        LIMIT ?
+    """,
+        "get_handoff_by_span_id": """
+        SELECT id, session_name, task_number, task_summary,
+               outcome, what_worked, what_failed, key_decisions,
+               file_path, root_span_id, created_at
+        FROM handoffs
+        WHERE root_span_id = ?
+        ORDER BY datetime(created_at) DESC, task_number DESC, rowid DESC
+        LIMIT 1
+    """,
+        "get_ledger_for_session": """
+        SELECT id, session_name, goal, key_learnings, key_decisions,
+               state_done, state_now, state_next, created_at
+        FROM continuity
+        WHERE session_name = ?
+        ORDER BY created_at DESC
+        LIMIT 1
+    """,
+    },
+    "postgres": {
+        "search_handoffs": f"""
+        SELECT h.id::text AS id, h.session_name,
+               {_PG_TASK_NUMBER},
+               h.goal AS task_summary,
+               h.what_worked, h.what_failed, h.key_decisions,
+               h.outcome, h.file_path, h.created_at,
+               ts_rank({_PG_HANDOFF_DOC}, plainto_tsquery('english', %s)) AS score
+        FROM handoffs h
+        WHERE {_PG_HANDOFF_DOC} @@ plainto_tsquery('english', %s)
+    """,
+        "search_handoffs_outcome_filter": " AND h.outcome = %s",
+        "search_handoffs_tail": " ORDER BY score DESC, h.created_at DESC LIMIT %s",
+        "search_plans": f"""
+        SELECT p.id, p.title, p.overview, p.approach, p.file_path,
+               p.indexed_at AS created_at,
+               ts_rank({_PG_PLAN_DOC}, plainto_tsquery('english', %s)) AS score
+        FROM plans p
+        WHERE {_PG_PLAN_DOC} @@ plainto_tsquery('english', %s)
+        ORDER BY score DESC, p.indexed_at DESC
+        LIMIT %s
+    """,
+        "search_continuity": f"""
+        SELECT c.id, c.session_name, c.goal, c.key_learnings, c.key_decisions,
+               c.state_now, c.indexed_at AS created_at,
+               ts_rank({_PG_CONTINUITY_DOC}, plainto_tsquery('english', %s)) AS score
+        FROM continuity c
+        WHERE {_PG_CONTINUITY_DOC} @@ plainto_tsquery('english', %s)
+        ORDER BY score DESC, c.indexed_at DESC
+        LIMIT %s
+    """,
+        "get_handoff_by_span_id": f"""
+        SELECT h.id::text AS id, h.session_name,
+               {_PG_TASK_NUMBER},
+               h.goal AS task_summary,
+               h.outcome, h.what_worked, h.what_failed, h.key_decisions,
+               h.file_path, h.root_span_id, h.created_at
+        FROM handoffs h
+        WHERE h.root_span_id = %s
+        ORDER BY h.created_at DESC NULLS LAST
+        LIMIT 1
+    """,
+        "get_ledger_for_session": """
+        SELECT id, session_name, goal, key_learnings, key_decisions,
+               state_done, state_now, state_next, indexed_at AS created_at
+        FROM continuity
+        WHERE session_name = %s
+        ORDER BY indexed_at DESC NULLS LAST
+        LIMIT 1
+    """,
+    },
+}
+
+
+def sql_for(backend: str, name: str) -> str:
+    """Return the SQL statement ``name`` for ``backend``.
+
+    Raises ``KeyError`` for an unknown backend or statement name — a programming
+    error, not a runtime condition.
+    """
+    return _SQL[backend][name]

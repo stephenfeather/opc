@@ -9,7 +9,7 @@
  * Session ID comes from stdin (input.session_id), provided by Claude Code.
  */
 
-import { readFileSync } from 'fs';
+import { readStdinSync } from './shared/stdin.js';
 import { join } from 'path';
 import { getActiveSessions, isValidId } from './shared/db-utils-pg.js';
 import { pgCoordinationStatus } from './shared/backend-resolution.js';
@@ -39,7 +39,7 @@ export function main(): void {
   // Read stdin to get current session_id (authoritative for self-filtering)
   let ownSessionId: string | null = null;
   try {
-    const stdinContent = readFileSync(0, 'utf-8');
+    const stdinContent = readStdinSync();
     const input = JSON.parse(stdinContent);
     if (input && typeof input.session_id === 'string' && isValidId(input.session_id)) {
       ownSessionId = input.session_id;

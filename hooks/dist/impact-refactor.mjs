@@ -1,5 +1,64 @@
-// src/impact-refactor.ts
-import { readFileSync as readFileSync2 } from "fs";
+// src/shared/stdin.ts
+import { fstatSync, readSync } from "fs";
+var CHUNK_SIZE = 64 * 1024;
+var EAGAIN_SLEEP_MS = 5;
+var DEFAULT_MAX_IDLE_MS = 1e4;
+var MAX_IDLE_ENV = "HOOK_STDIN_MAX_IDLE_MS";
+function resolveMaxIdleMs(explicit) {
+  if (explicit !== void 0) return explicit;
+  const fromEnv = process.env[MAX_IDLE_ENV];
+  if (fromEnv !== void 0 && fromEnv !== "" && Number.isFinite(Number(fromEnv))) {
+    return Math.max(0, Number(fromEnv));
+  }
+  return DEFAULT_MAX_IDLE_MS;
+}
+function isTty(fd) {
+  try {
+    return fstatSync(fd).isCharacterDevice();
+  } catch {
+    return false;
+  }
+}
+var sleepCell = new Int32Array(new SharedArrayBuffer(4));
+function sleepMs(ms) {
+  Atomics.wait(sleepCell, 0, 0, ms);
+}
+function readStdinSync(options = {}) {
+  const fd = options.fd ?? 0;
+  const maxIdleMs = resolveMaxIdleMs(options.maxIdleMs);
+  if (isTty(fd)) {
+    return "";
+  }
+  const chunks = [];
+  const buf = Buffer.alloc(CHUNK_SIZE);
+  let idleMs = 0;
+  for (; ; ) {
+    let n;
+    try {
+      n = readSync(fd, buf, 0, buf.length, null);
+    } catch (err) {
+      const code = err?.code;
+      if (code === "EAGAIN" || code === "EWOULDBLOCK") {
+        if (idleMs >= maxIdleMs) {
+          throw new RangeError(`stdin idle for ${maxIdleMs} ms with no data`);
+        }
+        sleepMs(EAGAIN_SLEEP_MS);
+        idleMs += EAGAIN_SLEEP_MS;
+        continue;
+      }
+      if (code === "EOF") {
+        break;
+      }
+      throw err;
+    }
+    if (n === 0) {
+      break;
+    }
+    idleMs = 0;
+    chunks.push(Buffer.from(buf.subarray(0, n)));
+  }
+  return Buffer.concat(chunks).toString("utf-8");
+}
 
 // src/daemon-client.ts
 import { existsSync, readFileSync, writeFileSync, unlinkSync } from "fs";
@@ -367,7 +426,7 @@ var EXCLUDE_WORDS = /* @__PURE__ */ new Set([
   "with"
 ]);
 function readStdin() {
-  return readFileSync2(0, "utf-8");
+  return readStdinSync();
 }
 function shouldTrigger(prompt) {
   return REFACTOR_KEYWORDS.some((pattern) => pattern.test(prompt));

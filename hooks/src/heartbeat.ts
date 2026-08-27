@@ -8,7 +8,7 @@
  * Always outputs { result: "continue" } — never blocks tool execution.
  */
 
-import { readFileSync } from 'fs';
+import { readStdinSync } from './shared/stdin.js';
 import { updateHeartbeatDetached, isValidId } from './shared/db-utils-pg.js';
 import { getProject } from './shared/session-id.js';
 
@@ -16,7 +16,7 @@ export function main(): void {
   // Try to get session ID from stdin (PostToolUse input)
   let sessionId: string | null = null;
   try {
-    const stdinContent = readFileSync(0, 'utf-8');
+    const stdinContent = readStdinSync();
     const input = JSON.parse(stdinContent);
     if (input && typeof input.session_id === 'string' && isValidId(input.session_id)) {
       sessionId = input.session_id;

@@ -5,7 +5,7 @@
  * Uses TLDR daemon for fast code extraction (replaces CLI spawning).
  */
 
-import { readFileSync } from 'fs';
+import { readStdinSync } from './shared/stdin.js';
 import { basename } from 'path';
 import { queryDaemonSync, setQueryDeadline, trackHookActivitySync } from './daemon-client.js';
 
@@ -104,7 +104,7 @@ function getTLDRExtract(filePath: string, sessionId?: string): TLDRExtract | nul
 }
 
 async function main() {
-  const input: HookInput = JSON.parse(readFileSync(0, 'utf-8'));
+  const input: HookInput = JSON.parse(readStdinSync());
 
   if (input.tool_name !== 'Edit') {
     console.log('{}');

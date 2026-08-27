@@ -7,7 +7,7 @@
  * on next startup.
  */
 
-import { readFileSync } from 'fs';
+import { readStdinSync } from './shared/stdin.js';
 import { markSessionExited } from './shared/db-utils-pg.js';
 
 interface SessionEndInput {
@@ -19,7 +19,7 @@ interface SessionEndInput {
 async function main() {
   let input: SessionEndInput;
   try {
-    input = JSON.parse(readFileSync(0, 'utf-8'));
+    input = JSON.parse(readStdinSync());
   } catch {
     console.log(JSON.stringify({ result: 'continue' }));
     return;

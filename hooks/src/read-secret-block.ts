@@ -16,7 +16,7 @@
  * is already aware of them and can paste a redacted excerpt manually.
  */
 
-import { readFileSync } from 'fs';
+import { readStdinSync } from './shared/stdin.js';
 import { basename } from 'path';
 
 interface HookInput {
@@ -89,7 +89,7 @@ function classify(rawPath: string): { description: string } | null {
 }
 
 function readStdin(): string {
-  return readFileSync(0, 'utf-8');
+  return readStdinSync();
 }
 
 function main(): void {

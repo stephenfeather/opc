@@ -5,7 +5,7 @@
  * Uses TLDR daemon for fast symbol lookup (replaces CLI spawning).
  */
 
-import { readFileSync } from 'fs';
+import { readStdinSync } from './shared/stdin.js';
 import { basename } from 'path';
 import { queryDaemonSync, trackHookActivitySync } from './daemon-client.js';
 
@@ -90,7 +90,7 @@ function checkSymbolExists(symbol: string): { exists: boolean, location?: string
 }
 
 async function main() {
-  const input: HookInput = JSON.parse(readFileSync(0, 'utf-8'));
+  const input: HookInput = JSON.parse(readStdinSync());
 
   if (input.tool_name !== 'Write' && input.tool_name !== 'Edit') {
     console.log('{}');

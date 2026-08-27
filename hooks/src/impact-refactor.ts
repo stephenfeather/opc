@@ -7,7 +7,8 @@
  * Uses TLDR daemon for fast cached responses (50ms vs 500ms CLI).
  */
 
-import { readFileSync, existsSync } from 'fs';
+import { existsSync } from 'fs';
+import { readStdinSync } from './shared/stdin.js';
 import { join } from 'path';
 import { queryDaemonSync, setQueryDeadline, DaemonResponse, trackHookActivitySync } from './daemon-client.js';
 
@@ -51,7 +52,7 @@ const EXCLUDE_WORDS = new Set([
 ]);
 
 function readStdin(): string {
-  return readFileSync(0, 'utf-8');
+  return readStdinSync();
 }
 
 function shouldTrigger(prompt: string): boolean {

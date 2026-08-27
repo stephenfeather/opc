@@ -9,6 +9,7 @@
  */
 
 import { readFileSync, existsSync } from 'fs';
+import { readStdinSync } from './shared/stdin.js';
 import { join } from 'path';
 import { spawn } from 'child_process';
 
@@ -25,7 +26,7 @@ interface TldrCacheMeta {
 }
 
 function readStdin(): string {
-  return readFileSync(0, 'utf-8');
+  return readStdinSync();
 }
 
 function getCacheAge(projectDir: string): number | undefined {

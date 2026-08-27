@@ -5,8 +5,7 @@
  * a reminder to verify the root cause before explaining to the user.
  */
 
-import { readFileSync } from 'fs';
-
+import { readStdinSync } from './shared/stdin.js';
 interface PostToolUseInput {
   tool_name: string;
   tool_input: {
@@ -106,7 +105,7 @@ function isRecordInput(value: unknown): value is Record<string, unknown> {
 function main(): void {
   let input: PostToolUseInput;
   try {
-    const stdinContent = readFileSync(0, 'utf-8');
+    const stdinContent = readStdinSync();
     const parsed = JSON.parse(stdinContent);
     if (!isRecordInput(parsed)) {
       console.log(JSON.stringify({ result: 'continue' }));

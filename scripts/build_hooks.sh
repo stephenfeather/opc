@@ -94,6 +94,15 @@ if [ -e "$STAGING" ] || [ -L "$STAGING" ]; then
     exit 1
 fi
 
+# Issue #291: fs.readFileSync(0) races Claude Code's stdin write and throws
+# EAGAIN on Node 26. Hooks must read stdin via shared/stdin.ts. Fail the build
+# if the pattern comes back (tests cover this too; this catches it earlier).
+if offenders=$(rg -n 'readFileSync\(\s*0\s*,' src --glob '!**/__tests__/**' --glob '!shared/stdin.ts' 2>/dev/null) && [ -n "$offenders" ]; then
+    echo "build_hooks: readFileSync(0) is forbidden in hooks (use shared/stdin.ts readStdinSync) — see issue #291:" >&2
+    echo "$offenders" >&2
+    exit 1
+fi
+
 npx esbuild src/*.ts --bundle --platform=node --format=esm \
     --outdir="$STAGING" --out-extension:.js=.mjs \
     --external:better-sqlite3 --legal-comments=inline

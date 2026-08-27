@@ -7,7 +7,8 @@
  * This helps developers identify cleanup opportunities at the start of work.
  */
 
-import { readFileSync, existsSync } from 'fs';
+import { existsSync } from 'fs';
+import { readStdinSync } from './shared/stdin.js';
 import { queryDaemonSync, trackHookActivitySync } from './daemon-client.js';
 
 interface SessionStartInput {
@@ -29,7 +30,7 @@ interface DeadCodeResult {
 }
 
 function readStdin(): string {
-  return readFileSync(0, 'utf-8');
+  return readStdinSync();
 }
 
 // Query daemon for dead code analysis (fast - uses in-memory indexes)

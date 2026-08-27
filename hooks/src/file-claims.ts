@@ -10,7 +10,7 @@
  * Part of the coordination layer architecture (Phase 1).
  */
 
-import { readFileSync } from 'fs';
+import { readStdinSync } from './shared/stdin.js';
 import { checkFileClaim, claimFile } from './shared/db-utils-pg.js';
 import { getProject } from './shared/session-id.js';
 import { isValidId } from './shared/db-utils-pg.js';
@@ -24,7 +24,7 @@ export function main(): void {
   // Read hook input from stdin
   let input: PreToolUseInput;
   try {
-    const stdinContent = readFileSync(0, 'utf-8');
+    const stdinContent = readStdinSync();
     input = JSON.parse(stdinContent) as PreToolUseInput;
   } catch {
     // If we can't read input, continue silently

@@ -5,7 +5,7 @@
  * Uses TLDR daemon for fast function lookup (replaces CLI spawning).
  */
 
-import { readFileSync } from 'fs';
+import { readStdinSync } from './shared/stdin.js';
 import { queryDaemonSync, setQueryDeadline, trackHookActivitySync } from './daemon-client.js';
 
 // Overall daemon budget. This hook runs under a 5s Claude Code timeout but
@@ -128,7 +128,7 @@ function getProjectDir(): string {
 }
 
 async function main() {
-  const input: HookInput = JSON.parse(readFileSync(0, 'utf-8'));
+  const input: HookInput = JSON.parse(readStdinSync());
 
   if (input.tool_name !== 'Edit') {
     console.log('{}');

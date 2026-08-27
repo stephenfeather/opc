@@ -8,7 +8,7 @@
  * Peer session awareness is handled by peer-awareness.ts (UserPromptSubmit).
  */
 
-import { readFileSync } from 'fs';
+import { readStdinSync } from './shared/stdin.js';
 import { join } from 'path';
 import { registerSession, isValidId } from './shared/db-utils-pg.js';
 import { pgCoordinationStatus, backendExplicitlySet } from './shared/backend-resolution.js';
@@ -30,7 +30,7 @@ export function main(): void {
   // Read hook input from stdin
   let input: SessionStartInput;
   try {
-    const stdinContent = readFileSync(0, 'utf-8');
+    const stdinContent = readStdinSync();
     input = JSON.parse(stdinContent) as SessionStartInput;
   } catch {
     // If we can't read input, just continue silently

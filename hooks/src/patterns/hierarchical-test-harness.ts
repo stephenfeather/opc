@@ -3,11 +3,11 @@
  * Reads JSON from stdin and calls the appropriate handler based on the input.
  */
 
-import { readFileSync } from 'fs';
+import { readStdinSync } from '../shared/stdin.js';
 import * as hierarchical from './hierarchical.js';
 
 async function readStdin(): Promise<string> {
-  return readFileSync(0, 'utf-8');
+  return readStdinSync();
 }
 
 async function main() {

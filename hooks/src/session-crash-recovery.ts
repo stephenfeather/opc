@@ -14,6 +14,7 @@
  */
 
 import { existsSync, writeFileSync, mkdirSync } from 'fs';
+import { readStdinSync } from './shared/stdin.js';
 import { readFileSync } from 'fs';
 import { execSync } from 'child_process';
 import * as path from 'path';
@@ -151,7 +152,7 @@ function isSessionCrashed(session: CrashedSession): boolean {
 }
 
 async function main() {
-  const input: SessionStartInput = JSON.parse(readFileSync(0, 'utf-8'));
+  const input: SessionStartInput = JSON.parse(readStdinSync());
   const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
 
   // Only run on startup (not resume/compact/clear)

@@ -188,6 +188,16 @@ class TestSqlTable:
         assert "@@" in sql
         assert "ts_rank" in sql
 
+    def test_postgres_span_lookup_keeps_sqlite_tie_breakers(self):
+        """SQLite orders by created_at, task_number, rowid. PG created_at is now()
+        (adapter drops the real value) so ties within one index run are common;
+        keep task_number then a stable file_path tie-break."""
+        sql = sql_for("postgres", "get_handoff_by_span_id")
+        order = sql.split("ORDER BY", 1)[1]
+        assert "h.created_at DESC" in order
+        assert "task-([0-9]{1,6})')::int DESC" in order
+        assert order.index("created_at") < order.index("task-(") < order.index("h.file_path DESC")
+
     def test_postgres_handoffs_maps_schema_shape(self):
         sql = sql_for("postgres", "search_handoffs")
         assert "goal AS task_summary" in sql

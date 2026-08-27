@@ -430,7 +430,7 @@ Located at `.claude/cache/artifact-index/context.db`. Schema defined in `scripts
 | Script/Hook | Operation | Details |
 |-------------|-----------|---------|
 | `scripts/core/artifact_index.py` | WRITE | Indexes handoff files |
-| `scripts/core/artifact_query.py` | READ | `search_handoffs()`, `get_handoff_by_span_id()` — FTS5 search |
+| `scripts/core/artifact_query.py` | READ | `search_handoffs()`, `get_handoff_by_span_id()` — FTS5 search on SQLite; on PostgreSQL, `websearch_to_tsquery` over `goal`/`what_worked`/`what_failed`/`key_decisions` backed by `idx_handoffs_search_fts` (GIN), with `goal` returned as `task_summary` and `task_number` derived from the `task-NN` filename (issue #282) |
 | `scripts/braintrust_analyze.py` | READ | `search_handoffs()` for contextual critique |
 
 ---
@@ -455,7 +455,7 @@ Located at `.claude/cache/artifact-index/context.db`. Schema defined in `scripts
 | Script/Hook | Operation | Details |
 |-------------|-----------|---------|
 | `scripts/core/artifact_index.py` | WRITE | Indexes plan files |
-| `scripts/core/artifact_query.py` | READ | `search_plans()` — FTS5 search |
+| `scripts/core/artifact_query.py` | READ | `search_plans()` — FTS5 search; on PostgreSQL `idx_plans_search_fts` (GIN) over title/overview/approach/phases, `indexed_at` returned as `created_at` |
 
 ---
 
@@ -479,7 +479,7 @@ Located at `.claude/cache/artifact-index/context.db`. Schema defined in `scripts
 | Script/Hook | Operation | Details |
 |-------------|-----------|---------|
 | `scripts/core/artifact_index.py` | WRITE | Indexes continuity ledger files |
-| `scripts/core/artifact_query.py` | READ | `search_continuity()`, `get_ledger_for_session()` |
+| `scripts/core/artifact_query.py` | READ | `search_continuity()`, `get_ledger_for_session()`; on PostgreSQL `idx_continuity_search_fts` (GIN), `indexed_at` returned as `created_at` |
 
 ---
 
@@ -503,7 +503,7 @@ Compound learning from Q&A — stores past questions and answers for deduplicati
 
 | Script/Hook | Operation | Details |
 |-------------|-----------|---------|
-| `scripts/core/artifact_query.py` | READ | `search_past_queries()` |
+| `scripts/core/artifact_query.py` | READ | `search_past_queries()` — SQLite only; returns `[]` on PostgreSQL or when `queries_fts` is absent |
 
 ---
 

@@ -125,6 +125,8 @@ Search the Context Graph for precedent from past sessions.
 | `with_content` | bool | | Include full file content |
 | `by_span_id` | str | | Fetch a handoff by Braintrust `root_span_id` |
 
+Reads from the same backend the indexer writes to (issue #282): PostgreSQL when it is the active backend (`AGENTICA_MEMORY_BACKEND` + a `CONTINUOUS_CLAUDE_DB_URL`/`DATABASE_URL`/`OPC_POSTGRES_URL` URL), otherwise the SQLite index at `.claude/cache/artifact-index/context.db`. The CLI's `--db <path>` always forces SQLite. Multi-word queries match artifacts containing *any* term on both backends. `past_queries` is always empty on PostgreSQL and `--save` is rejected there (exit 2) — the `queries` table exists only in the SQLite schema. PostgreSQL connection/schema failures exit 1 with a diagnostic; there is no automatic SQLite fallback.
+
 ### Documents (RAG collections)
 
 #### `query_documents`

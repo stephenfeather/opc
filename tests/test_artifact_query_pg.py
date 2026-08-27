@@ -605,6 +605,10 @@ class TestPostgresFailureBoundary:
             ("postgresql://u:pw@h:5432/db", "postgresql://***:***@h:5432/db"),
             ("host=h password=pw user=u", "host=h password=*** user=u"),
             ("connection refused at h:5432", "connection refused at h:5432"),
+            (
+                'missing "=" after "postgres//u:pw@h/db"',
+                'missing "=" after "postgres//***:***@h/db"',
+            ),
         ),
     )
     def test_redact_credentials(self, raw, expected):

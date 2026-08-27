@@ -880,17 +880,19 @@ def _is_pg_error(exc: BaseException) -> bool:
     return type(exc).__module__.split(".")[0] == "psycopg2"
 
 
-_URL_CREDS_RE = re.compile(r"://[^/\s@]*:[^@/\s]*@")
+# Any ``user:password@`` token, not only after ``://`` — a *malformed* DSN (the
+# case libpq echoes verbatim) may be missing the scheme separator entirely.
+_USERINFO_RE = re.compile(r"[^\s/:@\"']+:[^\s/:@\"']+@")
 _KV_PASSWORD_RE = re.compile(r"(password=)\S+")
 
 
 def redact_credentials(text: str) -> str:
-    """Mask credentials in URL (``://user:pw@``) or key=value (``password=``) form.
+    """Mask credentials in URL/userinfo (``user:pw@``) or key=value (``password=``) form.
 
     libpq echoes a malformed DSN verbatim in its error text, so anything that
     prints a psycopg2 message must pass through here first.
     """
-    text = _URL_CREDS_RE.sub("://***:***@", text)
+    text = _USERINFO_RE.sub("***:***@", text)
     return _KV_PASSWORD_RE.sub(r"\1***", text)
 
 

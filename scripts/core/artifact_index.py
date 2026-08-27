@@ -456,24 +456,35 @@ def _is_pg(conn) -> bool:
     return not isinstance(conn, sqlite3.Connection)
 
 
-def prune_legacy_rows(conn, table: str) -> int:
-    """Delete rows whose path is not absolute (pre-#283 relative-glob rows).
+def prune_legacy_rows(conn, table: str, canonical_path: str) -> int:
+    """Delete the legacy relative-path row(s) that ``canonical_path`` replaces.
 
-    Idempotent: canonical rows have absolute paths and are never touched. Returns
-    the number of rows removed. Only tables in ``_PRUNABLE_TABLES`` are allowed —
-    the name is interpolated into SQL, so it must come from that allowlist.
+    Pre-#283 bulk runs stored the relative glob path (``thoughts/shared/plans/p.md``)
+    and hashed the id from it; the canonical row uses the absolute path. A legacy
+    row is matched only when its relative ``file_path`` is a path-suffix of the
+    canonical absolute path just written, so rows belonging to other projects in
+    a shared database are never touched, and nothing is deleted unless its
+    replacement already exists. Idempotent; returns the number of rows removed.
+
+    Only tables in ``_PRUNABLE_TABLES`` are allowed — the name is interpolated
+    into SQL, so it must come from that allowlist.
     """
     if table not in _PRUNABLE_TABLES:
         raise ValueError(f"prune_legacy_rows: unsupported table {table!r}")
+    if not canonical_path.startswith("/"):
+        raise ValueError("prune_legacy_rows: canonical_path must be absolute")
     column = _PRUNABLE_TABLES[table]
     if _is_pg(conn):
+        # '%%' is a literal '%' for psycopg2's parameter interpolation.
+        sql = f"DELETE FROM {table} WHERE {column} NOT LIKE '/%%' " f"AND %s LIKE '%%/' || {column}"
         cur = conn.cursor()
         try:
-            cur.execute(f"DELETE FROM {table} WHERE {column} NOT LIKE %s", ("/%",))
+            cur.execute(sql, (canonical_path,))
             return cur.rowcount
         finally:
             cur.close()
-    return conn.execute(f"DELETE FROM {table} WHERE {column} NOT LIKE ?", ("/%",)).rowcount
+    sql = f"DELETE FROM {table} WHERE {column} NOT LIKE '/%' AND ? LIKE '%/' || {column}"
+    return conn.execute(sql, (canonical_path,)).rowcount
 
 
 def parse_plan(file_path: Path) -> dict:
@@ -489,20 +500,21 @@ def index_plans(conn, base_path: Path = Path("thoughts/shared/plans")):
         print(f"Plans directory not found: {base_path}")
         return 0
 
-    pruned = prune_legacy_rows(conn, "plans")
-    if pruned:
-        print(f"Removed {pruned} legacy relative-path plan rows (re-indexed below)")
-
     count = 0
+    pruned = 0
     for plan_file in base_path.glob("*.md"):
         try:
             data = parse_plan(plan_file)
             _index_plan(conn, data)
+            # Replacement row is written; now retire its pre-#283 relative twin.
+            pruned += prune_legacy_rows(conn, "plans", data["file_path"])
             count += 1
         except Exception as e:
             print(f"Error indexing {plan_file}: {e}")
 
     conn.commit()
+    if pruned:
+        print(f"Removed {pruned} legacy relative-path plan rows")
     print(f"Indexed {count} plans")
     return count
 
@@ -521,15 +533,9 @@ def index_continuity(conn, base_path: Path = Path(".")):
         try:
             data = parse_continuity(ledger_file)
             _index_continuity(conn, data)
-            # One ledger per session: drop any pre-#283 row for this session
-            # whose id was hashed from a relative path (continuity stores no
-            # file_path, so the session name is the only legacy key).
-            db_execute(
-                conn,
-                "DELETE FROM continuity WHERE session_name = ? AND id != ?",
-                (data["session_name"], data["id"]),
-                table_hint="continuity",
-            )
+            # No legacy pruning here: continuity stores no file_path, and a
+            # session name alone cannot distinguish a stale row from another
+            # project's ledger in a shared database (#284 decides its future).
             count += 1
         except Exception as e:
             print(f"Error indexing {ledger_file}: {e}")

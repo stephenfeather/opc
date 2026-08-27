@@ -208,28 +208,58 @@ class TestLegacyRowPruning:
         rows = conn.execute("SELECT file_path FROM plans").fetchall()
         assert rows == [(str((repo / "thoughts/shared/plans/p.md").resolve()),)]
 
-    def test_bulk_index_replaces_legacy_relative_continuity_row(self, conn, repo):
+    def test_continuity_never_deletes_other_rows_with_same_session_name(self, conn, repo):
+        """A session name is not a project discriminator; another project's
+        ledger with the same name must survive a bulk run (review R2)."""
         conn.execute(
             "INSERT INTO continuity (id, session_name) VALUES (?, ?)",
-            ("legacyid", "sess"),
+            ("other-project", "sess"),
         )
         conn.commit()
         ai.index_continuity(conn, Path("."))
-        ids = [r[0] for r in conn.execute("SELECT id FROM continuity").fetchall()]
-        assert ids == [generate_file_id(str((repo / "CONTINUITY_CLAUDE-sess.md").resolve()))]
+        ids = {r[0] for r in conn.execute("SELECT id FROM continuity").fetchall()}
+        assert ids == {
+            "other-project",
+            generate_file_id(str((repo / "CONTINUITY_CLAUDE-sess.md").resolve())),
+        }
 
-    def test_prune_is_idempotent_and_keeps_absolute_rows(self, conn, repo):
+    def test_prune_only_removes_the_suffix_twin_of_the_written_row(self, conn, repo):
         absolute = str((repo / "thoughts/shared/plans/p.md").resolve())
-        conn.execute(
-            "INSERT INTO plans (id, title, file_path) VALUES (?, ?, ?)", ("a", "t", absolute)
+        rows = (
+            ("a", absolute),  # canonical row — kept
+            ("twin", "thoughts/shared/plans/p.md"),  # legacy twin of `absolute` — removed
+            ("deeper", "shared/plans/p.md"),  # also a suffix twin — removed
+            ("foreign", "thoughts/shared/plans/other.md"),  # another file — kept
+            ("elsewhere", "some/other/project/thoughts/shared/plans/p.md"),  # not a suffix — kept
         )
+        for rid, path in rows:
+            conn.execute(
+                "INSERT INTO plans (id, title, file_path) VALUES (?, ?, ?)", (rid, "t", path)
+            )
+        conn.commit()
+        assert ai.prune_legacy_rows(conn, "plans", absolute) == 2
+        assert ai.prune_legacy_rows(conn, "plans", absolute) == 0  # idempotent
+        kept = {r[0] for r in conn.execute("SELECT id FROM plans").fetchall()}
+        assert kept == {"a", "foreign", "elsewhere"}
+
+    def test_prune_requires_absolute_canonical_path(self, conn):
+        with pytest.raises(ValueError):
+            ai.prune_legacy_rows(conn, "plans", "thoughts/shared/plans/p.md")
+
+    def test_legacy_row_survives_when_its_file_fails_to_index(self, conn, repo, monkeypatch):
+        """Deletion happens only after the replacement is written (review R2)."""
         conn.execute(
-            "INSERT INTO plans (id, title, file_path) VALUES (?, ?, ?)", ("r", "t", "rel/p.md")
+            "INSERT INTO plans (id, title, file_path) VALUES (?, ?, ?)",
+            ("legacyid", "old", "thoughts/shared/plans/p.md"),
         )
         conn.commit()
-        assert ai.prune_legacy_rows(conn, "plans") == 1
-        assert ai.prune_legacy_rows(conn, "plans") == 0
-        assert conn.execute("SELECT id FROM plans").fetchall() == [("a",)]
+
+        def boom(_path):
+            raise OSError("unreadable")
+
+        monkeypatch.setattr(ai, "parse_plan", boom)
+        ai.index_plans(conn, Path("thoughts/shared/plans"))
+        assert conn.execute("SELECT id FROM plans").fetchall() == [("legacyid",)]
 
     def test_handoffs_are_not_pruned_here(self, conn, repo):
         """Legacy handoff rows span ~600 project roots; #287 backfill owns them."""
@@ -243,7 +273,7 @@ class TestLegacyRowPruning:
 
     def test_prune_rejects_unknown_table(self, conn):
         with pytest.raises(ValueError):
-            ai.prune_legacy_rows(conn, "handoffs; DROP TABLE plans")
+            ai.prune_legacy_rows(conn, "handoffs; DROP TABLE plans", "/abs/p.md")
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +336,28 @@ class TestHandoffAdapter:
     def test_created_at_never_regresses_on_conflict(self):
         sql, _ = self._adapt()
         assert "created_at = COALESCE(EXCLUDED.created_at, handoffs.created_at)" in sql
+
+    @pytest.mark.parametrize(
+        "col",
+        ("session_name", "root_span_id", "turn_span_id", "session_id", "braintrust_session_id"),
+    )
+    def test_identity_fields_survive_blank_reindex(self, col):
+        """Parsers emit '' for absent frontmatter; a re-index must not erase
+        previously captured correlation ids with blanks (review R2)."""
+        sql, _ = self._adapt()
+        flat = "".join(sql.split())  # whitespace-insensitive: clauses may wrap
+        assert f"{col}=COALESCE(NULLIF(EXCLUDED.{col},''),handoffs.{col})" in flat
+
+    def test_task_number_survives_null_reindex(self):
+        sql, _ = self._adapt()
+        assert "task_number = COALESCE(EXCLUDED.task_number, handoffs.task_number)" in sql
+
+    @pytest.mark.parametrize(
+        "col", ("goal", "what_worked", "what_failed", "key_decisions", "files_modified", "outcome")
+    )
+    def test_content_fields_mirror_the_file(self, col):
+        sql, _ = self._adapt()
+        assert f"{col} = EXCLUDED.{col}" in sql
 
     def test_empty_created_at_becomes_null(self):
         params: list = list(_SQLITE_ORDER[:15]) + [""]

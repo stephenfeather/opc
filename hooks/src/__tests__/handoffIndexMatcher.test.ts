@@ -8,7 +8,22 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { classifyArtifactPath } from '../handoff-index.js';
+import { classifyArtifactPath, isIndexableToolEvent } from '../handoff-index.js';
+
+describe('isIndexableToolEvent', () => {
+  it('accepts the file-writing tools', () => {
+    expect(isIndexableToolEvent('Write')).toBe(true);
+    expect(isIndexableToolEvent('Edit')).toBe(true);
+    expect(isIndexableToolEvent('MultiEdit')).toBe(true);
+  });
+
+  it('rejects everything else', () => {
+    expect(isIndexableToolEvent('Read')).toBe(false);
+    expect(isIndexableToolEvent('Bash')).toBe(false);
+    expect(isIndexableToolEvent('')).toBe(false);
+    expect(isIndexableToolEvent(undefined)).toBe(false);
+  });
+});
 
 describe('classifyArtifactPath', () => {
   it('classifies markdown handoffs', () => {

@@ -75,6 +75,10 @@ function extractSessionName(filePath) {
   }
   return null;
 }
+var INDEXABLE_TOOLS = /* @__PURE__ */ new Set(["Write", "Edit", "MultiEdit"]);
+function isIndexableToolEvent(toolName) {
+  return !!toolName && INDEXABLE_TOOLS.has(toolName);
+}
 function classifyArtifactPath(filePath) {
   if (!filePath) return null;
   const normalized = filePath.replace(/\\/g, "/");
@@ -96,7 +100,7 @@ async function main() {
   const input = JSON.parse(await readStdin());
   const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const homeDir = process.env.HOME || process.env.USERPROFILE || "";
-  if (input.tool_name !== "Write") {
+  if (!isIndexableToolEvent(input.tool_name)) {
     console.log(JSON.stringify({ result: "continue" }));
     return;
   }
@@ -184,5 +188,6 @@ if (process.argv[1] && (process.argv[1].endsWith("handoff-index.ts") || process.
   main().catch(console.error);
 }
 export {
-  classifyArtifactPath
+  classifyArtifactPath,
+  isIndexableToolEvent
 };

@@ -133,6 +133,13 @@ function extractSessionName(filePath: string): string | null {
 
 export type ArtifactKind = 'handoff' | 'plan';
 
+const INDEXABLE_TOOLS: ReadonlySet<string> = new Set(['Write', 'Edit', 'MultiEdit']);
+
+/** True for tool events that change a file's content on disk. */
+export function isIndexableToolEvent(toolName: string | undefined): boolean {
+  return !!toolName && INDEXABLE_TOOLS.has(toolName);
+}
+
 /**
  * Decide whether a written file is an artifact the indexer should ingest.
  *
@@ -166,8 +173,10 @@ async function main() {
   const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const homeDir = process.env.HOME || process.env.USERPROFILE || '';
 
-  // Only process Write tool calls
-  if (input.tool_name !== 'Write') {
+  // Only process file-writing tool calls. The hook is registered with
+  // matcher "Write" today; accepting Edit/MultiEdit here means widening that
+  // matcher later re-indexes edited plans without a code change (#283).
+  if (!isIndexableToolEvent(input.tool_name)) {
     console.log(JSON.stringify({ result: 'continue' }));
     return;
   }

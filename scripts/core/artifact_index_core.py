@@ -290,22 +290,28 @@ def adapt_for_postgres(sql: str, params: tuple, table_hint: str) -> tuple:
             VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s)
             ON CONFLICT (file_path) DO UPDATE SET
-                session_name = EXCLUDED.session_name,
+                session_name = COALESCE(NULLIF(EXCLUDED.session_name, ''), handoffs.session_name),
                 session_uuid = COALESCE(EXCLUDED.session_uuid, handoffs.session_uuid),
-                task_number = EXCLUDED.task_number,
+                task_number = COALESCE(EXCLUDED.task_number, handoffs.task_number),
                 goal = EXCLUDED.goal,
                 what_worked = EXCLUDED.what_worked,
                 what_failed = EXCLUDED.what_failed,
                 key_decisions = EXCLUDED.key_decisions,
                 files_modified = EXCLUDED.files_modified,
                 outcome = EXCLUDED.outcome,
-                root_span_id = EXCLUDED.root_span_id,
-                turn_span_id = EXCLUDED.turn_span_id,
-                session_id = EXCLUDED.session_id,
-                braintrust_session_id = EXCLUDED.braintrust_session_id,
+                root_span_id = COALESCE(NULLIF(EXCLUDED.root_span_id, ''), handoffs.root_span_id),
+                turn_span_id = COALESCE(NULLIF(EXCLUDED.turn_span_id, ''), handoffs.turn_span_id),
+                session_id = COALESCE(NULLIF(EXCLUDED.session_id, ''), handoffs.session_id),
+                braintrust_session_id = COALESCE(
+                    NULLIF(EXCLUDED.braintrust_session_id, ''), handoffs.braintrust_session_id
+                ),
                 created_at = COALESCE(EXCLUDED.created_at, handoffs.created_at),
                 indexed_at = NOW()
         """
+        # Content fields (goal, what_worked, what_failed, key_decisions,
+        # files_modified, outcome) mirror the file and are overwritten on
+        # re-index. Correlation/identity fields are only replaced by a non-empty
+        # incoming value so a partial rewrite cannot erase trace metadata.
         if len(params) != 16:
             raise ValueError(
                 f"Expected 16 handoff params for PostgreSQL adaptation, got {len(params)}"

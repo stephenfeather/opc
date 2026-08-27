@@ -14,16 +14,65 @@ import * as path from 'path';
 import {
   classifyArtifactPath,
   indexScriptCandidates,
+  indexerArgs,
   isIndexableToolEvent,
   isWithinProject,
+  uvProjectDir,
 } from '../handoff-index.js';
 
 describe('indexScriptCandidates', () => {
-  it('prefers scripts/core/artifact_index.py and falls back to the legacy path', () => {
-    expect(indexScriptCandidates('/repo')).toEqual([
+  it('prefers the centralised OPC dir, then project-relative locations', () => {
+    expect(indexScriptCandidates('/some/project', '/Users/me/opc')).toEqual([
+      '/Users/me/opc/scripts/core/artifact_index.py',
+      '/some/project/scripts/core/artifact_index.py',
+      '/some/project/scripts/artifact_index.py',
+    ]);
+  });
+
+  it('falls back to project-relative locations when no OPC dir is resolvable', () => {
+    expect(indexScriptCandidates('/repo', null)).toEqual([
       '/repo/scripts/core/artifact_index.py',
       '/repo/scripts/artifact_index.py',
     ]);
+    expect(indexScriptCandidates('/repo')).toEqual(indexScriptCandidates('/repo', null));
+  });
+});
+
+describe('indexerArgs', () => {
+  it('runs the indexer inside the OPC project environment', () => {
+    expect(indexerArgs('/opc/scripts/core/artifact_index.py', '/p/thoughts/shared/plans/x.md', '/opc')).toEqual([
+      'run', '--project', '/opc', 'python', '/opc/scripts/core/artifact_index.py', '--file', '/p/thoughts/shared/plans/x.md',
+    ]);
+  });
+
+  it('omits --project when no OPC dir is resolvable', () => {
+    expect(indexerArgs('/p/scripts/core/artifact_index.py', '/p/a.md', null)).toEqual([
+      'run', 'python', '/p/scripts/core/artifact_index.py', '--file', '/p/a.md',
+    ]);
+  });
+});
+
+describe('uvProjectDir', () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'uvp-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('returns the dir when it is a uv project', () => {
+    fs.writeFileSync(path.join(root, 'pyproject.toml'), '[project]\nname = "x"\n');
+    expect(uvProjectDir(root)).toBe(root);
+  });
+
+  it('returns null for a script-only or stale dir, and for null', () => {
+    fs.mkdirSync(path.join(root, 'scripts', 'core'), { recursive: true });
+    expect(uvProjectDir(root)).toBeNull();
+    expect(uvProjectDir(path.join(root, 'does-not-exist'))).toBeNull();
+    expect(uvProjectDir(null)).toBeNull();
   });
 });
 

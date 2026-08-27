@@ -188,7 +188,7 @@ Session handoffs/task completions with embeddings for semantic search. Indexed b
 | Script/Hook | Operation | Details |
 |-------------|-----------|---------|
 | `scripts/core/artifact_index.py` | WRITE (upsert) | Indexes handoff markdown files into PostgreSQL via `_adapt_for_postgres()`; `init_postgres()` applies the #282/#283 DDL only when a one-row catalog probe says it is missing, so the per-write `--file` path pays a single SELECT |
-| `hooks/src/handoff-index.ts` | TRIGGER | PostToolUse:Write → `scripts/core/artifact_index.py --file` for handoffs **and** `thoughts/shared/plans/*.md` inside `CLAUDE_PROJECT_DIR` (#283; the hook previously pointed at a non-existent `scripts/artifact_index.py` and never spawned) |
+| `hooks/src/handoff-index.ts` | TRIGGER | PostToolUse:Write → `<opc>/scripts/core/artifact_index.py --file` for handoffs **and** `thoughts/shared/plans/*.md` inside `CLAUDE_PROJECT_DIR`, from any project. The indexer is located via `shared/opc-path.getOpcDir()` (`CLAUDE_OPC_DIR` → `~/.claude/opc.json` → project-relative fallbacks), since OPC is centralised rather than vendored per project (#283; the hook previously looked only under the project and never spawned) |
 
 ---
 

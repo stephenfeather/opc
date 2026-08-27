@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { spawn, execSync } from 'child_process';
 import Database from 'better-sqlite3';
+import { getOpcDir } from './shared/opc-path.js';
 
 interface PostToolUseInput {
   session_id: string;
@@ -136,15 +137,24 @@ export type ArtifactKind = 'handoff' | 'plan';
 const INDEXABLE_TOOLS: ReadonlySet<string> = new Set(['Write', 'Edit', 'MultiEdit']);
 
 /**
- * Where the indexer may live, most specific first. The script has been at
- * scripts/core/ since the core/ split; the old scripts/ location was still
- * hard-coded here, so the hook silently never spawned anything (#283).
+ * Where the indexer may live, most specific first.
+ *
+ * OPC is centralised (CLAUDE_OPC_DIR / ~/.claude/opc.json — see shared/opc-path),
+ * not vendored into every project, so the resolved OPC dir comes first; the
+ * project-relative locations remain as a fallback for the ~/opc repo itself
+ * and legacy layouts. (The old scripts/ location alone was hard-coded here, so
+ * the hook silently never spawned anything — #283.)
  */
-export function indexScriptCandidates(projectDir: string): string[] {
-  return [
+export function indexScriptCandidates(projectDir: string, opcDir: string | null = null): string[] {
+  const candidates: string[] = [];
+  if (opcDir) {
+    candidates.push(path.join(opcDir, 'scripts', 'core', 'artifact_index.py'));
+  }
+  candidates.push(
     path.join(projectDir, 'scripts', 'core', 'artifact_index.py'),
     path.join(projectDir, 'scripts', 'artifact_index.py'),
-  ];
+  );
+  return candidates;
 }
 
 /**
@@ -154,6 +164,32 @@ export function indexScriptCandidates(projectDir: string): string[] {
  * the indexer read (and, for handoffs, rewrite) a file elsewhere. Paths that
  * do not exist are rejected.
  */
+/**
+ * `uv` argv for the indexer. With `--project <opcDir>` uv uses OPC's own
+ * environment (psycopg2 etc.) instead of resolving — or creating — a venv in
+ * whatever project the artifact was written in.
+ */
+export function indexerArgs(indexScript: string, fullPath: string, opcDir: string | null): string[] {
+  const args = ['run'];
+  if (opcDir) {
+    args.push('--project', opcDir);
+  }
+  args.push('python', indexScript, '--file', fullPath);
+  return args;
+}
+
+/**
+ * The OPC dir is only a uv project if it carries a pyproject.toml. getOpcDir()
+ * can also resolve to a script-only install (~/.claude) or a stale opc.json
+ * target; passing those as --project makes uv fail, and a detached child with
+ * ignored stdio would fail silently. Return null so the spawn falls back to
+ * plain `uv run` in the current project.
+ */
+export function uvProjectDir(opcDir: string | null): string | null {
+  if (!opcDir) return null;
+  return fs.existsSync(path.join(opcDir, 'pyproject.toml')) ? opcDir : null;
+}
+
 export function isWithinProject(fullPath: string, projectDir: string): boolean {
   let projectRoot: string;
   let target: string;
@@ -288,10 +324,10 @@ async function main() {
     }
 
     // Always trigger indexing (idempotent, will upsert)
-    const indexScript = indexScriptCandidates(projectDir).find(p => fs.existsSync(p));
+    const indexScript = indexScriptCandidates(projectDir, getOpcDir()).find(p => fs.existsSync(p));
 
     if (indexScript) {
-      const child = spawn('uv', ['run', 'python', indexScript, '--file', fullPath], {
+      const child = spawn('uv', indexerArgs(indexScript, fullPath, uvProjectDir(getOpcDir())), {
         cwd: projectDir,
         detached: true,
         stdio: 'ignore',

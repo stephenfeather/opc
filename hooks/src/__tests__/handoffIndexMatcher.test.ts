@@ -19,11 +19,20 @@ import {
 } from '../handoff-index.js';
 
 describe('indexScriptCandidates', () => {
-  it('prefers scripts/core/artifact_index.py and falls back to the legacy path', () => {
-    expect(indexScriptCandidates('/repo')).toEqual([
+  it('prefers the centralised OPC dir, then project-relative locations', () => {
+    expect(indexScriptCandidates('/some/project', '/Users/me/opc')).toEqual([
+      '/Users/me/opc/scripts/core/artifact_index.py',
+      '/some/project/scripts/core/artifact_index.py',
+      '/some/project/scripts/artifact_index.py',
+    ]);
+  });
+
+  it('falls back to project-relative locations when no OPC dir is resolvable', () => {
+    expect(indexScriptCandidates('/repo', null)).toEqual([
       '/repo/scripts/core/artifact_index.py',
       '/repo/scripts/artifact_index.py',
     ]);
+    expect(indexScriptCandidates('/repo')).toEqual(indexScriptCandidates('/repo', null));
   });
 });
 

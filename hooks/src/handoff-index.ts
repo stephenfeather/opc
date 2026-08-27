@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { spawn, execSync } from 'child_process';
 import Database from 'better-sqlite3';
+import { getOpcDir } from './shared/opc-path.js';
 
 interface PostToolUseInput {
   session_id: string;
@@ -136,15 +137,24 @@ export type ArtifactKind = 'handoff' | 'plan';
 const INDEXABLE_TOOLS: ReadonlySet<string> = new Set(['Write', 'Edit', 'MultiEdit']);
 
 /**
- * Where the indexer may live, most specific first. The script has been at
- * scripts/core/ since the core/ split; the old scripts/ location was still
- * hard-coded here, so the hook silently never spawned anything (#283).
+ * Where the indexer may live, most specific first.
+ *
+ * OPC is centralised (CLAUDE_OPC_DIR / ~/.claude/opc.json — see shared/opc-path),
+ * not vendored into every project, so the resolved OPC dir comes first; the
+ * project-relative locations remain as a fallback for the ~/opc repo itself
+ * and legacy layouts. (The old scripts/ location alone was hard-coded here, so
+ * the hook silently never spawned anything — #283.)
  */
-export function indexScriptCandidates(projectDir: string): string[] {
-  return [
+export function indexScriptCandidates(projectDir: string, opcDir: string | null = null): string[] {
+  const candidates: string[] = [];
+  if (opcDir) {
+    candidates.push(path.join(opcDir, 'scripts', 'core', 'artifact_index.py'));
+  }
+  candidates.push(
     path.join(projectDir, 'scripts', 'core', 'artifact_index.py'),
     path.join(projectDir, 'scripts', 'artifact_index.py'),
-  ];
+  );
+  return candidates;
 }
 
 /**
@@ -288,7 +298,7 @@ async function main() {
     }
 
     // Always trigger indexing (idempotent, will upsert)
-    const indexScript = indexScriptCandidates(projectDir).find(p => fs.existsSync(p));
+    const indexScript = indexScriptCandidates(projectDir, getOpcDir()).find(p => fs.existsSync(p));
 
     if (indexScript) {
       const child = spawn('uv', ['run', 'python', indexScript, '--file', fullPath], {

@@ -3,6 +3,52 @@ import * as fs from "fs";
 import * as path from "path";
 import { spawn, execSync } from "child_process";
 import Database from "better-sqlite3";
+
+// src/shared/opc-path.ts
+import { existsSync, readFileSync } from "fs";
+import { join } from "path";
+function getOpcDirFromConfig() {
+  const homeDir = process.env.HOME || process.env.USERPROFILE || "";
+  if (!homeDir) return null;
+  const configPath = join(homeDir, ".claude", "opc.json");
+  if (!existsSync(configPath)) return null;
+  try {
+    const content = readFileSync(configPath, "utf-8");
+    const config = JSON.parse(content);
+    const opcDir = config.opc_dir;
+    if (opcDir && typeof opcDir === "string" && existsSync(opcDir)) {
+      return opcDir;
+    }
+  } catch {
+  }
+  return null;
+}
+function getOpcDir() {
+  const envOpcDir = process.env.CLAUDE_OPC_DIR;
+  if (envOpcDir && existsSync(envOpcDir)) {
+    return envOpcDir;
+  }
+  const configOpcDir = getOpcDirFromConfig();
+  if (configOpcDir) {
+    return configOpcDir;
+  }
+  const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  const localOpc = join(projectDir, "opc");
+  if (existsSync(localOpc)) {
+    return localOpc;
+  }
+  const homeDir = process.env.HOME || process.env.USERPROFILE || "";
+  if (homeDir) {
+    const globalClaude = join(homeDir, ".claude");
+    const globalScripts = join(globalClaude, "scripts", "core");
+    if (existsSync(globalScripts)) {
+      return globalClaude;
+    }
+  }
+  return null;
+}
+
+// src/handoff-index.ts
 //! @hook PostToolUse:Write @preserve
 function getPpid(pid) {
   if (process.platform === "win32") {
@@ -76,11 +122,16 @@ function extractSessionName(filePath) {
   return null;
 }
 var INDEXABLE_TOOLS = /* @__PURE__ */ new Set(["Write", "Edit", "MultiEdit"]);
-function indexScriptCandidates(projectDir) {
-  return [
+function indexScriptCandidates(projectDir, opcDir = null) {
+  const candidates = [];
+  if (opcDir) {
+    candidates.push(path.join(opcDir, "scripts", "core", "artifact_index.py"));
+  }
+  candidates.push(
     path.join(projectDir, "scripts", "core", "artifact_index.py"),
     path.join(projectDir, "scripts", "artifact_index.py")
-  ];
+  );
+  return candidates;
 }
 function isWithinProject(fullPath, projectDir) {
   let projectRoot;
@@ -179,7 +230,7 @@ ${content}`;
         storeSessionAffinity(projectDir, terminalPid, sessionName);
       }
     }
-    const indexScript = indexScriptCandidates(projectDir).find((p) => fs.existsSync(p));
+    const indexScript = indexScriptCandidates(projectDir, getOpcDir()).find((p) => fs.existsSync(p));
     if (indexScript) {
       const child = spawn("uv", ["run", "python", indexScript, "--file", fullPath], {
         cwd: projectDir,

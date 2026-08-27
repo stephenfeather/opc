@@ -141,6 +141,10 @@ function indexerArgs(indexScript, fullPath, opcDir) {
   args.push("python", indexScript, "--file", fullPath);
   return args;
 }
+function uvProjectDir(opcDir) {
+  if (!opcDir) return null;
+  return fs.existsSync(path.join(opcDir, "pyproject.toml")) ? opcDir : null;
+}
 function isWithinProject(fullPath, projectDir) {
   let projectRoot;
   let target;
@@ -240,7 +244,7 @@ ${content}`;
     }
     const indexScript = indexScriptCandidates(projectDir, getOpcDir()).find((p) => fs.existsSync(p));
     if (indexScript) {
-      const child = spawn("uv", indexerArgs(indexScript, fullPath, getOpcDir()), {
+      const child = spawn("uv", indexerArgs(indexScript, fullPath, uvProjectDir(getOpcDir())), {
         cwd: projectDir,
         detached: true,
         stdio: "ignore",
@@ -269,5 +273,6 @@ export {
   indexScriptCandidates,
   indexerArgs,
   isIndexableToolEvent,
-  isWithinProject
+  isWithinProject,
+  uvProjectDir
 };

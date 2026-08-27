@@ -17,6 +17,7 @@ import {
   indexerArgs,
   isIndexableToolEvent,
   isWithinProject,
+  uvProjectDir,
 } from '../handoff-index.js';
 
 describe('indexScriptCandidates', () => {
@@ -48,6 +49,30 @@ describe('indexerArgs', () => {
     expect(indexerArgs('/p/scripts/core/artifact_index.py', '/p/a.md', null)).toEqual([
       'run', 'python', '/p/scripts/core/artifact_index.py', '--file', '/p/a.md',
     ]);
+  });
+});
+
+describe('uvProjectDir', () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'uvp-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('returns the dir when it is a uv project', () => {
+    fs.writeFileSync(path.join(root, 'pyproject.toml'), '[project]\nname = "x"\n');
+    expect(uvProjectDir(root)).toBe(root);
+  });
+
+  it('returns null for a script-only or stale dir, and for null', () => {
+    fs.mkdirSync(path.join(root, 'scripts', 'core'), { recursive: true });
+    expect(uvProjectDir(root)).toBeNull();
+    expect(uvProjectDir(path.join(root, 'does-not-exist'))).toBeNull();
+    expect(uvProjectDir(null)).toBeNull();
   });
 });
 

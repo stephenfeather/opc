@@ -178,6 +178,18 @@ export function indexerArgs(indexScript: string, fullPath: string, opcDir: strin
   return args;
 }
 
+/**
+ * The OPC dir is only a uv project if it carries a pyproject.toml. getOpcDir()
+ * can also resolve to a script-only install (~/.claude) or a stale opc.json
+ * target; passing those as --project makes uv fail, and a detached child with
+ * ignored stdio would fail silently. Return null so the spawn falls back to
+ * plain `uv run` in the current project.
+ */
+export function uvProjectDir(opcDir: string | null): string | null {
+  if (!opcDir) return null;
+  return fs.existsSync(path.join(opcDir, 'pyproject.toml')) ? opcDir : null;
+}
+
 export function isWithinProject(fullPath: string, projectDir: string): boolean {
   let projectRoot: string;
   let target: string;
@@ -315,7 +327,7 @@ async function main() {
     const indexScript = indexScriptCandidates(projectDir, getOpcDir()).find(p => fs.existsSync(p));
 
     if (indexScript) {
-      const child = spawn('uv', indexerArgs(indexScript, fullPath, getOpcDir()), {
+      const child = spawn('uv', indexerArgs(indexScript, fullPath, uvProjectDir(getOpcDir())), {
         cwd: projectDir,
         detached: true,
         stdio: 'ignore',

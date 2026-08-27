@@ -187,8 +187,8 @@ Session handoffs/task completions with embeddings for semantic search. Indexed b
 
 | Script/Hook | Operation | Details |
 |-------------|-----------|---------|
-| `scripts/core/artifact_index.py` | WRITE (upsert) | Indexes handoff markdown files into PostgreSQL via `_adapt_for_postgres()`; `init_postgres()` adds the #283 columns idempotently |
-| `hooks/src/handoff-index.ts` | TRIGGER | PostToolUse:Write → `artifact_index.py --file` for handoffs **and** `thoughts/shared/plans/*.md` (#283) |
+| `scripts/core/artifact_index.py` | WRITE (upsert) | Indexes handoff markdown files into PostgreSQL via `_adapt_for_postgres()`; `init_postgres()` applies the #282/#283 DDL only when a one-row catalog probe says it is missing, so the per-write `--file` path pays a single SELECT |
+| `hooks/src/handoff-index.ts` | TRIGGER | PostToolUse:Write → `scripts/core/artifact_index.py --file` for handoffs **and** `thoughts/shared/plans/*.md` inside `CLAUDE_PROJECT_DIR` (#283; the hook previously pointed at a non-existent `scripts/artifact_index.py` and never spawned) |
 
 ---
 

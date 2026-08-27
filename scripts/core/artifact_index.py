@@ -32,6 +32,7 @@ try:
     )
     from scripts.core.artifact_index_core import (
         classify_file,
+        legacy_relative_path,
         parse_continuity_content,
         parse_handoff_content,
         parse_handoff_yaml_content,
@@ -48,6 +49,7 @@ except ModuleNotFoundError:
     )
     from artifact_index_core import (  # type: ignore[no-redef]
         classify_file,
+        legacy_relative_path,  # type: ignore[no-redef]
         parse_continuity_content,
         parse_handoff_content,
         parse_handoff_yaml_content,
@@ -204,14 +206,6 @@ def init_postgres():
         )
     """)
 
-    # Idempotent migration for existing databases missing session_uuid
-    cur.execute("""
-        ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS session_uuid TEXT
-    """)
-    cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_handoffs_session_uuid ON handoffs(session_uuid)
-    """)
-
     # Create plans table if not exists
     cur.execute("""
         CREATE TABLE IF NOT EXISTS plans (
@@ -242,18 +236,43 @@ def init_postgres():
         )
     """)
 
-    # Issue #283: the upstream PG tables lack columns the SQLite schema has; the
-    # adapter now carries them, so add them idempotently to existing databases.
-    for ddl in PG_COLUMN_MIGRATIONS:
-        cur.execute(ddl)
-
-    # GIN expression indexes backing artifact_query.py searches (issue #282).
-    # Idempotent; existing databases pick them up on the next indexer run.
-    for ddl in PG_FTS_INDEX_DDL:
-        cur.execute(ddl)
+    # Schema evolution (#282 GIN indexes, #283 columns) is idempotent but not
+    # free: ALTER TABLE / CREATE INDEX take relation locks, and the hook's --file
+    # fast path calls init_postgres() on every artifact write. Gate the DDL on a
+    # single catalog probe so an up-to-date database only pays one SELECT.
+    if not _pg_schema_is_current(cur):
+        # Older migration (session_uuid) lives under the same gate: a database
+        # carrying the sentinel column necessarily went through it already.
+        cur.execute("ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS session_uuid TEXT")
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_handoffs_session_uuid ON handoffs(session_uuid)"
+        )
+        for ddl in PG_COLUMN_MIGRATIONS:
+            cur.execute(ddl)
+        for ddl in PG_FTS_INDEX_DDL:
+            cur.execute(ddl)
 
     conn.commit()
     return conn
+
+
+# The last column and index added by the migrations above; their presence
+# means every earlier statement has already been applied.
+_PG_SCHEMA_SENTINEL_COLUMN = ("plans", "created_at")
+_PG_SCHEMA_SENTINEL_INDEX = "idx_continuity_search_fts"
+_PG_SCHEMA_PROBE_SQL = """
+    SELECT
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_name = %s AND column_name = %s)
+        AND EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = %s)
+"""
+
+
+def _pg_schema_is_current(cur) -> bool:
+    """One catalog SELECT: True when the #282/#283 DDL has already been applied."""
+    cur.execute(_PG_SCHEMA_PROBE_SQL, (*_PG_SCHEMA_SENTINEL_COLUMN, _PG_SCHEMA_SENTINEL_INDEX))
+    row = cur.fetchone()
+    return bool(row and row[0])
 
 
 # =============================================================================
@@ -457,14 +476,15 @@ def _is_pg(conn) -> bool:
 
 
 def prune_legacy_rows(conn, table: str, canonical_path: str) -> int:
-    """Delete the legacy relative-path row(s) that ``canonical_path`` replaces.
+    """Delete the legacy relative-path row that ``canonical_path`` replaces.
 
-    Pre-#283 bulk runs stored the relative glob path (``thoughts/shared/plans/p.md``)
-    and hashed the id from it; the canonical row uses the absolute path. A legacy
-    row is matched only when its relative ``file_path`` is a path-suffix of the
-    canonical absolute path just written, so rows belonging to other projects in
-    a shared database are never touched, and nothing is deleted unless its
-    replacement already exists. Idempotent; returns the number of rows removed.
+    Pre-#283 bulk runs stored the glob path relative to the project root
+    (``thoughts/shared/plans/p.md``) and hashed the id from it; the canonical row
+    uses the absolute path. The legacy twin is derived exactly
+    (:func:`legacy_relative_path`) and matched by equality — no wildcard scan, no
+    LIKE-pattern surprises from stored values — so a row from another project can
+    only be touched if it has the identical relative path, and nothing is deleted
+    unless its replacement was just written. Idempotent; returns rows removed.
 
     Only tables in ``_PRUNABLE_TABLES`` are allowed — the name is interpolated
     into SQL, so it must come from that allowlist.
@@ -473,18 +493,18 @@ def prune_legacy_rows(conn, table: str, canonical_path: str) -> int:
         raise ValueError(f"prune_legacy_rows: unsupported table {table!r}")
     if not canonical_path.startswith("/"):
         raise ValueError("prune_legacy_rows: canonical_path must be absolute")
+    legacy = legacy_relative_path(canonical_path)
+    if legacy is None:
+        return 0
     column = _PRUNABLE_TABLES[table]
     if _is_pg(conn):
-        # '%%' is a literal '%' for psycopg2's parameter interpolation.
-        sql = f"DELETE FROM {table} WHERE {column} NOT LIKE '/%%' " f"AND %s LIKE '%%/' || {column}"
         cur = conn.cursor()
         try:
-            cur.execute(sql, (canonical_path,))
+            cur.execute(f"DELETE FROM {table} WHERE {column} = %s", (legacy,))
             return cur.rowcount
         finally:
             cur.close()
-    sql = f"DELETE FROM {table} WHERE {column} NOT LIKE '/%' AND ? LIKE '%/' || {column}"
-    return conn.execute(sql, (canonical_path,)).rowcount
+    return conn.execute(f"DELETE FROM {table} WHERE {column} = ?", (legacy,)).rowcount
 
 
 def parse_plan(file_path: Path) -> dict:
@@ -675,6 +695,10 @@ def index_single_file(conn, file_path: Path) -> dict:
     try:
         data = parser(file_path)
         row_id = writer(conn, data, return_id=True)
+        if file_type == "plan":
+            # Same transaction as the replacement row (#283 review R3): the hook
+            # path must retire the legacy relative twin too, not only --plans.
+            prune_legacy_rows(conn, "plans", data["file_path"])
         conn.commit()
         if row_id is None:
             # The whole point is to surface the persisted PK; if the write

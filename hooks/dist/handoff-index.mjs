@@ -76,6 +76,16 @@ function extractSessionName(filePath) {
   return null;
 }
 var INDEXABLE_TOOLS = /* @__PURE__ */ new Set(["Write", "Edit", "MultiEdit"]);
+function indexScriptCandidates(projectDir) {
+  return [
+    path.join(projectDir, "scripts", "core", "artifact_index.py"),
+    path.join(projectDir, "scripts", "artifact_index.py")
+  ];
+}
+function isWithinProject(fullPath, projectDir) {
+  const rel = path.relative(path.resolve(projectDir), path.resolve(fullPath));
+  return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+}
 function isIndexableToolEvent(toolName) {
   return !!toolName && INDEXABLE_TOOLS.has(toolName);
 }
@@ -112,7 +122,7 @@ async function main() {
   }
   try {
     const fullPath = path.isAbsolute(filePath) ? filePath : path.join(projectDir, filePath);
-    if (!fs.existsSync(fullPath)) {
+    if (!isWithinProject(fullPath, projectDir) || !fs.existsSync(fullPath)) {
       console.log(JSON.stringify({ result: "continue" }));
       return;
     }
@@ -161,8 +171,8 @@ ${content}`;
         storeSessionAffinity(projectDir, terminalPid, sessionName);
       }
     }
-    const indexScript = path.join(projectDir, "scripts", "artifact_index.py");
-    if (fs.existsSync(indexScript)) {
+    const indexScript = indexScriptCandidates(projectDir).find((p) => fs.existsSync(p));
+    if (indexScript) {
       const child = spawn("uv", ["run", "python", indexScript, "--file", fullPath], {
         cwd: projectDir,
         detached: true,
@@ -178,10 +188,10 @@ ${content}`;
   }
 }
 async function readStdin() {
-  return new Promise((resolve) => {
+  return new Promise((resolve2) => {
     let data = "";
     process.stdin.on("data", (chunk) => data += chunk);
-    process.stdin.on("end", () => resolve(data));
+    process.stdin.on("end", () => resolve2(data));
   });
 }
 if (process.argv[1] && (process.argv[1].endsWith("handoff-index.ts") || process.argv[1].endsWith("handoff-index.js") || process.argv[1].endsWith("handoff-index.mjs"))) {
@@ -189,5 +199,7 @@ if (process.argv[1] && (process.argv[1].endsWith("handoff-index.ts") || process.
 }
 export {
   classifyArtifactPath,
-  isIndexableToolEvent
+  indexScriptCandidates,
+  isIndexableToolEvent,
+  isWithinProject
 };

@@ -135,6 +135,24 @@ export type ArtifactKind = 'handoff' | 'plan';
 
 const INDEXABLE_TOOLS: ReadonlySet<string> = new Set(['Write', 'Edit', 'MultiEdit']);
 
+/**
+ * Where the indexer may live, most specific first. The script has been at
+ * scripts/core/ since the core/ split; the old scripts/ location was still
+ * hard-coded here, so the hook silently never spawned anything (#283).
+ */
+export function indexScriptCandidates(projectDir: string): string[] {
+  return [
+    path.join(projectDir, 'scripts', 'core', 'artifact_index.py'),
+    path.join(projectDir, 'scripts', 'artifact_index.py'),
+  ];
+}
+
+/** True when `fullPath` is lexically inside `projectDir` (no `..` escape). */
+export function isWithinProject(fullPath: string, projectDir: string): boolean {
+  const rel = path.relative(path.resolve(projectDir), path.resolve(fullPath));
+  return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+}
+
 /** True for tool events that change a file's content on disk. */
 export function isIndexableToolEvent(toolName: string | undefined): boolean {
   return !!toolName && INDEXABLE_TOOLS.has(toolName);
@@ -191,7 +209,9 @@ async function main() {
   try {
     const fullPath = path.isAbsolute(filePath) ? filePath : path.join(projectDir, filePath);
 
-    if (!fs.existsSync(fullPath)) {
+    // Only artifacts inside this project are ours to index (a path elsewhere
+    // that happens to contain `handoffs` or `thoughts/shared/plans` is not).
+    if (!isWithinProject(fullPath, projectDir) || !fs.existsSync(fullPath)) {
       console.log(JSON.stringify({ result: 'continue' }));
       return;
     }
@@ -254,9 +274,9 @@ async function main() {
     }
 
     // Always trigger indexing (idempotent, will upsert)
-    const indexScript = path.join(projectDir, 'scripts', 'artifact_index.py');
+    const indexScript = indexScriptCandidates(projectDir).find(p => fs.existsSync(p));
 
-    if (fs.existsSync(indexScript)) {
+    if (indexScript) {
       const child = spawn('uv', ['run', 'python', indexScript, '--file', fullPath], {
         cwd: projectDir,
         detached: true,

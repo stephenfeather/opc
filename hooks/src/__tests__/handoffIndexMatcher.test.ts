@@ -8,7 +8,35 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { classifyArtifactPath, isIndexableToolEvent } from '../handoff-index.js';
+import {
+  classifyArtifactPath,
+  indexScriptCandidates,
+  isIndexableToolEvent,
+  isWithinProject,
+} from '../handoff-index.js';
+
+describe('indexScriptCandidates', () => {
+  it('prefers scripts/core/artifact_index.py and falls back to the legacy path', () => {
+    expect(indexScriptCandidates('/repo')).toEqual([
+      '/repo/scripts/core/artifact_index.py',
+      '/repo/scripts/artifact_index.py',
+    ]);
+  });
+});
+
+describe('isWithinProject', () => {
+  it('accepts paths inside the project', () => {
+    expect(isWithinProject('/repo/thoughts/shared/plans/x.md', '/repo')).toBe(true);
+    expect(isWithinProject('/repo/thoughts/shared/plans/x.md', '/repo/')).toBe(true);
+  });
+
+  it('rejects the project root itself, siblings, and traversal', () => {
+    expect(isWithinProject('/repo', '/repo')).toBe(false);
+    expect(isWithinProject('/repo-other/thoughts/shared/plans/x.md', '/repo')).toBe(false);
+    expect(isWithinProject('/repo/../elsewhere/thoughts/shared/plans/x.md', '/repo')).toBe(false);
+    expect(isWithinProject('/tmp/thoughts/shared/plans/x.md', '/repo')).toBe(false);
+  });
+});
 
 describe('isIndexableToolEvent', () => {
   it('accepts the file-writing tools', () => {

@@ -129,6 +129,12 @@ class TestPlanCreatedAt:
         p.write_text("# Big refactor\n")
         assert ai.parse_plan(p)["created_at"] == "2026-05-09"
 
+    def test_invalid_filename_date_is_ignored(self, repo):
+        """2026-13-45 would abort the TIMESTAMPTZ insert (aegis MEDIUM)."""
+        p = repo / "thoughts/shared/plans/2026-13-45-foo.md"
+        p.write_text("# Bad date\n")
+        assert ai.parse_plan(p)["created_at"] == ""
+
     def test_frontmatter_date_wins_over_filename(self, repo):
         p = repo / "thoughts/shared/plans/2026-05-09_x.md"
         p.write_text("---\ndate: 2026-06-01\n---\n# X\n")
@@ -223,24 +229,39 @@ class TestLegacyRowPruning:
             generate_file_id(str((repo / "CONTINUITY_CLAUDE-sess.md").resolve())),
         }
 
-    def test_prune_only_removes_the_suffix_twin_of_the_written_row(self, conn, repo):
+    def test_prune_only_removes_the_exact_legacy_twin_of_the_written_row(self, conn, repo):
         absolute = str((repo / "thoughts/shared/plans/p.md").resolve())
         rows = (
             ("a", absolute),  # canonical row — kept
             ("twin", "thoughts/shared/plans/p.md"),  # legacy twin of `absolute` — removed
-            ("deeper", "shared/plans/p.md"),  # also a suffix twin — removed
+            ("partial", "shared/plans/p.md"),  # not the legacy form — kept
+            ("wild", "%.md"),  # a LIKE pattern is just a string here — kept
             ("foreign", "thoughts/shared/plans/other.md"),  # another file — kept
-            ("elsewhere", "some/other/project/thoughts/shared/plans/p.md"),  # not a suffix — kept
+            ("elsewhere", "some/other/project/thoughts/shared/plans/p.md"),  # kept
         )
         for rid, path in rows:
             conn.execute(
                 "INSERT INTO plans (id, title, file_path) VALUES (?, ?, ?)", (rid, "t", path)
             )
         conn.commit()
-        assert ai.prune_legacy_rows(conn, "plans", absolute) == 2
+        assert ai.prune_legacy_rows(conn, "plans", absolute) == 1
         assert ai.prune_legacy_rows(conn, "plans", absolute) == 0  # idempotent
         kept = {r[0] for r in conn.execute("SELECT id FROM plans").fetchall()}
-        assert kept == {"a", "foreign", "elsewhere"}
+        assert kept == {"a", "partial", "wild", "foreign", "elsewhere"}
+
+    def test_prune_is_noop_for_paths_outside_a_thoughts_tree(self, conn):
+        assert ai.prune_legacy_rows(conn, "plans", "/somewhere/plan.md") == 0
+
+    def test_single_file_index_also_retires_the_legacy_twin(self, conn, repo):
+        """The hook path (--file) must not leave the pre-#283 row behind (R3)."""
+        conn.execute(
+            "INSERT INTO plans (id, title, file_path) VALUES (?, ?, ?)",
+            ("legacyid", "old", "thoughts/shared/plans/p.md"),
+        )
+        conn.commit()
+        ai.index_single_file(conn, Path("thoughts/shared/plans/p.md"))
+        rows = conn.execute("SELECT file_path FROM plans").fetchall()
+        assert rows == [(str((repo / "thoughts/shared/plans/p.md").resolve()),)]
 
     def test_prune_requires_absolute_canonical_path(self, conn):
         with pytest.raises(ValueError):
@@ -389,22 +410,27 @@ class TestPlanAdapter:
 
 
 class _Cur:
-    def __init__(self, sink):
+    def __init__(self, sink, schema_current):
         self.sink = sink
+        self.schema_current = schema_current
 
     def execute(self, sql, params=None):
         self.sink.append(" ".join(sql.split()))
+
+    def fetchone(self):
+        return (self.schema_current,)
 
     def close(self):
         pass
 
 
 class _Conn:
-    def __init__(self):
+    def __init__(self, schema_current=False):
         self.executed = []
+        self.schema_current = schema_current
 
     def cursor(self):
-        return _Cur(self.executed)
+        return _Cur(self.executed, self.schema_current)
 
     def commit(self):
         pass
@@ -429,6 +455,21 @@ class TestInitPostgresMigration:
         monkeypatch.setattr(ai, "pg_connect", lambda: c)
         ai.init_postgres()
         assert ddl in c.executed
+
+    def test_skips_all_ddl_when_schema_is_current(self, monkeypatch):
+        """The hook's --file fast path calls init_postgres on every write; an
+        up-to-date database must pay one catalog SELECT, no ALTER/CREATE (R3)."""
+        c = _Conn(schema_current=True)
+        monkeypatch.setattr(ai, "pg_connect", lambda: c)
+        ai.init_postgres()
+        ddl = [
+            s
+            for s in c.executed
+            if s.startswith(("ALTER TABLE", "CREATE INDEX IF NOT EXISTS idx_"))
+        ]
+        assert ddl == []
+        probes = [s for s in c.executed if "information_schema.columns" in s]
+        assert len(probes) == 1
 
     def test_docker_schema_has_the_columns(self):
         schema = (Path(__file__).resolve().parent.parent / "docker" / "init-schema.sql").read_text()

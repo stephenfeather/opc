@@ -575,9 +575,28 @@ _FILENAME_DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
 
 def _date_from_filename(file_path) -> str:
     """Return a leading ``YYYY-MM-DD`` from the file name, or "" (plans rarely
-    carry a frontmatter date; dated file names are the next best signal)."""
+    carry a frontmatter date; dated file names are the next best signal).
+
+    Calendar-validated via ``normalize_artifact_date`` — ``2026-13-45-foo.md``
+    must yield "" rather than a value that aborts the TIMESTAMPTZ insert.
+    """
     match = _FILENAME_DATE_RE.match(file_path.name)
-    return match.group(1) if match else ""
+    return (normalize_artifact_date(match.group(1)) or "") if match else ""
+
+
+def legacy_relative_path(canonical_path: str) -> str | None:
+    """Return the pre-#283 relative form of an absolute artifact path, or None.
+
+    Old bulk runs stored the glob path relative to the project root, which always
+    began at the ``thoughts/`` directory (``thoughts/shared/plans/x.md``). The
+    legacy twin is therefore derivable exactly, so callers can delete it with an
+    equality predicate instead of a wildcard scan.
+    """
+    marker = "/thoughts/"
+    idx = canonical_path.find(marker)
+    if not canonical_path.startswith("/") or idx < 0:
+        return None
+    return canonical_path[idx + 1 :]
 
 
 def parse_continuity_content(content: str, file_path) -> dict:

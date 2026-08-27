@@ -191,7 +191,9 @@ class TestSqlTable:
     def test_postgres_handoffs_maps_schema_shape(self):
         sql = sql_for("postgres", "search_handoffs")
         assert "goal AS task_summary" in sql
-        assert "task-([0-9]+)" in sql  # task_number derived from file_path
+        # task_number derived from file_path; bounded so an absurd number in a
+        # poisoned path cannot overflow ::int and abort the whole search.
+        assert "task-([0-9]{1,6})" in sql
         assert "AS task_number" in sql
 
     @pytest.mark.parametrize(
@@ -579,6 +581,34 @@ class TestPostgresFailureBoundary:
         rc = aq._run_span_lookup(self._args("--by-span-id", "x"))
         assert rc == 1
         assert "timeout expired" in capsys.readouterr().err
+
+    def test_malformed_dsn_error_does_not_echo_password(self, monkeypatch, capsys):
+        """libpq echoes a malformed DSN verbatim; credentials must be redacted (aegis LOW)."""
+        monkeypatch.setattr(aq, "use_postgres", lambda: True)
+
+        def bad_dsn():
+            raise _FakePgError(
+                'invalid dsn: missing "=" after "postgres//claude:s3cr3t@localhost/db" '
+                "in connection info string"
+            )
+
+        monkeypatch.setattr(aq, "_open_pg", bad_dsn)
+        rc = aq._run_search(self._args("hello"), "hello")
+        err = capsys.readouterr().err
+        assert rc == 1
+        assert "s3cr3t" not in err
+        assert "invalid dsn" in err
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        (
+            ("postgresql://u:pw@h:5432/db", "postgresql://***:***@h:5432/db"),
+            ("host=h password=pw user=u", "host=h password=*** user=u"),
+            ("connection refused at h:5432", "connection refused at h:5432"),
+        ),
+    )
+    def test_redact_credentials(self, raw, expected):
+        assert aq.redact_credentials(raw) == expected
 
     def test_non_pg_errors_still_propagate(self, monkeypatch):
         monkeypatch.setattr(aq, "use_postgres", lambda: True)

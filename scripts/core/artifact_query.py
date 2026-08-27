@@ -880,6 +880,20 @@ def _is_pg_error(exc: BaseException) -> bool:
     return type(exc).__module__.split(".")[0] == "psycopg2"
 
 
+_URL_CREDS_RE = re.compile(r"://[^/\s@]*:[^@/\s]*@")
+_KV_PASSWORD_RE = re.compile(r"(password=)\S+")
+
+
+def redact_credentials(text: str) -> str:
+    """Mask credentials in URL (``://user:pw@``) or key=value (``password=``) form.
+
+    libpq echoes a malformed DSN verbatim in its error text, so anything that
+    prints a psycopg2 message must pass through here first.
+    """
+    text = _URL_CREDS_RE.sub("://***:***@", text)
+    return _KV_PASSWORD_RE.sub(r"\1***", text)
+
+
 def _report_pg_error(exc: BaseException) -> int:
     """Print a concise, actionable PostgreSQL failure to stderr; return exit code 1.
 
@@ -888,7 +902,7 @@ def _report_pg_error(exc: BaseException) -> int:
     split-brain read this module exists to fix. Pass ``--db <path>`` to query a
     local SQLite index explicitly.
     """
-    print(f"PostgreSQL error: {exc}", file=sys.stderr)
+    print(f"PostgreSQL error: {redact_credentials(str(exc))}", file=sys.stderr)
     if "does not exist" in str(exc):
         print(
             "The artifact tables are missing in this database. "

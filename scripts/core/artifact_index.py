@@ -37,6 +37,7 @@ try:
         parse_handoff_yaml_content,
         parse_plan_content,
     )
+    from scripts.core.artifact_query_sql import PG_FTS_INDEX_DDL
     from scripts.core.db.backend_resolution import (
         get_active_backend,
         get_connection_url,
@@ -52,6 +53,7 @@ except ModuleNotFoundError:
         parse_handoff_yaml_content,
         parse_plan_content,
     )
+    from artifact_query_sql import PG_FTS_INDEX_DDL  # type: ignore[no-redef]
     from db.backend_resolution import (  # type: ignore[no-redef]
         get_active_backend,
         get_connection_url,
@@ -89,6 +91,7 @@ def _bootstrap() -> None:
 # DATABASE BACKEND SELECTION
 # =============================================================================
 
+
 def get_postgres_url() -> str | None:
     """Get PostgreSQL URL via the shared resolver (issue #71).
 
@@ -112,6 +115,7 @@ def use_postgres() -> bool:
         return False
     try:
         import psycopg2  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -120,6 +124,7 @@ def use_postgres() -> bool:
 # =============================================================================
 # SQLITE BACKEND
 # =============================================================================
+
 
 def get_db_path(custom_path: str | None = None) -> Path:
     """Get SQLite database path, creating directory if needed."""
@@ -150,9 +155,11 @@ def init_sqlite(db_path: Path) -> sqlite3.Connection:
 # POSTGRESQL BACKEND
 # =============================================================================
 
+
 def pg_connect():
     """Connect to PostgreSQL."""
     import psycopg2
+
     return psycopg2.connect(get_postgres_url())
 
 
@@ -224,6 +231,11 @@ def init_postgres():
         )
     """)
 
+    # GIN expression indexes backing artifact_query.py searches (issue #282).
+    # Idempotent; existing databases pick them up on the next indexer run.
+    for ddl in PG_FTS_INDEX_DDL:
+        cur.execute(ddl)
+
     conn.commit()
     return conn
 
@@ -231,6 +243,7 @@ def init_postgres():
 # =============================================================================
 # UNIFIED DATABASE INTERFACE
 # =============================================================================
+
 
 class DatabaseConnection:
     """Unified interface for SQLite and PostgreSQL."""
@@ -359,7 +372,6 @@ def db_execute(
     return None
 
 
-
 # --- Helpers imported from artifact_index_core ---
 # Module-level imports provide database adaptation, file classification,
 # and parse_*_content helpers; the remaining I/O wrappers are defined below.
@@ -374,8 +386,6 @@ def parse_handoff(file_path: Path) -> dict:
     return result
 
 
-
-
 def parse_handoff_yaml(file_path: Path) -> dict:
     """Parse a handoff YAML file into structured data."""
     raw_content = file_path.read_text()
@@ -383,8 +393,6 @@ def parse_handoff_yaml(file_path: Path) -> dict:
     if not result["created_at"]:
         result["created_at"] = datetime.now().isoformat()
     return result
-
-
 
 
 def index_handoffs(conn, base_path: Path = Path("thoughts/shared/handoffs")):

@@ -24,9 +24,18 @@ import re
 import secrets
 import sqlite3
 import stat
+import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
+
+# Dual import (package vs by-path execution) — same pattern as artifact_index.py.
+try:
+    from scripts.core.artifact_index import pg_connect, use_postgres
+    from scripts.core.artifact_query_sql import sql_for
+except ModuleNotFoundError:
+    from artifact_index import pg_connect, use_postgres  # type: ignore[no-redef]
+    from artifact_query_sql import sql_for  # type: ignore[no-redef]
 
 # ---------------------------------------------------------------------------
 # Faulthandler (side effect isolated to explicit call)
@@ -183,45 +192,91 @@ def generate_uuid7(
 
 
 # ---------------------------------------------------------------------------
+# Backend-agnostic execution (issue #282)
+# ---------------------------------------------------------------------------
+
+Backend = str  # "sqlite" | "postgres"
+SQLITE = "sqlite"
+POSTGRES = "postgres"
+
+
+def _execute(conn, sql: str, params: list, backend: Backend) -> tuple[list[str], list]:
+    """Run ``sql`` on ``conn`` and return ``(column_names, rows)``.
+
+    SQLite connections execute directly; psycopg2 connections have no
+    ``execute`` and go through a cursor that is always closed. The SQL must
+    already carry the backend's placeholders (``?`` vs ``%s``) — see
+    ``artifact_query_sql``.
+    """
+    if backend == SQLITE:
+        cursor = conn.execute(sql, params)
+        columns = [desc[0] for desc in cursor.description]
+        return columns, cursor.fetchall()
+    if backend == POSTGRES:
+        cur = conn.cursor()
+        try:
+            cur.execute(sql, params)
+            columns = [desc[0] for desc in cur.description] if cur.description else []
+            return columns, cur.fetchall()
+        finally:
+            cur.close()
+    raise ValueError(f"Unknown backend: {backend!r}")
+
+
+def _rows_as_dicts(columns: list[str], rows: list) -> list[dict]:
+    return [dict(zip(columns, row)) for row in rows]
+
+
+def pg_search_query(query: str) -> str:
+    """Build the ``websearch_to_tsquery`` input with the same contract as FTS5.
+
+    Mirrors :func:`escape_fts5_query`: whitespace-split tokens, each quoted and
+    OR-joined, so a multi-word search matches artifacts containing *any* term on
+    both backends (``plainto_tsquery`` would AND them — a silent recall
+    regression). Quoting neutralises websearch operators (``-term``, bare
+    ``OR``/``AND``); embedded double quotes are stripped since they cannot be
+    escaped inside a websearch phrase. ``websearch_to_tsquery`` never raises on
+    malformed input; an empty result simply matches nothing.
+    """
+    tokens = [w.replace('"', "") for w in query.split()]
+    return " OR ".join(f'"{t}"' for t in tokens if t)
+
+
+def _search_params(query: str, backend: Backend) -> list:
+    """Query params bound by the search statements, per backend.
+
+    SQLite FTS5 takes one escaped ``MATCH`` expression; PostgreSQL binds the
+    websearch expression twice (``ts_rank`` in the SELECT and the ``@@`` filter).
+    """
+    if backend == POSTGRES:
+        q = pg_search_query(query)
+        return [q, q]
+    return [escape_fts5_query(query)]
+
+
+# ---------------------------------------------------------------------------
 # DB lookup functions (take conn, return data)
 # ---------------------------------------------------------------------------
 
 
-def get_handoff_by_span_id(conn: sqlite3.Connection, root_span_id: str) -> dict | None:
+def get_handoff_by_span_id(conn, root_span_id: str, backend: Backend = SQLITE) -> dict | None:
     """Get a handoff by its Braintrust root_span_id.
 
     When multiple handoffs share the same root_span_id (e.g. multi-task
     sessions), returns the most recent one by created_at.
     """
-    sql = """
-        SELECT id, session_name, task_number, task_summary,
-               outcome, what_worked, what_failed, key_decisions,
-               file_path, root_span_id, created_at
-        FROM handoffs
-        WHERE root_span_id = ?
-        ORDER BY datetime(created_at) DESC, task_number DESC, rowid DESC
-        LIMIT 1
-    """
-    cursor = conn.execute(sql, [root_span_id])
-    columns = [desc[0] for desc in cursor.description]
-    row = cursor.fetchone()
-    return dict(zip(columns, row)) if row else None
+    columns, rows = _execute(
+        conn, sql_for(backend, "get_handoff_by_span_id"), [root_span_id], backend
+    )
+    return dict(zip(columns, rows[0])) if rows else None
 
 
-def get_ledger_for_session(conn: sqlite3.Connection, session_name: str) -> dict | None:
+def get_ledger_for_session(conn, session_name: str, backend: Backend = SQLITE) -> dict | None:
     """Get continuity ledger by session name."""
-    sql = """
-        SELECT id, session_name, goal, key_learnings, key_decisions,
-               state_done, state_now, state_next, created_at
-        FROM continuity
-        WHERE session_name = ?
-        ORDER BY created_at DESC
-        LIMIT 1
-    """
-    cursor = conn.execute(sql, [session_name])
-    columns = [desc[0] for desc in cursor.description]
-    row = cursor.fetchone()
-    return dict(zip(columns, row)) if row else None
+    columns, rows = _execute(
+        conn, sql_for(backend, "get_ledger_for_session"), [session_name], backend
+    )
+    return dict(zip(columns, rows[0])) if rows else None
 
 
 # ---------------------------------------------------------------------------
@@ -230,79 +285,55 @@ def get_ledger_for_session(conn: sqlite3.Connection, session_name: str) -> dict 
 
 
 def search_handoffs(
-    conn: sqlite3.Connection, query: str, outcome: str | None = None, limit: int = 5
+    conn,
+    query: str,
+    outcome: str | None = None,
+    limit: int = 5,
+    backend: Backend = SQLITE,
 ) -> list:
-    """Search handoffs using FTS5 with BM25 ranking."""
-    sql = """
-        SELECT h.id, h.session_name, h.task_number, h.task_summary,
-               h.what_worked, h.what_failed, h.key_decisions,
-               h.outcome, h.file_path, h.created_at,
-               handoffs_fts.rank as score
-        FROM handoffs_fts
-        JOIN handoffs h ON handoffs_fts.rowid = h.rowid
-        WHERE handoffs_fts MATCH ?
-    """
-    params = [escape_fts5_query(query)]
+    """Search handoffs — FTS5/BM25 on SQLite, tsvector/ts_rank on PostgreSQL."""
+    sql = sql_for(backend, "search_handoffs")
+    params = _search_params(query, backend)
 
     if outcome:
-        sql += " AND h.outcome = ?"
+        sql += sql_for(backend, "search_handoffs_outcome_filter")
         params.append(outcome)
 
-    sql += " ORDER BY rank LIMIT ?"
+    sql += sql_for(backend, "search_handoffs_tail")
     params.append(limit)
 
-    cursor = conn.execute(sql, params)
-    columns = [desc[0] for desc in cursor.description]
-    return [dict(zip(columns, row)) for row in cursor.fetchall()]
+    return _rows_as_dicts(*_execute(conn, sql, params, backend))
 
 
-def search_plans(conn: sqlite3.Connection, query: str, limit: int = 3) -> list:
-    """Search plans using FTS5 with BM25 ranking."""
-    sql = """
-        SELECT p.id, p.title, p.overview, p.approach, p.file_path, p.created_at,
-               plans_fts.rank as score
-        FROM plans_fts
-        JOIN plans p ON plans_fts.rowid = p.rowid
-        WHERE plans_fts MATCH ?
-        ORDER BY rank
-        LIMIT ?
+def search_plans(conn, query: str, limit: int = 3, backend: Backend = SQLITE) -> list:
+    """Search plans — FTS5/BM25 on SQLite, tsvector/ts_rank on PostgreSQL."""
+    params = [*_search_params(query, backend), limit]
+    return _rows_as_dicts(*_execute(conn, sql_for(backend, "search_plans"), params, backend))
+
+
+def search_continuity(conn, query: str, limit: int = 3, backend: Backend = SQLITE) -> list:
+    """Search continuity ledgers — FTS5/BM25 on SQLite, tsvector/ts_rank on PostgreSQL."""
+    params = [*_search_params(query, backend), limit]
+    return _rows_as_dicts(*_execute(conn, sql_for(backend, "search_continuity"), params, backend))
+
+
+def search_past_queries(conn, query: str, limit: int = 2, backend: Backend = SQLITE) -> list:
+    """Check if similar questions have been asked before.
+
+    The ``queries`` tables exist only in the SQLite schema. On PostgreSQL, and on
+    a SQLite database created without them, this returns ``[]`` instead of
+    crashing every search (issue #282).
     """
-    cursor = conn.execute(sql, [escape_fts5_query(query), limit])
-    columns = [desc[0] for desc in cursor.description]
-    return [dict(zip(columns, row)) for row in cursor.fetchall()]
-
-
-def search_continuity(conn: sqlite3.Connection, query: str, limit: int = 3) -> list:
-    """Search continuity ledgers using FTS5 with BM25 ranking."""
-    sql = """
-        SELECT c.id, c.session_name, c.goal, c.key_learnings, c.key_decisions,
-               c.state_now, c.created_at,
-               continuity_fts.rank as score
-        FROM continuity_fts
-        JOIN continuity c ON continuity_fts.rowid = c.rowid
-        WHERE continuity_fts MATCH ?
-        ORDER BY rank
-        LIMIT ?
-    """
-    cursor = conn.execute(sql, [escape_fts5_query(query), limit])
-    columns = [desc[0] for desc in cursor.description]
-    return [dict(zip(columns, row)) for row in cursor.fetchall()]
-
-
-def search_past_queries(conn: sqlite3.Connection, query: str, limit: int = 2) -> list:
-    """Check if similar questions have been asked before."""
-    sql = """
-        SELECT q.id, q.question, q.answer, q.was_helpful, q.created_at,
-               queries_fts.rank as score
-        FROM queries_fts
-        JOIN queries q ON queries_fts.rowid = q.rowid
-        WHERE queries_fts MATCH ?
-        ORDER BY rank
-        LIMIT ?
-    """
-    cursor = conn.execute(sql, [escape_fts5_query(query), limit])
-    columns = [desc[0] for desc in cursor.description]
-    return [dict(zip(columns, row)) for row in cursor.fetchall()]
+    if backend != SQLITE:
+        return []
+    sql = sql_for(SQLITE, "search_past_queries")
+    try:
+        columns, rows = _execute(conn, sql, [escape_fts5_query(query), limit], SQLITE)
+    except sqlite3.OperationalError as e:
+        if "no such table: queries_fts" in str(e):
+            return []
+        raise
+    return _rows_as_dicts(columns, rows)
 
 
 # ---------------------------------------------------------------------------
@@ -480,11 +511,12 @@ def format_results(results: dict, verbose: bool = False) -> str:
 
 
 def search_dispatch(
-    conn: sqlite3.Connection,
+    conn,
     query: str,
     search_type: str = "all",
     outcome: str | None = None,
     limit: int = 5,
+    backend: Backend = SQLITE,
 ) -> dict:
     """Dispatch search to appropriate handlers based on type.
 
@@ -496,19 +528,20 @@ def search_dispatch(
         search_type: One of 'handoffs', 'plans', 'continuity', 'all'
         outcome: Optional outcome filter for handoffs
         limit: Max results per type
+        backend: 'sqlite' or 'postgres' — selects the SQL dialect
 
     Returns:
         Dict with results keyed by type
     """
     results = {}
 
-    # Always check past queries
-    results["past_queries"] = search_past_queries(conn, query)
+    # Always check past queries (empty on PostgreSQL — no queries table there)
+    results["past_queries"] = search_past_queries(conn, query, backend=backend)
 
     search_handlers = {
-        "handoffs": lambda: search_handoffs(conn, query, outcome, limit),
-        "plans": lambda: search_plans(conn, query, limit),
-        "continuity": lambda: search_continuity(conn, query, limit),
+        "handoffs": lambda: search_handoffs(conn, query, outcome, limit, backend=backend),
+        "plans": lambda: search_plans(conn, query, limit, backend=backend),
+        "continuity": lambda: search_continuity(conn, query, limit, backend=backend),
     }
 
     if search_type == "all":
@@ -670,7 +703,7 @@ def read_text_within_root(
 
 
 def handle_span_id_lookup(
-    conn: sqlite3.Connection, span_id: str, with_content: bool = False
+    conn, span_id: str, with_content: bool = False, backend: Backend = SQLITE
 ) -> dict | None:
     """Handle --by-span-id lookup mode.
 
@@ -678,11 +711,12 @@ def handle_span_id_lookup(
         conn: Database connection
         span_id: Braintrust root_span_id to look up
         with_content: Whether to include full file content
+        backend: 'sqlite' or 'postgres'
 
     Returns:
         Handoff dict or None if not found
     """
-    handoff = get_handoff_by_span_id(conn, span_id)
+    handoff = get_handoff_by_span_id(conn, span_id, backend=backend)
 
     if not handoff:
         return None
@@ -724,7 +758,7 @@ def handle_span_id_lookup(
                     "content": ledger_content,
                 }
             else:
-                ledger = get_ledger_for_session(conn, session_name)
+                ledger = get_ledger_for_session(conn, session_name, backend=backend)
                 if ledger:
                     handoff["ledger"] = ledger
 
@@ -796,21 +830,115 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _open_db(db_path: Path) -> sqlite3.Connection:
-    """Open database connection with standard pragmas."""
+    """Open SQLite database connection with standard pragmas."""
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
-def _run_span_lookup(args: argparse.Namespace) -> None:
-    """Handle --by-span-id CLI mode."""
+def _open_pg():
+    """Open a PostgreSQL connection via the indexer's resolver (same URL precedence)."""
+    return pg_connect()
+
+
+def _select_backend(args: argparse.Namespace) -> Backend:
+    """Pick the backend the way the indexer does (issue #282).
+
+    A custom ``--db`` path always means SQLite and is honored BEFORE consulting
+    the resolver, so a mis-set AGENTICA_MEMORY_BACKEND cannot block a purely
+    local SQLite query. Otherwise defer to ``use_postgres()``; its ``ValueError``
+    (invalid backend config) propagates for the caller to report.
+    """
+    if args.db:
+        return SQLITE
+    return POSTGRES if use_postgres() else SQLITE
+
+
+def _resolve_backend_or_report(args: argparse.Namespace) -> Backend | None:
+    """Select the backend, printing a clean diagnostic (not a traceback) on config errors."""
+    try:
+        return _select_backend(args)
+    except ValueError as e:
+        print(f"Backend configuration error: {e}", file=sys.stderr)
+        return None
+
+
+def _open_conn(args: argparse.Namespace, backend: Backend):
+    """Open the connection for ``backend``; ``None`` (with a message) if SQLite DB is missing."""
+    if backend == POSTGRES:
+        return _open_pg()
     db_path = get_db_path(args.db)
     if not db_path.exists():
         print(f"Database not found: {db_path}")
-        return
+        print("Run: uv run python scripts/artifact_index.py --all")
+        return None
+    return _open_db(db_path)
 
-    with contextlib.closing(_open_db(db_path)) as conn:
-        handoff = handle_span_id_lookup(conn, args.by_span_id, with_content=args.with_content)
+
+def _is_pg_error(exc: BaseException) -> bool:
+    """True for any psycopg2 exception, without importing psycopg2 at module load."""
+    return type(exc).__module__.split(".")[0] == "psycopg2"
+
+
+# Any ``user:password@`` token, not only after ``://`` — a *malformed* DSN (the
+# case libpq echoes verbatim) may be missing the scheme separator entirely.
+_USERINFO_RE = re.compile(r"[^\s/:@\"']+:[^\s/:@\"']+@")
+_KV_PASSWORD_RE = re.compile(r"(password=)\S+")
+
+
+def redact_credentials(text: str) -> str:
+    """Mask credentials in URL/userinfo (``user:pw@``) or key=value (``password=``) form.
+
+    libpq echoes a malformed DSN verbatim in its error text, so anything that
+    prints a psycopg2 message must pass through here first.
+    """
+    text = _USERINFO_RE.sub("***:***@", text)
+    return _KV_PASSWORD_RE.sub(r"\1***", text)
+
+
+def _report_pg_error(exc: BaseException) -> int:
+    """Print a concise, actionable PostgreSQL failure to stderr; return exit code 1.
+
+    Connection/auth/timeout failures and missing artifact tables both surface
+    here. No automatic SQLite fallback: that would silently reintroduce the
+    split-brain read this module exists to fix. Pass ``--db <path>`` to query a
+    local SQLite index explicitly.
+    """
+    print(f"PostgreSQL error: {redact_credentials(str(exc))}", file=sys.stderr)
+    if "does not exist" in str(exc):
+        print(
+            "The artifact tables are missing in this database. "
+            "Run: uv run python scripts/core/artifact_index.py --all",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "Check the configured URL (CONTINUOUS_CLAUDE_DB_URL / DATABASE_URL / "
+            "OPC_POSTGRES_URL) and that the server is reachable; "
+            "or pass --db <path> to query a local SQLite index.",
+            file=sys.stderr,
+        )
+    return 1
+
+
+def _run_span_lookup(args: argparse.Namespace) -> int:
+    """Handle --by-span-id CLI mode. Returns a process exit code."""
+    backend = _resolve_backend_or_report(args)
+    if backend is None:
+        return 1
+    try:
+        conn = _open_conn(args, backend)
+        if conn is None:
+            return 0
+
+        with contextlib.closing(conn):
+            handoff = handle_span_id_lookup(
+                conn, args.by_span_id, with_content=args.with_content, backend=backend
+            )
+    except Exception as e:
+        if _is_pg_error(e):
+            return _report_pg_error(e)
+        raise
 
     if args.json:
         print(json.dumps(handoff, indent=2, default=str))
@@ -822,28 +950,48 @@ def _run_span_lookup(args: argparse.Namespace) -> None:
             print(f"\n{handoff['content']}")
     else:
         print(f"No handoff found for root_span_id: {args.by_span_id}")
+    return 0
 
 
-def _run_search(args: argparse.Namespace, query: str) -> None:
-    """Handle regular search CLI mode."""
-    db_path = get_db_path(args.db)
-    if not db_path.exists():
-        print(f"Database not found: {db_path}")
-        print("Run: uv run python scripts/artifact_index.py --all")
-        return
+def _run_search(args: argparse.Namespace, query: str) -> int:
+    """Handle regular search CLI mode. Returns a process exit code."""
+    backend = _resolve_backend_or_report(args)
+    if backend is None:
+        return 1
+    if args.save and backend != SQLITE:
+        # Refuse up front rather than search, print results, and exit 0 while
+        # silently dropping the requested compound-learning record.
+        print(
+            "--save is only supported on the SQLite backend (PostgreSQL has no queries "
+            "table). Re-run with --db <path> or without --save.",
+            file=sys.stderr,
+        )
+        return 2
 
-    with contextlib.closing(_open_db(db_path)) as conn:
-        results = search_dispatch(conn, query, args.type, args.outcome, args.limit)
+    try:
+        conn = _open_conn(args, backend)
+        if conn is None:
+            return 0
 
-        if args.json:
-            print(json.dumps(results, indent=2, default=str))
-        else:
-            formatted = format_results(results)
-            print(formatted)
+        with contextlib.closing(conn):
+            results = search_dispatch(
+                conn, query, args.type, args.outcome, args.limit, backend=backend
+            )
 
-            if args.save:
-                save_query(conn, query, formatted, results)
-                print("\n[Query saved for compound learning]")
+            if args.json:
+                print(json.dumps(results, indent=2, default=str))
+            else:
+                formatted = format_results(results)
+                print(formatted)
+
+                if args.save:
+                    save_query(conn, query, formatted, results)
+                    print("\n[Query saved for compound learning]")
+    except Exception as e:
+        if _is_pg_error(e):
+            return _report_pg_error(e)
+        raise
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -859,15 +1007,15 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.by_span_id:
-        _run_span_lookup(args)
-        return
-
-    if not args.query:
+        rc = _run_span_lookup(args)
+    elif not args.query:
         parser.print_help()
-        return
+        rc = 0
+    else:
+        rc = _run_search(args, " ".join(args.query))
 
-    query = " ".join(args.query)
-    _run_search(args, query)
+    if rc:
+        sys.exit(rc)
 
 
 if __name__ == "__main__":

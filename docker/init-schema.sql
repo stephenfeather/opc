@@ -162,6 +162,10 @@ CREATE INDEX IF NOT EXISTS idx_handoffs_created ON handoffs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_handoffs_outcome ON handoffs(outcome);
 CREATE INDEX IF NOT EXISTS idx_handoffs_goal_fts ON handoffs
     USING gin(to_tsvector('english', COALESCE(goal, '')));
+-- Backs artifact_query.py search_handoffs (issue #282). Expression must match
+-- scripts/core/artifact_query_sql.py:PG_FTS_INDEX_DDL exactly.
+CREATE INDEX IF NOT EXISTS idx_handoffs_search_fts ON handoffs
+    USING gin(to_tsvector('english', COALESCE(goal, '') || ' ' || COALESCE(what_worked, '') || ' ' || COALESCE(what_failed, '') || ' ' || COALESCE(key_decisions, '')));
 CREATE INDEX IF NOT EXISTS idx_handoffs_embedding_hnsw ON handoffs
     USING hnsw(embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
 
@@ -182,6 +186,9 @@ CREATE TABLE IF NOT EXISTS continuity (
     snapshot_reason TEXT,
     indexed_at TIMESTAMP DEFAULT NOW()
 );
+-- Backs artifact_query.py search_continuity (issue #282); see artifact_query_sql.py.
+CREATE INDEX IF NOT EXISTS idx_continuity_search_fts ON continuity
+    USING gin(to_tsvector('english', COALESCE(goal, '') || ' ' || COALESCE(key_learnings, '') || ' ' || COALESCE(key_decisions, '') || ' ' || COALESCE(state_now, '')));
 
 -- Memory Feedback: Track whether recalled learnings were actually useful
 CREATE TABLE IF NOT EXISTS memory_feedback (
@@ -281,6 +288,9 @@ CREATE TABLE IF NOT EXISTS plans (
     constraints TEXT,
     indexed_at TIMESTAMP DEFAULT NOW()
 );
+-- Backs artifact_query.py search_plans (issue #282); see artifact_query_sql.py.
+CREATE INDEX IF NOT EXISTS idx_plans_search_fts ON plans
+    USING gin(to_tsvector('english', COALESCE(title, '') || ' ' || COALESCE(overview, '') || ' ' || COALESCE(approach, '') || ' ' || COALESCE(phases, '')));
 
 -- =============================================================================
 -- DOCUMENT-COLLECTION RAG LAYER

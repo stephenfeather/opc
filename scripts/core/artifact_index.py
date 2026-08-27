@@ -163,6 +163,17 @@ def pg_connect():
     return psycopg2.connect(get_postgres_url())
 
 
+# Additive, idempotent column migrations for databases provisioned from the
+# upstream init-schema.sql before these fields were carried (issue #283).
+PG_COLUMN_MIGRATIONS: tuple[str, ...] = (
+    "ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS task_number INTEGER",
+    "ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS files_modified TEXT",
+    "ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS turn_span_id TEXT",
+    "ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS braintrust_session_id TEXT",
+    "ALTER TABLE plans ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ",
+)
+
+
 def init_postgres():
     """Initialize PostgreSQL connection and ensure schema exists."""
     conn = pg_connect()
@@ -230,6 +241,11 @@ def init_postgres():
             indexed_at TIMESTAMP DEFAULT NOW()
         )
     """)
+
+    # Issue #283: the upstream PG tables lack columns the SQLite schema has; the
+    # adapter now carries them, so add them idempotently to existing databases.
+    for ddl in PG_COLUMN_MIGRATIONS:
+        cur.execute(ddl)
 
     # GIN expression indexes backing artifact_query.py searches (issue #282).
     # Idempotent; existing databases pick them up on the next indexer run.
@@ -378,7 +394,13 @@ def db_execute(
 
 
 def parse_handoff(file_path: Path) -> dict:
-    """Parse a handoff markdown file into structured data."""
+    """Parse a handoff markdown file into structured data.
+
+    The path is resolved first so ``id`` (a hash of the path string) and
+    ``file_path`` are identical whether the caller passed a relative glob hit
+    or the hook's absolute ``--file`` (issue #283: two rows per artifact).
+    """
+    file_path = Path(file_path).resolve()
     raw_content = file_path.read_text()
     result = parse_handoff_content(raw_content, file_path)
     if not result["created_at"]:
@@ -387,7 +409,8 @@ def parse_handoff(file_path: Path) -> dict:
 
 
 def parse_handoff_yaml(file_path: Path) -> dict:
-    """Parse a handoff YAML file into structured data."""
+    """Parse a handoff YAML file into structured data (path resolved, see parse_handoff)."""
+    file_path = Path(file_path).resolve()
     raw_content = file_path.read_text()
     result = parse_handoff_yaml_content(raw_content, file_path)
     if not result["created_at"]:
@@ -424,7 +447,8 @@ def index_handoffs(conn, base_path: Path = Path("thoughts/shared/handoffs")):
 
 
 def parse_plan(file_path: Path) -> dict:
-    """Parse a plan markdown file into structured data."""
+    """Parse a plan markdown file into structured data (path resolved, see parse_handoff)."""
+    file_path = Path(file_path).resolve()
     content = file_path.read_text()
     return parse_plan_content(content, file_path)
 
@@ -439,23 +463,7 @@ def index_plans(conn, base_path: Path = Path("thoughts/shared/plans")):
     for plan_file in base_path.glob("*.md"):
         try:
             data = parse_plan(plan_file)
-            db_execute(
-                conn,
-                """
-                INSERT OR REPLACE INTO plans
-                (id, title, file_path, overview, approach, phases, constraints)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-                (
-                    data["id"],
-                    data["title"],
-                    data["file_path"],
-                    data["overview"],
-                    data["approach"],
-                    data["phases"],
-                    data["constraints"],
-                ),
-            )
+            _index_plan(conn, data)
             count += 1
         except Exception as e:
             print(f"Error indexing {plan_file}: {e}")
@@ -466,7 +474,8 @@ def index_plans(conn, base_path: Path = Path("thoughts/shared/plans")):
 
 
 def parse_continuity(file_path: Path) -> dict:
-    """Parse a continuity ledger into structured data."""
+    """Parse a continuity ledger into structured data (path resolved, see parse_handoff)."""
+    file_path = Path(file_path).resolve()
     content = file_path.read_text()
     return parse_continuity_content(content, file_path)
 
@@ -544,15 +553,22 @@ def _index_handoff(conn, data: dict, return_id: bool = False) -> str | None:
     )
 
 
+_PLAN_INSERT_SQL = """
+        INSERT OR REPLACE INTO plans
+        (id, title, file_path, overview, approach, phases, constraints, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """
+
+
 def _index_plan(conn, data: dict, return_id: bool = False) -> str | None:
-    """Write plan data to database. Returns the stored row id when requested."""
+    """Write plan data to database. Returns the stored row id when requested.
+
+    ``created_at`` comes from the plan's frontmatter ``date`` (issue #283); an
+    absent date binds NULL rather than "" so PostgreSQL's timestamp cast holds.
+    """
     return db_execute(
         conn,
-        """
-        INSERT OR REPLACE INTO plans
-        (id, title, file_path, overview, approach, phases, constraints)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """,
+        _PLAN_INSERT_SQL,
         (
             data["id"],
             data["title"],
@@ -561,6 +577,7 @@ def _index_plan(conn, data: dict, return_id: bool = False) -> str | None:
             data["approach"],
             data["phases"],
             data["constraints"],
+            data.get("created_at") or None,
         ),
         return_id=return_id,
     )

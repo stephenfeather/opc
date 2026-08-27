@@ -151,7 +151,12 @@ CREATE TABLE IF NOT EXISTS handoffs (
     content TEXT,
     embedding VECTOR(1024),
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    indexed_at TIMESTAMPTZ DEFAULT NOW()
+    indexed_at TIMESTAMPTZ DEFAULT NOW(),
+    -- Carried by the artifact indexer since issue #283 (mirrors artifact_schema.sql)
+    task_number INTEGER,
+    files_modified TEXT,
+    turn_span_id TEXT,
+    braintrust_session_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_handoffs_session ON handoffs(session_name);
@@ -286,7 +291,8 @@ CREATE TABLE IF NOT EXISTS plans (
     approach TEXT,
     phases TEXT,
     constraints TEXT,
-    indexed_at TIMESTAMP DEFAULT NOW()
+    indexed_at TIMESTAMP DEFAULT NOW(),
+    created_at TIMESTAMPTZ  -- plan frontmatter date (issue #283)
 );
 -- Backs artifact_query.py search_plans (issue #282); see artifact_query_sql.py.
 CREATE INDEX IF NOT EXISTS idx_plans_search_fts ON plans

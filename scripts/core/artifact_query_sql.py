@@ -43,7 +43,11 @@ _PG_PLAN_DOC = pg_document_expression(PLAN_DOC_COLUMNS, "p.")
 _PG_CONTINUITY_DOC = pg_document_expression(CONTINUITY_DOC_COLUMNS, "c.")
 # Bounded digit run: an unbounded [0-9]+ on a poisoned path would overflow ::int
 # and abort the whole statement (aegis review, #282).
-_PG_TASK_NUMBER_EXPR = "substring(h.file_path from 'task-([0-9]{1,6})')::int"
+# Prefer the stored column (written by the indexer since #283); fall back to the
+# filename convention for rows indexed before the column existed.
+_PG_TASK_NUMBER_EXPR = (
+    "COALESCE(h.task_number, substring(h.file_path from 'task-([0-9]{1,6})')::int)"
+)
 _PG_TASK_NUMBER = f"{_PG_TASK_NUMBER_EXPR} AS task_number"
 
 # Idempotent DDL the indexer applies on init so the searches above are

@@ -75,6 +75,23 @@ function extractSessionName(filePath) {
   }
   return null;
 }
+function classifyArtifactPath(filePath) {
+  if (!filePath) return null;
+  const normalized = filePath.replace(/\\/g, "/");
+  const segments = normalized.split("/");
+  const isMd = normalized.endsWith(".md");
+  const isYaml = normalized.endsWith(".yaml") || normalized.endsWith(".yml");
+  if (segments.includes("handoffs") && (isMd || isYaml)) {
+    return "handoff";
+  }
+  if (isMd && normalized.includes("/thoughts/shared/plans/")) {
+    return "plan";
+  }
+  if (isMd && normalized.startsWith("thoughts/shared/plans/")) {
+    return "plan";
+  }
+  return null;
+}
 async function main() {
   const input = JSON.parse(await readStdin());
   const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
@@ -84,8 +101,8 @@ async function main() {
     return;
   }
   const filePath = input.tool_input?.file_path || "";
-  const isHandoffFile = filePath.endsWith(".md") || filePath.endsWith(".yaml") || filePath.endsWith(".yml");
-  if (!filePath.includes("handoffs") || !isHandoffFile) {
+  const kind = classifyArtifactPath(filePath);
+  if (kind === null) {
     console.log(JSON.stringify({ result: "continue" }));
     return;
   }
@@ -100,7 +117,7 @@ async function main() {
     const isYamlFile = fullPath.endsWith(".yaml") || fullPath.endsWith(".yml");
     const hasFrontmatter = content.startsWith("---");
     const hasRootSpanId = content.includes("root_span_id:");
-    if (!hasRootSpanId) {
+    if (kind === "handoff" && !hasRootSpanId) {
       const stateFile = path.join(homeDir, ".claude", "state", "braintrust_sessions", `${input.session_id}.json`);
       if (fs.existsSync(stateFile)) {
         try {
@@ -133,10 +150,12 @@ ${content}`;
         }
       }
     }
-    const terminalPid = getTerminalShellPid();
-    const sessionName = extractSessionName(fullPath);
-    if (terminalPid && sessionName) {
-      storeSessionAffinity(projectDir, terminalPid, sessionName);
+    if (kind === "handoff") {
+      const terminalPid = getTerminalShellPid();
+      const sessionName = extractSessionName(fullPath);
+      if (terminalPid && sessionName) {
+        storeSessionAffinity(projectDir, terminalPid, sessionName);
+      }
     }
     const indexScript = path.join(projectDir, "scripts", "artifact_index.py");
     if (fs.existsSync(indexScript)) {
@@ -161,4 +180,9 @@ async function readStdin() {
     process.stdin.on("end", () => resolve(data));
   });
 }
-main().catch(console.error);
+if (process.argv[1] && (process.argv[1].endsWith("handoff-index.ts") || process.argv[1].endsWith("handoff-index.js") || process.argv[1].endsWith("handoff-index.mjs"))) {
+  main().catch(console.error);
+}
+export {
+  classifyArtifactPath
+};

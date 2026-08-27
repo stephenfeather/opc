@@ -131,6 +131,36 @@ function extractSessionName(filePath: string): string | null {
   return null;
 }
 
+export type ArtifactKind = 'handoff' | 'plan';
+
+/**
+ * Decide whether a written file is an artifact the indexer should ingest.
+ *
+ * - handoff: any .md/.yaml/.yml under a `handoffs` directory (unchanged).
+ * - plan: a .md file under `thoughts/shared/plans` (issue #283 — plans were
+ *   never indexed because this hook only matched handoffs).
+ *
+ * Pure function; the routing decision is unit-tested in isolation.
+ */
+export function classifyArtifactPath(filePath: string): ArtifactKind | null {
+  if (!filePath) return null;
+  const normalized = filePath.replace(/\\/g, '/');
+  const segments = normalized.split('/');
+  const isMd = normalized.endsWith('.md');
+  const isYaml = normalized.endsWith('.yaml') || normalized.endsWith('.yml');
+
+  if (segments.includes('handoffs') && (isMd || isYaml)) {
+    return 'handoff';
+  }
+  if (isMd && normalized.includes('/thoughts/shared/plans/')) {
+    return 'plan';
+  }
+  if (isMd && normalized.startsWith('thoughts/shared/plans/')) {
+    return 'plan';
+  }
+  return null;
+}
+
 async function main() {
   const input: PostToolUseInput = JSON.parse(await readStdin());
   const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
@@ -143,10 +173,8 @@ async function main() {
   }
 
   const filePath = input.tool_input?.file_path || '';
-
-  // Only process handoff files (.md or .yaml/.yml)
-  const isHandoffFile = filePath.endsWith('.md') || filePath.endsWith('.yaml') || filePath.endsWith('.yml');
-  if (!filePath.includes('handoffs') || !isHandoffFile) {
+  const kind = classifyArtifactPath(filePath);
+  if (kind === null) {
     console.log(JSON.stringify({ result: 'continue' }));
     return;
   }
@@ -168,8 +196,9 @@ async function main() {
     const hasFrontmatter = content.startsWith('---');
     const hasRootSpanId = content.includes('root_span_id:');
 
-    // If missing root_span_id, try to inject it
-    if (!hasRootSpanId) {
+    // If missing root_span_id, try to inject it (handoffs only — plans carry no
+    // Braintrust span and must not be rewritten)
+    if (kind === 'handoff' && !hasRootSpanId) {
       // Read Braintrust state file
       const stateFile = path.join(homeDir, '.claude', 'state', 'braintrust_sessions', `${input.session_id}.json`);
 
@@ -206,11 +235,13 @@ async function main() {
       }
     }
 
-    // Store session affinity: terminal_pid -> session_name
-    const terminalPid = getTerminalShellPid();
-    const sessionName = extractSessionName(fullPath);
-    if (terminalPid && sessionName) {
-      storeSessionAffinity(projectDir, terminalPid, sessionName);
+    // Store session affinity: terminal_pid -> session_name (handoffs only)
+    if (kind === 'handoff') {
+      const terminalPid = getTerminalShellPid();
+      const sessionName = extractSessionName(fullPath);
+      if (terminalPid && sessionName) {
+        storeSessionAffinity(projectDir, terminalPid, sessionName);
+      }
     }
 
     // Always trigger indexing (idempotent, will upsert)
@@ -242,4 +273,12 @@ async function readStdin(): Promise<string> {
   });
 }
 
-main().catch(console.error);
+// Only run as a hook entry point; importing the module (tests) must not read stdin.
+if (
+  process.argv[1] &&
+  (process.argv[1].endsWith('handoff-index.ts') ||
+    process.argv[1].endsWith('handoff-index.js') ||
+    process.argv[1].endsWith('handoff-index.mjs'))
+) {
+  main().catch(console.error);
+}

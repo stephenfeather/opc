@@ -195,7 +195,10 @@ class TestSqlTable:
         sql = sql_for("postgres", "get_handoff_by_span_id")
         order = sql.split("ORDER BY", 1)[1]
         assert "h.created_at DESC" in order
-        assert "task-([0-9]{1,6})')::int DESC" in order
+        assert (
+            "COALESCE(h.task_number, substring(h.file_path from 'task-([0-9]{1,6})')::int) DESC"
+            in order
+        )
         assert order.index("created_at") < order.index("task-(") < order.index("h.file_path DESC")
 
     def test_postgres_handoffs_maps_schema_shape(self):

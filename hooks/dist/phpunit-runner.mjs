@@ -7,10 +7,13 @@ var CHUNK_SIZE = 64 * 1024;
 var EAGAIN_SLEEP_MS = 5;
 var DEFAULT_MAX_IDLE_MS = 1e4;
 var MAX_IDLE_ENV = "HOOK_STDIN_MAX_IDLE_MS";
+function isTestRunner(env = process.env) {
+  return Boolean(env.VITEST) || env.NODE_ENV === "test";
+}
 function resolveMaxIdleMs(explicit) {
   if (explicit !== void 0) return explicit;
   const fromEnv = process.env[MAX_IDLE_ENV];
-  if (fromEnv !== void 0 && fromEnv !== "" && Number.isFinite(Number(fromEnv))) {
+  if (isTestRunner() && fromEnv !== void 0 && fromEnv !== "" && Number.isFinite(Number(fromEnv))) {
     return Math.max(0, Number(fromEnv));
   }
   return DEFAULT_MAX_IDLE_MS;

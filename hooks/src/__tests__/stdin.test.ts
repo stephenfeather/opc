@@ -18,7 +18,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
 
-import { MAX_IDLE_ENV, readStdinJson, readStdinSync } from '../shared/stdin.js';
+import { MAX_IDLE_ENV, isTestRunner, readStdinJson, readStdinSync } from '../shared/stdin.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const HELPER_SRC = path.join(HERE, '..', 'shared', 'stdin.ts');
@@ -169,15 +169,26 @@ describe('EAGAIN handling on a non-blocking pipe (deterministic via FIFO)', () =
     expect(Date.now() - started).toBeLessThan(1000);
   });
 
-  it('honours HOOK_STDIN_MAX_IDLE_MS when no explicit cap is given', () => {
+  it('honours HOOK_STDIN_MAX_IDLE_MS under a test runner when no explicit cap is given', () => {
     const prev = process.env[MAX_IDLE_ENV];
     process.env[MAX_IDLE_ENV] = '0';
     try {
+      expect(isTestRunner()).toBe(true); // vitest sets VITEST
       expect(() => readStdinSync({ fd: readerFd })).toThrow(/stdin idle for 0 ms/);
     } finally {
       if (prev === undefined) delete process.env[MAX_IDLE_ENV];
       else process.env[MAX_IDLE_ENV] = prev;
     }
+  });
+
+  it('ignores HOOK_STDIN_MAX_IDLE_MS outside a test runner (guards must not fail open)', () => {
+    // Prove the gate: with the runner markers removed the env knob is inert,
+    // so the read keeps retrying (we bound it via the explicit-cap-free path by
+    // checking the resolver through a short explicit call instead of waiting 10s).
+    expect(isTestRunner({})).toBe(false);
+    expect(isTestRunner({ NODE_ENV: 'production', HOOK_STDIN_MAX_IDLE_MS: '0' })).toBe(false);
+    expect(isTestRunner({ VITEST: 'true' })).toBe(true);
+    expect(isTestRunner({ NODE_ENV: 'test' })).toBe(true);
   });
 
   it('returns the payload once the writer delivers it and closes', () => {

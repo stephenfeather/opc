@@ -32,13 +32,27 @@ const DEFAULT_MAX_IDLE_MS = 10_000;
  * Override for the idle cap (ms). The vitest config sets it to 0 so a hook
  * module that reads stdin at import time fails instantly under test, exactly
  * as readFileSync(0) used to, instead of waiting out the cap per module.
+ *
+ * Honoured only under a test runner (VITEST or NODE_ENV=test): several hooks
+ * that read stdin are security guards which fail open when the read throws,
+ * so an env-controlled way to force that throw must not exist in production
+ * (aegis review of #291).
  */
 export const MAX_IDLE_ENV = 'HOOK_STDIN_MAX_IDLE_MS';
+
+export function isTestRunner(env: NodeJS.ProcessEnv = process.env): boolean {
+  return Boolean(env.VITEST) || env.NODE_ENV === 'test';
+}
 
 function resolveMaxIdleMs(explicit: number | undefined): number {
   if (explicit !== undefined) return explicit;
   const fromEnv = process.env[MAX_IDLE_ENV];
-  if (fromEnv !== undefined && fromEnv !== '' && Number.isFinite(Number(fromEnv))) {
+  if (
+    isTestRunner() &&
+    fromEnv !== undefined &&
+    fromEnv !== '' &&
+    Number.isFinite(Number(fromEnv))
+  ) {
     return Math.max(0, Number(fromEnv));
   }
   return DEFAULT_MAX_IDLE_MS;

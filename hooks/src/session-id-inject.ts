@@ -7,9 +7,7 @@
  * conversations across multiple interactions.
  */
 
-import { readFileSync } from 'fs';
-
-
+import { readStdinSync } from './shared/stdin.js';
 interface SessionStartInput {
   session_id: string;
   hook_event_name: string;
@@ -18,7 +16,7 @@ interface SessionStartInput {
 }
 
 function readStdin(): string {
-  return readFileSync(0, 'utf-8');
+  return readStdinSync();
 }
 
 function main(): void {

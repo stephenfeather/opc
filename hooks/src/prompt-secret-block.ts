@@ -18,7 +18,7 @@
  * chance the bypass is misused.
  */
 
-import { readFileSync } from 'fs';
+import { readStdinSync } from './shared/stdin.js';
 import { scanAll } from './credential-scanner/scan-all.ts';
 import type { Finding } from './credential-scanner/rules.ts';
 
@@ -34,7 +34,7 @@ interface BlockOutput {
 }
 
 function readStdin(): string {
-  return readFileSync(0, 'utf-8');
+  return readStdinSync();
 }
 
 function main(): void {

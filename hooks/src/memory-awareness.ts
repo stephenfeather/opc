@@ -11,7 +11,8 @@
  * 4. Claude proactively discloses and acts on relevant memories
  */
 
-import { readFileSync, existsSync } from 'fs';
+import { existsSync } from 'fs';
+import { readStdinSync } from './shared/stdin.js';
 import { spawnSync } from 'child_process';
 import { getOpcDir } from './shared/opc-path.js';
 import { isValidId } from './shared/db-utils-pg.js';
@@ -61,7 +62,7 @@ export function toLearningResult(r: any): LearningResult {
 }
 
 function readStdin(): string {
-  return readFileSync(0, 'utf-8');
+  return readStdinSync();
 }
 
 /**

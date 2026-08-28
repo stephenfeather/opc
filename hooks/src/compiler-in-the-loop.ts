@@ -9,6 +9,7 @@
  */
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { readStdinSync } from './shared/stdin.js';
 import { execSync } from 'child_process';
 import { dirname, join } from 'path';
 import { tmpdir } from 'os';
@@ -54,7 +55,7 @@ const STATE_DIR = process.env.CLAUDE_PROJECT_DIR
 const STATE_FILE = join(STATE_DIR, 'compiler-state.json');
 
 function readStdin(): string {
-  return readFileSync(0, 'utf-8');
+  return readStdinSync();
 }
 
 function ensureStateDir(): void {

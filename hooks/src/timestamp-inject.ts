@@ -9,8 +9,7 @@
  * - Rate-of-progress tracking
  */
 
-import { readFileSync } from 'fs';
-
+import { readStdinSync } from './shared/stdin.js';
 interface UserPromptSubmitInput {
   session_id: string;
   hook_event_name: string;
@@ -19,7 +18,7 @@ interface UserPromptSubmitInput {
 }
 
 function readStdin(): string {
-  return readFileSync(0, 'utf-8');
+  return readStdinSync();
 }
 
 /**

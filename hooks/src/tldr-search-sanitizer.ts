@@ -6,8 +6,7 @@
  *   tldr search "pattern" /path --project /path
  */
 
-import { readFileSync } from 'fs';
-
+import { readStdinSync } from './shared/stdin.js';
 interface PreToolUseInput {
   tool_name: string;
   tool_input: {
@@ -73,7 +72,7 @@ function sanitizeTldrSearch(command: string): { changed: boolean; sanitized: str
 async function main() {
   let input: PreToolUseInput;
   try {
-    input = JSON.parse(readFileSync(0, 'utf-8')) as PreToolUseInput;
+    input = JSON.parse(readStdinSync()) as PreToolUseInput;
   } catch {
     console.log('{}');
     return;

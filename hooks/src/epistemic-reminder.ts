@@ -10,8 +10,7 @@
  * - After Grep (other): lighter reminder
  */
 
-import { readFileSync } from 'fs';
-
+import { readStdinSync } from './shared/stdin.js';
 interface PostToolUseInput {
   tool_name: string;
   tool_input: {
@@ -29,7 +28,7 @@ interface HookOutput {
 function main(): void {
   let input: PostToolUseInput;
   try {
-    const stdinContent = readFileSync(0, 'utf-8');
+    const stdinContent = readStdinSync();
     input = JSON.parse(stdinContent);
   } catch {
     console.log(JSON.stringify({ result: 'continue' }));

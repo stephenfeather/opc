@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { readFileSync, existsSync } from 'fs';
+import { readStdinSync } from './shared/stdin.js';
 import { join } from 'path';
 import { spawnSync } from 'child_process';
 import { tmpdir } from 'os';
@@ -215,7 +216,7 @@ Or use the /explore skill for guided exploration.
 async function main() {
     try {
         // Read input from stdin
-        const input = readFileSync(0, 'utf-8');
+        const input = readStdinSync();
         let data: HookInput;
         try {
             data = JSON.parse(input);

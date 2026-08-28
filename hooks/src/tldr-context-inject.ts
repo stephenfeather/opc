@@ -11,7 +11,8 @@
  * Uses TLDR daemon for fast cached responses (50ms vs 500ms CLI).
  */
 
-import { readFileSync, existsSync } from 'fs';
+import { existsSync } from 'fs';
+import { readStdinSync } from './shared/stdin.js';
 import { join, dirname } from 'path';
 import {
   queryDaemonSync,
@@ -411,7 +412,7 @@ function findProjectRoot(startPath: string): string {
 }
 
 function readStdin(): string {
-  return readFileSync(0, 'utf-8');
+  return readStdinSync();
 }
 
 async function main() {

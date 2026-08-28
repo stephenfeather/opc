@@ -6,7 +6,8 @@
  * Reports test results as additional context.
  */
 
-import { readFileSync, existsSync } from 'fs';
+import { existsSync } from 'fs';
+import { readStdinSync } from './shared/stdin.js';
 import { execSync } from 'child_process';
 import * as path from 'path';
 
@@ -48,7 +49,7 @@ function hasUv(): boolean {
 }
 
 async function main() {
-  const input: HookInput = JSON.parse(readFileSync(0, 'utf-8'));
+  const input: HookInput = JSON.parse(readStdinSync());
 
   if (input.tool_name !== 'Edit' && input.tool_name !== 'Write') {
     console.log('{}');

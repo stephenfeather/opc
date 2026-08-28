@@ -10,8 +10,7 @@
  * - Suggests Nia documentation search with the error context
  */
 
-import { readFileSync } from 'fs';
-
+import { readStdinSync } from './shared/stdin.js';
 interface BashResponse {
   exit_code: number;
   stdout?: string;
@@ -128,7 +127,7 @@ function buildNiaSearchCommand(errorContext: string): string {
 async function main(): Promise<void> {
   let input: PostToolUseInput;
   try {
-    const rawInput = readFileSync(0, 'utf-8');
+    const rawInput = readStdinSync();
     input = JSON.parse(rawInput);
   } catch {
     console.log(JSON.stringify({ result: 'continue' }));

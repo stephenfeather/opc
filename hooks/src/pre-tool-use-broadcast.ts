@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { readFileSync, existsSync } from 'fs';
+import { existsSync } from 'fs';
+import { readStdinSync } from './shared/stdin.js';
 import { spawnSync } from 'child_process';
 import { join } from 'path';
 
@@ -19,7 +20,7 @@ interface HookOutput {
 const SAFE_ID_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
 
 async function main() {
-    const input = readFileSync(0, 'utf-8');
+    const input = readStdinSync();
     // Parse input but don't assign to unused variable
     JSON.parse(input) as PreToolUseInput;
 

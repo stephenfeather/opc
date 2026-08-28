@@ -8,7 +8,8 @@
  * This gives agents/subagents architectural context for better planning.
  */
 
-import { readFileSync, existsSync } from 'fs';
+import { existsSync } from 'fs';
+import { readStdinSync } from './shared/stdin.js';
 import { queryDaemonSync, trackHookActivitySync } from './daemon-client.js';
 
 interface HookInput {
@@ -60,7 +61,7 @@ const PLANNING_PATTERNS = [
 ];
 
 function readStdin(): string {
-  return readFileSync(0, 'utf-8');
+  return readStdinSync();
 }
 
 // Detect if prompt mentions planning/architecture

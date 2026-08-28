@@ -217,16 +217,11 @@ describe('heartbeat hook', () => {
   });
 
   it('outputs continue when no session ID available', async () => {
-    vi.doMock('fs', async () => {
-      const actual = await vi.importActual<typeof import('fs')>('fs');
-      return {
-        ...actual,
-        readFileSync: vi.fn((fd: unknown, ...rest: unknown[]) => {
-          if (fd === 0) return '{}';
-          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
-        }),
-      };
-    });
+    vi.doMock('../shared/stdin.js', () => ({
+      readStdinSync: vi.fn(() => {
+        return '{}';
+      }),
+    }));
     vi.doMock('../shared/db-utils-pg.js', () => ({
       updateHeartbeatDetached: vi.fn(),
       isValidId: (id: string) => /^[a-zA-Z0-9_-]+$/.test(id),
@@ -252,16 +247,11 @@ describe('heartbeat hook', () => {
   it('does not call updateHeartbeatDetached when stdin lacks a valid session_id', async () => {
     const mockUpdate = vi.fn();
 
-    vi.doMock('fs', async () => {
-      const actual = await vi.importActual<typeof import('fs')>('fs');
-      return {
-        ...actual,
-        readFileSync: vi.fn((fd: unknown, ...rest: unknown[]) => {
-          if (fd === 0) return '{}';
-          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
-        }),
-      };
-    });
+    vi.doMock('../shared/stdin.js', () => ({
+      readStdinSync: vi.fn(() => {
+        return '{}';
+      }),
+    }));
     vi.doMock('../shared/db-utils-pg.js', () => ({
       updateHeartbeatDetached: mockUpdate,
       isValidId: (id: string) => /^[a-zA-Z0-9_-]+$/.test(id),
@@ -282,16 +272,11 @@ describe('heartbeat hook', () => {
   it('prefers stdin session_id over file-based session ID', async () => {
     const mockUpdate = vi.fn();
 
-    vi.doMock('fs', async () => {
-      const actual = await vi.importActual<typeof import('fs')>('fs');
-      return {
-        ...actual,
-        readFileSync: vi.fn((fd: unknown, ...rest: unknown[]) => {
-          if (fd === 0) return JSON.stringify({ session_id: 's-fromstdin' });
-          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
-        }),
-      };
-    });
+    vi.doMock('../shared/stdin.js', () => ({
+      readStdinSync: vi.fn(() => {
+        return JSON.stringify({ session_id: 's-fromstdin' });
+      }),
+    }));
     vi.doMock('../shared/db-utils-pg.js', () => ({
       updateHeartbeatDetached: mockUpdate,
       isValidId: (id: string) => /^[a-zA-Z0-9_-]+$/.test(id),
@@ -309,16 +294,11 @@ describe('heartbeat hook', () => {
   });
 
   it('always outputs continue even when updateHeartbeatDetached throws', async () => {
-    vi.doMock('fs', async () => {
-      const actual = await vi.importActual<typeof import('fs')>('fs');
-      return {
-        ...actual,
-        readFileSync: vi.fn((fd: unknown, ...rest: unknown[]) => {
-          if (fd === 0) return '{}';
-          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
-        }),
-      };
-    });
+    vi.doMock('../shared/stdin.js', () => ({
+      readStdinSync: vi.fn(() => {
+        return '{}';
+      }),
+    }));
     vi.doMock('../shared/db-utils-pg.js', () => ({
       updateHeartbeatDetached: vi.fn(),
       isValidId: (id: string) => /^[a-zA-Z0-9_-]+$/.test(id),

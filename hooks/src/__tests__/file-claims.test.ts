@@ -23,22 +23,15 @@ describe('file-claims hook', () => {
     const mockClaimFile = vi.fn();
     const mockCheckClaim = vi.fn().mockReturnValue({ claimed: false });
 
-    vi.doMock('fs', async () => {
-      const actual = await vi.importActual<typeof import('fs')>('fs');
-      return {
-        ...actual,
-        readFileSync: vi.fn((fd: unknown, ...rest: unknown[]) => {
-          if (fd === 0) {
-            return JSON.stringify({
-              session_id: 's-stdin-id',
-              tool_name: 'Edit',
-              tool_input: { file_path: '/project/src/main.ts' },
-            });
-          }
-          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
-        }),
-      };
-    });
+    vi.doMock('../shared/stdin.js', () => ({
+      readStdinSync: vi.fn(() => {
+        return JSON.stringify({
+        session_id: 's-stdin-id',
+        tool_name: 'Edit',
+        tool_input: { file_path: '/project/src/main.ts' },
+        });
+      }),
+    }));
     vi.doMock('../shared/db-utils-pg.js', () => ({
       checkFileClaim: mockCheckClaim,
       claimFile: mockClaimFile,
@@ -62,21 +55,14 @@ describe('file-claims hook', () => {
     const mockClaimFile = vi.fn();
     const mockCheckClaim = vi.fn();
 
-    vi.doMock('fs', async () => {
-      const actual = await vi.importActual<typeof import('fs')>('fs');
-      return {
-        ...actual,
-        readFileSync: vi.fn((fd: unknown, ...rest: unknown[]) => {
-          if (fd === 0) {
-            return JSON.stringify({
-              tool_name: 'Edit',
-              tool_input: { file_path: '/project/src/main.ts' },
-            });
-          }
-          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
-        }),
-      };
-    });
+    vi.doMock('../shared/stdin.js', () => ({
+      readStdinSync: vi.fn(() => {
+        return JSON.stringify({
+        tool_name: 'Edit',
+        tool_input: { file_path: '/project/src/main.ts' },
+        });
+      }),
+    }));
     vi.doMock('../shared/db-utils-pg.js', () => ({
       checkFileClaim: mockCheckClaim,
       claimFile: mockClaimFile,
@@ -97,22 +83,15 @@ describe('file-claims hook', () => {
   });
 
   it('does not import getSessionId from session-id module', async () => {
-    vi.doMock('fs', async () => {
-      const actual = await vi.importActual<typeof import('fs')>('fs');
-      return {
-        ...actual,
-        readFileSync: vi.fn((fd: unknown, ...rest: unknown[]) => {
-          if (fd === 0) {
-            return JSON.stringify({
-              session_id: 's-test',
-              tool_name: 'Edit',
-              tool_input: { file_path: '/project/file.ts' },
-            });
-          }
-          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
-        }),
-      };
-    });
+    vi.doMock('../shared/stdin.js', () => ({
+      readStdinSync: vi.fn(() => {
+        return JSON.stringify({
+        session_id: 's-test',
+        tool_name: 'Edit',
+        tool_input: { file_path: '/project/file.ts' },
+        });
+      }),
+    }));
     vi.doMock('../shared/db-utils-pg.js', () => ({
       checkFileClaim: vi.fn().mockReturnValue({ claimed: false }),
       claimFile: vi.fn(),
@@ -128,22 +107,15 @@ describe('file-claims hook', () => {
   });
 
   it('warns when file is claimed by another session', async () => {
-    vi.doMock('fs', async () => {
-      const actual = await vi.importActual<typeof import('fs')>('fs');
-      return {
-        ...actual,
-        readFileSync: vi.fn((fd: unknown, ...rest: unknown[]) => {
-          if (fd === 0) {
-            return JSON.stringify({
-              session_id: 's-my-session',
-              tool_name: 'Edit',
-              tool_input: { file_path: '/project/src/shared.ts' },
-            });
-          }
-          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
-        }),
-      };
-    });
+    vi.doMock('../shared/stdin.js', () => ({
+      readStdinSync: vi.fn(() => {
+        return JSON.stringify({
+        session_id: 's-my-session',
+        tool_name: 'Edit',
+        tool_input: { file_path: '/project/src/shared.ts' },
+        });
+      }),
+    }));
     vi.doMock('../shared/db-utils-pg.js', () => ({
       checkFileClaim: vi.fn().mockReturnValue({ claimed: true, claimedBy: 's-other' }),
       claimFile: vi.fn(),
@@ -161,22 +133,15 @@ describe('file-claims hook', () => {
   });
 
   it('continues silently for non-Edit tools', async () => {
-    vi.doMock('fs', async () => {
-      const actual = await vi.importActual<typeof import('fs')>('fs');
-      return {
-        ...actual,
-        readFileSync: vi.fn((fd: unknown, ...rest: unknown[]) => {
-          if (fd === 0) {
-            return JSON.stringify({
-              session_id: 's-test',
-              tool_name: 'Read',
-              tool_input: { file_path: '/project/file.ts' },
-            });
-          }
-          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
-        }),
-      };
-    });
+    vi.doMock('../shared/stdin.js', () => ({
+      readStdinSync: vi.fn(() => {
+        return JSON.stringify({
+        session_id: 's-test',
+        tool_name: 'Read',
+        tool_input: { file_path: '/project/file.ts' },
+        });
+      }),
+    }));
     vi.doMock('../shared/db-utils-pg.js', () => ({
       checkFileClaim: vi.fn(),
       claimFile: vi.fn(),

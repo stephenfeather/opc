@@ -9,8 +9,7 @@
  *
  * Returns a system reminder suggesting the skill when errors are detected.
  */
-import { readFileSync } from 'fs';
-
+import { readStdinSync } from './shared/stdin.js';
 interface PostToolUseInput {
   tool_name: string;
   tool_input: Record<string, unknown>;
@@ -50,7 +49,7 @@ async function main() {
   let input: PostToolUseInput;
 
   try {
-    const rawInput = readFileSync(0, 'utf-8');
+    const rawInput = readStdinSync();
     input = JSON.parse(rawInput) as PostToolUseInput;
   } catch {
     // Malformed input - continue silently

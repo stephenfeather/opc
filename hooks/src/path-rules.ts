@@ -5,6 +5,7 @@
  * Matches file paths against patterns and injects relevant skill content
  */
 import { readFileSync, existsSync } from 'fs';
+import { readStdinSync } from './shared/stdin.js';
 import { join } from 'path';
 
 interface HookInput {
@@ -53,7 +54,7 @@ const PATH_RULES: PathRule[] = [
 ];
 
 function readStdin(): string {
-  return readFileSync(0, 'utf-8');
+  return readStdinSync();
 }
 
 function getProjectDir(): string {

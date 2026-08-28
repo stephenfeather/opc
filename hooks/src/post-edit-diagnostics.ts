@@ -6,7 +6,7 @@
  * Provides early feedback before tests run.
  */
 
-import { readFileSync } from 'fs';
+import { readStdinSync } from './shared/stdin.js';
 import { queryDaemonSync, trackHookActivitySync } from './daemon-client.js';
 
 interface HookInput {
@@ -27,7 +27,7 @@ interface HookOutput {
 }
 
 async function main() {
-  const input: HookInput = JSON.parse(readFileSync(0, 'utf-8'));
+  const input: HookInput = JSON.parse(readStdinSync());
 
   // Only run on Edit and Write operations
   if (input.tool_name !== 'Edit' && input.tool_name !== 'Write') {

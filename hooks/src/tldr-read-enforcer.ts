@@ -10,6 +10,7 @@
  */
 
 import { readFileSync, existsSync, statSync } from 'fs';
+import { readStdinSync } from './shared/stdin.js';
 import { basename, extname } from 'path';
 import { queryDaemonSync, DaemonResponse, trackHookActivitySync } from './daemon-client.js';
 
@@ -362,7 +363,7 @@ function getTldrContext(
 }
 
 function readStdin(): string {
-  return readFileSync(0, 'utf-8');
+  return readStdinSync();
 }
 
 async function main() {

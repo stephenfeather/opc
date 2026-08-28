@@ -10,7 +10,8 @@
  * Injects results via hookSpecificOutput.additionalContext.
  */
 
-import { readFileSync, existsSync } from 'fs';
+import { existsSync } from 'fs';
+import { readStdinSync } from './shared/stdin.js';
 import { spawnSync } from 'child_process';
 import { join } from 'path';
 import { getOpcDir } from './shared/opc-path.js';
@@ -52,7 +53,7 @@ function normalizeProjectName(projectDir: string): string {
 function main(): void {
   let input: SessionStartInput;
   try {
-    const stdinContent = readFileSync(0, 'utf-8');
+    const stdinContent = readStdinSync();
     input = JSON.parse(stdinContent) as SessionStartInput;
   } catch {
     console.log(JSON.stringify({ result: 'continue' }));

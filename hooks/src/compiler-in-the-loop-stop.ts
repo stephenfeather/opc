@@ -6,6 +6,7 @@
  */
 
 import { readFileSync, existsSync, unlinkSync } from 'fs';
+import { readStdinSync } from './shared/stdin.js';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -35,7 +36,7 @@ const STATE_FILE = join(STATE_DIR, 'compiler-state.json');
 const MAX_STATE_AGE_MS = 5 * 60 * 1000;
 
 function readStdin(): string {
-  return readFileSync(0, 'utf-8');
+  return readStdinSync();
 }
 
 function loadState(): CompilerState | null {

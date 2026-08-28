@@ -40,18 +40,11 @@ describe('peer-awareness hook', () => {
   });
 
   it('uses session_id from stdin to filter self from peers', async () => {
-    vi.doMock('fs', async () => {
-      const actual = await vi.importActual<typeof import('fs')>('fs');
-      return {
-        ...actual,
-        readFileSync: vi.fn((fd: unknown, ...rest: unknown[]) => {
-          if (fd === 0) {
-            return JSON.stringify({ session_id: 's-my-session' });
-          }
-          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
-        }),
-      };
-    });
+    vi.doMock('../shared/stdin.js', () => ({
+      readStdinSync: vi.fn(() => {
+        return JSON.stringify({ session_id: 's-my-session' });
+      }),
+    }));
     vi.doMock('../shared/db-utils-pg.js', () => ({
       getActiveSessions: vi.fn().mockReturnValue({
         success: true,
@@ -82,16 +75,11 @@ describe('peer-awareness hook', () => {
   });
 
   it('outputs empty when stdin has no session_id (no file fallback)', async () => {
-    vi.doMock('fs', async () => {
-      const actual = await vi.importActual<typeof import('fs')>('fs');
-      return {
-        ...actual,
-        readFileSync: vi.fn((fd: unknown, ...rest: unknown[]) => {
-          if (fd === 0) return '{}';
-          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
-        }),
-      };
-    });
+    vi.doMock('../shared/stdin.js', () => ({
+      readStdinSync: vi.fn(() => {
+        return '{}';
+      }),
+    }));
     vi.doMock('../shared/db-utils-pg.js', () => ({
       getActiveSessions: vi.fn(),
       isValidId: (id: string) => /^[a-zA-Z0-9_-]+$/.test(id),
@@ -114,16 +102,11 @@ describe('peer-awareness hook', () => {
   });
 
   it('does not import readSessionId from session-id module', async () => {
-    vi.doMock('fs', async () => {
-      const actual = await vi.importActual<typeof import('fs')>('fs');
-      return {
-        ...actual,
-        readFileSync: vi.fn((fd: unknown, ...rest: unknown[]) => {
-          if (fd === 0) return JSON.stringify({ session_id: 's-test' });
-          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
-        }),
-      };
-    });
+    vi.doMock('../shared/stdin.js', () => ({
+      readStdinSync: vi.fn(() => {
+        return JSON.stringify({ session_id: 's-test' });
+      }),
+    }));
     vi.doMock('../shared/db-utils-pg.js', () => ({
       getActiveSessions: vi.fn().mockReturnValue({ success: true, sessions: [] }),
       isValidId: (id: string) => /^[a-zA-Z0-9_-]+$/.test(id),
@@ -160,16 +143,11 @@ describe('peer-awareness hook', () => {
     process.env.AGENTICA_MEMORY_BACKEND = 'sqlite';
 
     try {
-      vi.doMock('fs', async () => {
-        const actual = await vi.importActual<typeof import('fs')>('fs');
-        return {
-          ...actual,
-          readFileSync: vi.fn((fd: unknown, ...rest: unknown[]) => {
-            if (fd === 0) return JSON.stringify({ session_id: 's-my-session' });
-            return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
-          }),
-        };
-      });
+      vi.doMock('../shared/stdin.js', () => ({
+        readStdinSync: vi.fn(() => {
+          return JSON.stringify({ session_id: 's-my-session' });
+        }),
+      }));
       const getActiveSessions = vi.fn();
       vi.doMock('../shared/db-utils-pg.js', () => ({
         getActiveSessions,
@@ -204,16 +182,11 @@ describe('peer-awareness hook', () => {
     const origAgentId = process.env.CLAUDE_AGENT_ID;
     process.env.CLAUDE_AGENT_ID = 'sub-1';
 
-    vi.doMock('fs', async () => {
-      const actual = await vi.importActual<typeof import('fs')>('fs');
-      return {
-        ...actual,
-        readFileSync: vi.fn((fd: unknown, ...rest: unknown[]) => {
-          if (fd === 0) return JSON.stringify({ session_id: 's-test' });
-          return (actual.readFileSync as (...args: unknown[]) => string | Buffer)(fd, ...rest);
-        }),
-      };
-    });
+    vi.doMock('../shared/stdin.js', () => ({
+      readStdinSync: vi.fn(() => {
+        return JSON.stringify({ session_id: 's-test' });
+      }),
+    }));
     vi.doMock('../shared/db-utils-pg.js', () => ({
       getActiveSessions: vi.fn(),
       isValidId: () => true,

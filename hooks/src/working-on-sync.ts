@@ -17,6 +17,7 @@
  */
 
 import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync } from 'fs';
+import { readStdinSync } from './shared/stdin.js';
 import { join } from 'path';
 import { updateWorkingOnDetached, isValidId } from './shared/db-utils-pg.js';
 import { getProject } from './shared/session-id.js';
@@ -173,7 +174,7 @@ function writeCache(sessionId: string, cache: WorkingOnCache): void {
 export function main(): void {
   let input: PostToolUseInput;
   try {
-    input = JSON.parse(readFileSync(0, 'utf-8')) as PostToolUseInput;
+    input = JSON.parse(readStdinSync()) as PostToolUseInput;
   } catch {
     console.log(JSON.stringify({ result: 'continue' }));
     return;

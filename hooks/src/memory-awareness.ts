@@ -16,6 +16,7 @@ import { readStdinSync } from './shared/stdin.js';
 import { spawnSync } from 'child_process';
 import { getOpcDir } from './shared/opc-path.js';
 import { isValidId } from './shared/db-utils-pg.js';
+import { isMemoryInjectionDisabled } from './shared/memory-opt-out.js';
 
 interface UserPromptSubmitInput {
   session_id: string;
@@ -339,6 +340,11 @@ function checkMemoryRelevance(
 }
 
 async function main() {
+  // Opt-out: OPC_MEMORY_LOSS=1 silences memory injection entirely.
+  if (isMemoryInjectionDisabled()) {
+    return;
+  }
+
   const input: UserPromptSubmitInput = JSON.parse(readStdin());
   const projectDir = process.env.CLAUDE_PROJECT_DIR || input.cwd;
 

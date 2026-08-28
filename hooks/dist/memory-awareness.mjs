@@ -116,6 +116,25 @@ function isValidId(id) {
   return SAFE_ID_PATTERN.test(id);
 }
 
+// src/shared/memory-opt-out.ts
+/*!
+ * Memory injection opt-out.
+ *
+ * Setting OPC_MEMORY_LOSS=1 in the environment disables the hooks that inject
+ * stored learnings into Claude's context (memory-awareness on UserPromptSubmit,
+ * session-start-memory-push on SessionStart). Useful for sessions where recall
+ * noise is unwanted — demos, benchmarks, or debugging the hooks themselves.
+ *
+ * Pure: reads only the env object it is handed.
+ */
+var MEMORY_LOSS_ENV = "OPC_MEMORY_LOSS";
+var TRUTHY = /* @__PURE__ */ new Set(["1", "true", "yes", "on"]);
+function isMemoryInjectionDisabled(env = process.env) {
+  const raw = env[MEMORY_LOSS_ENV];
+  if (raw === void 0) return false;
+  return TRUTHY.has(raw.trim().toLowerCase());
+}
+
 // src/memory-awareness.ts
 /*!
  * Memory Awareness Hook (UserPromptSubmit)
@@ -404,6 +423,9 @@ function checkMemoryRelevance(intent, projectDir, sessionId) {
   }
 }
 async function main() {
+  if (isMemoryInjectionDisabled()) {
+    return;
+  }
   const input = JSON.parse(readStdin());
   const projectDir = process.env.CLAUDE_PROJECT_DIR || input.cwd;
   if (process.env.CLAUDE_AGENT_ID) {

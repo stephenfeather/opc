@@ -15,6 +15,7 @@ import { readStdinSync } from './shared/stdin.js';
 import { spawnSync } from 'child_process';
 import { join } from 'path';
 import { getOpcDir } from './shared/opc-path.js';
+import { isMemoryInjectionDisabled } from './shared/memory-opt-out.js';
 
 interface SessionStartInput {
   session_id: string;
@@ -69,6 +70,12 @@ function main(): void {
 
   // Skip for subagents
   if (process.env.CLAUDE_AGENT_ID) {
+    console.log(JSON.stringify({ result: 'continue' }));
+    return;
+  }
+
+  // Opt-out: OPC_MEMORY_LOSS=1 silences memory injection entirely.
+  if (isMemoryInjectionDisabled()) {
     console.log(JSON.stringify({ result: 'continue' }));
     return;
   }

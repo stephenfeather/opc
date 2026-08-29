@@ -98,6 +98,12 @@ If `$HOME/.claude/` does not exist (e.g. CI, fresh box without Claude Code
 installed), the deploy step prints a skip message and exits 0 instead of
 failing. Issue #105 tracked the drift that motivated this automation.
 
+### Runtime opt-outs
+
+| Variable          | Effect                                                                                     |
+|-------------------|--------------------------------------------------------------------------------------------|
+| `OPC_MEMORY_LOSS` | `1`/`true`/`yes`/`on` disables memory injection: `memory-awareness` (UserPromptSubmit) and `session-start-memory-push` (SessionStart) exit without adding context. Implemented in `src/shared/memory-opt-out.ts`. |
+
 ---
 
 ## What Are Hooks?

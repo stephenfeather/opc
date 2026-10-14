@@ -70,7 +70,14 @@ function readStdinSync(options = {}) {
 import { basename, extname } from "path";
 
 // src/daemon-client.ts
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from "fs";
+import {
+  accessSync,
+  constants as fsConstants,
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  unlinkSync
+} from "fs";
 import { execSync, spawnSync } from "child_process";
 import { join, resolve } from "path";
 import { tmpdir } from "os";
@@ -243,13 +250,21 @@ function isDaemonReachable(projectDir) {
     }
   }
 }
+function isExecutable(path) {
+  try {
+    accessSync(path, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
 function localTldrStartSpec(tldrPath, projectDir, baseEnv) {
   if (!existsSync(join(tldrPath, "pyproject.toml"))) {
     return null;
   }
   const daemonArgs = ["daemon", "start", "--project", projectDir];
   const venvTldr = join(tldrPath, ".venv", "bin", "tldr");
-  if (existsSync(venvTldr)) {
+  if (isExecutable(venvTldr)) {
     return { command: venvTldr, args: daemonArgs, cwd: tldrPath, env: { ...baseEnv } };
   }
   if (!existsSync(join(tldrPath, "uv.lock"))) {

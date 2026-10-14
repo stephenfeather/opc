@@ -10,7 +10,14 @@
  * - Graceful degradation when indexing
  */
 
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
+import {
+  accessSync,
+  constants as fsConstants,
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  unlinkSync,
+} from 'fs';
 import { execSync, spawnSync } from 'child_process';
 import { join, resolve } from 'path';
 import { tmpdir } from 'os';
@@ -438,6 +445,15 @@ function isDaemonReachable(projectDir: string): boolean {
   }
 }
 
+function isExecutable(path: string): boolean {
+  try {
+    accessSync(path, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export interface LocalTldrStartSpec {
   command: string;
   args: string[];
@@ -467,7 +483,7 @@ export function localTldrStartSpec(
   }
   const daemonArgs = ['daemon', 'start', '--project', projectDir];
   const venvTldr = join(tldrPath, '.venv', 'bin', 'tldr');
-  if (existsSync(venvTldr)) {
+  if (isExecutable(venvTldr)) {
     return { command: venvTldr, args: daemonArgs, cwd: tldrPath, env: { ...baseEnv } };
   }
   if (!existsSync(join(tldrPath, 'uv.lock'))) {

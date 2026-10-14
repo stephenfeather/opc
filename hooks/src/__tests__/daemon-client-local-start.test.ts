@@ -5,7 +5,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
+import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -46,8 +46,16 @@ describe('localTldrStartSpec', () => {
     expect(localTldrStartSpec(tldrPath, '/proj', {})).toBeNull();
   });
 
+  it('ignores a non-executable venv tldr and uses frozen uv run when locked', () => {
+    const tldrPath = makeCheckout(['pyproject.toml', 'uv.lock', join('.venv', 'bin', 'tldr')]);
+    chmodSync(join(tldrPath, '.venv', 'bin', 'tldr'), 0o644);
+
+    expect(localTldrStartSpec(tldrPath, '/proj', {})!.command).toBe('uv');
+  });
+
   it('runs the checkout venv tldr directly when installed (no uv, no lock touch)', () => {
     const tldrPath = makeCheckout(['pyproject.toml', join('.venv', 'bin', 'tldr')]);
+    chmodSync(join(tldrPath, '.venv', 'bin', 'tldr'), 0o755);
 
     const spec = localTldrStartSpec(tldrPath, '/proj', { PATH: '/bin' });
 

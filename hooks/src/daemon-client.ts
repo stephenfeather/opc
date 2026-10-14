@@ -439,18 +439,23 @@ function isDaemonReachable(projectDir: string): boolean {
 }
 
 export interface LocalTldrStartSpec {
+  command: string;
   args: string[];
   cwd: string;
   env: NodeJS.ProcessEnv;
 }
 
 /**
- * Build the `uv run tldr daemon start` invocation for a local dev checkout of
- * tldr-code, or null when there is no usable checkout.
+ * Build the daemon-start invocation for a local dev checkout of tldr-code, or
+ * null when there is no usable checkout (caller falls back to global tldr).
  *
- * Issue #301: requires a pyproject.toml in tldrPath — otherwise `uv run` walks
- * up into the enclosing project (opc) and syncs/re-locks it. UV_FROZEN=1 keeps
- * uv from re-resolving or rewriting the package's uv.lock as a side effect.
+ * Issue #301: never let this start re-resolve or rewrite a uv.lock.
+ * - No pyproject.toml → null; `uv run` would walk up into the enclosing
+ *   project (opc) and sync/re-lock it.
+ * - Installed `.venv/bin/tldr` (e.g. `uv pip install -e .`) → run it directly;
+ *   no uv involved, so no lock is read or written.
+ * - Otherwise `uv run` with UV_FROZEN=1, only when uv.lock exists — frozen
+ *   mode exits on a missing lock, and unfrozen would create one.
  */
 export function localTldrStartSpec(
   tldrPath: string,
@@ -460,8 +465,17 @@ export function localTldrStartSpec(
   if (!existsSync(join(tldrPath, 'pyproject.toml'))) {
     return null;
   }
+  const daemonArgs = ['daemon', 'start', '--project', projectDir];
+  const venvTldr = join(tldrPath, '.venv', 'bin', 'tldr');
+  if (existsSync(venvTldr)) {
+    return { command: venvTldr, args: daemonArgs, cwd: tldrPath, env: { ...baseEnv } };
+  }
+  if (!existsSync(join(tldrPath, 'uv.lock'))) {
+    return null;
+  }
   return {
-    args: ['run', 'tldr', 'daemon', 'start', '--project', projectDir],
+    command: 'uv',
+    args: ['run', 'tldr', ...daemonArgs],
     cwd: tldrPath,
     env: { ...baseEnv, UV_FROZEN: '1' },
   };
@@ -530,7 +544,7 @@ export function tryStartDaemon(projectDir: string): boolean {
       // Try local dev installation first (only if it exists)
       const local = localTldrStartSpec(tldrPath, projectDir, process.env);
       if (local) {
-        const result = spawnSync('uv', local.args, {
+        const result = spawnSync(local.command, local.args, {
           timeout: Math.max(MIN_QUERY_BUDGET_MS, budgetClamp(10000)),
           stdio: 'ignore',
           cwd: local.cwd,

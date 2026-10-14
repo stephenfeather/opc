@@ -181,8 +181,17 @@ function localTldrStartSpec(tldrPath, projectDir, baseEnv) {
   if (!existsSync(join(tldrPath, "pyproject.toml"))) {
     return null;
   }
+  const daemonArgs = ["daemon", "start", "--project", projectDir];
+  const venvTldr = join(tldrPath, ".venv", "bin", "tldr");
+  if (existsSync(venvTldr)) {
+    return { command: venvTldr, args: daemonArgs, cwd: tldrPath, env: { ...baseEnv } };
+  }
+  if (!existsSync(join(tldrPath, "uv.lock"))) {
+    return null;
+  }
   return {
-    args: ["run", "tldr", "daemon", "start", "--project", projectDir],
+    command: "uv",
+    args: ["run", "tldr", ...daemonArgs],
     cwd: tldrPath,
     env: { ...baseEnv, UV_FROZEN: "1" }
   };
@@ -221,7 +230,7 @@ function tryStartDaemon(projectDir) {
       let started = false;
       const local = localTldrStartSpec(tldrPath, projectDir, process.env);
       if (local) {
-        const result = spawnSync("uv", local.args, {
+        const result = spawnSync(local.command, local.args, {
           timeout: Math.max(MIN_QUERY_BUDGET_MS, budgetClamp(1e4)),
           stdio: "ignore",
           cwd: local.cwd,

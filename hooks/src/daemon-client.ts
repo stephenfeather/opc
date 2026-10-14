@@ -438,6 +438,35 @@ function isDaemonReachable(projectDir: string): boolean {
   }
 }
 
+export interface LocalTldrStartSpec {
+  args: string[];
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+}
+
+/**
+ * Build the `uv run tldr daemon start` invocation for a local dev checkout of
+ * tldr-code, or null when there is no usable checkout.
+ *
+ * Issue #301: requires a pyproject.toml in tldrPath — otherwise `uv run` walks
+ * up into the enclosing project (opc) and syncs/re-locks it. UV_FROZEN=1 keeps
+ * uv from re-resolving or rewriting the package's uv.lock as a side effect.
+ */
+export function localTldrStartSpec(
+  tldrPath: string,
+  projectDir: string,
+  baseEnv: NodeJS.ProcessEnv,
+): LocalTldrStartSpec | null {
+  if (!existsSync(join(tldrPath, 'pyproject.toml'))) {
+    return null;
+  }
+  return {
+    args: ['run', 'tldr', 'daemon', 'start', '--project', projectDir],
+    cwd: tldrPath,
+    env: { ...baseEnv, UV_FROZEN: '1' },
+  };
+}
+
 /**
  * Try to start the daemon for a project.
  * Uses a lock file to prevent race conditions when multiple hooks fire in parallel.
@@ -499,11 +528,13 @@ export function tryStartDaemon(projectDir: string): boolean {
       let started = false;
 
       // Try local dev installation first (only if it exists)
-      if (existsSync(tldrPath)) {
-        const result = spawnSync('uv', ['run', 'tldr', 'daemon', 'start', '--project', projectDir], {
+      const local = localTldrStartSpec(tldrPath, projectDir, process.env);
+      if (local) {
+        const result = spawnSync('uv', local.args, {
           timeout: Math.max(MIN_QUERY_BUDGET_MS, budgetClamp(10000)),
           stdio: 'ignore',
-          cwd: tldrPath,
+          cwd: local.cwd,
+          env: local.env,
         });
         started = result.status === 0;
       }

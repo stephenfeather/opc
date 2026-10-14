@@ -237,6 +237,16 @@ function isDaemonReachable(projectDir) {
     }
   }
 }
+function localTldrStartSpec(tldrPath, projectDir, baseEnv) {
+  if (!existsSync(join(tldrPath, "pyproject.toml"))) {
+    return null;
+  }
+  return {
+    args: ["run", "tldr", "daemon", "start", "--project", projectDir],
+    cwd: tldrPath,
+    env: { ...baseEnv, UV_FROZEN: "1" }
+  };
+}
 function tryStartDaemon(projectDir) {
   if (process.env.TLDR_NO_AUTOSTART === "1") {
     return false;
@@ -269,11 +279,13 @@ function tryStartDaemon(projectDir) {
       const opcDir = process.env.CLAUDE_OPC_DIR || join(projectDir, "opc");
       const tldrPath = join(opcDir, "packages", "tldr-code");
       let started = false;
-      if (existsSync(tldrPath)) {
-        const result = spawnSync("uv", ["run", "tldr", "daemon", "start", "--project", projectDir], {
+      const local = localTldrStartSpec(tldrPath, projectDir, process.env);
+      if (local) {
+        const result = spawnSync("uv", local.args, {
           timeout: Math.max(MIN_QUERY_BUDGET_MS, budgetClamp(1e4)),
           stdio: "ignore",
-          cwd: tldrPath
+          cwd: local.cwd,
+          env: local.env
         });
         started = result.status === 0;
       }

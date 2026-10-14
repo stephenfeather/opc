@@ -67,7 +67,14 @@ function readStdinSync(options = {}) {
 }
 
 // src/daemon-client.ts
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from "fs";
+import {
+  accessSync,
+  constants as fsConstants,
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  unlinkSync
+} from "fs";
 import { execSync, spawnSync } from "child_process";
 import { join, resolve } from "path";
 import { tmpdir } from "os";
@@ -240,6 +247,33 @@ function isDaemonReachable(projectDir) {
     }
   }
 }
+function isExecutable(path) {
+  try {
+    accessSync(path, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function localTldrStartSpec(tldrPath, projectDir, baseEnv) {
+  if (!existsSync(join(tldrPath, "pyproject.toml"))) {
+    return null;
+  }
+  const daemonArgs = ["daemon", "start", "--project", projectDir];
+  const venvTldr = join(tldrPath, ".venv", "bin", "tldr");
+  if (isExecutable(venvTldr)) {
+    return { command: venvTldr, args: daemonArgs, cwd: tldrPath, env: { ...baseEnv } };
+  }
+  if (!existsSync(join(tldrPath, "uv.lock"))) {
+    return null;
+  }
+  return {
+    command: "uv",
+    args: ["run", "tldr", ...daemonArgs],
+    cwd: tldrPath,
+    env: { ...baseEnv, UV_FROZEN: "1" }
+  };
+}
 function tryStartDaemon(projectDir) {
   if (process.env.TLDR_NO_AUTOSTART === "1") {
     return false;
@@ -272,11 +306,13 @@ function tryStartDaemon(projectDir) {
       const opcDir = process.env.CLAUDE_OPC_DIR || join(projectDir, "opc");
       const tldrPath = join(opcDir, "packages", "tldr-code");
       let started = false;
-      if (existsSync(tldrPath)) {
-        const result = spawnSync("uv", ["run", "tldr", "daemon", "start", "--project", projectDir], {
+      const local = localTldrStartSpec(tldrPath, projectDir, process.env);
+      if (local) {
+        const result = spawnSync(local.command, local.args, {
           timeout: Math.max(MIN_QUERY_BUDGET_MS, budgetClamp(1e4)),
           stdio: "ignore",
-          cwd: tldrPath
+          cwd: local.cwd,
+          env: local.env
         });
         started = result.status === 0;
       }
